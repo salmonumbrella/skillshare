@@ -47,14 +47,15 @@ export function Input({ label, className = '', style, id, ...props }: InputProps
 
 interface TextareaProps extends TextareaHTMLAttributes<HTMLTextAreaElement> {
   label?: string;
+  wrapperClassName?: string;
 }
 
-export function Textarea({ label, className = '', style, id, ...props }: TextareaProps) {
+export function Textarea({ label, className = '', style, id, wrapperClassName = '', ...props }: TextareaProps) {
   const autoId = useId();
   const inputId = id ?? autoId;
 
   return (
-    <div>
+    <div className={wrapperClassName}>
       {label && (
         <label
           htmlFor={inputId}

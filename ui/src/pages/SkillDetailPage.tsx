@@ -1,11 +1,11 @@
-import { useParams, useNavigate, Link } from 'react-router-dom';
+import { useParams, useNavigate, Link, useBlocker, useBeforeUnload } from 'react-router-dom';
 import {
   ArrowLeft, Trash2, ExternalLink, FileText, ArrowUpRight, RefreshCw, Target,
   Type, AlignLeft, Files, Scale,
-  FileCode2, Braces, Settings, BookOpen, File, FolderOpen,
-  ShieldCheck, Link2, EyeOff, Eye,
+  FileCode2, Braces, Settings, BookOpen, File, FolderOpen, Zap,
+  ShieldCheck, Link2, EyeOff, Eye, ChevronDown, ChevronUp,
 } from 'lucide-react';
-import Markdown, { type Components } from 'react-markdown';
+import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { queryKeys, staleTimes } from '../lib/queryKeys';
@@ -14,85 +14,32 @@ import Card from '../components/Card';
 import CopyButton from '../components/CopyButton';
 import Button from '../components/Button';
 import IconButton from '../components/IconButton';
+import SegmentedControl from '../components/SegmentedControl';
+import SkillFrontmatterGuide from '../components/SkillFrontmatterGuide';
+import { createSkillMarkdownComponents } from '../components/SkillMarkdownComponents';
 import { SkillDetailSkeleton } from '../components/Skeleton';
 import { useToast } from '../components/Toast';
 import Spinner from '../components/Spinner';
 import ConfirmDialog from '../components/ConfirmDialog';
+import Tooltip from '../components/Tooltip';
 import { api, type Skill, type SkillStats } from '../api/client';
-import { lazy, Suspense, useState, useMemo } from 'react';
+import type { SkillMarkdownEditorSurface } from '../components/SkillMarkdownEditor';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { radius, shadows } from '../design';
 import { BlockStamp, RiskMeter } from '../components/audit';
 import { severityBadgeVariant } from '../lib/severity';
 import { useSyncMatrix } from '../hooks/useSyncMatrix';
+import { buildSkillDraftStats, buildSkillTokenBreakdown, parseSkillMarkdown } from '../lib/skillMarkdown';
+import {
+  formatFrontmatterValue,
+  getAdditionalFrontmatterEntries,
+  getReferenceFrontmatterEntries,
+} from '../lib/skillFrontmatter';
 
 const FileViewerModal = lazy(() => import('../components/FileViewerModal'));
+const SkillMarkdownEditor = lazy(() => import('../components/SkillMarkdownEditor'));
 
-type SkillManifest = {
-  name?: string;
-  description?: string;
-  license?: string;
-};
-
-function parseScalarValue(raw: string): string | undefined {
-  const trimmed = raw.trim();
-  if (!trimmed) return undefined;
-  // YAML block scalar indicators — fall through to block reader
-  if (/^[>|][+-]?$/.test(trimmed)) return undefined;
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
-    return trimmed.slice(1, -1).trim() || undefined;
-  }
-  return trimmed;
-}
-
-function extractManifestValue(frontmatter: string, key: 'name' | 'description' | 'license'): string | undefined {
-  const lines = frontmatter.split(/\r?\n/);
-  const keyPrefix = `${key}:`;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.startsWith(keyPrefix)) continue;
-
-    const inline = parseScalarValue(line.slice(keyPrefix.length));
-    if (inline) return inline;
-
-    const blockLines: string[] = [];
-    for (let j = i + 1; j < lines.length; j++) {
-      const candidate = lines[j];
-      if (candidate.trim() === '') {
-        blockLines.push('');
-        continue;
-      }
-      if (!candidate.startsWith(' ') && !candidate.startsWith('\t')) break;
-      blockLines.push(candidate.trim());
-      i = j;
-    }
-
-    const block = blockLines.join(' ').replace(/\s+/g, ' ').trim();
-    return block || undefined;
-  }
-
-  return undefined;
-}
-
-function parseSkillMarkdown(content: string): { manifest: SkillManifest; markdown: string } {
-  if (!content) return { manifest: {}, markdown: '' };
-
-  const match = content.match(/^---\s*\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n)?/);
-  if (!match) return { manifest: {}, markdown: content };
-
-  const frontmatter = match[1];
-  const manifest: SkillManifest = {
-    name: extractManifestValue(frontmatter, 'name'),
-    description: extractManifestValue(frontmatter, 'description'),
-    license: extractManifestValue(frontmatter, 'license'),
-  };
-
-  const markdown = content.slice(match[0].length);
-  return { manifest, markdown };
-}
+type DetailMode = 'read' | 'edit' | 'split';
 
 function skillTypeLabel(type?: string): string | undefined {
   if (!type) return undefined;
@@ -112,7 +59,17 @@ function getFileIcon(filename: string): { icon: typeof File; className: string }
 }
 
 /** Content stats bar showing server-provided content counts, file count, license */
-function ContentStatsBar({ stats, fileCount, license }: { stats: SkillStats; fileCount: number; license?: string }) {
+function ContentStatsBar({
+  stats,
+  fileCount,
+  license,
+  tokenBreakdown,
+}: {
+  stats: SkillStats;
+  fileCount: number;
+  license?: string;
+  tokenBreakdown: { loadTokens: number; previewTokens: number };
+}) {
   return (
     <div className="ss-detail-stats flex items-center gap-4 flex-wrap text-sm text-pencil-light py-3 mb-4 border-b border-muted">
       <span className="inline-flex items-center gap-1.5">
@@ -127,10 +84,19 @@ function ContentStatsBar({ stats, fileCount, license }: { stats: SkillStats; fil
         <Files size={12} strokeWidth={2.5} />
         {fileCount} file{fileCount !== 1 ? 's' : ''}
       </span>
-      <span className="inline-flex items-center gap-1.5">
-        <Braces size={12} strokeWidth={2.5} />
-        {stats.tokenCount.toLocaleString()} tokens
-      </span>
+      <Tooltip
+        content={(
+          <div className="space-y-1 text-left">
+            <div>Loading the skill: {tokenBreakdown.loadTokens.toLocaleString()} tokens</div>
+            <div>Reading the preview: {tokenBreakdown.previewTokens.toLocaleString()} tokens</div>
+          </div>
+        )}
+      >
+        <span className="inline-flex items-center gap-1.5">
+          <Zap size={12} strokeWidth={2.5} />
+          {stats.tokenCount.toLocaleString()} tokens
+        </span>
+      </Tooltip>
       {license && (
         <span className="inline-flex items-center gap-1.5">
           <Scale size={12} strokeWidth={2.5} />
@@ -173,7 +139,95 @@ export default function SkillDetailPage() {
   const [toggling, setToggling] = useState(false);
   const [blockedMessage, setBlockedMessage] = useState<string | null>(null);
   const [viewingFile, setViewingFile] = useState<string | null>(null);
+  const [savedContent, setSavedContent] = useState('');
+  const [draftContent, setDraftContent] = useState('');
+  const [mode, setMode] = useState<DetailMode>('read');
+  const [editorSurface, setEditorSurface] = useState<SkillMarkdownEditorSurface>('rich');
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const [openingFilePath, setOpeningFilePath] = useState<string | null>(null);
+  const [showFrontmatterGuide, setShowFrontmatterGuide] = useState(false);
+  const lastLoadedSkillRef = useRef<string | null>(null);
+  const contentAuthorityRef = useRef<'query' | 'save-response'>('query');
   const { toast } = useToast();
+  const skill = data?.skill;
+  const skillMdContent = data?.skillMdContent ?? '';
+  const files = data?.files ?? [];
+  const isDirty = draftContent !== savedContent;
+  const blocker = useBlocker(isDirty);
+  const previewSource = draftContent;
+  const parsedDoc = useMemo(() => parseSkillMarkdown(previewSource), [previewSource]);
+  const savedParsedDoc = useMemo(() => parseSkillMarkdown(skillMdContent), [skillMdContent]);
+  const referenceFrontmatterEntries = useMemo(
+    () => getReferenceFrontmatterEntries(parsedDoc.frontmatter),
+    [parsedDoc.frontmatter],
+  );
+  const additionalFrontmatterEntries = useMemo(
+    () => getAdditionalFrontmatterEntries(parsedDoc.frontmatter),
+    [parsedDoc.frontmatter],
+  );
+  const configuredFrontmatterEntries = useMemo(
+    () => referenceFrontmatterEntries.filter((entry) => entry.isSet),
+    [referenceFrontmatterEntries],
+  );
+  const compactFrontmatterEntries = useMemo(
+    () => configuredFrontmatterEntries.filter((entry) => entry.key !== 'name' && entry.key !== 'description'),
+    [configuredFrontmatterEntries],
+  );
+  const savedHasConfiguredFrontmatter = useMemo(() => {
+    const savedReferenceEntries = getReferenceFrontmatterEntries(savedParsedDoc.frontmatter);
+    const savedAdditionalEntries = getAdditionalFrontmatterEntries(savedParsedDoc.frontmatter);
+    return savedReferenceEntries.some((entry) => entry.isSet) || savedAdditionalEntries.length > 0;
+  }, [savedParsedDoc.frontmatter]);
+  const displayedStats = useMemo(
+    () => (isDirty ? buildSkillDraftStats(draftContent) : data?.stats ?? buildSkillDraftStats(draftContent)),
+    [data?.stats, draftContent, isDirty],
+  );
+  const tokenBreakdown = useMemo(() => {
+    const breakdown = buildSkillTokenBreakdown(draftContent);
+    return breakdown;
+  }, [draftContent]);
+  const hasConfiguredFrontmatter = configuredFrontmatterEntries.length > 0 || additionalFrontmatterEntries.length > 0;
+  const renderedMarkdown = parsedDoc.markdown.trim() ? parsedDoc.markdown : previewSource;
+
+  const handleSave = async (nextContent = draftContent) => {
+    if (!skill || !name || isSaving) return;
+
+    setIsSaving(true);
+    setSaveError(null);
+    try {
+      const response = await api.saveSkillFile(skill.flatName, 'SKILL.md', nextContent);
+      contentAuthorityRef.current = 'save-response';
+      setSavedContent(response.content);
+      setDraftContent(response.content);
+      toast('SKILL.md saved.', 'success');
+      await queryClient.invalidateQueries({ queryKey: queryKeys.skills.detail(name) });
+    } catch (e: unknown) {
+      const message = (e as Error).message;
+      setSaveError(message);
+      toast(message, 'error');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleDiscardDraft = () => {
+    setDraftContent(savedContent);
+    setSaveError(null);
+  };
+
+  const handleOpenLocalFile = async (filepath: string) => {
+    if (!skill || openingFilePath) return;
+
+    setOpeningFilePath(filepath);
+    try {
+      await api.openSkillFile(skill.flatName, filepath);
+    } catch (e: unknown) {
+      toast((e as Error).message, 'error');
+    } finally {
+      setOpeningFilePath(null);
+    }
+  };
 
   // Build lookup maps for skill cross-referencing
   const skillMaps = useMemo(() => {
@@ -186,55 +240,31 @@ export default function SkillDetailPage() {
     }
     return { byName, byFlat };
   }, [allSkills.data]);
-
-  if (isPending) return <SkillDetailSkeleton />;
-  if (error) {
-    return (
-      <Card variant="accent" className="text-center py-8">
-        <p className="text-danger text-lg">
-          Failed to load skill
-        </p>
-        <p className="text-pencil-light text-sm mt-1">{error.message}</p>
-      </Card>
-    );
-  }
-  if (!data) return null;
-
-  const { skill, skillMdContent, files: rawFiles } = data;
-  const files = rawFiles ?? [];
-  const parsedDoc = parseSkillMarkdown(skillMdContent ?? '');
-  const hasManifest = Boolean(parsedDoc.manifest.name || parsedDoc.manifest.description || parsedDoc.manifest.license);
-  const renderedMarkdown = parsedDoc.markdown.trim() ? parsedDoc.markdown : skillMdContent;
-
-  /** Try to resolve a reference to a known skill */
-  function resolveSkillRef(ref: string): Skill | undefined {
-    // Direct name match
-    if (skillMaps.byName.has(ref)) return skillMaps.byName.get(ref);
-    // Try as child: currentFlatName__ref (with / replaced by __)
-    const childFlat = `${skill.flatName}__${ref.replace(/\//g, '__')}`;
-    if (skillMaps.byFlat.has(childFlat)) return skillMaps.byFlat.get(childFlat);
-    return undefined;
-  }
-
-  /** Try to resolve a file path to a known skill */
-  function resolveFileSkill(filePath: string): Skill | undefined {
-    // Skip non-directory files (files with extensions)
-    if (/\.[a-z]+$/i.test(filePath) && !filePath.endsWith('.md')) return undefined;
-    const flat = `${skill.flatName}__${filePath.replace(/\//g, '__')}`;
-    return skillMaps.byFlat.get(flat);
-  }
-
-  // Custom Markdown link component: resolve skill references to internal links
-  const mdComponents: Components = {
-    a: ({ href, children, ...props }) => {
-      if (href) {
-        // Check if href is a skill reference (not a URL)
+  const mdComponents = useMemo(() => createSkillMarkdownComponents({
+    renderLink: ({ href, children, props }) => {
+      if (href && skill) {
         if (!href.startsWith('http') && !href.startsWith('#')) {
-          const resolved = resolveSkillRef(href);
-          if (resolved) {
+          if (skillMaps.byName.has(href)) {
+            const resolved = skillMaps.byName.get(href);
+            if (resolved) {
+              return (
+                <Link
+                  to={`/skills/${encodeURIComponent(resolved.flatName)}`}
+                  className="link-subtle inline-flex items-center gap-0.5"
+                >
+                  {children}
+                  <ArrowUpRight size={12} strokeWidth={2.5} className="shrink-0" />
+                </Link>
+              );
+            }
+          }
+
+          const childFlat = `${skill.flatName}__${href.replace(/\//g, '__')}`;
+          const childSkill = skillMaps.byFlat.get(childFlat);
+          if (childSkill) {
             return (
               <Link
-                to={`/skills/${encodeURIComponent(resolved.flatName)}`}
+                to={`/skills/${encodeURIComponent(childSkill.flatName)}`}
                 className="link-subtle inline-flex items-center gap-0.5"
               >
                 {children}
@@ -242,8 +272,8 @@ export default function SkillDetailPage() {
               </Link>
             );
           }
-          // Check if href matches a file in this skill — open in modal
-          const matchedFile = files.find((f) => f === href || f.endsWith('/' + href));
+
+          const matchedFile = files.find((file) => file === href || file.endsWith('/' + href));
           if (matchedFile) {
             return (
               <Button
@@ -258,14 +288,90 @@ export default function SkillDetailPage() {
           }
         }
       }
-      // Default: external link
+
       return (
         <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
           {children}
         </a>
       );
     },
-  };
+  }), [files, skill, skillMaps.byFlat, skillMaps.byName]);
+
+  useEffect(() => {
+    if (!skill) return;
+
+    const skillChanged = lastLoadedSkillRef.current !== skill.flatName;
+    lastLoadedSkillRef.current = skill.flatName;
+
+    if (skillChanged) {
+      contentAuthorityRef.current = 'query';
+      setSavedContent(skillMdContent);
+      setDraftContent(skillMdContent);
+      setSaveError(null);
+      return;
+    }
+
+    if (skillMdContent === savedContent) {
+      contentAuthorityRef.current = 'query';
+      return;
+    }
+
+    if (!isDirty && contentAuthorityRef.current === 'query') {
+      setSavedContent(skillMdContent);
+      setDraftContent(skillMdContent);
+      setSaveError(null);
+    }
+  }, [isDirty, savedContent, skill, skillMdContent]);
+
+  useEffect(() => {
+    if (!skill) return;
+    setShowFrontmatterGuide(!savedHasConfiguredFrontmatter);
+  }, [savedHasConfiguredFrontmatter, skill?.flatName]);
+
+  useBeforeUnload(
+    (event) => {
+      if (!isDirty) return;
+      event.preventDefault();
+      event.returnValue = '';
+    },
+    { capture: true },
+  );
+
+  useEffect(() => {
+    if (mode === 'read') return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 's') return;
+      event.preventDefault();
+      if (!isDirty || isSaving) return;
+      void handleSave();
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [draftContent, isDirty, isSaving, mode, skill, name]);
+
+  if (isPending) return <SkillDetailSkeleton />;
+  if (error) {
+    return (
+      <Card variant="accent" className="text-center py-8">
+        <p className="text-danger text-lg">
+          Failed to load skill
+        </p>
+        <p className="text-pencil-light text-sm mt-1">{error.message}</p>
+      </Card>
+    );
+  }
+  if (!data || !skill) return null;
+  const currentSkill = skill;
+
+  /** Try to resolve a file path to a known skill */
+  function resolveFileSkill(filePath: string): Skill | undefined {
+    // Skip non-directory files (files with extensions)
+    if (/\.[a-z]+$/i.test(filePath) && !filePath.endsWith('.md')) return undefined;
+    const flat = `${currentSkill.flatName}__${filePath.replace(/\//g, '__')}`;
+    return skillMaps.byFlat.get(flat);
+  }
 
   const handleDelete = async () => {
     setDeleting(true);
@@ -377,50 +483,177 @@ export default function SkillDetailPage() {
         {/* Main content: SKILL.md */}
         <div className="lg:col-span-2">
           <Card>
-            {hasManifest && (
-              <div
-                className="ss-detail-manifest mb-4 p-4 pt-5 border-2 border-dashed border-pencil-light/30"
-                style={{ borderRadius: radius.sm }}
-              >
-                <dl className="space-y-2">
-                  {parsedDoc.manifest.name && (
-                    <div>
-                      <dt className="text-sm text-muted-dark uppercase tracking-wide">Name</dt>
-                      <dd className="text-xl font-bold text-pencil">{parsedDoc.manifest.name}</dd>
+            <div
+              className="ss-detail-manifest mb-4 p-4 pt-5 border-2 border-dashed border-pencil-light/30"
+              style={{ borderRadius: radius.sm }}
+            >
+              <div className="mb-4 space-y-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  {parsedDoc.manifest.name ? (
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm text-muted-dark uppercase tracking-wide">Name</div>
+                      <div className="text-xl font-bold text-pencil">{parsedDoc.manifest.name}</div>
                     </div>
+                  ) : (
+                    <div className="min-w-0 flex-1" />
                   )}
-                  {parsedDoc.manifest.description && (
-                    <div>
-                      <dt className="text-sm text-muted-dark uppercase tracking-wide">Description</dt>
-                      <dd className="text-base text-pencil">{parsedDoc.manifest.description}</dd>
-                    </div>
-                  )}
-                  {parsedDoc.manifest.license && (
-                    <div>
-                      <dt className="text-sm text-muted-dark uppercase tracking-wide">License</dt>
-                      <dd className="text-base text-pencil">{parsedDoc.manifest.license}</dd>
-                    </div>
-                  )}
-                </dl>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setShowFrontmatterGuide((current) => !current)}
+                  >
+                    {showFrontmatterGuide ? <ChevronUp size={14} strokeWidth={2.5} /> : <ChevronDown size={14} strokeWidth={2.5} />}
+                    {showFrontmatterGuide ? 'Hide frontmatter' : 'Show frontmatter'}
+                  </Button>
+                </div>
+
+                {parsedDoc.manifest.description ? (
+                  <div className="min-w-0">
+                    <div className="text-sm text-muted-dark uppercase tracking-wide">Description</div>
+                    <div className="text-base text-pencil">{parsedDoc.manifest.description}</div>
+                  </div>
+                ) : null}
               </div>
-            )}
-            {/* Stage 1: Content Stats Bar */}
+
+              {!hasConfiguredFrontmatter ? (
+                <p className="rounded-[var(--radius-sm)] border border-muted/80 bg-paper/60 px-3 py-2 text-sm text-pencil-light">
+                  No frontmatter fields are set yet. The field guide below shows every option you can add.
+                </p>
+              ) : null}
+
+              {compactFrontmatterEntries.length > 0 || additionalFrontmatterEntries.length > 0 ? (
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                  {compactFrontmatterEntries.map((entry) => (
+                    <div key={entry.key} className="rounded-[var(--radius-sm)] border border-muted/80 bg-paper/60 px-3 py-2">
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-dark">{entry.key}</div>
+                      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words text-sm text-pencil">
+                        <code>{formatFrontmatterValue(entry.value)}</code>
+                      </pre>
+                    </div>
+                  ))}
+                  {additionalFrontmatterEntries.map((entry) => (
+                    <div key={entry.key} className="rounded-[var(--radius-sm)] border border-muted/80 bg-paper/60 px-3 py-2">
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-dark">{entry.key}</div>
+                      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-words text-sm text-pencil">
+                        <code>{formatFrontmatterValue(entry.value)}</code>
+                      </pre>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+
+              {showFrontmatterGuide ? (
+                <div className="mt-4 border-t border-dashed border-pencil-light/30 pt-4">
+                  <SkillFrontmatterGuide
+                    frontmatter={parsedDoc.frontmatter}
+                    headingLevel="h3"
+                  />
+                </div>
+              ) : null}
+            </div>
             <ContentStatsBar
-              stats={data.stats}
+              stats={displayedStats}
               fileCount={files.length}
               license={parsedDoc.manifest.license}
+              tokenBreakdown={tokenBreakdown}
             />
-            <div className="prose-hand">
-              {renderedMarkdown ? (
-                <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                  {renderedMarkdown}
-                </Markdown>
-              ) : (
-                <p className="text-pencil-light italic text-center py-8">
-                  No SKILL.md content available.
-                </p>
-              )}
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <SegmentedControl
+                value={mode}
+                onChange={setMode}
+                options={[
+                  { value: 'read', label: 'Read' },
+                  { value: 'edit', label: 'Edit' },
+                  { value: 'split', label: 'Split' },
+                ]}
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                {isSaving ? (
+                  <span className="rounded-full border border-blue bg-blue/10 px-3 py-1 text-sm font-medium text-blue inline-flex items-center gap-1.5">
+                    <Spinner size="sm" />
+                    Saving...
+                  </span>
+                ) : null}
+                {isDirty ? (
+                  <span className="rounded-full border border-warning bg-warning-light px-3 py-1 text-sm font-medium text-warning">
+                    Unsaved changes
+                  </span>
+                ) : null}
+              </div>
             </div>
+            {saveError ? (
+              <div
+                role="alert"
+                className="mb-4 rounded-[var(--radius-md)] border border-danger/40 bg-danger/5 px-4 py-3 text-sm text-danger"
+              >
+                {saveError}
+              </div>
+            ) : null}
+            {mode === 'read' ? (
+              <div className="prose-hand">
+                {renderedMarkdown ? (
+                  <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                    {renderedMarkdown}
+                  </Markdown>
+                ) : (
+                  <p className="text-pencil-light italic text-center py-8">
+                    No SKILL.md content available.
+                  </p>
+                )}
+              </div>
+            ) : mode === 'edit' ? (
+              <Suspense fallback={<EditorShellFallback mode="edit" />}>
+                <div className={editorShellClassName(isSaving)} aria-busy={isSaving}>
+                  <SkillMarkdownEditor
+                    value={draftContent}
+                    onChange={(next) => {
+                      setDraftContent(next);
+                      setSaveError(null);
+                    }}
+                    onSave={(next) => void handleSave(next)}
+                    onDiscard={handleDiscardDraft}
+                    onSurfaceChange={setEditorSurface}
+                    surface={editorSurface}
+                    mode="edit"
+                    isDirty={isDirty}
+                  />
+                </div>
+              </Suspense>
+            ) : (
+              <div className="grid grid-cols-1 items-stretch gap-4 xl:grid-cols-2 xl:auto-rows-fr">
+                <Suspense fallback={<EditorShellFallback mode="split" />}>
+                  <div className={editorShellClassName(isSaving, true)} aria-busy={isSaving}>
+                    <SkillMarkdownEditor
+                      value={draftContent}
+                      onChange={(next) => {
+                        setDraftContent(next);
+                        setSaveError(null);
+                      }}
+                      onSave={(next) => void handleSave(next)}
+                      onDiscard={handleDiscardDraft}
+                      onSurfaceChange={setEditorSurface}
+                      surface={editorSurface}
+                      mode="split"
+                      isDirty={isDirty}
+                    />
+                  </div>
+                </Suspense>
+                <div className="flex h-full min-h-0 flex-col rounded-[var(--radius-lg)] border-2 border-muted bg-surface p-4">
+                  <div className="mb-3 text-sm font-medium text-pencil-light">Preview</div>
+                  <div className="prose-hand min-h-0 flex-1">
+                    {renderedMarkdown ? (
+                      <Markdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                        {renderedMarkdown}
+                      </Markdown>
+                    ) : (
+                      <p className="text-pencil-light italic text-center py-8">
+                        No SKILL.md content available.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
           </Card>
         </div>
 
@@ -532,41 +765,47 @@ export default function SkillDetailPage() {
               <ul className="space-y-1.5 max-h-80 overflow-y-auto">
                 {files.map((f) => {
                   const linkedSkill = resolveFileSkill(f);
-                  const isSkillMd = f === 'SKILL.md';
                   const { icon: FileIcon, className: iconClass } = getFileIcon(f);
+                  const isOpening = openingFilePath === f;
+                  const canPreviewInModal = f !== 'SKILL.md';
                   return (
                     <li
                       key={f}
                       className="text-sm text-pencil-light truncate flex items-center gap-2"
                     >
                       <FileIcon size={14} strokeWidth={2} className={`shrink-0 ${iconClass}`} />
-                      {linkedSkill ? (
-                        <Link
-                          to={`/skills/${encodeURIComponent(linkedSkill.flatName)}`}
-                          className="font-mono link-subtle inline-flex items-center gap-1"
-                          style={{ fontSize: '0.8125rem' }}
-                          title={`View skill: ${linkedSkill.name}`}
-                        >
-                          {f}
-                          <ArrowUpRight size={11} strokeWidth={2.5} className="shrink-0" />
-                        </Link>
-                      ) : isSkillMd ? (
-                        <span
-                          className="font-mono truncate"
-                        >
-                          {f}
-                        </span>
-                      ) : (
+                      <Button
+                        variant="link"
+                        onClick={() => void handleOpenLocalFile(f)}
+                        disabled={isOpening}
+                        aria-label={`Open file ${f} locally`}
+                        className="font-mono link-subtle text-left truncate inline-flex items-center"
+                        style={{ fontSize: '0.8125rem' }}
+                        title={`Open locally: ${f}`}
+                      >
+                        {f}
+                      </Button>
+                      {canPreviewInModal ? (
                         <Button
                           variant="link"
                           onClick={() => setViewingFile(f)}
-                          className="font-mono link-subtle text-left truncate inline-flex items-center gap-1"
-                          style={{ fontSize: '0.8125rem' }}
-                          title={`View file: ${f}`}
+                          aria-label={`Preview file ${f}`}
+                          className="link-subtle inline-flex items-center gap-0.5 shrink-0"
+                          title={`Preview file: ${f}`}
                         >
-                          {f}
+                          <Eye size={12} strokeWidth={2.5} className="shrink-0" />
                         </Button>
-                      )}
+                      ) : null}
+                      {linkedSkill ? (
+                        <Link
+                          to={`/skills/${encodeURIComponent(linkedSkill.flatName)}`}
+                          className="link-subtle inline-flex items-center gap-0.5 shrink-0"
+                          title={`View nested skill: ${linkedSkill.name}`}
+                          aria-label={`View nested skill ${linkedSkill.name}`}
+                        >
+                          <ArrowUpRight size={11} strokeWidth={2.5} className="shrink-0" />
+                        </Link>
+                      ) : null}
                     </li>
                   );
                 })}
@@ -634,6 +873,35 @@ export default function SkillDetailPage() {
         onConfirm={handleDelete}
         onCancel={() => setConfirmDelete(false)}
       />
+
+      <ConfirmDialog
+        open={blocker.state === 'blocked'}
+        title="Unsaved Changes"
+        message="You have unsaved changes that will be lost. Discard them?"
+        confirmText="Discard"
+        variant="danger"
+        onConfirm={() => blocker.proceed?.()}
+        onCancel={() => blocker.reset?.()}
+      />
+    </div>
+  );
+}
+
+function editorShellClassName(isSaving: boolean, stretch = false): string {
+  return [
+    'transition-opacity',
+    stretch ? 'h-full min-h-0' : '',
+    isSaving ? 'pointer-events-none opacity-60' : '',
+  ].filter(Boolean).join(' ');
+}
+
+function EditorShellFallback({ mode }: { mode: 'edit' | 'split' }) {
+  return (
+    <div className="rounded-[var(--radius-lg)] border-2 border-muted bg-surface p-4 min-h-[20rem]">
+      <div className="flex items-center gap-2 text-sm text-pencil-light">
+        <Spinner size="sm" />
+        Loading editor for {mode} mode...
+      </div>
     </div>
   );
 }

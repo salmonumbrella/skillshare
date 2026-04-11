@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -173,7 +174,7 @@ func (s *Server) handleGetSkillFile(w http.ResponseWriter, r *http.Request) {
 	fp := r.PathValue("filepath")
 
 	// Reject path traversal attempts
-	if strings.Contains(fp, "..") {
+	if containsTraversalSegment(fp) {
 		writeError(w, http.StatusBadRequest, "invalid file path")
 		return
 	}
@@ -196,6 +197,30 @@ func (s *Server) handleGetSkillFile(w http.ResponseWriter, r *http.Request) {
 		absPath = filepath.Clean(absPath)
 		skillDir := filepath.Clean(d.SourcePath) + string(filepath.Separator)
 		if !strings.HasPrefix(absPath, skillDir) {
+			writeError(w, http.StatusBadRequest, "invalid file path")
+			return
+		}
+		if err := ensureResolvedPathWithinRoot(d.SourcePath, absPath); err != nil {
+			switch {
+			case errors.Is(err, errInvalidSkillFilePath):
+				writeError(w, http.StatusBadRequest, "invalid file path")
+			case errors.Is(err, os.ErrNotExist):
+				writeError(w, http.StatusNotFound, "file not found: "+fp)
+			default:
+				writeError(w, http.StatusInternalServerError, "failed to read file: "+err.Error())
+			}
+			return
+		}
+		info, err := os.Lstat(absPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				writeError(w, http.StatusNotFound, "file not found: "+fp)
+			} else {
+				writeError(w, http.StatusInternalServerError, "failed to read file: "+err.Error())
+			}
+			return
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			writeError(w, http.StatusBadRequest, "invalid file path")
 			return
 		}
@@ -225,6 +250,141 @@ func (s *Server) handleGetSkillFile(w http.ResponseWriter, r *http.Request) {
 			"content":     string(data),
 			"contentType": ct,
 			"filename":    filepath.Base(absPath),
+		})
+		return
+	}
+
+	writeError(w, http.StatusNotFound, "skill not found: "+name)
+}
+
+func (s *Server) handleSaveSkillFile(w http.ResponseWriter, r *http.Request) {
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
+	source := s.cfg.Source
+	s.mu.RUnlock()
+
+	var req struct {
+		Content *string `json:"content"`
+	}
+	if err := decodeStrictJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if req.Content == nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: missing content")
+		return
+	}
+
+	name := r.PathValue("name")
+	fp := r.PathValue("filepath")
+
+	// Find the skill using the same discovery behavior as file read.
+	discovered, err := sync.DiscoverSourceSkills(source)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	for _, d := range discovered {
+		baseName := filepath.Base(d.SourcePath)
+		if d.FlatName != name && baseName != name {
+			continue
+		}
+
+		s.mu.Lock()
+		filename, err := writeSkillFile(d.SourcePath, fp, []byte(*req.Content))
+		s.mu.Unlock()
+		if err != nil {
+			switch {
+			case errors.Is(err, errInvalidSkillFilePath):
+				writeError(w, http.StatusBadRequest, "invalid file path")
+			case errors.Is(err, os.ErrNotExist):
+				writeError(w, http.StatusNotFound, "file not found: "+fp)
+			default:
+				writeError(w, http.StatusInternalServerError, "failed to save file: "+err.Error())
+			}
+			return
+		}
+
+		writeJSON(w, map[string]any{
+			"filename": filename,
+			"content":  *req.Content,
+		})
+		return
+	}
+
+	writeError(w, http.StatusNotFound, "skill not found: "+name)
+}
+
+func (s *Server) handleOpenSkillFile(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	source := s.cfg.Source
+	s.mu.RUnlock()
+
+	name := r.PathValue("name")
+	fp := r.PathValue("filepath")
+
+	if containsTraversalSegment(fp) {
+		writeError(w, http.StatusBadRequest, "invalid file path")
+		return
+	}
+
+	discovered, err := sync.DiscoverSourceSkills(source)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	for _, d := range discovered {
+		baseName := filepath.Base(d.SourcePath)
+		if d.FlatName != name && baseName != name {
+			continue
+		}
+
+		absPath := filepath.Join(d.SourcePath, filepath.FromSlash(fp))
+		absPath = filepath.Clean(absPath)
+		skillDir := filepath.Clean(d.SourcePath) + string(filepath.Separator)
+		if !strings.HasPrefix(absPath, skillDir) {
+			writeError(w, http.StatusBadRequest, "invalid file path")
+			return
+		}
+		if err := ensureResolvedPathWithinRoot(d.SourcePath, absPath); err != nil {
+			switch {
+			case errors.Is(err, errInvalidSkillFilePath):
+				writeError(w, http.StatusBadRequest, "invalid file path")
+			case errors.Is(err, os.ErrNotExist):
+				writeError(w, http.StatusNotFound, "file not found: "+fp)
+			default:
+				writeError(w, http.StatusInternalServerError, "failed to open file: "+err.Error())
+			}
+			return
+		}
+		info, err := os.Lstat(absPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				writeError(w, http.StatusNotFound, "file not found: "+fp)
+			} else {
+				writeError(w, http.StatusInternalServerError, "failed to open file: "+err.Error())
+			}
+			return
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			writeError(w, http.StatusBadRequest, "invalid file path")
+			return
+		}
+
+		opener := s.openPath
+		if opener == nil {
+			opener = openLocalPath
+		}
+		if err := opener(absPath); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to open file: "+err.Error())
+			return
+		}
+
+		writeJSON(w, map[string]any{
+			"success":  true,
+			"filename": filepath.Base(absPath),
 		})
 		return
 	}

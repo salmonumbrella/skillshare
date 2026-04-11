@@ -82,8 +82,15 @@ func cmdCollect(args []string) error {
 
 	applyModeLabel(mode)
 
+	resources, rest, err := parseResourceFlags(rest, resourceFlagOptions{
+		defaultSelection: resourceSelection{skills: true},
+	})
+	if err != nil {
+		return err
+	}
+
 	if mode == modeProject {
-		err := cmdCollectProject(rest, cwd)
+		err := cmdCollectProject(rest, cwd, resources)
 		logCollectOp(config.ProjectConfigPath(cwd), start, err)
 		return err
 	}
@@ -116,6 +123,20 @@ func cmdCollect(args []string) error {
 		force = true
 	}
 
+	if resources.onlyManaged() {
+		if targetName != "" || collectAll {
+			return fmt.Errorf("target selection is only supported when collecting skills")
+		}
+		if jsonOutput {
+			result, collectErr := collectManagedResources("", resources, dryRun, force)
+			logCollectOp(config.ConfigPath(), start, collectErr)
+			return collectOutputJSON(result, dryRun, start, collectErr)
+		}
+		err := executeManagedCollect("", resources, dryRun, force)
+		logCollectOp(config.ConfigPath(), start, err)
+		return err
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		if jsonOutput {
@@ -146,32 +167,47 @@ func cmdCollect(args []string) error {
 		if sp != nil {
 			sp.Success("No local skills found")
 		}
-		if jsonOutput {
-			return collectOutputJSON(nil, dryRun, start, nil)
+		if !resources.includesManaged() {
+			if jsonOutput {
+				return collectOutputJSON(nil, dryRun, start, nil)
+			}
+			return nil
 		}
-		return nil
-	}
-
-	if sp != nil {
+	} else if sp != nil {
 		sp.Success(fmt.Sprintf("Found %d local skill(s)", len(allLocalSkills)))
 		displayLocalSkills(allLocalSkills)
 	}
 
 	if dryRun {
 		if jsonOutput {
-			names := make([]string, len(allLocalSkills))
-			for i, s := range allLocalSkills {
-				names[i] = s.Name
+			var result *sync.PullResult
+			if len(allLocalSkills) > 0 {
+				names := make([]string, len(allLocalSkills))
+				for i, s := range allLocalSkills {
+					names[i] = s.Name
+				}
+				result = &sync.PullResult{Pulled: names, Failed: make(map[string]error)}
+			}
+			if resources.includesManaged() {
+				managedResult, managedErr := collectManagedResources("", resources, true, force)
+				result = mergePullResults(result, managedResult)
+				logCollectOp(config.ConfigPath(), start, managedErr)
+				return collectOutputJSON(result, true, start, managedErr)
 			}
 			logCollectOp(config.ConfigPath(), start, nil)
-			return collectOutputJSON(&sync.PullResult{Pulled: names}, true, start, nil)
+			return collectOutputJSON(result, true, start, nil)
+		}
+		if resources.includesManaged() {
+			err := executeManagedCollect("", resources, true, force)
+			logCollectOp(config.ConfigPath(), start, err)
+			return err
 		}
 		ui.Info("Dry run - no changes made")
 		return nil
 	}
 
 	// Confirm unless --force (JSON implies force)
-	if !force {
+	if !force && len(allLocalSkills) > 0 {
 		if !confirmCollect() {
 			ui.Info("Cancelled")
 			return nil
@@ -179,15 +215,35 @@ func cmdCollect(args []string) error {
 	}
 
 	if jsonOutput {
-		result, collectErr := sync.PullSkills(allLocalSkills, cfg.Source, sync.PullOptions{
-			DryRun: dryRun,
-			Force:  force,
-		})
-		logCollectOp(config.ConfigPath(), start, collectErr)
-		return collectOutputJSON(result, dryRun, start, collectErr)
+		var result *sync.PullResult
+		var collectErr error
+		if len(allLocalSkills) > 0 {
+			result, collectErr = sync.PullSkills(allLocalSkills, cfg.Source, sync.PullOptions{
+				DryRun: dryRun,
+				Force:  force,
+			})
+			collectErr = combineCollectErrors(collectErr, collectResultError(result))
+		}
+		var managedErr error
+		if resources.includesManaged() {
+			var managedResult *sync.PullResult
+			managedResult, managedErr = collectManagedResources("", resources, dryRun, force)
+			result = mergePullResults(result, managedResult)
+		}
+		err = combineCollectErrors(collectErr, managedErr)
+		logCollectOp(config.ConfigPath(), start, err)
+		return collectOutputJSON(result, dryRun, start, err)
 	}
 
-	err = executeCollect(allLocalSkills, cfg.Source, dryRun, force)
+	var collectErr error
+	if len(allLocalSkills) > 0 {
+		collectErr = executeCollect(allLocalSkills, cfg.Source, dryRun, force)
+	}
+	var managedErr error
+	if resources.includesManaged() {
+		managedErr = executeManagedCollect("", resources, dryRun, force)
+	}
+	err = combineCollectErrors(collectErr, managedErr)
 	logCollectOp(config.ConfigPath(), start, err)
 	return err
 }
@@ -261,7 +317,7 @@ func executeCollect(skills []sync.LocalSkillInfo, source string, dryRun, force b
 		showCollectNextSteps(source)
 	}
 
-	return nil
+	return collectResultError(result)
 }
 
 // collectOutputJSON converts a collect result to JSON and writes to stdout.
@@ -290,10 +346,56 @@ func showCollectNextSteps(source string) {
 	ui.Info("Run 'skillshare sync' to distribute to all targets")
 
 	// Check if source has git
+	if strings.TrimSpace(source) == "" {
+		return
+	}
 	gitDir := filepath.Join(source, ".git")
 	if _, err := os.Stat(gitDir); err == nil {
 		ui.Info("Commit changes: cd %s && git add . && git commit", source)
 	}
+}
+
+func mergePullResults(left, right *sync.PullResult) *sync.PullResult {
+	switch {
+	case left == nil:
+		return right
+	case right == nil:
+		return left
+	}
+
+	merged := &sync.PullResult{
+		Pulled:  append(append([]string{}, left.Pulled...), right.Pulled...),
+		Skipped: append(append([]string{}, left.Skipped...), right.Skipped...),
+		Failed:  make(map[string]error, len(left.Failed)+len(right.Failed)),
+	}
+	for name, err := range left.Failed {
+		merged.Failed[name] = err
+	}
+	for name, err := range right.Failed {
+		merged.Failed[name] = err
+	}
+	return merged
+}
+
+func collectResultError(result *sync.PullResult) error {
+	if result == nil || len(result.Failed) == 0 {
+		return nil
+	}
+	return fmt.Errorf("some skills failed to collect")
+}
+
+func combineCollectErrors(errs ...error) error {
+	messages := make([]string, 0, len(errs))
+	for _, err := range errs {
+		if err == nil {
+			continue
+		}
+		messages = append(messages, err.Error())
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s", strings.Join(messages, "; "))
 }
 
 func printCollectHelp() {

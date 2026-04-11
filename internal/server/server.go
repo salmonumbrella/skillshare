@@ -319,6 +319,24 @@ func (s *Server) registerRoutes() {
 	// Overview
 	s.mux.HandleFunc("GET /api/overview", s.handleOverview)
 
+	// Rules and hooks
+	s.mux.HandleFunc("GET /api/rules", s.handleListRules)
+	s.mux.HandleFunc("GET /api/hooks", s.handleListHooks)
+	s.mux.HandleFunc("GET /api/managed/rules", s.handleListManagedRules)
+	s.mux.HandleFunc("POST /api/managed/rules", s.handleCreateManagedRule)
+	s.mux.HandleFunc("GET /api/managed/rules/diff", s.handleDiffManagedRules)
+	s.mux.HandleFunc("POST /api/managed/rules/collect", s.handleCollectManagedRules)
+	s.mux.HandleFunc("GET /api/managed/rules/{id...}", s.handleGetManagedRule)
+	s.mux.HandleFunc("PUT /api/managed/rules/{id...}", s.handleUpdateManagedRule)
+	s.mux.HandleFunc("DELETE /api/managed/rules/{id...}", s.handleDeleteManagedRule)
+	s.mux.HandleFunc("GET /api/managed/hooks", s.handleListManagedHooks)
+	s.mux.HandleFunc("POST /api/managed/hooks", s.handleCreateManagedHook)
+	s.mux.HandleFunc("GET /api/managed/hooks/diff", s.handleDiffManagedHooks)
+	s.mux.HandleFunc("POST /api/managed/hooks/collect", s.handleCollectManagedHooks)
+	s.mux.HandleFunc("GET /api/managed/hooks/{id...}", s.handleGetManagedHook)
+	s.mux.HandleFunc("PUT /api/managed/hooks/{id...}", s.handleUpdateManagedHook)
+	s.mux.HandleFunc("DELETE /api/managed/hooks/{id...}", s.handleDeleteManagedHook)
+
 	// Skills
 	s.mux.HandleFunc("GET /api/skills", s.handleListSkills)
 	s.mux.HandleFunc("GET /api/skills/templates", s.handleGetTemplates)

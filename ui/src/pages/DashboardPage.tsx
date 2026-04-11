@@ -18,6 +18,8 @@ import {
   ShieldAlert,
   FolderPlus,
   LayoutDashboard,
+  Webhook,
+  ScrollText,
 } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { queryKeys, staleTimes } from '../lib/queryKeys';
@@ -114,6 +116,24 @@ export default function DashboardPage() {
       color: 'text-blue',
       bg: 'bg-info-light',
       to: '/skills',
+    },
+    {
+      label: 'Hooks',
+      value: data.managedHooksCount ?? 0,
+      subtitle: 'compiled resources',
+      icon: Webhook,
+      color: 'text-warning',
+      bg: 'bg-warning-light',
+      to: '/hooks',
+    },
+    {
+      label: 'Rules',
+      value: data.managedRulesCount ?? 0,
+      subtitle: 'compiled resources',
+      icon: ScrollText,
+      color: 'text-success',
+      bg: 'bg-success-light',
+      to: '/rules',
     },
     {
       label: 'Targets',

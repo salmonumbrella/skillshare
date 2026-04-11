@@ -200,7 +200,7 @@ func printUsage() {
 	cmd("uninstall", "<name>...", "Remove skills from source directory")
 	cmd("list", "", "List all installed skills")
 	cmd("search", "[query]", "Search or browse GitHub for skills")
-	cmd("sync", "[extras] [--all]", "Sync skills (or extras) to targets")
+	cmd("sync", "[--all|--resources <list>]", "Sync skills and managed resources to targets")
 	cmd("status", "", "Show status of all targets")
 	fmt.Println()
 
@@ -225,7 +225,7 @@ func printUsage() {
 
 	// Sync & Backup
 	fmt.Println("SYNC & BACKUP")
-	cmd("collect", "[target]", "Collect local skills from target(s) to source")
+	cmd("collect", "[target] [--resources <list>]", "Collect local skills or managed resources")
 	cmd("backup", "", "Create backup of target(s)")
 	cmd("restore", "<target>", "Restore target from latest backup")
 	cmd("trash", "list", "List trashed skills")
@@ -268,7 +268,9 @@ func printUsage() {
 	fmt.Println("EXAMPLES")
 	fmt.Println(g + "  skillshare status                                   # Check current state")
 	fmt.Println("  skillshare sync --dry-run                           # Preview before sync")
+	fmt.Println("  skillshare sync --resources rules,hooks             # Sync managed rules and hooks")
 	fmt.Println("  skillshare collect claude                           # Import local skills")
+	fmt.Println("  skillshare collect --resources rules,hooks          # Import managed rules and hooks")
 	fmt.Println("  skillshare install anthropics/skills/pdf -p         # Project install")
 	fmt.Println("  skillshare target add cursor -p                     # Project target")
 	fmt.Println("  skillshare push -m \"Add new skill\"                  # Push to remote")

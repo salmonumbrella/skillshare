@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"skillshare/internal/backup"
 	"skillshare/internal/config"
 	"skillshare/internal/oplog"
 	"skillshare/internal/skillignore"
@@ -23,6 +22,7 @@ type syncLogStats struct {
 	DryRun       bool
 	Force        bool
 	ProjectScope bool
+	Resources    []string
 }
 
 // syncJSONOutput is the JSON representation for sync --json output.
@@ -55,6 +55,24 @@ type syncModeStats struct {
 	linked, local, updated, pruned int
 }
 
+func syncResultsForSkillError(entries []syncTargetEntry, err error) ([]syncTargetResult, int) {
+	if err == nil {
+		return nil, 0
+	}
+
+	results := make([]syncTargetResult, len(entries))
+	for i, entry := range entries {
+		results[i] = syncTargetResult{
+			name:    entry.name,
+			mode:    entry.mode,
+			include: entry.target.Include,
+			exclude: entry.target.Exclude,
+			errMsg:  err.Error(),
+		}
+	}
+	return results, len(entries)
+}
+
 func cmdSync(args []string) error {
 	if wantsHelp(args) {
 		printSyncHelp()
@@ -65,18 +83,6 @@ func cmdSync(args []string) error {
 	if len(args) > 0 && args[0] == "extras" {
 		return cmdSyncExtras(args[1:])
 	}
-
-	// Extract --all flag before mode parsing
-	hasAll := false
-	var filteredArgs []string
-	for _, a := range args {
-		if a == "--all" {
-			hasAll = true
-		} else {
-			filteredArgs = append(filteredArgs, a)
-		}
-	}
-	args = filteredArgs
 
 	start := time.Now()
 
@@ -100,6 +106,14 @@ func cmdSync(args []string) error {
 
 	applyModeLabel(mode)
 
+	resources, rest, err := parseResourceFlags(rest, resourceFlagOptions{
+		defaultSelection: resourceSelection{skills: true},
+		allowAll:         true,
+	})
+	if err != nil {
+		return err
+	}
+
 	dryRun, force, jsonOutput := parseSyncFlags(rest)
 
 	prevDiagOutput := sync.DiagOutput
@@ -111,28 +125,10 @@ func cmdSync(args []string) error {
 	}
 
 	if mode == modeProject {
-		if hasAll && !jsonOutput {
-			// Run project extras sync after project skills sync (text mode)
-			defer func() {
-				fmt.Println()
-				if extrasErr := cmdSyncExtras(append([]string{"-p"}, rest...)); extrasErr != nil {
-					ui.Warning("Extras sync: %v", extrasErr)
-				}
-			}()
-		}
-		stats, results, projIgnoreStats, err := cmdSyncProject(cwd, dryRun, force, jsonOutput)
+		stats, results, projIgnoreStats, err := cmdSyncProject(cwd, resources, dryRun, force, jsonOutput)
 		stats.ProjectScope = true
 		logSyncOp(config.ProjectConfigPath(cwd), stats, start, err)
 		if jsonOutput {
-			if hasAll {
-				projCfg, loadErr := config.LoadProject(cwd)
-				if loadErr == nil && len(projCfg.Extras) > 0 {
-					extrasEntries := runExtrasSyncEntries(projCfg.Extras, func(extra config.ExtraConfig) string {
-						return config.ExtrasSourceDirProject(cwd, extra.Name)
-					}, dryRun, force, cwd)
-					return syncOutputJSON(results, dryRun, start, projIgnoreStats, err, extrasEntries)
-				}
-			}
 			return syncOutputJSON(results, dryRun, start, projIgnoreStats, err)
 		}
 		return err
@@ -146,8 +142,9 @@ func cmdSync(args []string) error {
 		return err
 	}
 
-	// Validate config before sync
-	warnings, validErr := config.ValidateConfig(cfg)
+	// Validate config before sync, but allow managed-resource syncs to
+	// continue past source/skills-path issues so partial execution can happen.
+	warnings, validErr := validateConfigForSync(cfg, resources)
 	if validErr != nil {
 		if jsonOutput {
 			return writeJSONError(validErr)
@@ -159,51 +156,97 @@ func cmdSync(args []string) error {
 			ui.Warning("%s", w)
 		}
 	}
-
-	// Phase 1: Discovery
-	var spinner *ui.Spinner
-	if !jsonOutput {
-		spinner = ui.StartSpinner("Discovering skills")
-	}
-	discoveredSkills, ignoreStats, discoverErr := sync.DiscoverSourceSkillsWithStats(cfg.Source)
-	if discoverErr != nil {
-		if spinner != nil {
-			spinner.Fail("Discovery failed")
-		}
-		if jsonOutput {
-			return writeJSONError(discoverErr)
-		}
-		return discoverErr
-	}
-	if spinner != nil {
-		spinner.Success(fmt.Sprintf("Discovered %d skills", len(discoveredSkills)))
-		reportCollisions(discoveredSkills, cfg.Targets)
-	}
-
-	// Backup targets before sync (only if not dry-run and there are skills)
-	if !dryRun && len(discoveredSkills) > 0 && !jsonOutput {
-		backupTargetsBeforeSync(cfg)
-	}
-
-	// Phase 2: Per-target sync (parallel)
-	if !jsonOutput {
-		ui.Header("Syncing skills")
-		if dryRun {
-			ui.Warning("Dry run mode - no changes will be made")
-		}
-	}
-
 	var entries []syncTargetEntry
 	for name, target := range cfg.Targets {
 		entries = append(entries, syncTargetEntry{name: name, target: target, mode: getTargetMode(target.SkillsConfig().Mode, cfg.Mode)})
 	}
 
+	var discoveredSkills []sync.DiscoveredSkill
+	var ignoreStats *skillignore.IgnoreStats
+	var skillSyncErr error
+	if resources.skills {
+		// Ensure source exists
+		if _, err := os.Stat(cfg.Source); os.IsNotExist(err) {
+			sourceErr := fmt.Errorf("source directory does not exist: %s", cfg.Source)
+			if !resources.includesManaged() {
+				if jsonOutput {
+					return writeJSONError(sourceErr)
+				}
+				return sourceErr
+			}
+			skillSyncErr = sourceErr
+		} else {
+			var spinner *ui.Spinner
+			if !jsonOutput {
+				spinner = ui.StartSpinner("Discovering skills")
+			}
+			discoveredSkills, ignoreStats, err = sync.DiscoverSourceSkillsWithStats(cfg.Source)
+			if err != nil {
+				if spinner != nil {
+					spinner.Fail("Discovery failed")
+				}
+				if !resources.includesManaged() {
+					if jsonOutput {
+						return writeJSONError(err)
+					}
+					return err
+				}
+				skillSyncErr = err
+			} else if spinner != nil {
+				spinner.Success(fmt.Sprintf("Discovered %d skills", len(discoveredSkills)))
+				reportCollisions(discoveredSkills, cfg.Targets)
+			}
+			if err == nil && len(discoveredSkills) == 0 {
+				warnings = append(warnings, "source directory is empty (0 skills)")
+			}
+		}
+	}
+
+	if !dryRun && !jsonOutput {
+		shouldBackup := resources.includesManaged()
+		if !shouldBackup && skillSyncErr == nil && len(discoveredSkills) > 0 {
+			shouldBackup = true
+		}
+		if shouldBackup {
+			fmt.Println()
+			backupResources := resources
+			backupResources.skills = resources.skills && skillSyncErr == nil
+			backupTargetsBeforeSync(entries, backupResources)
+		}
+	}
+
+	if !jsonOutput {
+		switch {
+		case resources.skills && resources.includesManaged():
+			ui.Header("Syncing skills and resources")
+		case resources.skills:
+			ui.Header("Syncing skills")
+		default:
+			ui.Header("Syncing resources")
+		}
+		if dryRun {
+			ui.Warning("Dry run mode - no changes will be made")
+		}
+	}
+
 	var results []syncTargetResult
 	var failedTargets int
-	if jsonOutput {
-		results, failedTargets = runParallelSyncQuiet(entries, cfg.Source, discoveredSkills, dryRun, force, "")
-	} else {
-		results, failedTargets = runParallelSync(entries, cfg.Source, discoveredSkills, dryRun, force, "")
+	if resources.skills {
+		if skillSyncErr != nil {
+			results, failedTargets = syncResultsForSkillError(entries, skillSyncErr)
+		} else if jsonOutput || resources.includesManaged() {
+			results, failedTargets = runParallelSyncQuiet(entries, cfg.Source, discoveredSkills, dryRun, force, "")
+		} else {
+			results, failedTargets = runParallelSync(entries, cfg.Source, discoveredSkills, dryRun, force, "")
+		}
+	}
+	if resources.includesManaged() {
+		var managedFailed int
+		results, managedFailed = syncManagedResourcesForEntries(entries, results, resources, "", dryRun)
+		failedTargets += managedFailed
+		if !jsonOutput {
+			renderSyncResults(results)
+		}
 	}
 
 	var syncErr error
@@ -245,27 +288,15 @@ func cmdSync(args []string) error {
 	// for installed skills whose files may be missing from disk.
 
 	logSyncOp(config.ConfigPath(), syncLogStats{
-		Targets: len(cfg.Targets),
-		Failed:  failedTargets,
-		DryRun:  dryRun,
-		Force:   force,
+		Targets:   len(cfg.Targets),
+		Failed:    failedTargets,
+		DryRun:    dryRun,
+		Force:     force,
+		Resources: resources.names(),
 	}, start, syncErr)
 
 	if jsonOutput {
-		if hasAll && len(cfg.Extras) > 0 {
-			extrasEntries := runExtrasSyncEntries(cfg.Extras, func(extra config.ExtraConfig) string {
-				return config.ResolveExtrasSourceDir(extra, cfg.ExtrasSource, cfg.Source)
-			}, dryRun, force, "")
-			return syncOutputJSON(results, dryRun, start, ignoreStats, syncErr, extrasEntries)
-		}
 		return syncOutputJSON(results, dryRun, start, ignoreStats, syncErr)
-	}
-
-	if hasAll {
-		fmt.Println()
-		if extrasErr := cmdSyncExtras(rest); extrasErr != nil {
-			ui.Warning("Extras sync: %v", extrasErr)
-		}
 	}
 
 	return syncErr
@@ -296,6 +327,7 @@ func logSyncOp(cfgPath string, stats syncLogStats, start time.Time, cmdErr error
 		"targets_failed": stats.Failed,
 		"dry_run":        stats.DryRun,
 		"force":          stats.Force,
+		"resources":      stats.Resources,
 		"scope":          "global",
 	}
 	if stats.ProjectScope {
@@ -394,18 +426,18 @@ func syncOutputJSON(results []syncTargetResult, dryRun bool, start time.Time, iS
 	return writeJSONResult(&output, syncErr)
 }
 
-func backupTargetsBeforeSync(cfg *config.Config) {
+func backupTargetsBeforeSync(entries []syncTargetEntry, resources resourceSelection) {
 	backedUp := false
-	for name, target := range cfg.Targets {
-		backupPath, err := backup.Create(name, target.SkillsConfig().Path)
+	for _, entry := range entries {
+		backupPath, err := createSyncBackup(entry, resources)
 		if err != nil {
-			ui.Warning("Failed to backup %s: %v", name, err)
+			ui.Warning("Failed to backup %s: %v", entry.name, err)
 		} else if backupPath != "" {
 			if !backedUp {
 				ui.Header("Backing up")
 				backedUp = true
 			}
-			ui.Success("%s -> %s", name, backupPath)
+			ui.Success("%s -> %s", entry.name, backupPath)
 		}
 	}
 }
@@ -768,10 +800,11 @@ func syncSymlinkMode(name string, target config.TargetConfig, source string, dry
 func printSyncHelp() {
 	fmt.Println(`Usage: skillshare sync [options]
 
-Sync skills from source to all configured targets.
+Sync skills and managed resources from source to configured targets.
 
 Options:
-  --all             Sync skills and extras
+  --resources LIST  Sync only specific resources: skills,rules,hooks
+  --all             Sync skills, rules, and hooks
   --dry-run, -n     Preview changes without applying
   --force, -f       Force sync (overwrite local changes)
   --json            Output results as JSON
@@ -779,12 +812,10 @@ Options:
   --global, -g      Use global config
   --help, -h        Show this help
 
-Subcommands:
-  extras            Sync only extras (see: skillshare sync extras --help)
-
 Examples:
   skillshare sync                Sync skills to all targets
+  skillshare sync --all          Sync skills, rules, and hooks
+  skillshare sync --resources rules,hooks
   skillshare sync --dry-run      Preview sync changes
-  skillshare sync --all          Sync skills and extras
   skillshare sync -p             Sync project-level skills`)
 }

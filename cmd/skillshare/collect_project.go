@@ -8,7 +8,7 @@ import (
 	"skillshare/internal/ui"
 )
 
-func cmdCollectProject(args []string, root string) error {
+func cmdCollectProject(args []string, root string, resources resourceSelection) error {
 	dryRun := false
 	force := false
 	collectAll := false
@@ -29,6 +29,13 @@ func cmdCollectProject(args []string, root string) error {
 		}
 	}
 
+	if resources.onlyManaged() {
+		if targetName != "" || collectAll {
+			return fmt.Errorf("target selection is only supported when collecting skills")
+		}
+		return executeManagedCollect(root, resources, dryRun, force)
+	}
+
 	runtime, err := loadProjectRuntime(root)
 	if err != nil {
 		return err
@@ -47,6 +54,12 @@ func cmdCollectProject(args []string, root string) error {
 	allLocalSkills := collectLocalSkills(targets, runtime.sourcePath, "")
 	if len(allLocalSkills) == 0 {
 		sp.Success("No local skills found")
+		if resources.includesManaged() {
+			if dryRun {
+				return executeManagedCollect(root, resources, true, force)
+			}
+			return executeManagedCollect(root, resources, false, force)
+		}
 		return nil
 	}
 	sp.Success(fmt.Sprintf("Found %d local skill(s)", len(allLocalSkills)))
@@ -54,18 +67,29 @@ func cmdCollectProject(args []string, root string) error {
 	displayLocalSkills(allLocalSkills)
 
 	if dryRun {
+		if resources.includesManaged() {
+			return executeManagedCollect(root, resources, true, force)
+		}
 		ui.Info("Dry run - no changes made")
 		return nil
 	}
 
-	if !force {
+	if !force && len(allLocalSkills) > 0 {
 		if !confirmCollect() {
 			ui.Info("Cancelled")
 			return nil
 		}
 	}
 
-	return executeCollect(allLocalSkills, runtime.sourcePath, dryRun, force)
+	var collectErr error
+	if len(allLocalSkills) > 0 {
+		collectErr = executeCollect(allLocalSkills, runtime.sourcePath, dryRun, force)
+	}
+	var managedErr error
+	if resources.includesManaged() {
+		managedErr = executeManagedCollect(root, resources, dryRun, force)
+	}
+	return combineCollectErrors(collectErr, managedErr)
 }
 
 func selectCollectProjectTargets(runtime *projectRuntime, targetName string, collectAll bool) (map[string]config.TargetConfig, error) {

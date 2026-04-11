@@ -131,6 +131,7 @@ func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
 		if data, err := os.ReadFile(skillMdPath); err == nil {
 			skillMdContent = string(data)
 		}
+		stats := buildContentStats(skillMdContent)
 
 		// List all files in the skill directory
 		files := make([]string, 0)
@@ -153,6 +154,7 @@ func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
 			"skill":          item,
 			"skillMdContent": skillMdContent,
+			"stats":          stats,
 			"files":          files,
 		})
 		return

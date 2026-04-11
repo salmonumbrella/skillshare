@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"maps"
 	"net/http"
 	"time"
@@ -34,6 +35,7 @@ func ignorePayload(stats *skillignore.IgnoreStats) map[string]any {
 }
 
 type syncTargetResult struct {
+	Resource   string   `json:"resource"`
 	Target     string   `json:"target"`
 	Linked     []string `json:"linked"`
 	Updated    []string `json:"updated"`
@@ -48,11 +50,21 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	var body struct {
-		DryRun bool `json:"dryRun"`
-		Force  bool `json:"force"`
+		DryRun    bool     `json:"dryRun"`
+		Force     bool     `json:"force"`
+		Resources []string `json:"resources"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		// Default to non-dry-run, non-force
+		if err != io.EOF {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+	}
+
+	resources, err := parseServerSyncResources(body.Resources)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	globalMode := s.cfg.Mode
@@ -85,20 +97,6 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	results := make([]syncTargetResult, 0)
 
 	for name, target := range s.cfg.Targets {
-		sc := target.SkillsConfig()
-		mode := sc.Mode
-		if mode == "" {
-			mode = globalMode
-		}
-
-		res := syncTargetResult{
-			Target:  name,
-			Linked:  make([]string, 0),
-			Updated: make([]string, 0),
-			Skipped: make([]string, 0),
-			Pruned:  make([]string, 0),
-		}
-
 		syncErrArgs := map[string]any{
 			"targets_total":  len(s.cfg.Targets),
 			"targets_failed": 1,
@@ -108,61 +106,89 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			"scope":          "ui",
 		}
 
-		switch mode {
-		case "merge":
-			mergeResult, err := ssync.SyncTargetMergeWithSkills(name, target, allSkills, s.cfg.Source, body.DryRun, body.Force, s.projectRoot)
-			if err != nil {
-				s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
-				writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
-				return
-			}
-			res.Linked = mergeResult.Linked
-			res.Updated = mergeResult.Updated
-			res.Skipped = mergeResult.Skipped
-			res.DirCreated = mergeResult.DirCreated
-
-			pruneResult, err := ssync.PruneOrphanLinksWithSkills(ssync.PruneOptions{
-				TargetPath: sc.Path, SourcePath: s.cfg.Source, Skills: allSkills,
-				Include: sc.Include, Exclude: sc.Exclude, TargetNaming: sc.TargetNaming, TargetName: name,
-				DryRun: body.DryRun, Force: body.Force,
-			})
-			if err == nil {
-				res.Pruned = pruneResult.Removed
+		if resources.skills {
+			sc := target.SkillsConfig()
+			mode := sc.Mode
+			if mode == "" {
+				mode = globalMode
 			}
 
-		case "copy":
-			copyResult, err := ssync.SyncTargetCopyWithSkills(name, target, allSkills, s.cfg.Source, body.DryRun, body.Force, nil)
-			if err != nil {
-				s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
-				writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
-				return
-			}
-			res.Linked = copyResult.Copied
-			res.Updated = copyResult.Updated
-			res.Skipped = copyResult.Skipped
-			res.DirCreated = copyResult.DirCreated
+			res := newSyncTargetResult(name, "skills")
+			switch mode {
+			case "merge":
+				mergeResult, err := ssync.SyncTargetMergeWithSkills(name, target, allSkills, s.cfg.Source, body.DryRun, body.Force, s.projectRoot)
+				if err != nil {
+					s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
+					writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
+					return
+				}
+				res.Linked = mergeResult.Linked
+				res.Updated = mergeResult.Updated
+				res.Skipped = mergeResult.Skipped
+				res.DirCreated = mergeResult.DirCreated
 
-			pruneResult, err := ssync.PruneOrphanCopiesWithSkills(sc.Path, allSkills, sc.Include, sc.Exclude, name, sc.TargetNaming, body.DryRun)
-			if err == nil {
-				res.Pruned = pruneResult.Removed
-			}
+				pruneResult, err := ssync.PruneOrphanLinksWithSkills(ssync.PruneOptions{
+					TargetPath: sc.Path, SourcePath: s.cfg.Source, Skills: allSkills,
+					Include: sc.Include, Exclude: sc.Exclude, TargetNaming: sc.TargetNaming, TargetName: name,
+					DryRun: body.DryRun, Force: body.Force,
+				})
+				if err == nil {
+					res.Pruned = pruneResult.Removed
+				}
 
-		default:
-			err := ssync.SyncTarget(name, target, s.cfg.Source, body.DryRun, s.projectRoot)
-			if err != nil {
-				s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
-				writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
-				return
+			case "copy":
+				copyResult, err := ssync.SyncTargetCopyWithSkills(name, target, allSkills, s.cfg.Source, body.DryRun, body.Force, nil)
+				if err != nil {
+					s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
+					writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
+					return
+				}
+				res.Linked = copyResult.Copied
+				res.Updated = copyResult.Updated
+				res.Skipped = copyResult.Skipped
+				res.DirCreated = copyResult.DirCreated
+
+				pruneResult, err := ssync.PruneOrphanCopiesWithSkills(sc.Path, allSkills, sc.Include, sc.Exclude, name, sc.TargetNaming, body.DryRun)
+				if err == nil {
+					res.Pruned = pruneResult.Removed
+				}
+
+			default:
+				err := ssync.SyncTarget(name, target, s.cfg.Source, body.DryRun, s.projectRoot)
+				if err != nil {
+					s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
+					writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
+					return
+				}
+				res.Linked = []string{"(symlink mode)"}
 			}
-			res.Linked = []string{"(symlink mode)"}
+			results = append(results, res)
 		}
 
-		results = append(results, res)
+		if resources.rules {
+			res, err := s.syncManagedRulesForTarget(name, target, body.DryRun)
+			if err != nil {
+				s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
+				writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
+				return
+			}
+			results = append(results, res)
+		}
+
+		if resources.hooks {
+			res, err := s.syncManagedHooksForTarget(name, target, body.DryRun)
+			if err != nil {
+				s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
+				writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
+				return
+			}
+			results = append(results, res)
+		}
 	}
 
 	// Log the sync operation
 	s.writeOpsLog("sync", "ok", start, map[string]any{
-		"targets_total":  len(results),
+		"targets_total":  len(s.cfg.Targets),
 		"targets_failed": 0,
 		"dry_run":        body.DryRun,
 		"force":          body.Force,
@@ -175,6 +201,17 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 	maps.Copy(resp, ignorePayload(ignoreStats))
 	writeJSON(w, resp)
+}
+
+func newSyncTargetResult(target, resource string) syncTargetResult {
+	return syncTargetResult{
+		Resource: resource,
+		Target:   target,
+		Linked:   make([]string, 0),
+		Updated:  make([]string, 0),
+		Skipped:  make([]string, 0),
+		Pruned:   make([]string, 0),
+	}
 }
 
 type diffItem struct {

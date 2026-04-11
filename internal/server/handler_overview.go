@@ -8,6 +8,8 @@ import (
 
 	"skillshare/internal/git"
 	"skillshare/internal/install"
+	managedhooks "skillshare/internal/resources/hooks"
+	managedrules "skillshare/internal/resources/rules"
 	"skillshare/internal/sync"
 	"skillshare/internal/utils"
 	versioncheck "skillshare/internal/version"
@@ -54,15 +56,28 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	// Tracked repos
 	trackedRepos := buildTrackedRepos(source, skills)
 
+	managedRuleRecords, err := managedrules.NewStore(s.managedRulesProjectRoot()).List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list managed rules: "+err.Error())
+		return
+	}
+	managedHookRecords, err := managedhooks.NewStore(s.managedHooksProjectRoot()).List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list managed hooks: "+err.Error())
+		return
+	}
+
 	resp := map[string]any{
-		"source":        source,
-		"skillCount":    len(skills),
-		"topLevelCount": topLevelCount,
-		"targetCount":   targetCount,
-		"mode":          mode,
-		"version":       versioncheck.Version,
-		"trackedRepos":  trackedRepos,
-		"isProjectMode": isProjectMode,
+		"source":            source,
+		"skillCount":        len(skills),
+		"managedRulesCount": len(managedRuleRecords),
+		"managedHooksCount": len(managedHookRecords),
+		"topLevelCount":     topLevelCount,
+		"targetCount":       targetCount,
+		"mode":              mode,
+		"version":           versioncheck.Version,
+		"trackedRepos":      trackedRepos,
+		"isProjectMode":     isProjectMode,
 	}
 	if isProjectMode {
 		resp["projectRoot"] = projectRoot

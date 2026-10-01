@@ -40,7 +40,7 @@ export default function HooksImportDialog({ data, project, onClose, onImported }
   const existing = scopeEntries(data, project);
   const paths = scopePaths(data, project);
   const unmanaged = scopeUnmanaged(data, project);
-  const targets = hookAgents.filter((a) => unmanaged.some((u) => u.target === a));
+  const targets = hookAgents.filter((a) => a !== 'git' && unmanaged.some((u) => u.target === a));
   const reads = useQueries({
     queries: targets.map((from) => ({
       queryKey: [...queryKeys.hooks, 'import', project ?? '', from],
@@ -182,7 +182,7 @@ export default function HooksImportDialog({ data, project, onClose, onImported }
               value={pasteFrom}
               onChange={(v) => { setPasteFrom(v); setPasted(null); }}
               disabled={busy}
-              options={hookAgents.map((a) => ({ value: a, label: hookLabel(a), icon: <AgentIcon target={a} size={16} /> }))}
+              options={hookAgents.filter((a) => a !== 'git').map((a) => ({ value: a, label: hookLabel(a), icon: <AgentIcon target={a} size={16} /> }))}
             />
             <CodeEditor value={content} onChange={(v) => { setContent(v); setPasted(null); }} lang={isCodeAgent(pasteFrom) ? 'typescript' : 'json'} ariaLabel={t('hooks.importPaste')} placeholder={t('hooks.importPastePlaceholder')} disabled={busy} minHeight="96px" />
             <span className="flex items-center gap-2">
@@ -203,4 +203,3 @@ export default function HooksImportDialog({ data, project, onClose, onImported }
     </DialogShell>
   );
 }
-

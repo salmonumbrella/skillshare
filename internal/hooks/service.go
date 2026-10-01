@@ -20,6 +20,9 @@ type Service struct {
 	Platform    string
 	// ConfigDirs contains explicitly resolved native Agent directory overrides.
 	ConfigDirs map[string]string
+	Git        GitRunner
+	// GitGlobalConfig is the file override Git honors in GIT_CONFIG_GLOBAL.
+	GitGlobalConfig string
 }
 
 // Mutation is shared by CLI and dashboard preview/save/sync flows. An empty
@@ -52,7 +55,7 @@ type Change struct {
 	Name   string `json:"name"`
 	// Root is the hooks.projects root this change belongs to, empty for the config's own scope.
 	Root    string `json:"root,omitempty"`
-	Action  string `json:"action"` // add, update, remove, unchanged, adopt, release, conflict
+	Action  string `json:"action"` // add, update, remove, unchanged, adopt, release, conflict, inactive
 	Message string `json:"message,omitempty"`
 	// Events names the native events this change writes into a shared hooks file.
 	Events *EventChanges `json:"events,omitempty"`
@@ -85,7 +88,9 @@ type Plan struct {
 	stateBytes []byte
 	files      []*filePlan
 	// adopted are the ledger keys an Adopt mutation claims, recorded even without sync.
-	adopted []string
+	adopted     []string
+	gitGuards   []*gitGuard
+	gitInactive map[string]string
 }
 
 // FileDiff is one native file's text before and after a planned sync.
@@ -129,6 +134,7 @@ type SourceInfo struct {
 
 // Backup is metadata for one native write.
 type Backup struct {
+	Root   string `json:"root,omitempty"`
 	ID     string `json:"id"`
 	Target string `json:"target"`
 	Path   string `json:"path"`
@@ -138,20 +144,23 @@ type Backup struct {
 // Unmanaged names native hooks no Skillshare config owns, including additional
 // sources Skillshare never edits.
 type Unmanaged struct {
-	Target string   `json:"target"`
-	Path   string   `json:"path"`
-	Names  []string `json:"names"`
+	Project string   `json:"project,omitempty"`
+	Target  string   `json:"target"`
+	Path    string   `json:"path"`
+	Names   []string `json:"names"`
 }
 
 // Inventory is everything the list views need.
 type Inventory struct {
-	Source       SourceInfo        `json:"source"`
-	Targets      []TargetDef       `json:"targets"`
-	Paths        map[string]string `json:"paths"`
-	Plan         *Plan             `json:"plan,omitempty"`
-	PreviewError string            `json:"previewError,omitempty"`
-	Backups      []Backup          `json:"backups"`
-	Unmanaged    []Unmanaged       `json:"unmanaged"`
+	Git          *GitInfo            `json:"git,omitempty"`
+	ProjectGit   map[string]*GitInfo `json:"projectGit,omitempty"`
+	Source       SourceInfo          `json:"source"`
+	Targets      []TargetDef         `json:"targets"`
+	Paths        map[string]string   `json:"paths"`
+	Plan         *Plan               `json:"plan,omitempty"`
+	PreviewError string              `json:"previewError,omitempty"`
+	Backups      []Backup            `json:"backups"`
+	Unmanaged    []Unmanaged         `json:"unmanaged"`
 	// ProjectConfigs are hooks.projects roots that have their own Skillshare config;
 	// the global config cannot manage them.
 	ProjectConfigs []string `json:"projectConfigs"`
@@ -209,6 +218,10 @@ func (s *Service) home() (string, error) {
 // configDir is the Agent's own config directory in this scope. A project scope never
 // falls back to a global path.
 func (s *Service) configDir(target string) (string, error) {
+	if target == "git" {
+		d, err := s.gitDestination("")
+		return d.base, err
+	}
 	if s.ProjectRoot != "" {
 		dirs := map[string]string{"claude": ".claude", "codex": ".codex", "gemini": ".gemini", "qwen": ".qwen", "copilot": ".github", "cursor": ".cursor", "droid": ".factory", "antigravity": ".agents", "pi": ".pi", "amp": ".amp", "opencode": ".opencode"}
 		dir, ok := dirs[target]
@@ -251,6 +264,10 @@ func (s *Service) configDir(target string) (string, error) {
 // nativePath is the shared hooks file of a command Agent, or the folder that holds
 // Skillshare's files for Copilot and the code Agents.
 func (s *Service) nativePath(target string) (string, error) {
+	if target == "git" {
+		d, err := s.gitDestination("")
+		return d.hooksFile, err
+	}
 	dir, err := s.configDir(target)
 	if err != nil {
 		return "", err
@@ -284,6 +301,10 @@ func (s *Service) codePath(target, entry string) (string, error) {
 
 // scriptDir holds an entry's script files for a command Agent.
 func (s *Service) scriptDir(target, entry string) (string, error) {
+	if target == "git" {
+		d, err := s.gitDestination("")
+		return filepath.Join(d.base, "skillshare", "files", entry), err
+	}
 	dir, err := s.configDir(target)
 	if err != nil {
 		return "", err

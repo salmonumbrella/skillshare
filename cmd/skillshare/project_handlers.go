@@ -173,8 +173,11 @@ func patchProject(entry config.ManagedProject, o projectOptions) (config.Managed
 		if o.toggles["--no-"+kind] {
 			*slot = nil
 		}
-		if o.toggles["--"+kind] && *slot == nil {
-			*slot = &config.ResourceTargetConfig{}
+		if o.toggles["--"+kind] {
+			if *slot == nil {
+				*slot = &config.ResourceTargetConfig{}
+			}
+			(*slot).SetEnabled(true)
 		}
 		for _, field := range []string{"mode", "naming", "include", "exclude"} {
 			values, ok := o.values["--"+kind+"-"+field]

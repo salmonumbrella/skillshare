@@ -19,23 +19,19 @@ func printSyncOverlapHint(targets map[string]config.TargetConfig, isProject, jso
 	if jsonOutput {
 		return
 	}
-	explained := map[string]bool{}
-	for _, c := range config.SkillsFolderConflicts(targets, defaultMode) {
-		ui.Warning("%s sync skills to %s with different settings, so each sync undoes the other",
-			joinAnd(c.Targets), shortenPath(c.Path))
+	conflicts, rest := sync.TargetFolderConflicts(targets, isProject, defaultMode, sync.HarmlessOverlap(targets, defaultMode, discovered))
+	printSyncFolderConflicts(conflicts, rest, isProject)
+}
+
+// printSyncFolderConflicts renders prepared diagnostics without rediscovering targets.
+func printSyncFolderConflicts(conflicts []config.SkillsFolderConflict, rest int, isProject bool) {
+	for _, c := range conflicts {
+		ui.Warning("%s sync skills to %s with different settings, so each sync undoes the other", joinAnd(c.Targets), shortenPath(c.Path))
 		for _, name := range c.Stop {
 			fmt.Println(ui.DimText("  keep one: " + skillsOffCommand(name, isProject)))
 		}
-		for _, name := range c.Targets {
-			explained[name] = true
-		}
 	}
-	rest := 0
-	for _, name := range config.DetectPathOverlap(targets, isProject, sync.HarmlessOverlap(targets, defaultMode, discovered)) {
-		if !explained[name] {
-			rest++
-		}
-	}
+
 	if rest > 0 {
 		ui.Warning("%s share skill folders %s %s", plural(rest, "target"), theme.Dim().Render("— see"), theme.Accent().Render("skillshare doctor"))
 	}

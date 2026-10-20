@@ -520,3 +520,17 @@ func TestProject_TextDefaultsAndRelativeKey(t *testing.T) {
 		}
 	}
 }
+
+func TestProject_TextUnmatchedSync(t *testing.T) {
+	sb, root := projectFixture(t)
+	sb.CreateSkill("alpha", map[string]string{"SKILL.md": "---\nname: alpha\n---\n# Alpha\n"})
+	for _, args := range [][]string{
+		{"project", "add", root, "--target", "claude", "--skills-include", "typo", "--sync"},
+		{"project", "sync", "app", "--dry-run"},
+		{"project", "edit", "app", "--skills-include", "other-typo", "--sync", "--dry-run"},
+	} {
+		r := sb.RunCLI(args...)
+		r.AssertSuccess(t)
+		r.AssertOutputContains(t, "matches no skill in the source")
+	}
+}

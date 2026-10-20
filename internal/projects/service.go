@@ -65,7 +65,7 @@ func resource(rc *config.ResourceTargetConfig) *Resource {
 	if rc == nil {
 		return nil
 	}
-	return &Resource{Mode: rc.Mode, TargetNaming: rc.TargetNaming, Include: append([]string{}, rc.Include...), Exclude: append([]string{}, rc.Exclude...)}
+	return &Resource{Disabled: !rc.IsEnabled(), Mode: rc.Mode, TargetNaming: rc.TargetNaming, Include: append([]string{}, rc.Include...), Exclude: append([]string{}, rc.Exclude...)}
 }
 func item(root string, p config.ManagedProject) Item {
 	abs := config.ExpandPath(root)

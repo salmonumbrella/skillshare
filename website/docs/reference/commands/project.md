@@ -41,7 +41,7 @@ skillshare project remove <project> [--yes] [--dry-run] [--json]
 | `--global`, `-g` | all | Explicit global scope (also the default for this command) |
 | `--help`, `-h` | all | Show help |
 
-Resource settings also enable a disabled resource. Editing changes only supplied settings; enabling an existing resource keeps its settings. Opposing toggles such as `--skills --no-skills` are rejected. There is no agents naming flag. Unlike [`target`](/docs/reference/commands/target), these include/exclude flags replace lists rather than add or remove individual patterns.
+Resource settings turn on a resource that is omitted from the project. Use `--skills` or `--agents` to turn an existing disabled resource on. Editing changes only supplied settings; enabling an existing resource keeps its settings. Opposing toggles such as `--skills --no-skills` are rejected. There is no agents naming flag. Unlike [`target`](/docs/reference/commands/target), these include/exclude flags replace lists rather than add or remove individual patterns.
 
 ## Examples {#examples}
 

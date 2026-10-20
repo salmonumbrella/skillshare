@@ -141,7 +141,8 @@ root explicitly. Ambiguous name/root matches fail instead of choosing one.
 Edit changes only supplied settings. `--target`, `--skills-include`, `--skills-exclude`,
 `--agents-include`, and `--agents-exclude` replace their lists; repeat filter flags for
 multiple patterns, use an empty value to clear. `--skills` / `--no-skills` and
-`--agents` / `--no-agents` toggle resources. Any resource setting enables that resource.
+`--agents` / `--no-agents` toggle resources. Any resource setting turns on that resource
+when it is omitted from the project. Enabling an existing resource keeps its settings.
 `--skills-mode` / `--agents-mode` accept merge, symlink or copy; an empty value inherits.
 `--skills-naming` accepts flat, standard or prefixed; empty inherits. There is no agents
 naming flag, and agents filters with symlink mode are rejected.

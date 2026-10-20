@@ -114,6 +114,12 @@ func renderProjectResult(o projectOptions, r projects.Result, err error, start t
 		ui.Row(ui.MarkNone, "Registration", r.Registration, ui.RowWidth("Registration"))
 	}
 	if r.Sync != nil {
+		for _, unmatched := range r.Sync.Unmatched {
+			for _, pattern := range unmatched.Patterns {
+				ui.Warning("%s: %s", unmatched.Target, (ssync.UnmatchedInclude{Pattern: pattern, Suggestions: unmatched.Suggestions}).Warning())
+			}
+		}
+		printSyncFolderConflicts(r.Sync.FolderConflicts, r.Sync.PathOverlap, false)
 		for _, row := range r.Sync.Results {
 			ui.Row(ui.MarkOK, row.Target, fmt.Sprintf("%d linked, %d updated, %d skipped, %d pruned", len(row.Linked), len(row.Updated), len(row.Skipped), len(row.Pruned)), ui.RowWidth(row.Target))
 		}
@@ -147,7 +153,7 @@ func renderProjectItem(item projects.Item) {
 			r = item.Agents
 		}
 		value := "off"
-		if r != nil {
+		if r != nil && !r.Disabled {
 			value = "on"
 			if r.Mode != "" {
 				value += " (" + r.Mode + ")"

@@ -17,7 +17,7 @@ func projectCandidateFixture(t *testing.T, body string) (string, *config.Config,
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	t.Setenv("SKILLSHARE_CONFIG", path)
-	data := []byte(strings.ReplaceAll("# project collection\ntargets: {}\nprojects:\n"+body, "$ROOT", filepath.ToSlash(dir)))
+	data := []byte(strings.NewReplacer("$ROOT/", dir+string(filepath.Separator), "$ROOT", dir).Replace("# project collection\ntargets: {}\nprojects:\n" + body))
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		t.Fatal(err)
 	}

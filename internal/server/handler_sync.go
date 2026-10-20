@@ -6,14 +6,15 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
-	"path/filepath"
 	"slices"
 	"sort"
 	"time"
 
 	"skillshare/internal/config"
+	"skillshare/internal/projects"
 	"skillshare/internal/skillignore"
 	ssync "skillshare/internal/sync"
+	"skillshare/internal/utils"
 )
 
 // ignorePayload builds the common ignored-skills fields for JSON responses.
@@ -65,7 +66,11 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if body.Project != "" {
-		root := s.declaredProjectRoot(body.Project)
+		root, lookupErr := lookupProjectRoot(s.cfg.Projects, body.Project)
+		if lookupErr != nil && !errors.Is(lookupErr, projects.ErrNotFound) {
+			writeError(w, http.StatusBadRequest, lookupErr.Error())
+			return
+		}
 		if _, ok := s.cfg.Projects[root]; !ok {
 			writeError(w, http.StatusBadRequest, "unknown project: "+body.Project)
 			return
@@ -117,10 +122,10 @@ func folderConflicts(targets map[string]config.TargetConfig, isProject bool, def
 
 // projectTargets returns the targets of the project declared under root.
 func (s *Server) projectTargets(root string) map[string]config.TargetConfig {
-	abs := filepath.Clean(config.ExpandPath(root))
+	abs := config.ExpandPath(root)
 	targets := map[string]config.TargetConfig{}
 	for name, target := range s.cfg.Targets {
-		if target.ProjectRoot() != "" && filepath.Clean(target.ProjectRoot()) == abs {
+		if target.ProjectRoot() != "" && utils.PathsEqual(target.ProjectRoot(), abs) {
 			targets[name] = target
 		}
 	}

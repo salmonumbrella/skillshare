@@ -161,3 +161,31 @@ func TestLoadReadOnly_WindowsLegacyConfigPath(t *testing.T) {
 		t.Fatalf("explicit config override ignored: %q", got)
 	}
 }
+
+func TestLoadReadOnly_PrepareSaveRetainsEmbeddedSkills(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "config.yaml")
+	t.Setenv("SKILLSHARE_CONFIG", path)
+	original := "source: " + root + "/skills\ntargets: {}\nskills:\n  - name: legacy\n    source: github.com/user/repo\n    custom: retained\n"
+	if err := os.WriteFile(path, []byte(original), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadReadOnly()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Mode = "copy"
+	c, err := PrepareSave(path, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(c.Bytes), "name: legacy") || !strings.Contains(string(c.Bytes), "custom: retained") {
+		t.Fatalf("embedded skills lost: %s", c.Bytes)
+	}
+	if err := c.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(RegistryPath(root)); !os.IsNotExist(err) {
+		t.Fatalf("unexpected registry migration: %v", err)
+	}
+}

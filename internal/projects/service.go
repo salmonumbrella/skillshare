@@ -313,7 +313,7 @@ func (s *Service) Sync(key string, opts ExecuteOptions) (Result, error) {
 		}
 	}
 	if agents {
-		discovery.Agents, discovery.AgentsAvailable = ssync.DiscoverTargetAgents(cfg.EffectiveAgentsSource())
+		discovery.Agents, discovery.AgentsAvailable, discovery.AgentIgnoreStats = ssync.DiscoverTargetAgentsWithStats(cfg.EffectiveAgentsSource())
 	}
 	opts.ProjectMode = false
 	opts.ProjectRoot = ""

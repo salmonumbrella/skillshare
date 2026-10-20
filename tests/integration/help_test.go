@@ -92,6 +92,9 @@ func TestHelp_PluginCommandsAndSyncBoundary(t *testing.T) {
 func TestSubcommandHelp_ShowsUsageInsteadOfRunning(t *testing.T) {
 	for _, args := range [][]string{
 		{"target", "add", "--help"},
+		{"project", "add", "--help"},
+		{"project", "remove", "--help"},
+		{"project", "list", "--help"},
 		{"target", "remove", "--help"},
 		{"target", "list", "--help"},
 		{"trash", "list", "--help"},

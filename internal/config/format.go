@@ -29,6 +29,15 @@ var configSections = []string{
 // existing is the file being replaced, or nil; its comments are kept on every
 // key that is still present.
 func marshalConfig(v any, header []byte, existing []byte) ([]byte, error) {
+	// Embedded skills are legacy metadata, not a current config-schema field.
+	// Keep them in this same serializer until a normal Load migrates them.
+	if cfg, ok := v.(*Config); ok && cfg.legacySkills.Kind != 0 {
+		type payload Config
+		v = struct {
+			*payload `yaml:",inline"`
+			Skills   yaml.Node `yaml:"skills,omitempty"`
+		}{(*payload)(cfg), cfg.legacySkills}
+	}
 	var doc yaml.Node
 	if err := doc.Encode(v); err != nil {
 		return nil, err

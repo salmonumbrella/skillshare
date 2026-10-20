@@ -167,3 +167,27 @@ func TestExecuteTargets_NoEffectiveTargetsReturnsEmptyCollections(t *testing.T) 
 		t.Fatalf("empty selection = %+v, %v", got, err)
 	}
 }
+
+func TestExecuteTargets_RetainsPreparedAgentIgnoreStatistics(t *testing.T) {
+	source := t.TempDir()
+	for _, name := range []string{"keep.md", "ignored.md"} {
+		if err := os.WriteFile(filepath.Join(source, name), []byte("# Agent\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ignore := filepath.Join(source, ".agentignore")
+	if err := os.WriteFile(ignore, []byte("ignored.md\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	agents, available, stats := DiscoverTargetAgentsWithStats(source)
+	if !available || len(agents) != 1 || agents[0].RelPath != "keep.md" || stats.Root != ignore || !slices.Equal(stats.Ignored, []string{"ignored.md"}) {
+		t.Fatalf("discovery lost disabled-agent statistics: %+v %+v", agents, stats)
+	}
+	if err := os.Remove(ignore); err != nil {
+		t.Fatal(err)
+	}
+	result, err := ExecuteTargets(context.Background(), &config.Config{}, map[string]config.TargetConfig{}, ExecuteOptions{Kinds: []string{"agent"}, DryRun: true, Discovery: TargetDiscovery{Agents: agents, AgentsAvailable: available, AgentIgnoreStats: stats}})
+	if err != nil || result.AgentIgnoreStats != stats || !slices.Equal(result.AgentIgnoreStats.Ignored, []string{"ignored.md"}) {
+		t.Fatalf("prepared statistics rediscovered or dropped: %+v %v", result, err)
+	}
+}

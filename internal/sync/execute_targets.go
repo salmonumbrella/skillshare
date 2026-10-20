@@ -47,6 +47,7 @@ type TargetDiscovery struct {
 	IgnoreStats      *skillignore.IgnoreStats
 	Agents           []resource.DiscoveredResource
 	AgentsAvailable  bool
+	AgentIgnoreStats *resource.AgentIgnoreStats
 	SourceIncomplete bool
 	Warnings         []string
 }
@@ -70,14 +71,15 @@ type ExecuteOptions struct {
 
 // ExecuteResult retains completed rows even when one or every target fails.
 type ExecuteResult struct {
-	Results         []TargetResult
-	Warnings        []string
-	Unmatched       []TargetUnmatchedInclude
-	Failed          []TargetFailure
-	FolderConflicts []config.SkillsFolderConflict
-	PathOverlap     int
-	Skills          []DiscoveredSkill
-	IgnoreStats     *skillignore.IgnoreStats
+	Results          []TargetResult
+	Warnings         []string
+	Unmatched        []TargetUnmatchedInclude
+	Failed           []TargetFailure
+	FolderConflicts  []config.SkillsFolderConflict
+	PathOverlap      int
+	Skills           []DiscoveredSkill
+	IgnoreStats      *skillignore.IgnoreStats
+	AgentIgnoreStats *resource.AgentIgnoreStats
 }
 
 // ExecuteTargets syncs prepared resources directly, without HTTP, prompts or logs.
@@ -116,7 +118,7 @@ func ExecuteTargets(ctx context.Context, cfg *config.Config, targets map[string]
 		}
 		for _, name := range slices.Sorted(maps.Keys(runTargets)) {
 			if err := ctx.Err(); err != nil {
-				return ExecuteResult{Results: results, Warnings: warnings, Failed: failed, Unmatched: unmatched, Skills: allSkills, IgnoreStats: opts.Discovery.IgnoreStats}, err
+				return ExecuteResult{Results: results, Warnings: warnings, Failed: failed, Unmatched: unmatched, Skills: allSkills, IgnoreStats: opts.Discovery.IgnoreStats, AgentIgnoreStats: opts.Discovery.AgentIgnoreStats}, err
 			}
 			target := runTargets[name]
 			sc := target.SkillsConfig()
@@ -182,7 +184,7 @@ func ExecuteTargets(ctx context.Context, cfg *config.Config, targets map[string]
 			agentTargets := make([]AgentTarget, 0, len(runTargets))
 			for _, name := range slices.Sorted(maps.Keys(runTargets)) {
 				if err := ctx.Err(); err != nil {
-					return ExecuteResult{Results: results, Warnings: warnings, Failed: failed, Unmatched: unmatched, Skills: allSkills, IgnoreStats: opts.Discovery.IgnoreStats}, err
+					return ExecuteResult{Results: results, Warnings: warnings, Failed: failed, Unmatched: unmatched, Skills: allSkills, IgnoreStats: opts.Discovery.IgnoreStats, AgentIgnoreStats: opts.Discovery.AgentIgnoreStats}, err
 				}
 				target := runTargets[name]
 				agentTargets = append(agentTargets, AgentTarget{
@@ -256,7 +258,7 @@ func ExecuteTargets(ctx context.Context, cfg *config.Config, targets map[string]
 	}
 	conflicts, overlap := TargetFolderConflicts(diagnostics, opts.ProjectMode, globalMode, HarmlessOverlap(diagnostics, globalMode, allSkills))
 	slices.SortFunc(unmatched, func(a, b TargetUnmatchedInclude) int { return strings.Compare(a.Target, b.Target) })
-	return ExecuteResult{Results: results, Warnings: warnings, Failed: failed, Unmatched: unmatched, FolderConflicts: conflicts, PathOverlap: overlap, Skills: allSkills, IgnoreStats: opts.Discovery.IgnoreStats}, nil
+	return ExecuteResult{Results: results, Warnings: warnings, Failed: failed, Unmatched: unmatched, FolderConflicts: conflicts, PathOverlap: overlap, Skills: allSkills, IgnoreStats: opts.Discovery.IgnoreStats, AgentIgnoreStats: opts.Discovery.AgentIgnoreStats}, nil
 }
 
 func runsKind(kinds []string, kind string) bool {

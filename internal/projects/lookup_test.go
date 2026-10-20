@@ -126,3 +126,15 @@ func assertAmbiguous(t *testing.T, err error, want []string) {
 		}
 	}
 }
+
+func TestFind_DefaultNameUsesDeclaredSpelling(t *testing.T) {
+	cwd := t.TempDir()
+	home := t.TempDir()
+	key := filepath.Join(home, "parent", "child") + string(filepath.Separator) + ".."
+	entries := map[string]config.ManagedProject{key: {Targets: []string{"claude"}}}
+	name := entries[key].ProjectName(key)
+	got, err := Find(entries, name, cwd, home)
+	if err != nil || got != key {
+		t.Fatalf("displayed name %q did not resolve exact declared key: got %q, %v", name, got, err)
+	}
+}

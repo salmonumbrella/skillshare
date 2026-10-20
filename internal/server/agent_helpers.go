@@ -1,13 +1,9 @@
 package server
 
 import (
-	"os"
-	"path/filepath"
-
 	"skillshare/internal/config"
 	"skillshare/internal/resource"
 	ssync "skillshare/internal/sync"
-	"skillshare/internal/utils"
 )
 
 // Kind constants for diff/sync operations.
@@ -34,28 +30,24 @@ func discoverActiveAgents(agentsSource string) []resource.DiscoveredResource {
 // agentIgnorePayload returns JSON-serialisable fields describing .agentignore state.
 // Pass pre-discovered agents to avoid duplicate filesystem traversal; nil triggers discovery.
 func agentIgnorePayload(agentsSource string, all []resource.DiscoveredResource) map[string]any {
+	if all == nil && agentsSource != "" {
+		all = discoverAllAgents(agentsSource)
+	}
+	stats := resource.InspectAgentIgnore(agentsSource, all)
+	return agentIgnoreStatsPayload(&stats)
+}
+
+// agentIgnoreStatsPayload adapts prepared discovery without traversing again.
+func agentIgnoreStatsPayload(stats *resource.AgentIgnoreStats) map[string]any {
 	root := ""
-	ignoredNames := []string{}
-	if agentsSource != "" {
-		resolved := utils.ResolveSymlink(agentsSource)
-		ignoreFile := filepath.Join(resolved, ".agentignore")
-		if _, err := os.Stat(ignoreFile); err == nil {
-			root = ignoreFile
-		}
-		if all == nil {
-			all = discoverAllAgents(agentsSource)
-		}
-		for _, a := range all {
-			if a.Disabled {
-				ignoredNames = append(ignoredNames, a.RelPath)
-			}
+	ignored := []string{}
+	if stats != nil {
+		root = stats.Root
+		if stats.Ignored != nil {
+			ignored = stats.Ignored
 		}
 	}
-	return map[string]any{
-		"agent_ignore_root":    root,
-		"agent_ignored_count":  len(ignoredNames),
-		"agent_ignored_skills": ignoredNames,
-	}
+	return map[string]any{"agent_ignore_root": root, "agent_ignored_count": len(ignored), "agent_ignored_skills": ignored}
 }
 
 // resolveAgentPath returns the expanded agent target path for a target,

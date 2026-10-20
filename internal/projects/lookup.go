@@ -43,7 +43,13 @@ func find(projects map[string]config.ManagedProject, token, cwd, home string, na
 		if err != nil {
 			continue
 		}
-		if utils.PathsEqual(identity, root) || (names && project.ProjectName(root) == token) {
+		// Default names use the declared spelling, just like config expansion.
+		// Only tilde expansion needs the resolver's explicit home context.
+		nameRoot := key
+		if utils.HasTildePrefix(key) {
+			nameRoot = filepath.Join(home, key[1:])
+		}
+		if utils.PathsEqual(identity, root) || (names && project.ProjectName(nameRoot) == token) {
 			candidates = append(candidates, key)
 		}
 	}

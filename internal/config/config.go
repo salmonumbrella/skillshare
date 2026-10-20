@@ -376,6 +376,9 @@ type GlobalSources struct {
 
 // Config holds the application configuration
 type Config struct {
+	// legacySkills retains unmigrated embedded metadata during read-only edits.
+	// Ordinary Load removes this section through migrateSkillsToRegistry first.
+	legacySkills yaml.Node     `yaml:"-"`
 	Plugins      yaml.Node     `yaml:"plugins,omitempty"`
 	Hooks        yaml.Node     `yaml:"hooks,omitempty"`
 	MCP          *MCPConfig    `yaml:"mcp,omitempty"`
@@ -691,7 +694,7 @@ func ConfigPath() string {
 // LoadReadOnly reads the migrated config view without writing files or relocating
 // legacy state. On Windows a legacy config is read in place when needed.
 func LoadReadOnly() (*Config, error) {
-	path := readOnlyConfigPath(runtime.GOOS)
+	path := ReadOnlyConfigPath()
 	cfg, err := loadConfig(path, false)
 	if err != nil {
 		return nil, err
@@ -702,6 +705,9 @@ func LoadReadOnly() (*Config, error) {
 	}
 	return cfg, nil
 }
+
+// ReadOnlyConfigPath selects the config read in place, including Windows legacy fallback.
+func ReadOnlyConfigPath() string { return readOnlyConfigPath(runtime.GOOS) }
 
 func readOnlyConfigPath(goos string) string {
 	path := ConfigPath()
@@ -751,6 +757,16 @@ func decodeConfig(path string, data []byte, persist bool) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
+
+	// Retain legacy metadata until an ordinary Load migrates it to the registry.
+	// Project candidates must not discard this raw section while loading in place.
+	var legacy struct {
+		Skills yaml.Node `yaml:"skills"`
+	}
+	if err := yaml.Unmarshal(data, &legacy); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+	cfg.legacySkills = legacy.Skills
 
 	threshold, err := normalizeAuditBlockThreshold(cfg.Audit.BlockThreshold)
 	if err != nil {

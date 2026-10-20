@@ -11,11 +11,21 @@ import (
 
 // DiscoverTargetAgents preserves agent discovery's empty-source/prune behavior.
 func DiscoverTargetAgents(source string) ([]resource.DiscoveredResource, bool) {
+	agents, available, _ := DiscoverTargetAgentsWithStats(source)
+	return agents, available
+}
+
+// DiscoverTargetAgentsWithStats retains disabled agents in the ignore report
+// while returning only active agents for execution, using a single discovery.
+func DiscoverTargetAgentsWithStats(source string) ([]resource.DiscoveredResource, bool, *resource.AgentIgnoreStats) {
+	var all []resource.DiscoveredResource
+	available := false
 	if info, err := os.Stat(source); err == nil && info.IsDir() {
-		all, _ := (resource.AgentKind{}).Discover(source)
-		return resource.ActiveAgents(all), true
+		all, _ = (resource.AgentKind{}).Discover(source)
+		available = true
 	}
-	return nil, false
+	stats := resource.InspectAgentIgnore(source, all)
+	return resource.ActiveAgents(all), available, &stats
 }
 
 // BackupTargetsOptions describes the adapter's backup location and policy.

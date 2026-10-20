@@ -211,11 +211,13 @@ func TestServicePut_NoOpAndPreviewDoNotWrite(t *testing.T) {
 
 func TestServiceRemove_PreviewAndLeftoverRoots(t *testing.T) {
 	s, cfg, path, root, original := serviceFixture(t)
+	mcpRoot := root + string(filepath.Separator) + "."
+	hooksRoot := root + string(filepath.Separator)
 	var extra struct {
 		MCP   *config.MCPConfig `yaml:"mcp"`
 		Hooks yaml.Node         `yaml:"hooks"`
 	}
-	if err := yaml.Unmarshal([]byte("mcp:\n  projects:\n    "+root+": {servers: {}}\nhooks:\n  projects:\n    "+root+": {entries: {}}\n"), &extra); err != nil {
+	if err := yaml.Unmarshal([]byte("mcp:\n  projects:\n    "+mcpRoot+": {servers: {}}\nhooks:\n  projects:\n    "+hooksRoot+": {entries: {}}\n"), &extra); err != nil {
 		t.Fatal(err)
 	}
 	cfg.MCP = extra.MCP
@@ -232,7 +234,7 @@ func TestServiceRemove_PreviewAndLeftoverRoots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != 2 || result.Registration != "kept" || len(result.Detach.Retained) != 2 || len(result.Warnings) != 2 || !strings.Contains(result.Warnings[0], "mcp.projects") || !strings.Contains(result.Warnings[1], "hooks.projects") {
+	if calls != 2 || result.Registration != "kept" || len(result.Detach.Retained) != 2 || len(result.Warnings) != 2 || result.Warnings[0] != "mcp.projects still contains root "+mcpRoot || result.Warnings[1] != "hooks.projects still contains root "+hooksRoot {
 		t.Fatalf("preview report: %+v", result)
 	}
 	if got, _ := os.ReadFile(path); !bytes.Equal(got, original) {

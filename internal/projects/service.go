@@ -244,6 +244,7 @@ func field(node *yaml.Node, key string) *yaml.Node {
 	return nil
 }
 func leftoverWarnings(cfg *config.Config, root string) []string {
+	normalizedRoot := filepath.Clean(config.ExpandPath(root))
 	sections := map[string]*yaml.Node{"hooks.projects": field(&cfg.Hooks, "projects")}
 	if cfg.MCP != nil {
 		sections["mcp.projects"] = cfg.MCP.Projects
@@ -256,7 +257,7 @@ func leftoverWarnings(cfg *config.Config, root string) []string {
 		}
 		for i := 0; i+1 < len(node.Content); i += 2 {
 			key := node.Content[i].Value
-			if utils.PathsEqual(config.ExpandPath(key), config.ExpandPath(root)) {
+			if utils.PathsEqual(filepath.Clean(config.ExpandPath(key)), normalizedRoot) {
 				warnings = append(warnings, fmt.Sprintf("%s still contains root %s", name, key))
 			}
 		}

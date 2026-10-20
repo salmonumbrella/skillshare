@@ -86,7 +86,7 @@ Removal detaches skills before removing the registration. A whole-folder link is
 | add, edit, remove | `action`, `project`, `applied`, `affected`, `warnings`; optional `sync` or `detach` |
 | sync | `action`, `project`, `sync`; previews also have `applied: false` |
 
-Project objects include `root` (stored spelling), `path` (expanded path), `name`, `targets`, `skills`, `agents`, `groups`, `missing`, and `hasOwnConfig`. Disabled resources are `null`. The sync result includes `results`, `failed`, `warnings`, and discovery/filter diagnostics.
+Project objects include `root` (stored spelling), `path` (expanded path), `name`, `targets`, `skills`, `agents`, `groups`, `missing`, and `hasOwnConfig`. An omitted resource is `null`. A present resource exposes its settings even when disabled; this JSON shape does not expose its enabled flag. Text `project list` and `project show` report the on/off state. The sync result includes `results`, `failed`, `warnings`, and discovery/filter diagnostics.
 
 A failed target makes sync exit 1 while reporting completed targets. If add/edit saves successfully but its sync fails, the registration stays saved; fix the target and retry with `project sync`. A missing project folder can still be edited, but cannot be synced.
 

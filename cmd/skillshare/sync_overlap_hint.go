@@ -39,6 +39,9 @@ func printSyncFolderConflicts(conflicts []config.SkillsFolderConflict, rest int,
 
 // skillsOffCommand is the command that stops syncing skills to target name.
 func skillsOffCommand(name string, isProject bool) string {
+	if project, _, ok := config.SplitProjectTarget(name); ok && !isProject {
+		return "skillshare project edit --no-skills -- '" + strings.ReplaceAll(project, "'", "'\\''") + "'"
+	}
 	cmd := "skillshare target " + name + " --skills=false"
 	if isProject {
 		cmd += " -p"

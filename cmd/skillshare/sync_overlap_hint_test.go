@@ -9,6 +9,27 @@ import (
 	"skillshare/internal/sync"
 )
 
+func TestSkillsOffCommand_ProjectTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		isProject bool
+		want      string
+	}{
+		{"app@claude", false, "skillshare project edit --no-skills -- 'app'"},
+		{"app space@claude", false, "skillshare project edit --no-skills -- 'app space'"},
+		{"app's@claude", false, "skillshare project edit --no-skills -- 'app'\\''s'"},
+		{"-app@claude", false, "skillshare project edit --no-skills -- '-app'"},
+		{"codex", false, "skillshare target codex --skills=false"},
+		{"codex", true, "skillshare target codex --skills=false -p"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := skillsOffCommand(tc.name, tc.isProject); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPrintSyncOverlapHint_NamesConflictAndFix(t *testing.T) {
 	keepPathsUnfolded(t)
 	targets := map[string]config.TargetConfig{

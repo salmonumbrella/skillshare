@@ -80,7 +80,7 @@ func TestProjectPatchExplicitEnablePreservesDisabledSettings(t *testing.T) {
 func TestProjectTextPreparedSyncDiagnostics(t *testing.T) {
 	r := projects.Result{Sync: &projects.ExecuteResult{
 		Unmatched:       []ssync.TargetUnmatchedInclude{{Target: "app@claude", Patterns: []string{"typo"}, Suggestions: []string{"team_alpha"}, All: true}},
-		FolderConflicts: []config.SkillsFolderConflict{{Targets: []string{"app@claude", "ordinary"}, Path: "/prepared/skills", Stop: []string{"ordinary"}}},
+		FolderConflicts: []config.SkillsFolderConflict{{Targets: []string{"app@claude", "ordinary"}, Path: "/prepared/skills", Stop: []string{"ordinary", "app@claude"}}},
 		PathOverlap:     2,
 	}}
 	output := stripANSIWarnings(captureStdout(t, func() {
@@ -88,7 +88,7 @@ func TestProjectTextPreparedSyncDiagnostics(t *testing.T) {
 			t.Fatal(err)
 		}
 	}))
-	for _, want := range []string{`app@claude: include filter "typo" matches no skill`, `did you mean "team_alpha"`, "app@claude and ordinary sync skills to /prepared/skills with different settings", "keep one: skillshare target ordinary --skills=false", "2 targets share skill folders", "skillshare doctor"} {
+	for _, want := range []string{`app@claude: include filter "typo" matches no skill`, `did you mean "team_alpha"`, "app@claude and ordinary sync skills to /prepared/skills with different settings", "keep one: skillshare target ordinary --skills=false", "keep one: skillshare project edit --no-skills -- 'app'", "2 targets share skill folders", "skillshare doctor"} {
 		if !strings.Contains(output, want) {
 			t.Errorf("missing %q in %s", want, output)
 		}

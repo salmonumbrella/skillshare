@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/rand"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -55,19 +56,20 @@ func (c *SaveCandidate) Write() error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
-	tmp, err := os.CreateTemp(dir, ".skillshare-config-*")
+	// Exclusive creation applies the process umask without changing global state.
+	tmpPath := filepath.Join(dir, ".skillshare-config-"+rand.Text())
+	tmp, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create config temporary file: %w", err)
 	}
 	defer os.Remove(tmp.Name())
-	// Retain the existing config's permissions; new configs use Save's 0644.
-	perm := os.FileMode(0644)
+	// Retain an existing config's permissions across atomic replacement. New
+	// configs keep the creation mode above, including the process umask.
 	if info, err := os.Stat(dest); err == nil {
-		perm = info.Mode().Perm()
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("failed to set config permissions: %w", err)
+		if err := tmp.Chmod(info.Mode().Perm()); err != nil {
+			_ = tmp.Close()
+			return fmt.Errorf("failed to set config permissions: %w", err)
+		}
 	}
 	if _, err := tmp.Write(c.Bytes); err != nil {
 		_ = tmp.Close()

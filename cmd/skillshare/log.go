@@ -11,9 +11,7 @@ import (
 
 	"skillshare/internal/config"
 	"skillshare/internal/oplog"
-	"skillshare/internal/projectdir"
 	"skillshare/internal/ui"
-	"skillshare/internal/utils"
 )
 
 func cmdLog(args []string) error {
@@ -264,13 +262,7 @@ func runLogStats(configPath string, auditOnly bool, f oplog.Filter) error {
 }
 
 func isProjectLogConfig(configPath string) bool {
-	configDir := filepath.Dir(configPath)
-	if !projectdir.IsName(filepath.Base(configDir)) {
-		return false
-	}
-	// The visible project directory shares its name with the global config
-	// directory, so exclude the global location by full path.
-	return !utils.PathsEqual(configDir, config.BaseDir())
+	return oplog.IsProjectConfig(configPath)
 }
 
 // runLogTUIDispatch launches the interactive TUI with async log loading.

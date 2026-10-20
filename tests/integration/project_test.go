@@ -483,6 +483,22 @@ func TestProject_GlobalOplogWithConfigOverride(t *testing.T) {
 	if len(projectLogs(t, sb)) != 1 {
 		t.Fatal("global project operation not logged to global state")
 	}
+	read := sb.RunCLI("log", "-g", "--cmd", "project", "--json")
+	read.AssertSuccess(t)
+	if !strings.Contains(read.Stdout, `"cmd":"project"`) {
+		t.Fatalf("global log reader missed project add: %s", read.Output())
+	}
+	sb.RunCLI("log", "-g", "--stats").AssertOutputContains(t, "project")
+	sb.RunCLI("log", "-g", "--clear").AssertSuccess(t)
+	cleared := sb.RunCLI("log", "-g", "--cmd", "project", "--json")
+	cleared.AssertSuccess(t)
+	if cleared.Stdout != "" {
+		t.Fatalf("global log clear missed project add: %s", cleared.Stdout)
+	}
+	raw, err := os.ReadFile(filepath.Join(sb.Home, ".local", "state", "skillshare", "logs", "operations.log"))
+	if err != nil || len(raw) != 0 {
+		t.Fatalf("canonical log not cleared: %q %v", raw, err)
+	}
 	for _, name := range []string{"logs", ".gitignore"} {
 		if _, err := os.Stat(filepath.Join(filepath.Dir(sb.ConfigPath), name)); !os.IsNotExist(err) {
 			t.Fatalf("global config treated as a project: %s (%v)", name, err)

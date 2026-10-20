@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -243,8 +242,5 @@ func logProject(cfg *config.Config, command, action, root, status string, err er
 	if cfg.Log.MaxEntries != nil && *cfg.Log.MaxEntries >= 0 {
 		limit = *cfg.Log.MaxEntries
 	}
-	// This command is always global. The selected config can live in a legacy
-	// .../skillshare directory that oplog would otherwise mistake for a project.
-	routingPath := filepath.Join(config.BaseDir(), "config.yaml")
-	_ = oplog.WriteWithLimit(routingPath, oplog.OpsFile, e, limit)
+	_ = oplog.WriteWithLimit(config.ReadOnlyConfigPath(), oplog.OpsFile, e, limit)
 }

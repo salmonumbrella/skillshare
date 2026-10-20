@@ -54,7 +54,6 @@ If your config was created before this feature, add the comment as the **first l
 # yaml-language-server: $schema=https://raw.githubusercontent.com/runkids/skillshare/main/schemas/project-config.schema.json
 ```
 
-Or simply re-run `skillshare init --force` (global) or `skillshare init -p --force` (project) to regenerate the config with the schema comment.
 
 ### Supported editors
 
@@ -679,7 +678,7 @@ Each entry in `targets` is a [supported target](./supported-targets.md) name. Sk
 - **Names in output.** `sync`, `status`, `diff`, `doctor` and `backup` show a project's targets as `<name>@<target>`, for example `shop-web@claude`. `name` cannot contain `@`, `/` or `\`, and two projects cannot share one.
 - **Agents** are written only for tools that have a project agents folder. A project with `agents` and no `skills` syncs agents alone.
 - **A missing folder is skipped.** `sync` prints `project <folder>: folder not found, skipped` and never recreates a project you moved or deleted.
-- **`target` and `collect` leave projects alone.** `skillshare target` lists and edits the `targets` section only, and `collect` does not pull a project's own skills into the source. Edit `projects` in `config.yaml`, or on the dashboard's **Projects** page.
+- **`target` and `collect` leave projects alone.** `skillshare target` lists and edits the `targets` section only, and `collect` does not pull a project's own skills into the source. Use [`skillshare project`](/docs/reference/commands/project) to add, edit, sync, or remove project registrations, or use the dashboard’s **Projects** page.
 - Skills with a `targets` frontmatter field are matched against the tool, so `targets: [claude]` reaches `shop-web@claude`.
 
 MCP servers for the same folders are listed under [`mcp.projects`](/docs/reference/commands/mcp#manage-several-projects-from-the-global-config), keyed by the same folder. For a step-by-step setup see [Many Projects, One Config](/docs/how-to/recipes/many-projects-one-config).

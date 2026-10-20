@@ -55,8 +55,6 @@ targets:
 # yaml-language-server: $schema=https://raw.githubusercontent.com/runkids/skillshare/main/schemas/project-config.schema.json
 ```
 
-または単純に `skillshare init --force`（グローバル）や `skillshare init -p --force`（プロジェクト）を
-再実行して、スキーマコメント付きで Config を再生成してください。
 
 ### 対応エディタ
 
@@ -698,7 +696,7 @@ projects:
 - **出力での名前表記。** `sync`、`status`、`diff`、`doctor`、`backup` は project の Target を `<name>@<target>`（例: `shop-web@claude`）の形で表示します。`name` に `@`、`/`、`\` は使えず、2つの project で同じ名前は共有できません。
 - **Agent** は project 用の Agent フォルダーを持つツールにのみ書き込まれます。`agents` があり `skills` がない project は Agent だけを sync します。
 - **見つからないフォルダーはスキップされます。** `sync` は `project <folder>: folder not found, skipped` と表示し、移動または削除した project を再作成することはありません。
-- **`target` と `collect` は project に触れません。** `skillshare target` は `targets` セクションのみを一覧・編集し、`collect` は project 自身の Skill を Source に取り込みません。編集は `config.yaml` を直接、またはダッシュボードの **プロジェクト** ページから行ってください。
+- **`target` と `collect` は project に触れません。** `skillshare target` は `targets` セクションのみを一覧・編集し、`collect` は project 自身の Skill を Source に取り込みません。[`skillshare project`](/docs/reference/commands/project) でプロジェクトの登録・編集・同期・削除を行うか、ダッシュボードの **プロジェクト** ページを使用してください。
 - `targets` フロントマターフィールドを持つ Skill はツールと照合されるため、`targets: [claude]` は `shop-web@claude` に届きます。
 
 同じフォルダーの MCP サーバーは、同じフォルダーをキーとして [`mcp.projects`](/docs/reference/commands/mcp#manage-several-projects-from-the-global-config) に一覧されます。手順は[多数の Project を 1 つの Config で](/docs/how-to/recipes/many-projects-one-config)を参照してください。

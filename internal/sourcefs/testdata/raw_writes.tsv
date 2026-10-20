@@ -318,9 +318,6 @@ internal/server/handler_skill_content.go	writeFileAtomic	os.Remove	tmpPath	agent
 internal/server/handler_skill_content.go	writeFileAtomic	os.Rename	tmpPath, path	agents
 internal/server/handler_skillignore.go	(*Server).handlePutSkillignore	os.Remove	ignorePath	source-unmigrated
 internal/server/handler_skillignore.go	(*Server).handlePutSkillignore	os.WriteFile	ignorePath	source-unmigrated
-internal/server/handler_targets.go	<package>	os.Remove	<ref>	target
-internal/server/handler_targets.go	copySkillDir	os.MkdirAll	dstPath	target
-internal/server/handler_targets.go	copySkillDir	os.OpenFile	dstPath	target
 internal/server/handler_trash.go	(*Server).handleDeleteTrash	os.RemoveAll	resolved.entry.Path	trash
 internal/server/handler_trash.go	(*Server).handleEmptyTrash	os.RemoveAll	item.Path	trash
 internal/skillignore/write.go	AddPattern	os.MkdirAll	filepath.Dir(filePath)	source-unmigrated
@@ -362,6 +359,9 @@ internal/sync/copy.go	SyncTargetCopyWithSkillsOptions	os.RemoveAll	targetSkillPa
 internal/sync/copy.go	copySkillToTarget	os.Chmod	skillFile	target
 internal/sync/copy.go	copySkillToTarget	os.Chmod	skillFile	target
 internal/sync/copy.go	copySkillToTarget	os.RemoveAll	dst	target
+internal/sync/detach_target.go	<package>	os.Remove	<ref>	target
+internal/sync/detach_target.go	copySkillDir	os.MkdirAll	dstPath	target
+internal/sync/detach_target.go	copySkillDir	os.OpenFile	dstPath	target
 internal/sync/extension.go	runExtensionFile	os.MkdirAll	filepath.Dir(tgtFile)	target
 internal/sync/extension.go	runExtensionFile	os.WriteFile	tgtFile	target
 internal/sync/extras.go	CollectExtraFiles	os.MkdirAll	filepath.Dir(destPath)	extras

@@ -688,12 +688,50 @@ func ConfigPath() string {
 	return filepath.Join(BaseDir(), "config.yaml")
 }
 
+// LoadReadOnly reads the migrated config view without writing files or relocating
+// legacy state. On Windows a legacy config is read in place when needed.
+func LoadReadOnly() (*Config, error) {
+	path := readOnlyConfigPath(runtime.GOOS)
+	cfg, err := loadConfig(path, false)
+	if err != nil {
+		return nil, err
+	}
+	// Keep an old registry readable without moving it to the canonical source root.
+	if !fileExists(RegistryPath(cfg.RegistryDir)) && fileExists(RegistryPath(filepath.Dir(path))) {
+		cfg.RegistryDir = filepath.Dir(path)
+	}
+	return cfg, nil
+}
+
+func readOnlyConfigPath(goos string) string {
+	path := ConfigPath()
+	if goos != "windows" || os.Getenv("SKILLSHARE_CONFIG") != "" {
+		return path
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	legacy := filepath.Join(home, ".config", "skillshare", "config.yaml")
+	if fileExists(legacy) {
+		return legacy
+	}
+	return path
+}
+
 // Load reads the config from the default location
 func Load() (*Config, error) {
-	path := ConfigPath()
+	return loadConfig(ConfigPath(), true)
+}
 
-	// Migrate skills[] to registry.yaml (one-time, silent)
-	_ = migrateSkillsToRegistry(path)
+func loadConfig(path string, persist bool) (*Config, error) {
+	// Migrate skills[] to registry.yaml (one-time, silent).
+	if persist {
+		_ = migrateSkillsToRegistry(path)
+	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -703,6 +741,12 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
 
+	return decodeConfig(path, data, persist)
+}
+
+// decodeConfig shares normalization and expansion with prepared saves. Only a
+// normal Load persists the legacy migrations.
+func decodeConfig(path string, data []byte, persist bool) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
@@ -742,8 +786,8 @@ func Load() (*Config, error) {
 	}
 	cfg.GiteaHosts = giteaHosts
 
-	// Migrate legacy flat target fields to skills: sub-key (one-time, persisted immediately)
-	if migrateTargetConfigs(cfg.Targets) {
+	// Migrate legacy flat target fields in memory, persisting only for ordinary Load.
+	if migrateTargetConfigs(cfg.Targets) && persist {
 		if migrated, err := marshalConfig(&cfg, schemaComment, data); err == nil {
 			// Write a symlinked config's target so the link survives.
 			dest := utils.ResolveSymlink(path)
@@ -798,7 +842,9 @@ func Load() (*Config, error) {
 	// (without a legacy source: top-level) still resolve a registry root.
 	if skillsDir := cfg.EffectiveSkillsSource(); skillsDir != "" {
 		cfg.RegistryDir = SourceRoot(skillsDir)
-		MigrateRegistryToSource(filepath.Dir(path), cfg.RegistryDir)
+		if persist {
+			MigrateRegistryToSource(filepath.Dir(path), cfg.RegistryDir)
+		}
 	}
 
 	return &cfg, nil
@@ -806,32 +852,11 @@ func Load() (*Config, error) {
 
 // Save writes the config to the default location
 func (c *Config) Save() error {
-	path := ConfigPath()
-
-	// Ensure directory exists
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create config directory: %w", err)
-	}
-
-	// fork patch: fold $HOME prefixes back to ~ so serialized paths are
-	// machine-agnostic (dotfiles-friendly). Opt-in via preserve_tilde_on_save.
-	// The in-memory config is left untouched; we marshal a shallow copy with
-	// folded path fields.
-	payload := c.withoutProjectTargets()
-	if c.PreserveTildeOnSave {
-		payload = payload.cloneForSave()
-	}
-	data, err := marshalConfigFile(path, payload, schemaComment)
+	candidate, err := PrepareSave(ConfigPath(), c)
 	if err != nil {
-		return fmt.Errorf("failed to marshal config: %w", err)
+		return err
 	}
-
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("failed to write config: %w", err)
-	}
-
-	return nil
+	return candidate.Write()
 }
 
 // cloneForSave returns a shallow copy of c with all path fields folded back to

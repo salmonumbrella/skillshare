@@ -91,10 +91,8 @@ internal/check/checktest/fixture.go	Seed	os.MkdirAll	dir	test-helper
 internal/check/checktest/fixture.go	Seed	os.WriteFile	filepath.Join(dir, "SKILL.md")	test-helper
 internal/check/tree_check.go	FetchRemoteTreeHashesForRef	os.MkdirTemp	""	tmp
 internal/check/tree_check.go	FetchRemoteTreeHashesForRef	os.RemoveAll	tmpDir	tmp
-internal/config/config.go	(*Config).Save	os.MkdirAll	dir	config
-internal/config/config.go	(*Config).Save	os.WriteFile	path	config
-internal/config/config.go	Load	os.Rename	tmpPath, dest	config
-internal/config/config.go	Load	os.WriteFile	tmpPath	config
+internal/config/config.go	decodeConfig	os.Rename	tmpPath, dest	config
+internal/config/config.go	decodeConfig	os.WriteFile	tmpPath	config
 internal/config/config.go	migrateSkillsToRegistry	os.WriteFile	configPath	config
 internal/config/extras_migrate.go	MigrateExtrasDir	os.MkdirAll	filepath.Join(configDir, "extras")	extras
 internal/config/extras_migrate.go	MigrateExtrasDir	os.Rename	oldPath, newPath	extras
@@ -110,6 +108,10 @@ internal/config/registry.go	(*Registry).Save	os.MkdirAll	dir	source-unmigrated
 internal/config/registry.go	(*Registry).Save	os.WriteFile	path	source-unmigrated
 internal/config/registry.go	MigrateRegistryToSource	os.Remove	oldPath	source-unmigrated
 internal/config/registry.go	MigrateRegistryToSource	os.WriteFile	newPath	source-unmigrated
+internal/config/save_candidate.go	(*SaveCandidate).Write	os.CreateTemp	dir	config
+internal/config/save_candidate.go	(*SaveCandidate).Write	os.MkdirAll	dir	config
+internal/config/save_candidate.go	(*SaveCandidate).Write	os.Remove	tmp.Name()	config
+internal/config/save_candidate.go	(*SaveCandidate).Write	os.Rename	tmp.Name(), dest	config
 internal/git/info.go	resolveMetadataConflicts	os.WriteFile	filepath.Join(dir, path)	source-unmigrated
 internal/git/info.go	restorePullResidue	os.Remove	full	source-unmigrated
 internal/git/scope.go	DisableNestedRepo	os.Rename	gitDir, disabled	source-unmigrated

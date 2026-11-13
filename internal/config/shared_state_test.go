@@ -1,10 +1,14 @@
 package config
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -15,6 +19,221 @@ import (
 	"gopkg.in/yaml.v3"
 	"skillshare/internal/testutil"
 )
+
+// This mode is part of this test binary, never an installed helper. Its pipes
+// are barriers; deadlines only bound a broken test, not prove exclusion.
+func TestSharedLeaseProcess(t *testing.T) {
+	if os.Getenv("SKILLSHARE_RECEIPT_CHILD") != "lease" {
+		return
+	}
+	f, closeLease, err := BeginSharedStateWrite(context.Background(), os.Getenv("SKILLSHARE_CONFIG"), os.Getenv("SKILLSHARE_RECEIPT_ROOT"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.State.Pointer = os.Getenv("SKILLSHARE_RECEIPT_POINTER")
+	if err := f.Save(); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("leased")
+	in := bufio.NewScanner(os.Stdin)
+	if !in.Scan() {
+		t.Fatal("missing parent barrier")
+	}
+	switch in.Text() {
+	case "exit":
+		// Deliberately omit Close: the kernel must release this process's lock.
+		os.Exit(0)
+	case "release":
+		closeLease()
+	default:
+		t.Fatal("unexpected barrier command")
+	}
+}
+
+func startSharedLeaseProcess(t *testing.T, sb *testutil.Sandbox) (io.WriteCloser, func()) {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestSharedLeaseProcess$")
+	// NewSandbox has explicitly isolated HOME/XDG/config and native overrides.
+	cmd.Env = append(os.Environ(), "SKILLSHARE_RECEIPT_CHILD=lease", "SKILLSHARE_RECEIPT_ROOT="+sb.SourcePath, "SKILLSHARE_RECEIPT_POINTER="+filepath.Join(sb.Root, "published.yaml"))
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	waited := false
+	t.Cleanup(func() {
+		cancel()
+		_ = in.Close()
+		if !waited {
+			_ = cmd.Wait()
+		}
+	})
+	if scanner := bufio.NewScanner(out); !scanner.Scan() || scanner.Text() != "leased" {
+		t.Fatal("child did not reach its leased barrier")
+	}
+	return in, func() {
+		t.Helper()
+		err := cmd.Wait()
+		waited = true
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestSharedLeaseProcessContentionAndExit(t *testing.T) {
+	for _, exit := range []bool{false, true} {
+		t.Run(fmt.Sprint(exit), func(t *testing.T) {
+			sb := testutil.NewSandbox(t)
+			defer sb.Cleanup()
+			sb.WriteConfig("targets: {}\n")
+			in, wait := startSharedLeaseProcess(t, sb)
+			path, err := SharedStatePath(sb.ConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lockPath := strings.TrimSuffix(path, ".yaml") + ".lock"
+			inode, err := os.Stat(lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.GOOS != "windows" {
+				for _, p := range []string{filepath.Dir(path), path, lockPath} {
+					info, err := os.Stat(p)
+					if err != nil || info.Mode().Perm()&0077 != 0 {
+						t.Fatalf("shared state is not private: %s %v", p, err)
+					}
+				}
+			} else {
+				t.Log("POSIX mode assertions do not establish Windows ACL privacy")
+			}
+			configs := []string{sb.ConfigPath}
+			alias := filepath.Join(sb.Root, "alias.yaml")
+			if err := os.Symlink(sb.ConfigPath, alias); err == nil {
+				configs = append(configs, alias)
+			} else {
+				t.Logf("file-link alias unavailable: %v", err)
+			}
+			for _, p := range configs {
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				_, release, err := BeginSharedStateWrite(ctx, p, sb.SourcePath, "")
+				cancel()
+				if err == nil {
+					release()
+				}
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("cross-process exclusion failed for %s: %v", p, err)
+				}
+			}
+			_, releaseOther, err := BeginSharedStateWrite(context.Background(), filepath.Join(sb.Root, "independent.yaml"), sb.SourcePath, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			releaseOther()
+			command := "release"
+			if exit {
+				command = "exit"
+			}
+			if _, err := fmt.Fprintln(in, command); err != nil {
+				t.Fatal(err)
+			}
+			wait()
+			fresh, release, err := BeginSharedStateWrite(context.Background(), sb.ConfigPath, sb.SourcePath, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer release()
+			if fresh.State.Pointer != filepath.Join(sb.Root, "published.yaml") {
+				t.Fatal("acquisition did not reload the process writer's state")
+			}
+			if now, err := os.Stat(lockPath); err != nil || !os.SameFile(inode, now) {
+				t.Fatal("release replaced or removed the stable lock inode")
+			}
+		})
+	}
+}
+
+func TestSharedLeaseDefaultTimeout(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.WriteConfig("targets: {}\n")
+	in, wait := startSharedLeaseProcess(t, sb)
+	// Background has no deadline: this asserts the owner's bounded wait itself.
+	_, release, err := BeginSharedStateWrite(context.Background(), sb.ConfigPath, sb.SourcePath, "")
+	if err == nil {
+		release()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("unbounded or missing owner timeout: %v", err)
+	}
+	if _, err := fmt.Fprintln(in, "release"); err != nil {
+		t.Fatal(err)
+	}
+	wait()
+}
+
+// context.WithTimeout asks Deadline after the pre-acquire identity check.
+// This barrier moves the config at that exact existing acquisition boundary.
+type sharedAcquireBarrier struct {
+	context.Context
+	arrive func()
+}
+
+func (c sharedAcquireBarrier) Deadline() (time.Time, bool) {
+	c.arrive()
+	return time.Time{}, false
+}
+
+func TestSharedLeaseIdentityMovesDuringAcquire(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.WriteConfig("targets: {}\n")
+	alias, other := filepath.Join(sb.Root, "alias.yaml"), filepath.Join(sb.Root, "other.yaml")
+	sb.WriteFile(other, "targets: {}\n")
+	if err := os.Symlink(sb.ConfigPath, alias); err != nil {
+		t.Skipf("config-link movement requires file links: %v", err)
+	}
+	in, wait := startSharedLeaseProcess(t, sb)
+	ctx := sharedAcquireBarrier{Context: context.Background(), arrive: func() {
+		if err := os.Remove(alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, alias); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fmt.Fprintln(in, "release"); err != nil {
+			t.Fatal(err)
+		}
+		wait()
+	}}
+	if _, release, err := BeginSharedStateWrite(ctx, alias, sb.SourcePath, ""); err == nil {
+		release()
+		t.Fatal("moved config acquired the old identity's lease")
+	}
+	for _, p := range []string{sb.ConfigPath, other} {
+		_, release, err := BeginSharedStateWrite(context.Background(), p, sb.SourcePath, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		release()
+	}
+}
 
 func fixtureSharedIntent(t *testing.T, sb *testutil.Sandbox) *SharedExtraIntent {
 	t.Helper()

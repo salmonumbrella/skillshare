@@ -389,7 +389,7 @@ func sharedNativeFacts(p *config.SharedExtraIntent) (map[string]string, error) {
 	return facts, nil
 }
 
-func reconcileSharedNative(p *config.SharedExtraIntent, after bool) error {
+func reconcileSharedNative(p *config.SharedExtraIntent, after bool, repairFault func(string) error) error {
 	got, err := sharedNativeFacts(p)
 	if err != nil {
 		return err
@@ -412,6 +412,11 @@ func reconcileSharedNative(p *config.SharedExtraIntent, after bool) error {
 		expected, ok := want[name]
 		if !ok || got[name] == expected {
 			continue
+		}
+		if repairFault != nil && after && (name == attachCreated || name == extraWritten || name == "fallback") {
+			if err := repairFault(name); err != nil {
+				return err
+			}
 		}
 		path := p.Effects[0].Path
 		if name == "fallback" {

@@ -30,6 +30,8 @@ type SharedExtrasRun struct {
 	recovered map[string]bool
 	// The recorded declaration's relative paths precede this run's pointer update.
 	declarationDir string
+
+	metadataRepairFault func(string) error
 }
 
 type SharedExtrasScope struct{ Name, Target string }
@@ -168,7 +170,8 @@ func (r *SharedExtrasRun) currentTarget(old config.SharedPlacement, t config.Sha
 		return false, false
 	}
 	extension := previous.Extension
-	if strings.ContainsAny(extension, `/\`) || strings.HasPrefix(extension, ".") {
+	pathExtension := strings.ContainsAny(extension, `/\`) || strings.HasPrefix(extension, ".")
+	if pathExtension {
 		extension = sharedfile.ResolvePath(declarationDir(old, r.declarationDir), extension)
 	}
 	for _, extra := range r.cfg.Extras {
@@ -177,15 +180,19 @@ func (r *SharedExtrasRun) currentTarget(old config.SharedPlacement, t config.Sha
 		}
 		source := config.ResolveExtrasSourceDir(extra, r.cfg.EffectiveExtrasSource(), r.cfg.EffectiveSkillsSource())
 		for _, now := range extra.Targets {
-			if !utils.PathsEqual(resolve(now.Path), t.Path) || now.As != t.As {
+			if !utils.PathsEqual(filepath.Clean(resolve(now.Path)), filepath.Clean(t.Path)) || now.As != t.As {
 				continue
 			}
 			mode := ExtraTargetMode(now.Mode, extra.File != "")
 			if now.Extension != "" {
 				mode = "copy"
 			}
-			same := mode == t.Mode && extra.File == old.Receipt.File && utils.PathsEqual(source, old.Receipt.Source) &&
-				now.Extension == extension && now.Flatten == previous.Flatten &&
+			sameExtension := now.Extension == extension
+			if pathExtension {
+				sameExtension = utils.PathsEqual(filepath.Clean(now.Extension), filepath.Clean(extension))
+			}
+			same := mode == t.Mode && extra.File == old.Receipt.File && utils.PathsEqual(filepath.Clean(source), filepath.Clean(old.Receipt.Source)) &&
+				sameExtension && now.Flatten == previous.Flatten &&
 				slices.Equal(now.Include, previous.Include) && slices.Equal(now.Exclude, previous.Exclude)
 			return same, r.cfg.ExtraOrigin(extra.Name) == sharedfile.Shared
 		}
@@ -707,7 +714,7 @@ func (r *SharedExtrasRun) recoverPending() error {
 	if !before && !after {
 		return fmt.Errorf("shared placement for %s at %s is ambiguous; kept for recovery", p.Placement.Name, p.Effects[0].Path)
 	}
-	if err := reconcileSharedNative(p, after); err != nil {
+	if err := reconcileSharedNative(p, after, r.metadataRepairFault); err != nil {
 		return err
 	}
 	if after && !p.RetainOnly {

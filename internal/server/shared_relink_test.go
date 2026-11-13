@@ -78,9 +78,17 @@ func TestSharedReceiptRelinkAPI(t *testing.T) {
 						return state
 					}
 					before := loadState().State.Extras
-					if len(before) != 2 || len(before[0].Receipt.Targets) != 2 || len(before[0].Receipt.Targets[0].Native) == 0 {
+					if len(before) != 3 {
 						t.Fatalf("placement did not record native proof: %+v", before)
 					}
+					for _, row := range []struct{ name, path string }{{"rules", target}, {"rules", sibling}, {"other", filepath.Join(sb.Root, "other")}} {
+						p := sharedRelinkReceipt(t, before, row.name, row.path)
+						if len(p.Receipt.Targets[0].Native) == 0 {
+							t.Fatalf("missing native proof for %s at %s", row.name, row.path)
+						}
+					}
+					otherBefore := sharedRelinkReceipt(t, before, "other", filepath.Join(sb.Root, "other"))
+					siblingBefore := sharedRelinkReceipt(t, before, "rules", sibling)
 					// Native-only output joins the override, without acquiring a receipt.
 					if result, err := syncpkg.SyncExtraFile(syncpkg.NewExtraFile(source, file, native, "", mode), false, ""); err != nil || len(result.Errors) > 0 {
 						t.Fatalf("native placement: %v %+v", err, result)
@@ -122,11 +130,11 @@ func TestSharedReceiptRelinkAPI(t *testing.T) {
 						t.Fatalf("relink=%d %s", rr.Code, rr.Body.String())
 					}
 					state := loadState().State
-					if state.Pending != nil || len(state.Extras) == 0 || !reflect.DeepEqual(state.Extras[len(state.Extras)-1], before[1]) {
+					if state.Pending != nil || !reflect.DeepEqual(sharedRelinkReceipt(t, state.Extras, "other", filepath.Join(sb.Root, "other")), otherBefore) {
 						t.Fatalf("unrelated receipt changed: %+v", state)
 					}
 					if action == "move" || action == "as" {
-						if len(state.Extras) != 2 || len(state.Extras[0].Receipt.Targets) != 1 || !reflect.DeepEqual(state.Extras[0].Receipt.Targets[0], before[0].Receipt.Targets[1]) {
+						if len(state.Extras) != 2 || !reflect.DeepEqual(sharedRelinkReceipt(t, state.Extras, "rules", sibling), siblingBefore) {
 							t.Fatalf("unselected receipt changed: %+v", state.Extras)
 						}
 						want := "original\n"
@@ -168,6 +176,26 @@ func TestSharedReceiptRelinkAPI(t *testing.T) {
 			}
 		}
 	}
+}
+
+func sharedRelinkReceipt(t *testing.T, placements []config.SharedPlacement, name, path string) config.SharedPlacement {
+	t.Helper()
+	var found []config.SharedPlacement
+	for _, p := range placements {
+		if p.Name != name {
+			continue
+		}
+		for _, target := range p.Receipt.Targets {
+			if target.Path == path {
+				p.Receipt.Targets = []config.SharedPlacedTarget{target}
+				found = append(found, p)
+			}
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("expected exactly one receipt for %s at %s: %+v", name, path, placements)
+	}
+	return found[0]
 }
 
 func TestRelinkNativeCleanupWithoutSharedState(t *testing.T) {

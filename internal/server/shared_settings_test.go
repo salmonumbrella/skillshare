@@ -266,7 +266,7 @@ func TestSharedPublicationAPIRefusesBeforeStaging(t *testing.T) {
 				sb.WriteFile(filepath.Join(dir, "fixture.txt"), "fixture")
 				testutil.RunGit(t, dir, "init")
 				testutil.ConfigureGitUser(t, dir)
-				testutil.RunGit(t, dir, "add", "-A")
+				testutil.RunGit(t, dir, "add", "fixture.txt")
 				testutil.RunGit(t, dir, "commit", "-m", "initial fixture")
 				testutil.RunGit(t, dir, "remote", "add", "origin", filepath.Join(sb.Root, "remote.git"))
 				sb.WriteFile(shared, "version: 2\n")
@@ -337,6 +337,9 @@ func TestSharedPullAPIReloadsAndDetachesLastExtra(t *testing.T) {
 	root := filepath.Dir(sb.ConfigPath)
 	testutil.RunGit(t, root, "init")
 	testutil.ConfigureGitUser(t, root)
+	sb.WriteFile(filepath.Join(root, ".gitignore"), "config.yaml\n")
+	testutil.RunGit(t, root, "add", ".gitignore")
+	testutil.RunGit(t, root, "commit", "-m", "local root scaffold")
 	testutil.RunGit(t, root, "remote", "add", "origin", remote)
 	cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
 	if err != nil {
@@ -416,5 +419,63 @@ func TestNamedSharedExtrasSyncProtectsEditedReplacement(t *testing.T) {
 	}
 	if len(results) != 1 || len(results[0].Targets) != 2 || len(results[0].Targets[0].Warnings) == 0 || results[0].Targets[1].Skipped != 1 {
 		t.Fatalf("results=%+v", results)
+	}
+}
+
+func TestSharedSyncAPIPartialFailureRetainsReceiptAndReleases(t *testing.T) {
+	for _, name := range []string{"", "rules"} {
+		t.Run("selected="+name, func(t *testing.T) {
+			sb := testutil.NewSandbox(t)
+			defer sb.Cleanup()
+			source, good := filepath.Join(sb.Root, "rules"), filepath.Join(sb.Root, "good")
+			blocked, other := filepath.Join(sb.Root, "blocked"), filepath.Join(sb.Root, "other")
+			bad := filepath.Join(blocked, "child")
+			shared := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
+			sb.WriteFile(filepath.Join(source, "fixture.md"), "managed\n")
+			sb.WriteFile(blocked, "user-owned parent\n")
+			sb.WriteFile(shared, fmt.Sprintf("version: 1\nextras: [{name: rules, source: %q, targets: [{path: %q, mode: copy}, {path: %q, mode: copy}]}, {name: other, source: %q, targets: [{path: %q, mode: copy}]}]\n", filepath.ToSlash(source), filepath.ToSlash(good), filepath.ToSlash(bad), filepath.ToSlash(source), filepath.ToSlash(other)))
+			sb.WriteConfig("source: " + filepath.ToSlash(sb.SourcePath) + "\nshared: {path: ./team.yaml}\ntargets: {}\n")
+			cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := New(cfg, "127.0.0.1:0", "", "")
+			rr := serveExtras(s, http.MethodPost, "/api/extras/sync", fmt.Sprintf(`{"name":%q}`, name))
+			if rr.Code != http.StatusOK {
+				t.Fatal(rr.Body.String())
+			}
+			var body struct {
+				Extras []extraSyncResult `json:"extras"`
+			}
+			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body.Extras) == 0 || len(body.Extras[0].Targets) != 2 || body.Extras[0].Targets[0].Synced != 1 || len(body.Extras[0].Targets[1].Errors) == 0 {
+				t.Fatalf("partial response=%s", rr.Body.String())
+			}
+			state, err := config.LoadSharedState(sb.ConfigPath, cfg.EffectiveGitRoot(), filepath.Dir(shared))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.State.Pending != nil || len(state.State.Extras) == 0 || state.State.Extras[0].Receipt.Targets[0].Path != good {
+				t.Fatal("API lost successful subset")
+			}
+			if name != "" {
+				if _, err := os.Lstat(other); !os.IsNotExist(err) {
+					t.Fatal("named failure touched other extra")
+				}
+			}
+			sb.WriteFile(shared, "version: 1\n")
+			rr = serveExtras(s, http.MethodPost, "/api/extras/sync", `{}`)
+			if rr.Code != http.StatusOK {
+				t.Fatal("failed API action leaked lease", rr.Body.String())
+			}
+			if _, err := os.Lstat(filepath.Join(good, "fixture.md")); !os.IsNotExist(err) {
+				t.Fatal("API did not detach successful subset")
+			}
+			if sb.ReadFile(blocked) != "user-owned parent\n" {
+				t.Fatal("API changed failed target parent")
+			}
+		})
 	}
 }

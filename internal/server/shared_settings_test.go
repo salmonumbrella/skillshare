@@ -3,17 +3,165 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"skillshare/internal/config"
 	"skillshare/internal/sharedfile"
+	syncpkg "skillshare/internal/sync"
 	"skillshare/internal/testutil"
 )
+
+func TestSharedUnavailableRelinkAPILeavesFilesAndConfigUnchanged(t *testing.T) {
+	if !syncpkg.CanCreateFileLink() {
+		t.Skip("requires file links")
+	}
+	for _, unavailable := range []string{"missing", "version"} {
+		for _, action := range []string{"move", "as", "source"} {
+			t.Run(unavailable+"/"+action, func(t *testing.T) {
+				sb := testutil.NewSandbox(t)
+				defer sb.Cleanup()
+				shared := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
+				source, target := filepath.Join(sb.Root, "source-extra"), filepath.Join(sb.Root, "target-extra")
+				replacement := filepath.Join(sb.Root, "replacement")
+				sb.WriteFile(filepath.Join(source, "fixture.md"), "old source\n")
+				sb.WriteFile(filepath.Join(replacement, "fixture.md"), "new source\n")
+				file := ""
+				if action == "as" {
+					file = "file: fixture.md,"
+				}
+				sb.WriteFile(shared, "version: 1\n")
+				sb.WriteConfig(fmt.Sprintf("source: %q\nshared: {path: ./team.yaml}\ntargets: {}\nextras: [{name: rules, source: %q, %s targets: [{path: %q, mode: merge}]}]\n", filepath.ToSlash(sb.SourcePath), filepath.ToSlash(source), file, filepath.ToSlash(target)))
+				cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				s := New(cfg, "127.0.0.1:0", "", "")
+				if _, err := s.syncExtras("rules", false, false); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Readlink(filepath.Join(target, "fixture.md")); err != nil {
+					t.Fatal("initial placement missing", err)
+				}
+				if unavailable == "missing" {
+					if err := os.Remove(shared); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					sb.WriteFile(shared, "version: 2\n")
+				}
+				s.cfg, err = config.LoadReadOnlyPath(sb.ConfigPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Walk the synthetic sandbox only, including state and backup folders.
+				snapshot := func() map[string]string {
+					files := map[string]string{}
+					if err := filepath.WalkDir(sb.Root, func(path string, entry fs.DirEntry, err error) error {
+						if err != nil {
+							return err
+						}
+						info, err := entry.Info()
+						if err != nil {
+							return err
+						}
+						content := ""
+						if entry.Type()&os.ModeSymlink != 0 {
+							content, err = os.Readlink(path)
+						} else if !entry.IsDir() {
+							var raw []byte
+							raw, err = os.ReadFile(path)
+							content = string(raw)
+						}
+						files[path] = info.Mode().String() + ":" + content
+						return err
+					}); err != nil {
+						t.Fatal(err)
+					}
+					return files
+				}
+				before := snapshot()
+				configBefore, err := json.Marshal(s.cfg.Extras)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body := fmt.Sprintf(`{"path":%q,"target":{"path":%q}}`, target, filepath.Join(sb.Root, "moved"))
+				handler := (*Server).handleExtrasEditTarget
+				if action == "as" {
+					body = fmt.Sprintf(`{"path":%q,"target":{"path":%q,"as":"renamed.md"}}`, target, target)
+				} else if action == "source" {
+					body = fmt.Sprintf(`{"source":%q}`, replacement)
+					handler = (*Server).handleExtrasEdit
+				}
+				r := httptest.NewRequest(http.MethodPut, "/", strings.NewReader(body))
+				r.SetPathValue("name", "rules")
+				rr := httptest.NewRecorder()
+				handler(s, rr, r)
+				if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), config.SharedUnavailable) {
+					t.Fatalf("response=%d %s", rr.Code, rr.Body.String())
+				}
+				if !reflect.DeepEqual(before, snapshot()) {
+					t.Fatal("refused relink changed config, sources, targets, state or backups")
+				}
+				configAfter, err := json.Marshal(s.cfg.Extras)
+				if err != nil || string(configBefore) != string(configAfter) {
+					t.Fatal("refused relink mutated in-memory config")
+				}
+			})
+		}
+	}
+}
+
+func TestSharedUnavailableAllowsConfigOnlyExtraRepairs(t *testing.T) {
+	for _, action := range []string{"target-settings", "rename", "same-source"} {
+		t.Run(action, func(t *testing.T) {
+			sb := testutil.NewSandbox(t)
+			defer sb.Cleanup()
+			source, target := filepath.Join(sb.Root, "source-extra"), filepath.Join(sb.Root, "target-extra")
+			sb.WriteFile(filepath.Join(source, "fixture.md"), "source\n")
+			sb.WriteFile(filepath.Join(target, "fixture.md"), "user file\n")
+			sb.WriteConfig(fmt.Sprintf("source: %q\nshared: {path: ./missing.yaml}\ntargets: {}\nextras: [{name: rules, source: %q, targets: [{path: %q, mode: copy}]}]\n", filepath.ToSlash(sb.SourcePath), filepath.ToSlash(source), filepath.ToSlash(target)))
+			cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := New(cfg, "127.0.0.1:0", "", "")
+			body := fmt.Sprintf(`{"path":%q,"target":{"path":%q,"mode":"copy","include":["fixture.md"],"flatten":true}}`, target, target)
+			handler := (*Server).handleExtrasEditTarget
+			if action == "rename" {
+				body, handler = `{"name":"notes"}`, (*Server).handleExtrasEdit
+			} else if action == "same-source" {
+				body, handler = fmt.Sprintf(`{"source":%q}`, source), (*Server).handleExtrasEdit
+			}
+			r := httptest.NewRequest(http.MethodPatch, "/", strings.NewReader(body))
+			r.SetPathValue("name", "rules")
+			rr := httptest.NewRecorder()
+			handler(s, rr, r)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("repair=%d %s", rr.Code, rr.Body.String())
+			}
+			if sb.ReadFile(filepath.Join(source, "fixture.md")) != "source\n" || sb.ReadFile(filepath.Join(target, "fixture.md")) != "user file\n" {
+				t.Fatal("config-only repair applied or pruned a target")
+			}
+			if action == "rename" && s.cfg.Extras[0].Name != "notes" || action == "target-settings" && !s.cfg.Extras[0].Targets[0].Flatten {
+				t.Fatal("repair was not saved")
+			}
+			statePath, err := config.SharedStatePath(sb.ConfigPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+				t.Fatal("config-only repair accessed shared state")
+			}
+		})
+	}
+}
 
 func TestSharedOwnedAPIRefusesBeforeSideEffects(t *testing.T) {
 	for _, tc := range []struct {

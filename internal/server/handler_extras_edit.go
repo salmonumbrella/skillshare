@@ -118,6 +118,13 @@ func (s *Server) handleExtrasEditTarget(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	moved := newPath != oldPath || next.As != old.As
+	if moved && !s.IsProjectMode() {
+		if err := s.cfg.CheckSharedApply(); err != nil {
+			writeSharedError(w, err)
+			return
+		}
+	}
 
 	prev := extra.Targets
 	extras[idx].Targets = slices.Clone(prev)
@@ -134,7 +141,6 @@ func (s *Server) handleExtrasEditTarget(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	moved := newPath != oldPath || next.As != old.As
 	resp := map[string]any{"success": true, "name": name, "target": next.Path}
 	status, msg := "ok", ""
 	if moved {
@@ -248,6 +254,12 @@ func (s *Server) handleExtrasEdit(w http.ResponseWriter, r *http.Request) {
 	newSource := s.extrasSourceDir(next)
 	relink := filepath.Clean(newSource) != filepath.Clean(oldSource)
 	if relink {
+		if !s.IsProjectMode() {
+			if err := s.cfg.CheckSharedApply(); err != nil {
+				writeSharedError(w, err)
+				return
+			}
+		}
 		if extra.File != "" {
 			if info, err := os.Stat(filepath.Join(newSource, extra.File)); err != nil || info.IsDir() {
 				writeError(w, http.StatusBadRequest, fmt.Sprintf("%s not found in %s", extra.File, newSource))

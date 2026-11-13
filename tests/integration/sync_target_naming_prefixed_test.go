@@ -659,11 +659,36 @@ func TestSync_PrefixedCopyToStandardMerge_Baseline(t *testing.T) {
 		t.Fatal("prefixed copy was not created")
 	}
 	sb.RunCLI("target", "claude", "--mode", "merge", "--target-naming", "standard").AssertSuccess(t)
-	diff := sb.RunCLI("diff", "--no-tui")
+	diff := sb.RunCLI("diff", "--json")
 	diff.AssertSuccess(t)
 	t.Logf("diff stdout:\n%s\ndiff stderr:\n%s", diff.Stdout, diff.Stderr)
-	if strings.Contains(diff.Stdout, "local only") || strings.Contains(diff.Stdout, "sync --force") {
-		t.Error("diff treats an unedited managed copy as local")
+	var report struct {
+		Targets []struct {
+			Name, Mode, Error string
+			Items             []struct{ Name, Reason string }
+		}
+	}
+	if err := json.Unmarshal([]byte(diff.Stdout), &report); err != nil {
+		t.Fatalf("parse diff --json: %v\n%s", err, diff.Stdout)
+	}
+	foundTarget := false
+	for _, target := range report.Targets {
+		if target.Name != "claude" {
+			continue
+		}
+		foundTarget = true
+		if target.Mode != "merge" || target.Error != "" {
+			t.Errorf("unexpected diff target: %+v", target)
+		}
+		for _, item := range target.Items {
+			if (item.Name == "emil-design-prototype" && item.Reason == "local only") ||
+				(item.Name == "prototype" && strings.Contains(item.Reason, "sync --force")) {
+				t.Errorf("diff treats an unedited managed copy as local: %+v", item)
+			}
+		}
+	}
+	if !foundTarget {
+		t.Error("diff did not report the claude target")
 	}
 	result := sb.RunCLI("sync")
 	result.AssertSuccess(t)

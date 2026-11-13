@@ -639,3 +639,39 @@ func TestDiff_RenamedMergeLinkShowsNoFileChanges(t *testing.T) {
 		t.Errorf("dry run copies to the old name:\n%s", out)
 	}
 }
+
+// Test the supported transition: prefixed naming requires copy mode, so a
+// switch to merge must also select a naming supported by merge.
+func TestSync_PrefixedCopyToStandardMerge_Baseline(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.SetEnv("CODEX_HOME", "")
+	sb.SetEnv("CLAUDE_CONFIG_DIR", "")
+	sb.SetEnv("PI_CODING_AGENT_DIR", "")
+	sb.CreateNestedSkill("_emil-design/skills/prototype", map[string]string{
+		"SKILL.md": "---\nname: prototype\n---\n# Prototype",
+	})
+	targetPath := sb.CreateTarget("claude")
+	writeNamingConfig(sb, targetPath, "prefixed", "copy")
+	sb.RunCLI("sync").AssertSuccess(t)
+	oldPath := filepath.Join(targetPath, "emil-design-prototype")
+	if !sb.FileExists(filepath.Join(oldPath, "SKILL.md")) {
+		t.Fatal("prefixed copy was not created")
+	}
+	sb.RunCLI("target", "claude", "--mode", "merge", "--target-naming", "standard").AssertSuccess(t)
+	diff := sb.RunCLI("diff", "--no-tui")
+	diff.AssertSuccess(t)
+	t.Logf("diff stdout:\n%s\ndiff stderr:\n%s", diff.Stdout, diff.Stderr)
+	if strings.Contains(diff.Stdout, "local only") || strings.Contains(diff.Stdout, "sync --force") {
+		t.Error("diff treats an unedited managed copy as local")
+	}
+	result := sb.RunCLI("sync")
+	result.AssertSuccess(t)
+	t.Logf("sync stdout:\n%s\nsync stderr:\n%s", result.Stdout, result.Stderr)
+	if sb.FileExists(filepath.Join(oldPath, "SKILL.md")) {
+		t.Error("sync left the unedited prefixed copy behind")
+	}
+	if !sb.IsSymlink(filepath.Join(targetPath, "prototype")) {
+		t.Error("sync did not create the standard-named link")
+	}
+}

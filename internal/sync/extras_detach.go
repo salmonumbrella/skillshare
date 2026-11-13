@@ -23,6 +23,8 @@ type SharedExtrasRun struct {
 	state     *config.SharedStateFile
 	dryRun    bool
 	protected map[string]bool
+	// The recorded declaration's relative paths precede this run's pointer update.
+	declarationDir string
 }
 
 func BeginSharedExtras(cfg *config.Config, dryRun bool) (*SharedExtrasRun, error) {
@@ -37,8 +39,12 @@ func BeginSharedExtras(cfg *config.Config, dryRun bool) (*SharedExtrasRun, error
 	if err != nil {
 		return nil, &config.SharedError{Code: config.SharedUnavailable, Path: path, Cause: err}
 	}
+	previousPath := state.State.Pointer
+	if previousPath == "" {
+		previousPath = path
+	}
 	state.RecordPointer(path)
-	return &SharedExtrasRun{cfg: cfg, state: state, dryRun: dryRun, protected: map[string]bool{}}, nil
+	return &SharedExtrasRun{cfg: cfg, state: state, dryRun: dryRun, protected: map[string]bool{}, declarationDir: filepath.Dir(previousPath)}, nil
 }
 
 func (r *SharedExtrasRun) Protected() map[string]bool {
@@ -88,6 +94,25 @@ func keptExtraResult() *ExtraResult {
 }
 
 func (r *SharedExtrasRun) currentTarget(old config.SharedPlacement, t config.SharedPlacedTarget, resolve func(string) string) (bool, bool) {
+	var declaration config.ExtraConfig
+	if err := old.Declaration.Decode(&declaration); err != nil {
+		return false, false
+	}
+	var previous *config.ExtraTargetConfig
+	for i := range declaration.Targets {
+		candidate := &declaration.Targets[i]
+		if utils.PathsEqual(sharedfile.ResolvePath(r.declarationDir, candidate.Path), t.Path) && candidate.As == t.As {
+			previous = candidate
+			break
+		}
+	}
+	if previous == nil {
+		return false, false
+	}
+	extension := previous.Extension
+	if strings.ContainsAny(extension, `/\`) || strings.HasPrefix(extension, ".") {
+		extension = sharedfile.ResolvePath(r.declarationDir, extension)
+	}
 	for _, extra := range r.cfg.Extras {
 		if extra.Name != old.Name {
 			continue
@@ -101,7 +126,9 @@ func (r *SharedExtrasRun) currentTarget(old config.SharedPlacement, t config.Sha
 			if now.Extension != "" {
 				mode = "copy"
 			}
-			same := mode == t.Mode && extra.File == old.Receipt.File && utils.PathsEqual(source, old.Receipt.Source)
+			same := mode == t.Mode && extra.File == old.Receipt.File && utils.PathsEqual(source, old.Receipt.Source) &&
+				now.Extension == extension && now.Flatten == previous.Flatten &&
+				slices.Equal(now.Include, previous.Include) && slices.Equal(now.Exclude, previous.Exclude)
 			return same, r.cfg.ExtraOrigin(extra.Name) == sharedfile.Shared
 		}
 	}
@@ -301,18 +328,7 @@ func (r *SharedExtrasRun) Record(extra config.ExtraConfig, sourceDir string, run
 	if !ok {
 		return
 	}
-	index := -1
-	for i, old := range r.state.State.Extras {
-		if old.Name == extra.Name && old.Receipt.Source == sourceDir && old.Receipt.File == extra.File {
-			index = i
-			break
-		}
-	}
 	next := config.SharedPlacement{Name: extra.Name, Declaration: declaration, Receipt: config.SharedReceipt{Source: sourceDir, File: extra.File}}
-	if index >= 0 {
-		next = r.state.State.Extras[index]
-		next.Declaration = declaration
-	}
 	for _, tr := range run.Targets {
 		if tr.Err != nil || tr.ExtensionErr != nil || tr.ModeErr != nil || tr.SkippedBy != "" || tr.Result == nil || len(tr.Result.Errors) > 0 || tr.Result.Skipped > 0 {
 			continue
@@ -321,17 +337,23 @@ func (r *SharedExtrasRun) Record(extra config.ExtraConfig, sourceDir string, run
 		if protectedOutput(placedOutput(extra.File, target), r.protected) {
 			continue
 		}
-		previous := -1
-		for i, old := range next.Receipt.Targets {
-			if old.Path == target.Path && old.As == target.As {
-				previous = i
-				break
+		var previous *config.SharedPlacedTarget
+		for _, old := range r.state.State.Extras {
+			if old.Name != extra.Name || old.Receipt.Source != sourceDir || old.Receipt.File != extra.File {
+				continue
+			}
+			for i := range old.Receipt.Targets {
+				candidate := &old.Receipt.Targets[i]
+				if candidate.Path == target.Path && candidate.As == target.As {
+					previous = candidate
+					break
+				}
 			}
 		}
 		if extra.File == "" && (target.Mode == "copy" || target.Mode == "merge") {
 			target.Files = map[string]string{}
-			if previous >= 0 {
-				for rel, hash := range next.Receipt.Targets[previous].Files {
+			if previous != nil {
+				for rel, hash := range previous.Files {
 					target.Files[rel] = hash
 				}
 			}
@@ -351,20 +373,27 @@ func (r *SharedExtrasRun) Record(extra config.ExtraConfig, sourceDir string, run
 			// An identical file that SyncExtraFile did not attach remains the user's.
 			continue
 		}
-		if previous < 0 {
-			next.Receipt.Targets = append(next.Receipt.Targets, target)
-		} else {
-			next.Receipt.Targets[previous] = target
-		}
+		next.Receipt.Targets = append(next.Receipt.Targets, target)
 	}
 	if len(next.Receipt.Targets) == 0 {
 		return
 	}
-	if index < 0 {
-		r.state.State.Extras = append(r.state.State.Extras, next)
-	} else {
-		r.state.State.Extras[index] = next
+	// A target-only run replaces only its own receipts. Other targets retain
+	// their old declaration until they too have detached and applied its change.
+	var remaining []config.SharedPlacement
+	for _, old := range r.state.State.Extras {
+		if old.Name == extra.Name && old.Receipt.Source == sourceDir && old.Receipt.File == extra.File {
+			old.Receipt.Targets = slices.DeleteFunc(slices.Clone(old.Receipt.Targets), func(target config.SharedPlacedTarget) bool {
+				return slices.ContainsFunc(next.Receipt.Targets, func(recorded config.SharedPlacedTarget) bool {
+					return recorded.Path == target.Path && recorded.As == target.As
+				})
+			})
+		}
+		if len(old.Receipt.Targets) > 0 {
+			remaining = append(remaining, old)
+		}
 	}
+	r.state.State.Extras = append(remaining, next)
 }
 
 // DetachExtraFileTarget uses restore's ownership tests but leaves edited

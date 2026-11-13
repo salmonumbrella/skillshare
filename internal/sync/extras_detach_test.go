@@ -12,6 +12,215 @@ import (
 	"skillshare/internal/testutil"
 )
 
+func TestSharedOutputSettingsChangeDetachesPriorOutputs(t *testing.T) {
+	for _, change := range []string{"extension", "relative-extension", "flatten", "include", "exclude", "local-include"} {
+		for _, edited := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/edited=%v", change, edited), func(t *testing.T) {
+				extensionChange := strings.Contains(change, "extension")
+				if extensionChange && runtime.GOOS == "windows" {
+					t.Skip("cat transform fixture requires Unix")
+				}
+				sb, _, source, target := sharedRunFixture(t, "copy", false)
+				sb.WriteFile(filepath.Join(source, "nested", "guide.md"), "guide\n")
+				shared := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
+				settings := ""
+				if extensionChange {
+					settings = ", extension: old-format"
+					if change == "relative-extension" {
+						settings = ", extension: ./old-format"
+					}
+				}
+				writeDeclaration := func(settings string) *config.Config {
+					sb.WriteFile(shared, fmt.Sprintf("version: 1\nextras: [{name: rules, source: %q, targets: [{path: %q, mode: copy%s}]}]\n", filepath.ToSlash(source), filepath.ToSlash(target), settings))
+					cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+					if err != nil {
+						t.Fatal(err)
+					}
+					return cfg
+				}
+				cfg := writeDeclaration(settings)
+				opts := ExtraRunOptions{ResolvePath: config.ExpandPath, ResolveExtension: func(name string) (*ExtensionSpec, error) {
+					ext := "txt"
+					if filepath.Base(name) == "new-format" {
+						ext = "toml"
+					}
+					return &ExtensionSpec{Name: name, Run: []string{"cat"}, Dir: source, OutputExt: ext}, nil
+				}}
+				session, err := BeginSharedExtras(cfg, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				run := RunExtraTargets(cfg.Extras[0], source, opts)
+				if len(run.Targets) != 1 || run.Targets[0].Err != nil || run.Targets[0].Result == nil || len(run.Targets[0].Result.Errors) > 0 {
+					t.Fatalf("initial apply=%+v", run)
+				}
+				session.Record(cfg.Extras[0], source, run, nil)
+				if err := session.Save(); err != nil {
+					t.Fatal(err)
+				}
+				session, err = BeginSharedExtras(cfg, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if detached := session.Detach(config.ExpandPath); len(detached) != 0 {
+					t.Fatalf("unchanged output settings churned: %+v", detached)
+				}
+				oldOutput := filepath.Join(target, "nested", "guide.md")
+				switch change {
+				case "extension", "relative-extension":
+					oldOutput = filepath.Join(target, "nested", "guide.txt")
+					settings = ", extension: new-format"
+					if change == "relative-extension" {
+						settings = ", extension: ./new-format"
+					}
+				case "flatten":
+					settings = ", flatten: true"
+				case "include", "local-include":
+					settings = ", include: [fixture.md]"
+				case "exclude":
+					settings = ", exclude: [nested/]"
+				}
+				if edited {
+					sb.WriteFile(oldOutput, "edited by user\n")
+				}
+				if change == "local-include" {
+					sb.WriteConfig(fmt.Sprintf("source: %q\nshared: {path: ./team.yaml}\ntargets: {}\nextras: [{name: rules, source: %q, targets: [{path: %q, mode: copy%s}]}]\n", filepath.ToSlash(sb.SourcePath), filepath.ToSlash(source), filepath.ToSlash(target), settings))
+					settings = "" // The local override changes output selection.
+				}
+				cfg = writeDeclaration(settings)
+				session, err = BeginSharedExtras(cfg, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				detached := session.Detach(config.ExpandPath)
+				if len(detached) != 1 || len(detached[0].Errors) != 0 {
+					t.Fatalf("settings change did not detach: %+v", detached)
+				}
+				if edited {
+					if len(detached[0].Kept) != 1 || detached[0].Kept[0] != oldOutput || !session.Protected()[oldOutput] {
+						t.Fatalf("edited prior output not reported/protected: %+v", detached)
+					}
+				} else if _, err := os.Lstat(oldOutput); !os.IsNotExist(err) {
+					t.Fatalf("stale output remains: %s: %v", oldOutput, err)
+				}
+				opts.Force, opts.Protected = true, session.Protected()
+				run = RunExtraTargets(cfg.Extras[0], source, opts)
+				if run.Targets[0].Err != nil || run.Targets[0].Result == nil || len(run.Targets[0].Result.Errors) != 0 {
+					t.Fatalf("replacement apply=%+v", run)
+				}
+				session.Record(cfg.Extras[0], source, run, nil)
+				if err := session.Save(); err != nil {
+					t.Fatal(err)
+				}
+				if edited && sb.ReadFile(oldOutput) != "edited by user\n" {
+					t.Fatal("replacement overwrote edited prior output")
+				}
+				if extensionChange && sb.ReadFile(filepath.Join(target, "nested", "guide.toml")) != "guide\n" {
+					t.Fatal("extension filename was not replaced")
+				}
+				if change == "flatten" && sb.ReadFile(filepath.Join(target, "guide.md")) != "guide\n" {
+					t.Fatal("flattened output missing")
+				}
+				selected := "fixture.md"
+				if extensionChange {
+					selected = "fixture.toml"
+				}
+				if sb.ReadFile(filepath.Join(target, selected)) != "managed content\n" {
+					t.Fatal("selected output missing")
+				}
+			})
+		}
+	}
+}
+
+func TestSharedOutputSettingsSelectedTargetKeepsOtherDeclaration(t *testing.T) {
+	sb, _, source, target := sharedRunFixture(t, "copy", false)
+	other := filepath.Join(sb.Root, "other")
+	sb.WriteFile(filepath.Join(source, "nested", "guide.md"), "guide\n")
+	shared := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
+	writeDeclaration := func(flatten bool) *config.Config {
+		sb.WriteFile(shared, fmt.Sprintf("version: 1\nextras: [{name: rules, source: %q, targets: [{path: %q, mode: copy, flatten: %v},{path: %q, mode: copy, flatten: %v}]}]\n", filepath.ToSlash(source), filepath.ToSlash(target), flatten, filepath.ToSlash(other), flatten))
+		cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	cfg := writeDeclaration(false)
+	applySharedFixture(t, cfg, source)
+	cfg = writeDeclaration(true)
+	session, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detached := session.DetachTarget(config.ExpandPath, "rules", target); len(detached) != 1 {
+		t.Fatalf("selected detach=%+v", detached)
+	}
+	extra := cfg.Extras[0]
+	extra.Targets = extra.Targets[:1]
+	run := RunExtraTargets(extra, source, ExtraRunOptions{ResolvePath: config.ExpandPath, Protected: session.Protected()})
+	session.Record(extra, source, run, nil)
+	if err := session.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if sb.ReadFile(filepath.Join(other, "nested", "guide.md")) != "guide\n" {
+		t.Fatal("selected sync touched unselected target")
+	}
+	session, err = BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detached := session.DetachTarget(config.ExpandPath, "rules", other); len(detached) != 1 || detached[0].Removed != 2 {
+		t.Fatalf("unselected target lost its prior declaration: %+v", detached)
+	}
+}
+
+func TestSharedSameOutputSettingsLocalHandoffAndNoPointer(t *testing.T) {
+	sb, _, source, target := sharedRunFixture(t, "copy", false)
+	shared := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
+	sb.WriteFile(shared, fmt.Sprintf("version: 1\nextras: [{name: rules, source: %q, targets: [{path: %q, mode: copy, flatten: true, include: ['*.md'], exclude: [draft.md]}]}]\n", filepath.ToSlash(source), filepath.ToSlash(target)))
+	cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applySharedFixture(t, cfg, source)
+	sb.WriteConfig(fmt.Sprintf("source: %q\nshared: {path: ./team.yaml}\ntargets: {}\nextras: [{name: rules, source: %q, targets: [{path: %q, mode: copy, flatten: true, include: ['*.md'], exclude: [draft.md]}]}]\n", filepath.ToSlash(sb.SourcePath), filepath.ToSlash(source), filepath.ToSlash(target)))
+	cfg, err = config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detached := session.Detach(config.ExpandPath); len(detached) != 0 || len(session.state.State.Extras) != 0 {
+		t.Fatalf("same settings should hand off without cleanup: %+v", detached)
+	}
+	if sb.ReadFile(filepath.Join(target, "fixture.md")) != "managed content\n" {
+		t.Fatal("same-identity handoff removed local output")
+	}
+	if err := session.Save(); err != nil {
+		t.Fatal(err)
+	}
+	statePath, err := config.SharedStatePath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := sb.ReadFile(statePath)
+	// A directory in place of the pointer would fail if no-pointer consulted it.
+	if err := os.Remove(shared); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(shared, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Shared = nil
+	session, err = BeginSharedExtras(cfg, false)
+	if session != nil || err != nil || len(session.Detach(config.ExpandPath)) != 0 || session.Save() != nil || before != sb.ReadFile(statePath) {
+		t.Fatal("no-pointer touched shared state")
+	}
+}
+
 func sharedRunFixture(t *testing.T, mode string, single bool) (*testutil.Sandbox, *config.Config, string, string) {
 	t.Helper()
 	sb := testutil.NewSandbox(t)

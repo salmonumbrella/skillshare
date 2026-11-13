@@ -92,13 +92,17 @@ func NewSandbox(t *testing.T) *Sandbox {
 	sb.SetEnv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
 	sb.SetEnv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
 
+	sb.IsolateNativeClients()
+
 	return sb
 }
 
 // SetEnv sets an environment variable, saving the original
 func (sb *Sandbox) SetEnv(key, value string) {
 	sb.T.Helper()
-	sb.OrigEnv[key] = os.Getenv(key)
+	if _, saved := sb.OrigEnv[key]; !saved {
+		sb.OrigEnv[key] = os.Getenv(key)
+	}
 	os.Setenv(key, value)
 }
 
@@ -341,4 +345,15 @@ func (sb *Sandbox) ListDir(path string) []string {
 		names[i] = entry.Name()
 	}
 	return names
+}
+
+// IsolateNativeClients replaces inherited client overrides before any service runs.
+func (sb *Sandbox) IsolateNativeClients() {
+	for key, dir := range map[string]string{
+		"CLAUDE_CONFIG_DIR": ".claude", "CODEX_HOME": ".codex",
+		"COPILOT_HOME": ".copilot", "OPENCODE_CONFIG_DIR": ".config/opencode",
+		"PI_CODING_AGENT_DIR": ".pi/agent",
+	} {
+		sb.SetEnv(key, filepath.Join(sb.Home, filepath.FromSlash(dir)))
+	}
 }

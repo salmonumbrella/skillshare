@@ -145,10 +145,16 @@ func (s *Server) handleExtrasEditTarget(w http.ResponseWriter, r *http.Request) 
 	status, msg := "ok", ""
 	if moved {
 		sourceDir := s.extrasSourceDir(extra)
-		oldMode := syncpkg.ExtraTargetMode(old.Mode, extra.File != "")
 		var errs []string
-		resp["pruned"], _, errs = syncpkg.ClearExtraTarget(extra.File, sourceDir, oldPath, old.As, oldMode, nil)
-		results, syncErr := s.syncExtras(name, false, false)
+		var relinks []extraRelink
+		if !s.IsProjectMode() && s.cfg.SharedEnabled() {
+			extra.Targets = []config.ExtraTargetConfig{old}
+			relinks = []extraRelink{{Extra: extra, Source: sourceDir}}
+		} else {
+			oldMode := syncpkg.ExtraTargetMode(old.Mode, extra.File != "")
+			resp["pruned"], _, errs = syncpkg.ClearExtraTarget(extra.File, sourceDir, oldPath, old.As, oldMode, nil)
+		}
+		results, syncErr := s.syncExtras(name, false, false, relinks...)
 		if syncErr != nil {
 			if !writeSharedError(w, syncErr) {
 				writeError(w, http.StatusInternalServerError, syncErr.Error())
@@ -156,6 +162,15 @@ func (s *Server) handleExtrasEditTarget(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		resp["extras"] = results
+		if len(relinks) > 0 {
+			pruned := 0
+			for _, result := range results {
+				for _, target := range result.Targets {
+					pruned += target.Pruned
+				}
+			}
+			resp["pruned"] = pruned
+		}
 		if len(errs) > 0 {
 			resp["prune_errors"] = errs
 		}
@@ -286,7 +301,10 @@ func (s *Server) handleExtrasEdit(w http.ResponseWriter, r *http.Request) {
 	// Links into the old folder go only once the config points elsewhere, so a
 	// failed save leaves working targets alone.
 	var pruneErrs []string
-	if relink {
+	var relinks []extraRelink
+	if relink && !s.IsProjectMode() && s.cfg.SharedEnabled() {
+		relinks = []extraRelink{{Extra: extra, Source: oldSource}}
+	} else if relink {
 		for _, t := range extra.Targets {
 			mode := syncpkg.ExtraTargetMode(t.Mode, extra.File != "")
 			_, _, errs := syncpkg.ClearExtraTarget(extra.File, oldSource, resolveExtrasTargetPath(s.projectRoot, t.Path), t.As, mode, nil)
@@ -297,7 +315,7 @@ func (s *Server) handleExtrasEdit(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"success": true, "name": next.Name}
 	status, msg := "ok", ""
 	if relink {
-		results, syncErr := s.syncExtras(next.Name, false, false)
+		results, syncErr := s.syncExtras(next.Name, false, false, relinks...)
 		if syncErr != nil {
 			if !writeSharedError(w, syncErr) {
 				writeError(w, http.StatusInternalServerError, syncErr.Error())

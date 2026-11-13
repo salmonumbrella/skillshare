@@ -74,6 +74,112 @@ func TestSharedCopyReceiptSaveFailureRecoversBeforeDetach(t *testing.T) {
 	}
 }
 
+func TestSharedRelinkStopsNativeCleanupOnReceiptFailure(t *testing.T) {
+	for _, failure := range []string{"checkpoint", "native-proof"} {
+		t.Run(failure, func(t *testing.T) {
+			sb, cfg, source, target := sharedRunFixture(t, "copy", true)
+			sb.WriteFile(filepath.Join(target, "fixture.md"), "original\n")
+			applySharedFixture(t, cfg, source)
+			old := cfg.Extras[0]
+			native := filepath.Join(sb.Root, "native-only")
+			sb.WriteFile(filepath.Join(native, "fixture.md"), "native original\n")
+			f := NewExtraFile(source, old.File, native, "", "copy")
+			if _, err := SyncExtraFile(f, false, ""); err != nil {
+				t.Fatal(err)
+			}
+			old.Targets = append(old.Targets, config.ExtraTargetConfig{Path: native, Mode: "copy"})
+			replacement := filepath.Join(sb.Root, "replacement")
+			sb.WriteFile(filepath.Join(replacement, "fixture.md"), "replacement\n")
+			sb.WriteConfig(fmt.Sprintf("source: %q\nshared: {path: ./team.yaml}\ntargets: {}\nextras: [{name: rules, file: fixture.md, source: %q, targets: [{path: %q, mode: copy}]}]\n", filepath.ToSlash(sb.SourcePath), filepath.ToSlash(replacement), filepath.ToSlash(target)))
+			session, err := BeginSharedExtras(cfg, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			if failure == "checkpoint" {
+				session.state.SetWriteFaultForTest(func() error { return errors.New("relink checkpoint fault") })
+			} else {
+				ForgetExtraTarget(NewExtraFile(source, old.File, target, "", "copy"))
+			}
+			results := session.DetachRelink(old, source, config.ExpandPath)
+			found := false
+			for _, result := range results {
+				found = found || len(result.Errors) > 0
+			}
+			if !found || sb.ReadFile(f.Target) != "managed content\n" {
+				t.Fatalf("cleanup advanced after receipt failure: %+v", results)
+			}
+			state, err := config.LoadSharedState(sb.ConfigPath, cfg.EffectiveGitRoot(), filepath.Dir(cfg.SharedStatus().Path))
+			if err != nil || len(state.State.Extras) != 1 {
+				t.Fatalf("failed cleanup lost retry receipt: %v %+v", err, state)
+			}
+		})
+	}
+}
+
+func TestSharedRelinkProtectionSurvivesForceApply(t *testing.T) {
+	sb, cfg, source, target := sharedRunFixture(t, "copy", true)
+	applySharedFixture(t, cfg, source)
+	sb.WriteFile(filepath.Join(target, "fixture.md"), "edited\n")
+	old := cfg.Extras[0]
+	replacement := filepath.Join(sb.Root, "replacement")
+	sb.WriteFile(filepath.Join(replacement, "fixture.md"), "replacement\n")
+	sb.WriteConfig(fmt.Sprintf("source: %q\nshared: {path: ./team.yaml}\ntargets: {}\nextras: [{name: rules, file: fixture.md, source: %q, targets: [{path: %q, mode: copy}]}]\n", filepath.ToSlash(sb.SourcePath), filepath.ToSlash(replacement), filepath.ToSlash(target)))
+	session, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	results := session.DetachRelink(old, source, config.ExpandPath)
+	if len(results) != 1 || len(results[0].Kept) != 1 || len(results[0].Errors) > 0 {
+		t.Fatalf("detach=%+v", results)
+	}
+	RunExtraTargets(session.Config().Extras[0], replacement, ExtraRunOptions{ResolvePath: config.ExpandPath, Protected: session.Protected(), Shared: session, Force: true})
+	if sb.ReadFile(filepath.Join(target, "fixture.md")) != "edited\n" {
+		t.Fatal("force apply overwrote kept receipt output")
+	}
+}
+
+func TestSharedDirectoryRelinkCleansOnlyNativeUnreceiptedLinks(t *testing.T) {
+	if !CanCreateFileLink() {
+		t.Skip("requires file links")
+	}
+	sb, cfg, source, target := sharedRunFixture(t, "merge", false)
+	applySharedFixture(t, cfg, source)
+	old := cfg.Extras[0]
+	native := filepath.Join(target, "native.md")
+	sb.WriteFile(filepath.Join(source, "native.md"), "native\n")
+	if err := os.Symlink(filepath.Join(source, "native.md"), native); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(target, "fixture.md")); err != nil {
+		t.Fatal(err)
+	}
+	sb.WriteFile(filepath.Join(target, "fixture.md"), "edited\n")
+	sb.WriteFile(filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml"), "version: 1\n")
+	for _, dry := range []bool{true, false} {
+		session, err := BeginSharedExtras(cfg, dry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Dry-run keeps its supplied config snapshot, as the existing owner does.
+		session.cfg.Extras = nil
+		results := session.DetachRelink(old, source, config.ExpandPath)
+		session.Close()
+		for _, result := range results {
+			if len(result.Errors) > 0 {
+				t.Fatalf("cleanup=%+v", results)
+			}
+		}
+		if _, err := os.Lstat(native); dry && err != nil || !dry && !os.IsNotExist(err) {
+			t.Fatalf("native cleanup dry=%v: %v", dry, err)
+		}
+		if sb.ReadFile(filepath.Join(target, "fixture.md")) != "edited\n" {
+			t.Fatal("native cleanup erased receipt-protected content")
+		}
+	}
+}
+
 func TestSharedOutputSettingsChangeDetachesPriorOutputs(t *testing.T) {
 	for _, change := range []string{"extension", "relative-extension", "flatten", "include", "exclude", "local-include"} {
 		for _, edited := range []bool{false, true} {

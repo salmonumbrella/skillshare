@@ -206,6 +206,65 @@ func (r *SharedExtrasRun) DetachTarget(resolve func(string) string, name, path s
 	})
 }
 
+// DetachRelink runs receipt cleanup before native-only cleanup. Remember exact
+// receipt outputs even after a successful detach relinquishes their ownership:
+// restoring them twice can consume the user's original restore point.
+func (r *SharedExtrasRun) DetachRelink(extra config.ExtraConfig, source string, resolve func(string) string) []DetachResult {
+	handled := map[string]bool{}
+	if r != nil {
+		for _, old := range r.state.State.Extras {
+			for _, target := range old.Receipt.Targets {
+				if old.Receipt.File != "" || target.Mode == "symlink" || len(target.Files) == 0 {
+					handled[placedOutput(old.Receipt.File, target)] = true
+				} else {
+					for rel := range target.Files {
+						handled[filepath.Join(target.Path, filepath.FromSlash(rel))] = true
+					}
+				}
+			}
+		}
+	}
+	results := r.detach(resolve, func(name string, target config.SharedPlacedTarget) bool {
+		return name == extra.Name && slices.ContainsFunc(extra.Targets, func(t config.ExtraTargetConfig) bool {
+			return utils.PathsEqual(resolve(t.Path), target.Path)
+		})
+	})
+	if r != nil && r.dryRun {
+		return results
+	}
+	for _, result := range results {
+		if len(result.Errors) > 0 {
+			return results
+		}
+	}
+	for _, target := range extra.Targets {
+		path := resolve(target.Path)
+		mode := ExtraTargetMode(target.Mode, extra.File != "")
+		output := placedOutput(extra.File, config.SharedPlacedTarget{Path: path, As: target.As})
+		var removed int
+		var kept bool
+		var errs []string
+		if extra.File == "" && mode == "merge" && r != nil {
+			removed, errs = pruneExtraOrphans(path, source, map[string]bool{}, mode, handled, r.Protected())
+		} else if !protectedOutput(output, handled) && !protectedOutput(output, r.Protected()) {
+			removed, kept, errs = ClearExtraTarget(extra.File, source, path, target.As, mode, nil)
+		}
+		if removed > 0 || kept || len(errs) > 0 {
+			result := DetachResult{Name: extra.Name, Target: path, Removed: removed, Errors: errs}
+			if kept {
+				result.Kept = []string{output}
+			}
+			results = append(results, result)
+		}
+		if len(errs) > 0 && r != nil {
+			r.protected[output] = true
+			r.latch(fmt.Errorf("native relink cleanup failed: %s", strings.Join(errs, "; ")))
+			break
+		}
+	}
+	return results
+}
+
 func (r *SharedExtrasRun) detach(resolve func(string) string, selected func(string, config.SharedPlacedTarget) bool) []DetachResult {
 	if r == nil {
 		return nil

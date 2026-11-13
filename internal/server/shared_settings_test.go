@@ -56,10 +56,7 @@ func TestSharedUnavailableRelinkAPILeavesFilesAndConfigUnchanged(t *testing.T) {
 				} else {
 					sb.WriteFile(shared, "version: 2\n")
 				}
-				s.cfg, err = config.LoadReadOnlyPath(sb.ConfigPath)
-				if err != nil {
-					t.Fatal(err)
-				}
+				// Keep startup's usable view: the real route must reload before editing.
 				// Walk the synthetic sandbox only, including state and backup folders.
 				snapshot := func() map[string]string {
 					files := map[string]string{}
@@ -92,17 +89,14 @@ func TestSharedUnavailableRelinkAPILeavesFilesAndConfigUnchanged(t *testing.T) {
 					t.Fatal(err)
 				}
 				body := fmt.Sprintf(`{"path":%q,"target":{"path":%q}}`, target, filepath.Join(sb.Root, "moved"))
-				handler := (*Server).handleExtrasEditTarget
+				method, route := http.MethodPut, "/api/extras/rules/targets"
 				if action == "as" {
 					body = fmt.Sprintf(`{"path":%q,"target":{"path":%q,"as":"renamed.md"}}`, target, target)
 				} else if action == "source" {
 					body = fmt.Sprintf(`{"source":%q}`, replacement)
-					handler = (*Server).handleExtrasEdit
+					method, route = http.MethodPatch, "/api/extras/rules"
 				}
-				r := httptest.NewRequest(http.MethodPut, "/", strings.NewReader(body))
-				r.SetPathValue("name", "rules")
-				rr := httptest.NewRecorder()
-				handler(s, rr, r)
+				rr := serveExtras(s, method, route, body)
 				if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), config.SharedUnavailable) {
 					t.Fatalf("response=%d %s", rr.Code, rr.Body.String())
 				}

@@ -682,14 +682,27 @@ func extrasSyncStatus(results []extraSyncResult) (string, int) {
 	}
 }
 
+type extraRelink struct {
+	Extra  config.ExtraConfig
+	Source string
+}
+
 // syncExtras syncs every extra (or only the one named) into its targets.
+// Relinks carry saved declarations whose old outputs need cleanup first.
 // Per-target failures are reported in the results. Callers must hold s.mu.
-func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult, error) {
+func (s *Server) syncExtras(name string, dryRun, force bool, relinks ...extraRelink) ([]extraSyncResult, error) {
 	var session *syncpkg.SharedExtrasRun
 	cfg := s.cfg
 	if !s.IsProjectMode() {
 		var err error
-		session, err = syncpkg.BeginSharedExtras(cfg, dryRun, syncpkg.SharedExtrasScope{Name: name})
+		scope := syncpkg.SharedExtrasScope{Name: name}
+		if len(relinks) > 0 {
+			scope.Name = relinks[0].Extra.Name
+			if len(relinks[0].Extra.Targets) == 1 {
+				scope.Target = resolveExtrasTargetPath(s.projectRoot, relinks[0].Extra.Targets[0].Path)
+			}
+		}
+		session, err = syncpkg.BeginSharedExtras(cfg, dryRun, scope)
 		if err != nil {
 			return nil, err
 		}
@@ -736,7 +749,15 @@ func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult,
 	if name != "" {
 		names = []string{name}
 	}
-	for _, detached := range session.Detach(opts.ResolvePath, names...) {
+	var detachedTargets []syncpkg.DetachResult
+	if len(relinks) > 0 {
+		for _, relink := range relinks {
+			detachedTargets = append(detachedTargets, session.DetachRelink(relink.Extra, relink.Source, opts.ResolvePath)...)
+		}
+	} else {
+		detachedTargets = session.Detach(opts.ResolvePath, names...)
+	}
+	for _, detached := range detachedTargets {
 		if len(detached.Errors) > 0 {
 			detachErr = errors.Join(detachErr, fmt.Errorf("shared extras detach failed: %s", strings.Join(detached.Errors, "; ")))
 		}
@@ -744,7 +765,14 @@ func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult,
 		for _, path := range detached.Kept {
 			target.Warnings = append(target.Warnings, "kept: edited by you: "+path)
 		}
-		results = append(results, extraSyncResult{Name: detached.Name, Targets: []extraTargetSyncResult{target}})
+		if idx := slices.IndexFunc(results, func(old extraSyncResult) bool { return old.Name == detached.Name }); idx >= 0 {
+			results[idx].Targets = append(results[idx].Targets, target)
+		} else {
+			results = append(results, extraSyncResult{Name: detached.Name, Targets: []extraTargetSyncResult{target}})
+		}
+	}
+	if len(relinks) > 0 && detachErr != nil {
+		return results, detachErr
 	}
 
 	for _, extra := range extras {

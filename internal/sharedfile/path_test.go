@@ -15,8 +15,14 @@ func TestPaths(t *testing.T) {
 	}{
 		{"", "", true}, {"~/x", filepath.Join(home, "x"), true},
 		{"extras/rules", filepath.Join(home, "team", "extras", "rules"), true},
+		{`.\rules`, filepath.Join(home, "team", "rules"), true},
+		{`extras\nested/rules`, filepath.Join(home, "team", "extras", "nested", "rules"), true},
+		{`..\rules`, filepath.Join(home, "rules"), true},
+		{`~\rules\nested`, filepath.Join(home, "rules", "nested"), true},
+		{"~", home, true},
 		{filepath.Join(home, "absolute"), filepath.Join(home, "absolute"), false},
-		{"C:\\machine\\rules", "C:\\machine\\rules", false},
+		{`C:\machine\rules`, filepath.Clean(`C:\machine\rules`), false},
+		{`\\server\share\rules`, filepath.Clean(`\\server\share\rules`), false},
 	} {
 		if got := ResolvePath(filepath.Join(home, "team"), tc.in); got != tc.want {
 			t.Errorf("resolve %q=%q want=%q", tc.in, got, tc.want)

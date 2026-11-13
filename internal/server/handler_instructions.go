@@ -299,6 +299,9 @@ func (s *Server) handleConvertTargetInstructions(w http.ResponseWriter, r *http.
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, body.ShareAs, body.ShareInto) {
+		return
+	}
 	it, found, ok := s.targetInstructions(name)
 	if !found {
 		writeCodedError(w, http.StatusNotFound, "instructions_target_not_found", "target not found: "+name, map[string]string{"target": name})

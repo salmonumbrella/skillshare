@@ -81,6 +81,9 @@ func cmdExtrasRemoveTarget(args []string) error {
 		if loadErr != nil {
 			return loadErr
 		}
+		if err := cfg.CheckExtraWritable(name); err != nil {
+			return err
+		}
 		extras = cfg.Extras
 		configPath = config.ConfigPath()
 		saveFn = cfg.Save

@@ -82,6 +82,9 @@ func (s *Server) handleExtrasEditTarget(w http.ResponseWriter, r *http.Request) 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, name) {
+		return
+	}
 
 	extras := s.extrasConfig()
 	idx := slices.IndexFunc(extras, func(e config.ExtraConfig) bool { return e.Name == name })
@@ -179,6 +182,9 @@ func (s *Server) handleExtrasEdit(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, name, body.Name) {
+		return
+	}
 
 	extras := s.extrasConfig()
 	idx := slices.IndexFunc(extras, func(e config.ExtraConfig) bool { return e.Name == name })

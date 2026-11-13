@@ -937,6 +937,9 @@ func (m extrasListTUIModel) doSetMode(name, targetPath, newMode string) (string,
 		if err != nil {
 			return "", err
 		}
+		if err := cfg.CheckExtraWritable(name); err != nil {
+			return "", err
+		}
 		if err := setMode(cfg.Extras); err != nil {
 			return "", err
 		}
@@ -1035,6 +1038,15 @@ func (m extrasListTUIModel) projectRoot() string {
 }
 
 func (m extrasListTUIModel) doSync(name, targetPath string) (string, error) {
+	if m.projCfg == nil {
+		cfg, err := config.Load()
+		if err != nil {
+			return "", err
+		}
+		if err := cfg.CheckSharedApply(); err != nil {
+			return "", err
+		}
+	}
 	extra, targets, err := m.resolveExtraWithTargets(name, targetPath)
 	if err != nil {
 		return "", err
@@ -1075,6 +1087,15 @@ func (m extrasListTUIModel) doSync(name, targetPath string) (string, error) {
 }
 
 func (m extrasListTUIModel) doCollect(name, targetPath string) (string, error) {
+	if m.projCfg == nil {
+		cfg, err := config.Load()
+		if err != nil {
+			return "", err
+		}
+		if err := cfg.CheckExtraWritable(name); err != nil {
+			return "", err
+		}
+	}
 	extra, targets, err := m.resolveExtraWithTargets(name, targetPath)
 	if err != nil {
 		return "", err
@@ -1121,6 +1142,9 @@ func (m extrasListTUIModel) doFlattenToggle(name string, t extrasTargetInfo) tea
 			cfg, loadErr := config.Load()
 			if loadErr != nil {
 				return extrasActionDoneMsg{err: loadErr}
+			}
+			if err := cfg.CheckExtraWritable(name); err != nil {
+				return extrasActionDoneMsg{err: err}
 			}
 			if err := applyExtraTarget(cfg.Extras, name, targetPath, func(et *config.ExtraTargetConfig) { et.Flatten = newFlatten }); err != nil {
 				return extrasActionDoneMsg{err: err}

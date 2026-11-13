@@ -482,6 +482,12 @@ func cmdSync(args []string) error {
 		if analyzeErr == nil && len(analyzeEntries) > 0 {
 			ctxCost = buildContextCostJSON(analyzeEntries, cfg.ContextBudget)
 		}
+		if hasAll && cfg.CheckSharedApply() != nil {
+			if syncErr == nil {
+				syncErr = cfg.CheckSharedApply()
+			}
+			return syncOutputJSON(results, dryRun, start, ignoreStats, syncErr, ctxCost, mcpResult, hooksResult, linkWarnings)
+		}
 		if hasAll && len(cfg.Extras) > 0 {
 			agentPaths := collectAgentTargetPathsGlobal(cfg)
 			extrasEntries, extrasErr := runExtrasSyncEntries(cfg.Extras, func(extra config.ExtraConfig) string {

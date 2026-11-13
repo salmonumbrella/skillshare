@@ -480,6 +480,9 @@ func (s *Server) handleExtrasCreate(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, body.Name) {
+		return
+	}
 
 	// Check for duplicate
 	if err := config.ValidateExtraNameUnique(body.Name, s.extrasConfig()); err != nil {
@@ -603,6 +606,10 @@ func (s *Server) handleExtrasSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.RLock()
+	if !s.IsProjectMode() && writeSharedError(w, s.cfg.CheckSharedApply()) {
+		s.mu.RUnlock()
+		return
+	}
 	var validationErr error
 	if s.IsProjectMode() {
 		validationErr = s.projectCfg.ValidateExtras(s.projectRoot)
@@ -672,6 +679,11 @@ func extrasSyncStatus(results []extraSyncResult) (string, int) {
 // syncExtras syncs every extra (or only the one named) into its targets.
 // Per-target failures are reported in the results. Callers must hold s.mu.
 func (s *Server) syncExtras(name string, dryRun, force bool) []extraSyncResult {
+	if !s.IsProjectMode() {
+		if err := s.cfg.CheckSharedApply(); err != nil {
+			return []extraSyncResult{{Name: name, Targets: []extraTargetSyncResult{{Error: err.Error()}}}}
+		}
+	}
 	projectRoot := s.projectRoot
 	source := s.cfg.EffectiveSkillsSource()
 	extrasSource := s.cfg.EffectiveExtrasSource()
@@ -795,6 +807,9 @@ func (s *Server) handleExtrasMode(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, name) {
+		return
+	}
 
 	extras := s.extrasConfig()
 
@@ -888,6 +903,9 @@ func (s *Server) handleExtrasDelete(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, name) {
+		return
+	}
 
 	// Find the extra
 	extras := s.extrasConfig()
@@ -976,6 +994,9 @@ func (s *Server) handleExtrasAddTarget(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, name) {
+		return
+	}
 
 	extras := s.extrasConfig()
 	idx := -1
@@ -1063,6 +1084,9 @@ func (s *Server) handleExtrasRemoveTarget(w http.ResponseWriter, r *http.Request
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, name) {
+		return
+	}
 
 	extras := s.extrasConfig()
 	idx := -1

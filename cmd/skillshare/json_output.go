@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"reflect"
+	"skillshare/internal/config"
 	"slices"
 	"time"
 
@@ -45,7 +47,12 @@ func writeJSONResult(v any, cmdErr error) error {
 // writeJSONError writes a JSON error object to stdout and returns a
 // jsonSilentError so that main() exits non-zero without extra output.
 func writeJSONError(err error) error {
-	out, merr := json.MarshalIndent(map[string]string{"error": err.Error()}, "", "  ")
+	payload := map[string]string{"error": err.Error()}
+	var sharedErr *config.SharedError
+	if errors.As(err, &sharedErr) {
+		payload["error_code"] = sharedErr.Code
+	}
+	out, merr := json.MarshalIndent(payload, "", "  ")
 	if merr != nil {
 		fmt.Fprintf(os.Stderr, "json marshal error: %v\n", merr)
 		fmt.Printf("{\"error\": %q}\n", err.Error())

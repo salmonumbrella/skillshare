@@ -70,6 +70,9 @@ func extrasCollectGlobal(name, fromPath string, dryRun, force bool, start time.T
 	if err != nil {
 		return err
 	}
+	if err := cfg.CheckExtraWritable(name); err != nil {
+		return err
+	}
 
 	extra, target, err := resolveCollectExtra(cfg.Extras, name, fromPath, modeGlobal, "")
 	if err != nil {

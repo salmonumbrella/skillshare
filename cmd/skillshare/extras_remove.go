@@ -55,6 +55,9 @@ func cmdExtrasRemove(args []string) error {
 }
 
 func removeExtraFromGlobalConfig(cfg *config.Config, name string) (string, error) {
+	if err := cfg.CheckExtraWritable(name); err != nil {
+		return "", err
+	}
 	idx := -1
 	var removed config.ExtraConfig
 	for i, e := range cfg.Extras {
@@ -133,6 +136,9 @@ func restoreExtraFileTargets(extra config.ExtraConfig, sourceDir string, mode ru
 func extrasRemoveGlobal(name string, force bool, start time.Time) error {
 	cfg, err := config.Load()
 	if err != nil {
+		return err
+	}
+	if err := cfg.CheckExtraWritable(name); err != nil {
 		return err
 	}
 

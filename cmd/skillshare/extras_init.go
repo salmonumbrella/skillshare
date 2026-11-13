@@ -190,6 +190,9 @@ func extrasInitGlobal(o extrasInitOptions, start time.Time) error {
 	if err != nil {
 		return err
 	}
+	if err := cfg.CheckExtraWritable(o.name); err != nil {
+		return err
+	}
 
 	if o.force {
 		cfg.Extras = removeExtraByName(cfg.Extras, o.name)

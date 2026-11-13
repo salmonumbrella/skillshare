@@ -147,6 +147,10 @@ func main() {
 		if errors.As(err, &auditErr) {
 			exitCode = 2
 		}
+		var sharedErr *config.SharedError
+		if errors.As(err, &sharedErr) {
+			exitCode = 3
+		}
 		// jsonSilentError means JSON output was already written to stdout;
 		// exit non-zero without adding plain-text noise.
 		var silent *jsonSilentError
@@ -155,7 +159,7 @@ func main() {
 		}
 		if serving {
 			fmt.Fprintf(os.Stderr, "✗ %v\n", err)
-			os.Exit(1)
+			os.Exit(exitCode)
 		}
 		fmt.Println()
 		ui.Error("%v", err)

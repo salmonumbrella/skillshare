@@ -166,6 +166,9 @@ func (s *Server) handleCreateSharedInstructions(w http.ResponseWriter, r *http.R
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, body.Name) {
+		return
+	}
 	extras := s.sharedExtras()
 	if err := config.ValidateExtraNameUnique(body.Name, *extras); err != nil {
 		writeCodedError(w, http.StatusConflict, "instructions_name_taken", err.Error(), map[string]string{"name": body.Name})
@@ -369,6 +372,13 @@ func (s *Server) assignTarget(name string, want []string, warnings ...*[]syncpkg
 	if _, linked := s.cfg.Targets[it.SameAs]; linked {
 		return fmt.Errorf("%s reads the same file as %s; change %s instead", name, it.SameAs, it.SameAs)
 	}
+	planned, err := instructions.PlanAssign(s.cfg.Extras, instructions.Target{Name: name, File: it.Path, Import: it.Import}, want, s.instructionsResolver())
+	if err != nil {
+		return err
+	}
+	if err := s.checkSharedExtraChanges(planned); err != nil {
+		return err
+	}
 	extras, err := instructions.Assign(s.cfg.Extras, instructions.Target{Name: name, File: it.Path, Import: it.Import}, want, s.instructionsResolver(), warnings...)
 	s.cfg.Extras = extras
 	return err
@@ -425,6 +435,9 @@ func (s *Server) handleAssignSharedInstructions(w http.ResponseWriter, r *http.R
 			}
 			return
 		}
+	}
+	if writeSharedError(w, s.checkSharedExtraChanges(planned)) {
+		return
 	}
 	warnings := []syncpkg.FileWarning{}
 	errs := []string{}
@@ -489,6 +502,9 @@ func (s *Server) handleRestoreSharedInstructions(w http.ResponseWriter, r *http.
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, name) {
+		return
+	}
 	it, _, ok := s.targetInstructions(body.Target)
 	if !ok {
 		writeCodedError(w, http.StatusBadRequest, "instructions_no_file", body.Target+" has no instruction file", map[string]string{"target": body.Target})
@@ -533,6 +549,9 @@ func (s *Server) handleResolveSharedInstructions(w http.ResponseWriter, r *http.
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.requireLocalExtra(w, name) {
+		return
+	}
 	res := s.instructionsResolver()
 	var i, j int
 	if body.Path != "" {

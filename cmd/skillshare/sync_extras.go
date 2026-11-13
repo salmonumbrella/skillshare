@@ -68,6 +68,13 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 		return err
 	}
 
+	if err := cfg.CheckSharedApply(); err != nil {
+		if jsonOutput {
+			return writeJSONError(err)
+		}
+		return err
+	}
+
 	// Target problems fail only those targets' skills and agents, not extras.
 	if _, _, err := config.ValidateConfigForSync(cfg); err != nil {
 		return err

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"skillshare/internal/config"
+	"skillshare/internal/sharedfile"
 	"skillshare/internal/testutil"
 )
 
@@ -222,5 +224,61 @@ func TestSharedPullAPIReloadsAndDetachesLastExtra(t *testing.T) {
 	pull()
 	if _, err := os.Lstat(filepath.Join(sb.Home, "placed", "fixture.md")); !os.IsNotExist(err) {
 		t.Fatal("dashboard pull did not detach")
+	}
+}
+
+func TestSharedErrorIncludesSafeTranslationParams(t *testing.T) {
+	rr := httptest.NewRecorder()
+	err := &config.SharedError{Code: config.SharedPublication, Path: "/team.yaml", Cause: &sharedfile.Unavailable{
+		Path: "/team.yaml", Reason: sharedfile.Privacy, Findings: []sharedfile.Finding{{Line: 7, Entry: "rules", Rule: "secret"}},
+	}}
+	if !writeSharedError(rr, err) {
+		t.Fatal("not handled")
+	}
+	var body struct {
+		Params map[string]string `json:"error_params"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{"path": "/team.yaml", "reason": "privacy", "line": "7", "entry": "rules", "rule": "secret"} {
+		if body.Params[key] != want {
+			t.Errorf("%s=%q want %q", key, body.Params[key], want)
+		}
+	}
+}
+
+func TestNamedSharedExtrasSyncProtectsEditedReplacement(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	source, target := filepath.Join(sb.Root, "rules"), filepath.Join(sb.Root, "placed")
+	shared := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
+	sb.WriteFile(filepath.Join(source, "fixture.md"), "managed\n")
+	sb.WriteFile(shared, fmt.Sprintf("version: 1\nextras: [{name: rules, source: %q, targets: [{path: %q, mode: copy}]}]\n", filepath.ToSlash(source), filepath.ToSlash(target)))
+	sb.WriteConfig("source: " + filepath.ToSlash(sb.SourcePath) + "\nshared: {path: ./team.yaml}\ntargets: {}\n")
+	cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, "127.0.0.1:0", "", "")
+	if _, err := s.syncExtras("rules", false, false); err != nil {
+		t.Fatal(err)
+	}
+	sb.WriteFile(filepath.Join(target, "fixture.md"), "edited\n")
+	replacement := filepath.Join(sb.Root, "replacement")
+	sb.WriteFile(filepath.Join(replacement, "fixture.md"), "replacement\n")
+	sb.WriteFile(shared, strings.ReplaceAll(sb.ReadFile(shared), filepath.ToSlash(source), filepath.ToSlash(replacement)))
+	if err := s.reloadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	results, err := s.syncExtras("rules", false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.ReadFile(filepath.Join(target, "fixture.md")) != "edited\n" {
+		t.Fatal("named apply overwrote protected output")
+	}
+	if len(results) != 1 || len(results[0].Targets) != 2 || len(results[0].Targets[0].Warnings) == 0 || results[0].Targets[1].Skipped != 1 {
+		t.Fatalf("results=%+v", results)
 	}
 }

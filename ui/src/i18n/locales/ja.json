@@ -3622,5 +3622,17 @@
   "plugins.error.importRecipeIdentityRequired": "このリモートレシピにはプラグインの識別情報がありません。インポート前に、共有宣言の plugin: にネイティブパッケージ名を設定してください。インポートではソースをダウンロードしません。",
   "plugins.error.unimportTargetRequired": "unimport にはローカルのインポート記録を選択する --target が必要です",
   "plugins.error.unimportTargetMissing": "{name} にはターゲット {target} のバインディングがありません",
-  "plugins.error.unimportReceiptRequired": "{name}/{target} には共有ソースレシピに対応するローカルのインポートがありません"
+  "plugins.error.unimportReceiptRequired": "{name}/{target} には共有ソースレシピに対応するローカルのインポートがありません",
+  "shared.error.shared_owned": "{name} は {file} で定義されています。共有ファイルを編集するか、このマシンでこの項目をスキップまたは上書きしてください。",
+  "shared.error.shared_unavailable": "共有 extras を適用できません。{reason} 修正を pull するか、skillshare を更新するか、shared.path を編集してください。",
+  "shared.error.shared_publication": "共有設定 {file} の公開を拒否しました。{reason} ファイルと送信履歴を確認し、安全でないコミットを手動で修正してから再試行してください。",
+  "shared.reason.missing": "共有設定ファイル {file} が見つかりません。",
+  "shared.reason.unreadable": "共有設定ファイル {file} を読み取れません。",
+  "shared.reason.parse": "共有設定ファイル {file} の YAML が不正です（行 {line}）。",
+  "shared.reason.version": "{file} は新しい共有設定バージョンを使用しています。skillshare を更新するか、互換性のあるファイルを pull してください。",
+  "shared.reason.newer-section": "{file} に未対応のセクションがあります（行 {line}）。skillshare を更新してください。",
+  "shared.reason.machine-key": "{file} にマシン固有の設定があります（行 {line}）。ローカルの config.yaml に保存してください。",
+  "shared.reason.unknown-key": "{file} に不明な設定があります（行 {line}）。",
+  "shared.reason.privacy": "共有設定 {file} のプライバシーチェックに失敗しました（行 {line}、項目 {entry}、ルール {rule}）。",
+  "shared.reason.entry": "共有設定 {file} に不正な項目 {entry} があります（行 {line}）。"
 }

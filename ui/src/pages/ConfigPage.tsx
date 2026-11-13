@@ -30,6 +30,8 @@ import { formatYaml } from '../lib/formatYaml';
 import { yamlKeyOffset } from '../lib/yamlSection';
 import { shortenHome } from '../lib/paths';
 import { useOverviewQuery } from '../hooks/useSharedQueries';
+import SharedNotice from '../components/SharedNotice';
+import { sharedErrorMessage } from '../lib/sharedSettings';
 import { invalidate } from '../lib/queryEvents';
 
 type ConfigTab = 'config' | 'skillignore' | 'agentignore' | 'extensions';
@@ -80,6 +82,7 @@ export default function ConfigPage() {
   });
   const configFile = useEditableFile(configData, {
     skipEmpty: true,
+    errorMessage: (error) => sharedErrorMessage(error, t),
     save: async (value) => {
       const formatted = formatYaml(value, { organizeConfig: true });
       const res = await api.putConfig(formatted);
@@ -362,6 +365,7 @@ export default function ConfigPage() {
         title={t('layout.nav.settings')}
         subtitle={`${t(isProjectMode ? 'app.project' : 'app.global')}${configDir ? ` · ${shortenHome(configDir)}` : ''}`}
       />
+      <SharedNotice shared={configData?.shared} />
       <SettingsTabs current={tab === 'extensions' ? 'extensions' : 'files'} />
 
       {tab === 'extensions' ? (

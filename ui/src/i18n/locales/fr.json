@@ -3622,5 +3622,17 @@
   "plugins.error.importRecipeIdentityRequired": "Cette recette distante ne définit pas l’identité du plugin. Avant l’import, définissez plugin: avec le nom du paquet natif dans la déclaration partagée ; l’import ne télécharge pas le code source.",
   "plugins.error.unimportTargetRequired": "unimport nécessite --target pour sélectionner un enregistrement d’import local",
   "plugins.error.unimportTargetMissing": "{name} n’a aucune liaison pour la cible {target}",
-  "plugins.error.unimportReceiptRequired": "{name}/{target} n’a aucun import local associé à une recette de source partagée"
+  "plugins.error.unimportReceiptRequired": "{name}/{target} n’a aucun import local associé à une recette de source partagée",
+  "shared.error.shared_owned": "{name} provient de {file}. Modifiez le fichier partagé, ignorez cette entrée ou remplacez-la sur cette machine.",
+  "shared.error.shared_unavailable": "Impossible d’appliquer les extras partagés. {reason} Récupérez une correction, mettez skillshare à jour ou modifiez shared.path.",
+  "shared.error.shared_publication": "Publication des paramètres partagés {file} refusée. {reason} Vérifiez le fichier et l’historique sortant ; corrigez manuellement les commits dangereux avant de réessayer.",
+  "shared.reason.missing": "Le fichier de paramètres partagés {file} est introuvable.",
+  "shared.reason.unreadable": "Le fichier de paramètres partagés {file} est illisible.",
+  "shared.reason.parse": "Le fichier partagé {file} contient du YAML invalide (ligne {line}).",
+  "shared.reason.version": "{file} utilise une version plus récente des paramètres partagés. Mettez skillshare à jour ou récupérez un fichier compatible.",
+  "shared.reason.newer-section": "{file} contient une section non prise en charge (ligne {line}). Mettez skillshare à jour.",
+  "shared.reason.machine-key": "{file} contient un paramètre propre à la machine (ligne {line}). Conservez-le dans config.yaml local.",
+  "shared.reason.unknown-key": "{file} contient un paramètre inconnu (ligne {line}).",
+  "shared.reason.privacy": "Échec du contrôle de confidentialité pour {file} (ligne {line}, entrée {entry}, règle {rule}).",
+  "shared.reason.entry": "Les paramètres partagés {file} contiennent une entrée invalide {entry} (ligne {line})."
 }

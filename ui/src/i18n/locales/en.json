@@ -3622,5 +3622,17 @@
   "plugins.error.importRecipeIdentityRequired": "This remote recipe has no plugin identity. Set plugin: to the native package name in the shared declaration before importing; import does not download source.",
   "plugins.error.unimportTargetRequired": "unimport requires --target to select a local import receipt",
   "plugins.error.unimportTargetMissing": "{name} has no binding for target {target}",
-  "plugins.error.unimportReceiptRequired": "{name}/{target} has no local import backed by a shared source recipe"
+  "plugins.error.unimportReceiptRequired": "{name}/{target} has no local import backed by a shared source recipe",
+  "shared.error.shared_owned": "{name} comes from {file}. Edit the shared file, or skip or override this entry on this machine.",
+  "shared.error.shared_unavailable": "Shared extras cannot be applied. {reason} Pull a fix, upgrade skillshare, or edit shared.path.",
+  "shared.error.shared_publication": "Publishing shared settings {file} was refused. {reason} Check the file and outgoing history; repair unsafe commits manually before retrying.",
+  "shared.reason.missing": "Shared settings file {file} is missing.",
+  "shared.reason.unreadable": "Shared settings file {file} cannot be read.",
+  "shared.reason.parse": "Shared settings file {file} contains invalid YAML (line {line}).",
+  "shared.reason.version": "{file} uses a newer shared settings version. Upgrade skillshare or pull a compatible file.",
+  "shared.reason.newer-section": "{file} contains a section this version cannot apply (line {line}). Upgrade skillshare.",
+  "shared.reason.machine-key": "{file} contains a machine-only setting (line {line}). Keep it in local config.yaml.",
+  "shared.reason.unknown-key": "{file} contains an unknown setting (line {line}).",
+  "shared.reason.privacy": "Shared settings {file} failed privacy checks (line {line}, entry {entry}, rule {rule}).",
+  "shared.reason.entry": "Shared settings {file} has an invalid entry {entry} (line {line})."
 }

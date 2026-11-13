@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, ApiError, type GitStatus } from '../api/client';
 import { ToastProvider } from '../components/Toast';
 import { I18nProvider } from '../i18n';
+import { queryKeys } from '../lib/queryKeys';
 import GitSyncPage from './GitSyncPage';
 
 vi.mock('../context/AppContext', () => ({ useAppContext: () => ({ isProjectMode: false }) }));
@@ -194,4 +195,15 @@ describe('discard changes', () => {
     expect((screen.getByRole('button', { name: 'Discard changes' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
+});
+
+it('keeps Pull enabled while shared settings need repair and clears the notice on refresh', async () => {
+  vi.mocked(api.gitStatus).mockResolvedValue({ ...status, hasRemote: true, isDirty: false, files: [],
+    shared: { enabled: true, usable: false, path: '/team.yaml', reason: 'missing' } });
+  const client = mount();
+  expect(await screen.findByRole('alert')).toHaveTextContent('Shared settings file /team.yaml is missing');
+  expect((screen.getByRole('button', { name: 'Pull' }) as HTMLButtonElement).disabled).toBe(false);
+  vi.mocked(api.gitStatus).mockResolvedValue({ ...status, hasRemote: true, isDirty: false, files: [] });
+  await client.refetchQueries({ queryKey: queryKeys.gitStatus });
+  await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
 });

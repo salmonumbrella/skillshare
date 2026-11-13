@@ -3622,5 +3622,17 @@
   "plugins.error.importRecipeIdentityRequired": "此远程安装配方没有插件标识。导入前，请将共享声明中的 plugin: 设为原生包名；导入不会下载源代码。",
   "plugins.error.unimportTargetRequired": "unimport 需要 --target 来选择本机导入记录",
   "plugins.error.unimportTargetMissing": "{name} 没有目标 {target} 的绑定",
-  "plugins.error.unimportReceiptRequired": "{name}/{target} 没有共享来源配置支持的本机导入"
+  "plugins.error.unimportReceiptRequired": "{name}/{target} 没有共享来源配置支持的本机导入",
+  "shared.error.shared_owned": "{name} 来自 {file}。请编辑共享文件，或在本机跳过或覆盖此条目。",
+  "shared.error.shared_unavailable": "无法应用共享 extras。{reason} 请 pull 修复、升级 skillshare 或编辑 shared.path。",
+  "shared.error.shared_publication": "已拒绝发布共享设置 {file}。{reason} 请检查文件和待推送历史，手动修复不安全的提交后重试。",
+  "shared.reason.missing": "共享设置文件 {file} 不存在。",
+  "shared.reason.unreadable": "无法读取共享设置文件 {file}。",
+  "shared.reason.parse": "共享设置文件 {file} 的 YAML 无效（第 {line} 行）。",
+  "shared.reason.version": "{file} 使用较新的共享设置版本。请升级 skillshare 或 pull 兼容文件。",
+  "shared.reason.newer-section": "{file} 包含此版本不支持的区段（第 {line} 行）。请升级 skillshare。",
+  "shared.reason.machine-key": "{file} 包含本机专用设置（第 {line} 行）。请将其保留在本机 config.yaml 中。",
+  "shared.reason.unknown-key": "{file} 包含未知设置（第 {line} 行）。",
+  "shared.reason.privacy": "共享设置 {file} 未通过隐私检查（第 {line} 行，条目 {entry}，规则 {rule}）。",
+  "shared.reason.entry": "共享设置 {file} 包含无效条目 {entry}（第 {line} 行）。"
 }

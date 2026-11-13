@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -92,5 +93,38 @@ func TestSharedNoPointerPublicationDoesNoSharedStateIO(t *testing.T) {
 	}
 	if sb.ReadFile(path) != "invalid state" {
 		t.Fatal("no-pointer touched state")
+	}
+}
+
+func TestSharedPublicationRefusesMalformedStateBeforeAnyWrite(t *testing.T) {
+	sb, cfg := sharedFixture(t, "targets: {}\n", "version: 1\n")
+	path, err := SharedStatePath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb.WriteFile(path, "version: [invalid\n")
+	before := sb.ReadFile(path)
+	for _, check := range []func() error{
+		func() error { _, err := cfg.SharedGitPaths(sb.SourcePath); return err },
+		func() error { return cfg.CheckSharedWorktree(sb.SourcePath) },
+		func() error { return cfg.CheckSharedOutgoing(sb.SourcePath, install.ParseOptions{}) },
+		func() error { return cfg.RecordSharedPointer(sb.SourcePath, true) },
+	} {
+		var shared *SharedError
+		if err := check(); !errors.As(err, &shared) || shared.Code != SharedPublication {
+			t.Fatalf("check=%v", err)
+		}
+		if sb.ReadFile(path) != before {
+			t.Fatal("state changed")
+		}
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.SharedGitPaths(sb.SourcePath); err != nil {
+		t.Fatal("fresh state must be valid absence", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("read created state")
 	}
 }

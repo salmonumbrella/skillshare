@@ -20,6 +20,8 @@ import { useAppContext } from '../context/AppContext';
 import { useT, plural } from '../i18n';
 import { parseRemoteURL } from '../lib/parseRemoteURL';
 import { queryKeys, staleTimes } from '../lib/queryKeys';
+import SharedNotice from '../components/SharedNotice';
+import { sharedErrorMessage } from '../lib/sharedSettings';
 import { invalidate } from '../lib/queryEvents';
 
 const SCOPES = ['skills', 'agents', 'extras', 'root'];
@@ -80,7 +82,7 @@ export default function GitSyncPage() {
     try {
       await work();
     } catch (err) {
-      setRunError((err as Error).message);
+      setRunError(sharedErrorMessage(err, t));
       setMergeFailed(err instanceof ApiError && err.code === 'merge_failed');
       setPushRejected(err instanceof ApiError && err.code === 'push_rejected');
       setLockedPath(err instanceof ApiError && err.code === 'permission_denied' ? String(err.params?.path ?? '') : '');
@@ -183,6 +185,7 @@ export default function GitSyncPage() {
     return (
       <div className="animate-page-in">
         {header()}
+        <SharedNotice shared={status.shared} />
         <EmptyState icon={AlertTriangle} title={t('gitSync.gitNotInstalled.title')} description={t('gitSync.gitNotInstalled.hint')} />
       </div>
     );
@@ -222,6 +225,7 @@ export default function GitSyncPage() {
       ))}
 
       <div className="mb-6 flex flex-col gap-4 empty:hidden">
+        <SharedNotice shared={status.shared} />
         {status.scopeMismatch && status.mismatchScope && (
           <div className="ss-note bad !items-center">
             <AlertTriangle size={16} />

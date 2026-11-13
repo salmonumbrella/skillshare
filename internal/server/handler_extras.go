@@ -719,17 +719,19 @@ func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult,
 
 	results := make([]extraSyncResult, 0)
 	var detachErr error
-	if name == "" {
-		for _, detached := range session.Detach(opts.ResolvePath) {
-			if len(detached.Errors) > 0 {
-				detachErr = fmt.Errorf("shared extras detach failed: %s", strings.Join(detached.Errors, "; "))
-			}
-			target := extraTargetSyncResult{Target: detached.Target, Pruned: detached.Removed, Errors: detached.Errors, Warnings: []string{}}
-			for _, path := range detached.Kept {
-				target.Warnings = append(target.Warnings, "kept: edited by you: "+path)
-			}
-			results = append(results, extraSyncResult{Name: detached.Name, Targets: []extraTargetSyncResult{target}})
+	var names []string
+	if name != "" {
+		names = []string{name}
+	}
+	for _, detached := range session.Detach(opts.ResolvePath, names...) {
+		if len(detached.Errors) > 0 {
+			detachErr = errors.Join(detachErr, fmt.Errorf("shared extras detach failed: %s", strings.Join(detached.Errors, "; ")))
 		}
+		target := extraTargetSyncResult{Target: detached.Target, Pruned: detached.Removed, Errors: detached.Errors, Warnings: []string{}}
+		for _, path := range detached.Kept {
+			target.Warnings = append(target.Warnings, "kept: edited by you: "+path)
+		}
+		results = append(results, extraSyncResult{Name: detached.Name, Targets: []extraTargetSyncResult{target}})
 	}
 
 	for _, extra := range s.extrasConfig() {
@@ -784,7 +786,12 @@ func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult,
 			result.Targets = append(result.Targets, out)
 		}
 
-		results = append(results, result)
+		if idx := slices.IndexFunc(results, func(old extraSyncResult) bool { return old.Name == result.Name }); idx >= 0 {
+			results[idx].Targets = append(results[idx].Targets, result.Targets...)
+			results[idx].Warnings = append(results[idx].Warnings, result.Warnings...)
+		} else {
+			results = append(results, result)
+		}
 	}
 
 	return results, errors.Join(detachErr, session.Save())

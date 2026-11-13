@@ -5,7 +5,7 @@ import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
 import { I18nProvider } from '../i18n';
 import { ToastProvider } from '../components/Toast';
-import { api } from '../api/client';
+import { api, ApiError } from '../api/client';
 import ExtrasPage from './ExtrasPage';
 
 vi.mock('../context/AppContext', () => ({ useAppContext: () => ({ isProjectMode: true }) }));
@@ -135,4 +135,22 @@ describe('Extras page in a project', () => {
     expect(api.editExtra).toHaveBeenCalledWith('rules', { name: 'docs' });
   });
 
+});
+
+it('keeps the extra edit draft open after a shared ownership refusal', async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.editExtra).mockRejectedValueOnce(new ApiError(409, 'fallback', {
+    code: 'shared_owned', params: { name: 'rules', path: '/team.yaml' },
+  }));
+  renderPage();
+  await user.click(await screen.findByRole('button', { name: 'More actions for rules' }));
+  await user.click(screen.getByRole('menuitem', { name: 'Edit extra…' }));
+  const dialog = screen.getByRole('dialog');
+  const name = within(dialog).getByLabelText('Name');
+  await user.clear(name);
+  await user.type(name, 'my-rules');
+  await user.click(within(dialog).getByRole('button', { name: 'Save' }));
+  expect(await screen.findByText(/rules comes from/)).toBeTruthy();
+  expect(screen.getByRole('dialog')).toBe(dialog);
+  expect((name as HTMLInputElement).value).toBe('my-rules');
 });

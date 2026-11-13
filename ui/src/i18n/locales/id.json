@@ -3622,5 +3622,17 @@
   "plugins.error.importRecipeIdentityRequired": "Resep jarak jauh ini tidak memiliki identitas plugin. Sebelum mengimpor, isi plugin: dengan nama paket native dalam deklarasi bersama; impor tidak mengunduh kode sumber.",
   "plugins.error.unimportTargetRequired": "unimport memerlukan --target untuk memilih catatan impor lokal",
   "plugins.error.unimportTargetMissing": "{name} tidak memiliki ikatan untuk target {target}",
-  "plugins.error.unimportReceiptRequired": "{name}/{target} tidak memiliki impor lokal yang didukung resep sumber bersama"
+  "plugins.error.unimportReceiptRequired": "{name}/{target} tidak memiliki impor lokal yang didukung resep sumber bersama",
+  "shared.error.shared_owned": "{name} berasal dari {file}. Edit berkas bersama, lewati entri ini, atau timpa secara lokal di mesin ini.",
+  "shared.error.shared_unavailable": "Extras bersama tidak dapat diterapkan. {reason} Tarik perbaikan, perbarui skillshare, atau edit shared.path.",
+  "shared.error.shared_publication": "Publikasi pengaturan bersama {file} ditolak. {reason} Periksa berkas dan riwayat keluar; perbaiki commit yang tidak aman secara manual sebelum mencoba lagi.",
+  "shared.reason.missing": "Berkas pengaturan bersama {file} tidak ditemukan.",
+  "shared.reason.unreadable": "Berkas pengaturan bersama {file} tidak dapat dibaca.",
+  "shared.reason.parse": "Berkas bersama {file} berisi YAML tidak valid (baris {line}).",
+  "shared.reason.version": "{file} memakai versi pengaturan bersama yang lebih baru. Perbarui skillshare atau tarik berkas yang kompatibel.",
+  "shared.reason.newer-section": "{file} berisi bagian yang tidak didukung (baris {line}). Perbarui skillshare.",
+  "shared.reason.machine-key": "{file} berisi pengaturan khusus mesin (baris {line}). Simpan di config.yaml lokal.",
+  "shared.reason.unknown-key": "{file} berisi pengaturan tidak dikenal (baris {line}).",
+  "shared.reason.privacy": "Pengaturan bersama {file} gagal dalam pemeriksaan privasi (baris {line}, entri {entry}, aturan {rule}).",
+  "shared.reason.entry": "Pengaturan bersama {file} memiliki entri tidak valid {entry} (baris {line})."
 }

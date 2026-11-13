@@ -4,8 +4,10 @@ import (
 	"errors"
 	"net/http"
 	"reflect"
+	"strconv"
 
 	"skillshare/internal/config"
+	"skillshare/internal/sharedfile"
 )
 
 func writeSharedError(w http.ResponseWriter, err error) bool {
@@ -13,7 +15,16 @@ func writeSharedError(w http.ResponseWriter, err error) bool {
 	if !errors.As(err, &shared) {
 		return false
 	}
-	writeCodedError(w, http.StatusConflict, shared.Code, shared.Error(), map[string]string{"name": shared.Name, "path": shared.Path})
+	params := map[string]string{"name": shared.Name, "path": shared.Path}
+	var unavailable *sharedfile.Unavailable
+	if errors.As(err, &unavailable) {
+		params["reason"] = string(unavailable.Reason)
+		if len(unavailable.Findings) > 0 {
+			f := unavailable.Findings[0]
+			params["line"], params["entry"], params["rule"] = strconv.Itoa(f.Line), f.Entry, f.Rule
+		}
+	}
+	writeCodedError(w, http.StatusConflict, shared.Code, shared.Error(), params)
 	return true
 }
 

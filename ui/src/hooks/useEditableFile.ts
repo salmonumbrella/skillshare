@@ -7,11 +7,12 @@ interface EditableFileOptions {
   save: (value: string) => Promise<string | void>;
   // Keep the editor as it is when the fetched text is empty.
   skipEmpty?: boolean;
+  errorMessage?: (error: unknown) => string;
 }
 
 // useEditableFile holds the editor state for one server file: it loads the
 // fetched text, tracks whether the edit differs from it, saves, and resets.
-export function useEditableFile(data: { raw?: string } | undefined, { save, skipEmpty = false }: EditableFileOptions) {
+export function useEditableFile(data: { raw?: string } | undefined, { save, skipEmpty = false, errorMessage }: EditableFileOptions) {
   const { toast } = useToast();
   const [value, setValue] = useState('');
   const [dirty, setDirty] = useState(false);
@@ -40,7 +41,7 @@ export function useEditableFile(data: { raw?: string } | undefined, { save, skip
       if (written !== undefined) setValue(written);
       setDirty(false);
     } catch (e: unknown) {
-      toast((e as Error).message, 'error');
+      toast(errorMessage ? errorMessage(e) : (e as Error).message, 'error');
     } finally {
       setSaving(false);
     }

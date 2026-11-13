@@ -411,11 +411,16 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 			}
 		}
 		if mode == "merge" {
-			pruned, pruneErrors := pruneExtraOrphans(targetPath, sourcePath, sourceSet, mode)
+			pruned, pruneErrors := pruneExtraOrphans(targetPath, sourcePath, sourceSet, mode, opts.Protected)
 			result.Pruned = pruned
 			result.Errors = append(result.Errors, pruneErrors...)
 		}
 		if copies != nil {
+			for rel := range copies.m.Managed {
+				if protectedOutput(filepath.Join(targetPath, rel), opts.Protected) {
+					sourceSet[rel] = true
+				}
+			}
 			removed, err := copies.pruneOrphans(sourceSet, false)
 			if err != nil {
 				result.Errors = append(result.Errors, err.Error())
@@ -526,7 +531,7 @@ func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force, relative boo
 // corresponding source. In merge mode only symlinks into sourcePath are pruned;
 // user-created local files and links elsewhere are preserved. Empty parent
 // directories are cleaned up. Hidden files (names starting with ".") are skipped.
-func pruneExtraOrphans(targetPath, sourcePath string, sourceFiles map[string]bool, mode string) (pruned int, errors []string) {
+func pruneExtraOrphans(targetPath, sourcePath string, sourceFiles map[string]bool, mode string, protections ...map[string]bool) (pruned int, errors []string) {
 	// Collect paths to prune (walk first, delete after to avoid mutation during walk)
 	var toRemove []string
 
@@ -547,6 +552,11 @@ func pruneExtraOrphans(targetPath, sourcePath string, sourceFiles map[string]boo
 			return nil
 		}
 
+		for _, protected := range protections {
+			if protectedOutput(path, protected) {
+				return nil
+			}
+		}
 		// Skip hidden files
 		if strings.HasPrefix(info.Name(), ".") {
 			return nil

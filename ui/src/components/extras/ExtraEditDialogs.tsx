@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from 'react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { X } from 'lucide-react';
+import { sharedErrorMessage } from '../../lib/sharedSettings';
 import { api } from '../../api/client';
 import type { Extra, ExtraEditResult, ExtraTarget } from '../../api/client';
 import { queryKeys } from '../../lib/queryKeys';
@@ -135,7 +136,7 @@ export function EditTargetDialog({ extra, target, extensions, markFor, onClose, 
       report(extra.name, res);
       onSaved();
     } catch (err) {
-      toast((err as Error).message, 'error');
+      toast(sharedErrorMessage(err, t), 'error');
       setSaving(false);
     }
   };
@@ -277,7 +278,7 @@ export function EditExtraDialog({ extra, sharedDir, onClose, onSaved }: {
       report(trimmedName, res);
       onSaved();
     } catch (err) {
-      toast((err as Error).message, 'error');
+      toast(sharedErrorMessage(err, t), 'error');
       setSaving(false);
     }
   };

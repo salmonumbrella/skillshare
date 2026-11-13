@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1056,40 +1057,57 @@ func (m extrasListTUIModel) doSync(name, targetPath string) (string, error) {
 	}
 	selected := *extra
 	selected.Targets = targets
-	sourceDir := m.sourceFunc(*extra)
+	var sourceDir string
 	if m.projCfg == nil {
 		sourceDir = config.ResolveExtrasSourceDir(*extra, m.cfg.EffectiveExtrasSource(), m.cfg.EffectiveSkillsSource())
+	} else {
+		sourceDir = m.sourceFunc(*extra)
 	}
 	projectRoot := m.projectRoot()
 	extDir := globalExtensionsDir()
 	if projectRoot != "" {
 		extDir = projectExtensionsDir(projectRoot)
 	}
+	var detached []sync.DetachResult
+	if targetPath != "" {
+		detached = session.DetachTarget(config.ExpandPath, name, targetPath)
+	} else {
+		detached = session.Detach(config.ExpandPath, name)
+	}
+	var runErr error
+	kept, removed := 0, 0
+	for _, result := range detached {
+		kept += len(result.Kept)
+		removed += result.Removed
+		for _, err := range result.Errors {
+			runErr = errors.Join(runErr, fmt.Errorf("detach: %s", err))
+		}
+	}
+	mode := modeGlobal
+	if projectRoot != "" {
+		mode = modeProject
+	}
 	run := sync.RunExtraTargets(selected, sourceDir, sync.ExtraRunOptions{ResolvePath: func(path string) string {
-		return canonicalExtraTargetPath(map[bool]runMode{true: modeProject, false: modeGlobal}[projectRoot != ""], projectRoot, path)
+		return canonicalExtraTargetPath(mode, projectRoot, path)
 	}, ProjectRoot: projectRoot, Protected: session.Protected(), ResolveExtension: func(ext string) (*sync.ExtensionSpec, error) { return resolveExtension(ext, extDir) }})
 	if run.SourceMissing {
-		return "", fmt.Errorf("extras source directory does not exist: %s", sourceDir)
+		runErr = errors.Join(runErr, fmt.Errorf("extras source directory does not exist: %s", sourceDir))
 	}
 	for _, tr := range run.Targets {
-		if tr.ModeErr != nil {
-			return "", tr.ModeErr
-		}
-		if tr.ExtensionErr != nil {
-			return "", tr.ExtensionErr
-		}
-		if tr.Err != nil {
-			return "", tr.Err
-		}
+		runErr = errors.Join(runErr, tr.ModeErr, tr.ExtensionErr, tr.Err)
 		if tr.Result != nil && len(tr.Result.Errors) > 0 {
-			return "", fmt.Errorf("%s", strings.Join(tr.Result.Errors, "; "))
+			runErr = errors.Join(runErr, fmt.Errorf("%s", strings.Join(tr.Result.Errors, "; ")))
 		}
 	}
 	session.Record(selected, sourceDir, run, nil)
-	if err := session.Save(); err != nil {
+	if err := errors.Join(runErr, session.Save()); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("✓ Synced %q to %d target(s)", name, len(run.Targets)), nil
+	message := fmt.Sprintf("✓ Synced %q to %d target(s)", name, len(run.Targets))
+	if kept > 0 || removed > 0 {
+		message += fmt.Sprintf("; detached %d, kept %d: edited by you", removed, kept)
+	}
+	return message, nil
 }
 
 func (m extrasListTUIModel) doCollect(name, targetPath string) (string, error) {

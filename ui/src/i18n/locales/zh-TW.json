@@ -3622,5 +3622,17 @@
   "plugins.error.importRecipeIdentityRequired": "此遠端安裝配方沒有外掛識別資訊。匯入前，請將共用宣告中的 plugin: 設為原生套件名稱；匯入不會下載原始碼。",
   "plugins.error.unimportTargetRequired": "unimport 需要 --target 來選取本機匯入紀錄",
   "plugins.error.unimportTargetMissing": "{name} 沒有目標 {target} 的綁定",
-  "plugins.error.unimportReceiptRequired": "{name}/{target} 沒有共用來源設定支持的本機匯入"
+  "plugins.error.unimportReceiptRequired": "{name}/{target} 沒有共用來源設定支持的本機匯入",
+  "shared.error.shared_owned": "{name} 來自 {file}。請編輯共用檔案，或在本機略過或覆寫此項目。",
+  "shared.error.shared_unavailable": "無法套用共用 extras。{reason} 請 pull 修正、升級 skillshare 或編輯 shared.path。",
+  "shared.error.shared_publication": "已拒絕發布共用設定 {file}。{reason} 請檢查檔案與待推送歷史，手動修正不安全的提交後重試。",
+  "shared.reason.missing": "共用設定檔 {file} 不存在。",
+  "shared.reason.unreadable": "無法讀取共用設定檔 {file}。",
+  "shared.reason.parse": "共用設定檔 {file} 的 YAML 無效（第 {line} 行）。",
+  "shared.reason.version": "{file} 使用較新的共用設定版本。請升級 skillshare 或 pull 相容檔案。",
+  "shared.reason.newer-section": "{file} 包含此版本不支援的區段（第 {line} 行）。請升級 skillshare。",
+  "shared.reason.machine-key": "{file} 包含本機專用設定（第 {line} 行）。請保留在本機 config.yaml 中。",
+  "shared.reason.unknown-key": "{file} 包含未知設定（第 {line} 行）。",
+  "shared.reason.privacy": "共用設定 {file} 未通過隱私檢查（第 {line} 行，項目 {entry}，規則 {rule}）。",
+  "shared.reason.entry": "共用設定 {file} 包含無效項目 {entry}（第 {line} 行）。"
 }

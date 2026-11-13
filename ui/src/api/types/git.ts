@@ -1,7 +1,10 @@
 import type { SyncResult, UnmatchedInclude } from './sync';
 
+import type { SharedStatusPayload } from './config';
+
 // Git types
 export interface GitStatus {
+  shared?: SharedStatusPayload;
   gitInstalled: boolean;
   isRepo: boolean;
   hasRemote: boolean;
@@ -47,6 +50,7 @@ export interface PushResponse {
 }
 
 export interface PullResponse {
+  shared?: SharedStatusPayload;
   success: boolean;
   upToDate: boolean;
   commits: { hash: string; message: string }[];

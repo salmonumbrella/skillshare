@@ -386,3 +386,164 @@ func TestProtectedExtensionOutputSkipsBeforeExecution(t *testing.T) {
 		t.Fatal("protected output changed")
 	}
 }
+
+func TestSharedMergeReplacedForeignLinkIsProtected(t *testing.T) {
+	if !CanCreateFileLink() {
+		t.Skip("requires file links")
+	}
+	sb, cfg, source, target := sharedRunFixture(t, "merge", false)
+	applySharedFixture(t, cfg, source)
+	output := filepath.Join(target, "fixture.md")
+	foreign := filepath.Join(sb.Root, "native.md")
+	sb.WriteFile(foreign, "native content\n")
+	if err := os.Remove(output); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(foreign, output); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(source); err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(sb.Root, "replacement")
+	sb.WriteFile(filepath.Join(replacement, "fixture.md"), "replacement\n")
+	sb.WriteFile(filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml"), fmt.Sprintf("version: 1\nextras: [{name: rules, source: %q, targets: [{path: %q, mode: merge}]}]\n", filepath.ToSlash(replacement), filepath.ToSlash(target)))
+	cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := session.Detach(config.ExpandPath)
+	if len(results) != 1 || len(results[0].Kept) != 1 {
+		t.Fatalf("detach=%+v", results)
+	}
+	RunExtraTargets(cfg.Extras[0], replacement, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Protected: session.Protected()})
+	dest, err := os.Readlink(output)
+	if err != nil || dest != foreign {
+		t.Fatalf("link replaced: %q %v", dest, err)
+	}
+}
+
+func TestSharedMergeDoesNotAcquirePreexistingLinks(t *testing.T) {
+	if !CanCreateFileLink() {
+		t.Skip("requires file links")
+	}
+	sb, cfg, source, target := sharedRunFixture(t, "merge", false)
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(target, "fixture.md")
+	if err := os.Symlink(filepath.Join(source, "fixture.md"), output); err != nil {
+		t.Fatal(err)
+	}
+	applySharedFixture(t, cfg, source)
+	sb.WriteFile(filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml"), "version: 1\n")
+	cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Detach(config.ExpandPath)
+	if _, err := os.Readlink(output); err != nil {
+		t.Fatal("preexisting link detached", err)
+	}
+}
+
+func TestProtectedAncestorPreventsMergeOrphanPruning(t *testing.T) {
+	if !CanCreateFileLink() {
+		t.Skip("requires file links")
+	}
+	root := t.TempDir()
+	source, target := filepath.Join(root, "source"), filepath.Join(root, "target", "nested")
+	if err := os.MkdirAll(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0755); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(target, "orphan.md")
+	if err := os.Symlink(filepath.Join(source, "gone.md"), output); err != nil {
+		t.Fatal(err)
+	}
+	_, err := SyncExtraTarget(config.ExtraConfig{}, config.ExtraTargetConfig{}, source, target, "merge", nil, ExtraSyncOptions{Force: true, Protected: map[string]bool{filepath.Dir(target): true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Readlink(output); err != nil {
+		t.Fatal("protected ancestor pruned", err)
+	}
+}
+
+func TestSharedDetachDoesNotFollowReplacedParent(t *testing.T) {
+	if !CanCreateFileLink() {
+		t.Skip("requires directory links")
+	}
+	sb, cfg, source, target := sharedRunFixture(t, "copy", false)
+	sb.WriteFile(filepath.Join(source, "nested", "own.md"), "same content\n")
+	applySharedFixture(t, cfg, source)
+	nested := filepath.Join(target, "nested")
+	if err := os.RemoveAll(nested); err != nil {
+		t.Fatal(err)
+	}
+	native := filepath.Join(sb.Root, "native")
+	sb.WriteFile(filepath.Join(native, "own.md"), "same content\n")
+	if err := os.Symlink(native, nested); err != nil {
+		t.Fatal(err)
+	}
+	sb.WriteFile(filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml"), "version: 1\n")
+	cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := session.Detach(config.ExpandPath)
+	if len(results) != 1 || len(results[0].Kept) == 0 || !session.Protected()[nested] {
+		t.Fatalf("detach=%+v protected=%v", results, session.Protected())
+	}
+	if sb.ReadFile(filepath.Join(native, "own.md")) != "same content\n" {
+		t.Fatal("native file removed")
+	}
+	RunExtraTargets(config.ExtraConfig{Targets: []config.ExtraTargetConfig{{Path: target, Mode: "copy"}}}, source, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Protected: session.Protected()})
+	if sb.ReadFile(filepath.Join(native, "own.md")) != "same content\n" {
+		t.Fatal("native file overwritten")
+	}
+}
+
+func TestSharedDetachSelectionPreservesOtherReceipts(t *testing.T) {
+	sb, cfg, source, target := sharedRunFixture(t, "copy", false)
+	other := filepath.Join(sb.Root, "other")
+	sb.WriteFile(filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml"), fmt.Sprintf("version: 1\nextras: [{name: rules, source: %q, targets: [{path: %q,mode: copy},{path: %q,mode: copy}]}]\n", filepath.ToSlash(source), filepath.ToSlash(target), filepath.ToSlash(other)))
+	cfg, loadErr := config.LoadReadOnlyPath(sb.ConfigPath)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	applySharedFixture(t, cfg, source)
+	sb.WriteFile(filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml"), "version: 1\n")
+	cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if results := session.Detach(config.ExpandPath, "unselected"); len(results) != 0 || len(session.state.State.Extras[0].Receipt.Targets) != 2 {
+		t.Fatalf("name filter=%+v", results)
+	}
+	results := session.DetachTarget(config.ExpandPath, "rules", target)
+	if len(results) != 1 || len(session.state.State.Extras[0].Receipt.Targets) != 1 || session.state.State.Extras[0].Receipt.Targets[0].Path != other {
+		t.Fatalf("target filter=%+v state=%+v", results, session.state.State.Extras)
+	}
+	if _, err := os.Stat(filepath.Join(other, "fixture.md")); err != nil {
+		t.Fatal("unselected target touched", err)
+	}
+}

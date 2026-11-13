@@ -3622,5 +3622,17 @@
   "plugins.error.importRecipeIdentityRequired": "Esta receta remota no tiene una identidad de plugin. Antes de importar, establece plugin: con el nombre del paquete nativo en la declaración compartida; la importación no descarga el código fuente.",
   "plugins.error.unimportTargetRequired": "unimport requiere --target para seleccionar un registro de importación local",
   "plugins.error.unimportTargetMissing": "{name} no tiene un enlace para el destino {target}",
-  "plugins.error.unimportReceiptRequired": "{name}/{target} no tiene una importación local respaldada por una receta de fuente compartida"
+  "plugins.error.unimportReceiptRequired": "{name}/{target} no tiene una importación local respaldada por una receta de fuente compartida",
+  "shared.error.shared_owned": "{name} proviene de {file}. Edita el archivo compartido, omite esta entrada o sustitúyela en este equipo.",
+  "shared.error.shared_unavailable": "No se pueden aplicar los extras compartidos. {reason} Descarga una corrección, actualiza skillshare o edita shared.path.",
+  "shared.error.shared_publication": "Se rechazó publicar la configuración compartida {file}. {reason} Revisa el archivo y el historial saliente; corrige manualmente los commits inseguros antes de reintentar.",
+  "shared.reason.missing": "Falta el archivo de configuración compartida {file}.",
+  "shared.reason.unreadable": "No se puede leer el archivo de configuración compartida {file}.",
+  "shared.reason.parse": "El archivo compartido {file} contiene YAML inválido (línea {line}).",
+  "shared.reason.version": "{file} usa una versión más reciente de configuración compartida. Actualiza skillshare o descarga un archivo compatible.",
+  "shared.reason.newer-section": "{file} contiene una sección no compatible (línea {line}). Actualiza skillshare.",
+  "shared.reason.machine-key": "{file} contiene una opción exclusiva del equipo (línea {line}). Consérvala en config.yaml local.",
+  "shared.reason.unknown-key": "{file} contiene una opción desconocida (línea {line}).",
+  "shared.reason.privacy": "La configuración compartida {file} no superó los controles de privacidad (línea {line}, entrada {entry}, regla {rule}).",
+  "shared.reason.entry": "La configuración compartida {file} tiene una entrada inválida {entry} (línea {line})."
 }

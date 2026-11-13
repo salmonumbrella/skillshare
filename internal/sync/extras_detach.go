@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"skillshare/internal/config"
@@ -107,7 +108,20 @@ func (r *SharedExtrasRun) currentTarget(old config.SharedPlacement, t config.Sha
 	return false, false
 }
 
-func (r *SharedExtrasRun) Detach(resolve func(string) string) []DetachResult {
+func (r *SharedExtrasRun) Detach(resolve func(string) string, names ...string) []DetachResult {
+	return r.detach(resolve, func(name string, _ config.SharedPlacedTarget) bool {
+		return len(names) == 0 || slices.Contains(names, name)
+	})
+}
+
+// DetachTarget keeps a TUI target-only action from touching other placements.
+func (r *SharedExtrasRun) DetachTarget(resolve func(string) string, name, path string) []DetachResult {
+	return r.detach(resolve, func(candidate string, target config.SharedPlacedTarget) bool {
+		return candidate == name && utils.PathsEqual(target.Path, resolve(path))
+	})
+}
+
+func (r *SharedExtrasRun) detach(resolve func(string) string, selected func(string, config.SharedPlacedTarget) bool) []DetachResult {
 	if r == nil {
 		return nil
 	}
@@ -117,6 +131,10 @@ func (r *SharedExtrasRun) Detach(resolve func(string) string) []DetachResult {
 		keep := old
 		keep.Receipt.Targets = nil
 		for _, target := range old.Receipt.Targets {
+			if !selected(old.Name, target) {
+				keep.Receipt.Targets = append(keep.Receipt.Targets, target)
+				continue
+			}
 			if same, shared := r.currentTarget(old, target, resolve); same {
 				if shared {
 					keep.Receipt.Targets = append(keep.Receipt.Targets, target)
@@ -151,6 +169,14 @@ func (r *SharedExtrasRun) detachTarget(old config.SharedPlacement, target config
 	result := DetachResult{Name: old.Name, Target: target.Path}
 	if old.Receipt.File != "" {
 		f := NewExtraFile(old.Receipt.Source, old.Receipt.File, target.Path, target.As, target.Mode)
+		if parent, err := linkedPlacementParent(target.Path, placedOutput(old.Receipt.File, target)); err != nil {
+			result.Errors = append(result.Errors, err.Error())
+			return result
+		} else if parent != "" {
+			ForgetExtraTarget(f)
+			result.Kept = append(result.Kept, parent)
+			return result
+		}
 		changed, kept, err := DetachExtraFileTarget(f)
 		if err != nil {
 			result.Errors = append(result.Errors, err.Error())
@@ -164,7 +190,11 @@ func (r *SharedExtrasRun) detachTarget(old config.SharedPlacement, target config
 		return result
 	}
 	switch target.Mode {
-	case "copy":
+	case "copy", "merge", "":
+		if info, err := os.Lstat(target.Path); err == nil && utils.IsLinkMode(target.Path, info.Mode()) {
+			result.Kept = append(result.Kept, target.Path)
+			return result
+		}
 		copies := loadCopyTracker(target.Path)
 		for rel, expected := range target.Files {
 			path := filepath.Join(target.Path, filepath.FromSlash(rel))
@@ -172,6 +202,14 @@ func (r *SharedExtrasRun) detachTarget(old config.SharedPlacement, target config
 			relative, err := filepath.Rel(target.Path, path)
 			if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
 				result.Errors = append(result.Errors, "invalid placement output path")
+				continue
+			}
+			if parent, err := linkedPlacementParent(target.Path, path); err != nil {
+				result.Errors = append(result.Errors, err.Error())
+				continue
+			} else if parent != "" {
+				result.Kept = append(result.Kept, parent)
+				copies.forget(rel)
 				continue
 			}
 			info, err := os.Lstat(path)
@@ -183,12 +221,12 @@ func (r *SharedExtrasRun) detachTarget(old config.SharedPlacement, target config
 				result.Errors = append(result.Errors, err.Error())
 				continue
 			}
-			if !info.Mode().IsRegular() {
+			if !info.Mode().IsRegular() && !utils.IsLinkMode(path, info.Mode()) {
 				result.Kept = append(result.Kept, path)
 				copies.forget(rel)
 				continue
 			}
-			hash, err := utils.FileHash(path)
+			hash, err := sharedOutputIdentity(path)
 			if err != nil {
 				result.Errors = append(result.Errors, err.Error())
 				continue
@@ -216,37 +254,43 @@ func (r *SharedExtrasRun) detachTarget(old config.SharedPlacement, target config
 		if kept {
 			result.Kept = append(result.Kept, target.Path)
 		}
-	default:
-		copies := loadCopyTracker(target.Path)
-		for rel := range target.Files {
-			path := filepath.Join(target.Path, filepath.FromSlash(rel))
-			if info, err := os.Lstat(path); err == nil && !utils.IsLinkMode(path, info.Mode()) && !copies.owns(rel) {
-				result.Kept = append(result.Kept, path)
-			} else if err != nil && !os.IsNotExist(err) {
-				result.Errors = append(result.Errors, err.Error())
-			}
-		}
-		removedLinks, pruneErrors := PruneExtraTarget(target.Path, old.Receipt.Source, "merge")
-		result.Removed = removedLinks
-		result.Errors = append(result.Errors, pruneErrors...)
-		// Report edited fallback copies before the tracker forgets them.
-		for rel := range copies.m.Managed {
-			if !copies.owns(rel) {
-				if _, err := os.Lstat(filepath.Join(target.Path, rel)); err == nil {
-					result.Kept = append(result.Kept, filepath.Join(target.Path, rel))
-				}
-			}
-		}
-		removed, err := copies.pruneOrphans(map[string]bool{}, false)
-		result.Removed += len(removed)
-		if err != nil {
-			result.Errors = append(result.Errors, err.Error())
-		}
-		if err := copies.save(); err != nil {
-			result.Errors = append(result.Errors, err.Error())
-		}
+
 	}
 	return result
+}
+
+// A replaced directory link changes the referent of every output below it.
+// Never follow it to hash/delete native content, or let replacement apply use it.
+func linkedPlacementParent(base, output string) (string, error) {
+	for parent := filepath.Dir(output); ; parent = filepath.Dir(parent) {
+		info, err := os.Lstat(parent)
+		if err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+		if err == nil && utils.IsLinkMode(parent, info.Mode()) {
+			return parent, nil
+		}
+		if utils.PathsEqual(parent, filepath.Clean(base)) || filepath.Dir(parent) == parent {
+			return "", nil
+		}
+	}
+}
+
+// Link identity remains available after its source disappears. A link replaced
+// by a file or another link never inherits the old output's ownership.
+func sharedOutputIdentity(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if utils.IsLinkMode(path, info.Mode()) {
+		dest, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		return "link:" + filepath.Clean(resolveReadlink(dest, path)), nil
+	}
+	return utils.FileHash(path)
 }
 
 func (r *SharedExtrasRun) Record(extra config.ExtraConfig, sourceDir string, run ExtraRun, outputExt func(config.ExtraTargetConfig) string) {
@@ -293,7 +337,7 @@ func (r *SharedExtrasRun) Record(extra config.ExtraConfig, sourceDir string, run
 			}
 			valid := true
 			for _, rel := range tr.Result.written {
-				hash, err := utils.FileHash(filepath.Join(tr.Path, rel))
+				hash, err := sharedOutputIdentity(filepath.Join(tr.Path, rel))
 				if err != nil {
 					valid = false
 					break

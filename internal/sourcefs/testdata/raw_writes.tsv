@@ -399,6 +399,7 @@ internal/sync/extras_block.go	applyExtraBlock	os.WriteFile	f.Target	target
 internal/sync/extras_block.go	collectExtraBlock	os.WriteFile	f.Source	extras
 internal/sync/extras_block.go	restoreExtraBlock	os.Remove	f.Target	target
 internal/sync/extras_block.go	restoreExtraBlock	os.WriteFile	f.Target	target
+internal/sync/extras_detach.go	(*SharedExtrasRun).detachTarget	os.Remove	path	target
 internal/sync/extras_file.go	CollectBackExtraFile	os.MkdirAll	filepath.Dir(f.Source)	extras
 internal/sync/extras_file.go	CollectBackExtraFile	os.WriteFile	f.Source	extras
 internal/sync/extras_file.go	RestoreExtraTarget	os.Remove	f.Target	target

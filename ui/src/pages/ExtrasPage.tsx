@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Ellipsis, FileText, FoldVertical, Folder, FolderPlus, Link2, ListFilter, Pencil, Plus, Puzzle, RefreshCw, Trash2, X, Zap } from 'lucide-react';
+import { sharedErrorMessage } from '../lib/sharedSettings';
 import { api } from '../api/client';
 import type { AvailableTarget, Extra, ExtraTarget } from '../api/client';
 import { queryKeys, staleTimes } from '../lib/queryKeys';
@@ -258,7 +259,7 @@ function AddExtraDialog({ onClose, onCreated, extensions, known, sharedDir, fold
       toast(t('extras.toast.created', { name: name.trim() }), 'success');
       onCreated(agents);
     } catch (err) {
-      toast((err as Error).message, 'error');
+      toast(sharedErrorMessage(err, t), 'error');
       setSaving(false);
     }
   };
@@ -496,7 +497,7 @@ export default function ExtrasPage() {
       toast(buildSyncToast(t('extras.toast.syncOne', { name }), t('extras.toast.syncOneFailed', { name }), totals, force, t), syncToastType(totals));
       void invalidate(queryClient, 'extrasChanged');
     } catch (err) {
-      toast((err as Error).message, 'error');
+      toast(sharedErrorMessage(err, t), 'error');
     }
   };
 
@@ -512,7 +513,7 @@ export default function ExtrasPage() {
       void invalidate(queryClient, 'extrasChanged');
     } catch (err) {
       if (prev) queryClient.setQueryData(queryKeys.extras, prev);
-      toast((err as Error).message, 'error');
+      toast(sharedErrorMessage(err, t), 'error');
     }
   };
 
@@ -530,7 +531,7 @@ export default function ExtrasPage() {
       void invalidate(queryClient, 'extrasChanged');
       return true;
     } catch (err) {
-      toast((err as Error).message, 'error');
+      toast(sharedErrorMessage(err, t), 'error');
       void invalidate(queryClient, 'extrasChanged');
       return false;
     }
@@ -760,7 +761,7 @@ export default function ExtrasPage() {
             toast(t('extras.toast.removed', { name }), 'success');
             void invalidate(queryClient, 'extrasChanged');
           } catch (err) {
-            toast((err as Error).message, 'error');
+            toast(sharedErrorMessage(err, t), 'error');
           }
         }}
         onCancel={() => setRemoveExtra(null)}
@@ -779,7 +780,7 @@ export default function ExtrasPage() {
             toast(t('extras.toast.targetRemoved', { path: target.path }), 'success');
             void invalidate(queryClient, 'extrasChanged');
           } catch (err) {
-            toast((err as Error).message, 'error');
+            toast(sharedErrorMessage(err, t), 'error');
           }
         }}
         onCancel={() => setRemoveTarget(null)}

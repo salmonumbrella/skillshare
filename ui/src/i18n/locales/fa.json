@@ -3622,5 +3622,17 @@
   "plugins.error.importRecipeIdentityRequired": "این دستور نصب راه دور، شناسهٔ افزونه ندارد. پیش از واردکردن، مقدار plugin: را در تعریف مشترک روی نام بستهٔ بومی تنظیم کنید؛ واردکردن، کد منبع را دانلود نمی‌کند.",
   "plugins.error.unimportTargetRequired": "unimport برای انتخاب سابقهٔ واردکردن محلی به --target نیاز دارد",
   "plugins.error.unimportTargetMissing": "{name} هیچ اتصالی برای مقصد {target} ندارد",
-  "plugins.error.unimportReceiptRequired": "{name}/{target} هیچ واردکردن محلی با دستور نصب منبع مشترک ندارد"
+  "plugins.error.unimportReceiptRequired": "{name}/{target} هیچ واردکردن محلی با دستور نصب منبع مشترک ندارد",
+  "shared.error.shared_owned": "{name} از {file} می‌آید. فایل مشترک را ویرایش کنید یا این ورودی را در این دستگاه نادیده بگیرید یا بازنویسی کنید.",
+  "shared.error.shared_unavailable": "اعمال افزونه‌های مشترک ممکن نیست. {reason} اصلاحیه را دریافت کنید، skillshare را ارتقا دهید یا shared.path را ویرایش کنید.",
+  "shared.error.shared_publication": "انتشار تنظیمات مشترک {file} رد شد. {reason} فایل و تاریخچه خروجی را بررسی و کامیت‌های ناامن را پیش از تلاش دوباره دستی اصلاح کنید.",
+  "shared.reason.missing": "فایل تنظیمات مشترک {file} وجود ندارد.",
+  "shared.reason.unreadable": "خواندن فایل تنظیمات مشترک {file} ممکن نیست.",
+  "shared.reason.parse": "فایل مشترک {file} دارای YAML نامعتبر است (خط {line}).",
+  "shared.reason.version": "{file} از نسخه جدیدتر تنظیمات مشترک استفاده می‌کند. skillshare را ارتقا دهید یا فایل سازگار دریافت کنید.",
+  "shared.reason.newer-section": "{file} بخشی دارد که این نسخه پشتیبانی نمی‌کند (خط {line}). skillshare را ارتقا دهید.",
+  "shared.reason.machine-key": "{file} دارای تنظیم مختص دستگاه است (خط {line}). آن را در config.yaml محلی نگه دارید.",
+  "shared.reason.unknown-key": "{file} دارای تنظیم ناشناخته است (خط {line}).",
+  "shared.reason.privacy": "بررسی حریم خصوصی تنظیمات مشترک {file} ناموفق بود (خط {line}، ورودی {entry}، قاعده {rule}).",
+  "shared.reason.entry": "تنظیمات مشترک {file} ورودی نامعتبر {entry} دارد (خط {line})."
 }

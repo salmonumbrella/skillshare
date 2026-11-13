@@ -20,7 +20,7 @@ type SharedPlacedTarget struct {
 	Path  string            `yaml:"path"`
 	Mode  string            `yaml:"mode,omitempty"`
 	As    string            `yaml:"as,omitempty"`
-	Files map[string]string `yaml:"files,omitempty"` // written relative outputs and hashes; merge uses names to recognize replaced links
+	Files map[string]string `yaml:"files,omitempty"` // written relative outputs: content hashes or link identities
 }
 type SharedReceipt struct {
 	Source  string               `yaml:"source"`

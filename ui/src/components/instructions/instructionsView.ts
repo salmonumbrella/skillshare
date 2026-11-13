@@ -1,3 +1,4 @@
+import { sharedErrorMessage } from '../../lib/sharedSettings';
 import { ApiError } from '../../api/client';
 import type { InstructionsWarning } from '../../api/client';
 import type { useT } from '../../i18n';
@@ -377,7 +378,7 @@ export function instructionsWarningMessage(warning: InstructionsWarning, t: Retu
 }
 
 export function instructionsErrorMessage(error: unknown, t: ReturnType<typeof useT>): string {
-  let message = (error as Error).message;
+  let message = sharedErrorMessage(error, t);
   if (error instanceof ApiError && error.code?.startsWith('instructions_')) {
     const params = Object.fromEntries(Object.entries(error.params ?? {}).map(([key, value]) => [key, typeof value === 'string' ? shortenHome(value) : String(value)]));
     message = t(`instructions.error.${error.code}`, params, message);

@@ -1,3 +1,13 @@
+export interface SharedStatusPayload {
+  enabled: boolean;
+  usable: boolean;
+  path?: string;
+  reason?: string;
+  findings?: { line?: number; column?: number; entry?: string; key?: string; rule?: string }[];
+  entries?: { name: string; origin: string }[];
+  warnings?: string[];
+}
+
 export interface ConfigSaveResponse {
   success: boolean;
   warnings?: string[];

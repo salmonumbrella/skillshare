@@ -15,6 +15,8 @@ assert.equal(stateRoot, path.join(process.env.RUNNER_TEMP, 'pr880-fixtures'));
 const { chromium } = await import(pathToFileURL(process.env.CAPTURE_PLAYWRIGHT).href);
 const viewport = { width: 1440, height: 1100 };
 const narrowViewport = { width: 1024, height: 900 };
+const annotationHeight = 56;
+let captureTitle = '';
 const names = ['_absent', '_occupied', '_blocked', '_restored', '_restored-dirty', '_restored-status', '_clean', '_dirty'];
 const declarationStates = [
   'absent-row', 'occupied-row', 'absent-confirm', 'absent-result', 'occupied-confirm', 'occupied-result',
@@ -31,7 +33,8 @@ const manifest = {
     '_restored-status ordinary checkout DELETE after real restore guard and reconfirmation: synthetic repo_status_failed 409; not backend failure proof',
     'unlink-warning DELETE on both pins: real successful unlink, then synthetic warning field added to its response; no metadata persistence fault or partial oplog is proven',
   ],
-  media: 'Dark clean style, CSS viewport crops only. Browser devicePixelRatio measured; no physical display claim. Caption/pointer are capture overlays.',
+  media: 'Dark clean style; complete app viewport below an external 56px caption matte, no scaling. Browser devicePixelRatio measured; no physical display claim. Pointer is a capture overlay. Recording has an explicit Dashboard → Skills chapter cut, not continuous real-time.',
+  presentation: { annotationHeight, appOrigin: { x: 0, y: annotationHeight }, exportedCanvases: [viewport, narrowViewport], appViewports: [viewport, narrowViewport].map(size => ({ ...size, height: size.height - annotationHeight })) },
 };
 let browser;
 let activeFixture;
@@ -45,18 +48,19 @@ function translate(messages, key, params = {}) {
   return messages[key].replace(/\{(\w+)\}/g, (_, name) => String(params[name] ?? `{${name}}`));
 }
 async function caption(page, text) {
-  await page.evaluate(text => { document.querySelector('#ci-caption').textContent = text; }, text);
+  captureTitle = text;
+}
+async function annotate(raw, file, title) {
+  // Hash-only relative textfile paths avoid filter escaping; title bytes never enter argv or a shell.
+  const textfile = `caption-${createHash('sha256').update(title).digest('hex')}.txt`;
+  await writeFile(path.join(output, textfile), title);
+  command('ffmpeg', ['-y', '-f', 'image2pipe', '-c:v', file.endsWith('.png') ? 'png' : 'mjpeg', '-i', 'pipe:0', '-vf',
+    `pad=iw:ih+${annotationHeight}:0:${annotationHeight}:color=0x15171b,drawtext=fontfile=caption-font.ttf:textfile=${textfile}:expansion=none:fontcolor=white:fontsize=20:x=(w-text_w)/2:y=(${annotationHeight}-text_h)/2`,
+    '-frames:v', '1', file], { input: raw, stdio: ['pipe', 'pipe', 'pipe'], cwd: output });
 }
 async function overlays(page) {
   // Only annotations are injected. No app DOM, API result or product assertion is replaced.
   await page.evaluate(() => {
-    const banner = document.createElement('div');
-    banner.id = 'ci-caption';
-    Object.assign(banner.style, {
-      position: 'fixed', inset: '0 0 auto 0', height: '52px', zIndex: '2147483646',
-      background: '#15171b', color: '#fff', font: '600 21px/52px system-ui', textAlign: 'center', pointerEvents: 'none',
-    });
-    document.body.append(banner);
     const pointer = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     pointer.id = 'ci-pointer';
     pointer.setAttribute('width', '28'); pointer.setAttribute('height', '36');
@@ -74,7 +78,7 @@ async function click(page, target) {
   const box = await target.boundingBox();
   assert.ok(box);
   const tip = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-  assert.ok(tip.y > 52, 'Click target must remain below caption');
+  assert.ok(tip.x >= 0 && tip.x < page.viewportSize().width && tip.y >= 0 && tip.y < page.viewportSize().height, 'Click target must remain inside app viewport');
   const from = await page.locator('#ci-pointer').evaluate(el => ({ x: parseFloat(el.style.left), y: parseFloat(el.style.top) }));
   for (let i = 1; i <= 24; i++) {
     const t = i / 24;
@@ -103,7 +107,7 @@ async function settleCapture(page, expectDialog) {
       const r = el.getBoundingClientRect();
       return !el.closest('[inert], [aria-hidden="true"]') && style.visibility === 'visible'
         && Number(style.opacity) === 1 && r.width > 0 && r.height > 0
-        && r.bottom > 52 && r.top < innerHeight && r.right > 0 && r.left < innerWidth
+        && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth
         // Own animations only: a toast's countdown and loading spinners keep running.
         && el.getAnimations().every(animation => !animation.pending
           && (animation.playState === 'finished' || animation.playState === 'idle'));
@@ -143,37 +147,60 @@ async function shot(page, side, state, title, { group = 'desktop', dialog = fals
   assert.equal(await page.getByRole('dialog').count(), Number(dialog), `${state}: expected live dialog state`);
   assert.equal(await page.locator('.ss-ghost, .ss-menu').count(), 0, `${state}: no closing overlay or menu`);
   const file = `${group}-${side}-${state}.png`;
-  await page.screenshot({ path: path.join(output, file), fullPage: false });
+  const raw = await page.screenshot({ fullPage: false });
   assert.deepEqual(await page.evaluate(captureMetrics), metrics, `${state}: frame changed during PNG capture`);
-  manifest.captures.push({ side, state, group, file, title, metrics });
+  await annotate(raw, path.join(output, file), title);
+  manifest.captures.push({ side, state, group, file, title, metrics, exportedCanvas: { width: metrics.viewport.width, height: metrics.viewport.height + annotationHeight }, annotationHeight });
 }
 
 async function startRecording(page) {
   const directory = path.join(output, 'recording-frames');
   await mkdir(directory, { recursive: true });
   let stop = false;
+  let paused = false;
+  let sampling;
+  const cuts = [];
   let recordingError;
   const frames = [];
   const loop = (async () => {
     while (!stop) {
-      assert.ok(await page.locator('html').evaluate(el => el.classList.contains('dark')));
-      const name = `${String(frames.length).padStart(6, '0')}.jpg`;
-      const time = performance.now();
-      const title = await page.locator('#ci-caption').textContent();
-      await page.screenshot({ path: path.join(directory, name), type: 'jpeg', quality: 90, fullPage: false });
-      frames.push({ name, time, title });
+      if (paused) { await page.waitForTimeout(25); continue; }
+      sampling = (async () => {
+        assert.ok(await page.locator('html').evaluate(el => el.classList.contains('dark')));
+        const name = `${String(frames.length).padStart(6, '0')}.jpg`;
+        const time = performance.now();
+        const title = captureTitle;
+        const raw = await page.screenshot({ type: 'jpeg', quality: 90, fullPage: false });
+        await writeFile(path.join(directory, name), raw);
+        frames.push({ name, time, title });
+      })();
+      await sampling;
       await page.waitForTimeout(100);
     }
   })().catch(error => { recordingError = error; stop = true; });
-  return async () => {
+  const finish = async () => {
     stop = true;
     await loop;
+    if (paused && cuts.length) cuts.at(-1).end = performance.now();
     if (recordingError) throw recordingError;
     assert.ok(frames.length > 1);
-    // Preserve actual sample timing. The frames begin only after the loaded dark app.
-    const list = frames.flatMap((frame, i) => [
+    // Keep actual sample timestamps; only the explicitly marked route-loading interval is omitted.
+    let timeline = 0;
+    for (const [i, frame] of frames.entries()) {
+      const next = frames[i + 1]?.time;
+      frame.duration = next === undefined ? 0.15 : (next - frame.time - cuts.reduce((sum, cut) => sum + Math.max(0, Math.min(next, cut.end) - Math.max(frame.time, cut.start)), 0)) / 1000;
+      assert.ok(frame.duration > 0, 'Exported sample duration must remain positive');
+      frame.timeline = timeline;
+      timeline += frame.duration;
+      await annotate(await readFile(path.join(directory, frame.name)), path.join(directory, frame.name), frame.title);
+    }
+    for (const cut of cuts) {
+      const resumed = frames.find(frame => frame.time >= cut.end);
+      Object.assign(cut, { resumeFrame: resumed?.name, timeline: resumed?.timeline });
+    }
+    const list = frames.flatMap(frame => [
       `file '${frame.name}'`,
-      `duration ${i + 1 < frames.length ? (frames[i + 1].time - frame.time) / 1000 : 0.15}`,
+      `duration ${frame.duration}`,
     ]);
     list.push(`file '${frames.at(-1).name}'`);
     await writeFile(path.join(directory, 'frames.txt'), list.join('\n'));
@@ -185,9 +212,20 @@ async function startRecording(page) {
     assert.equal(probe.streams[0].height, viewport.height);
     manifest.recording = {
       file: 'removal-sequence.mp4', frames: frames.length, probe,
+      timing: 'time: screenshot-request monotonic ms; cut start/end: monotonic ms. timeline/duration: concat seconds, quantized to 30fps; final sample holds 0.15s, probe gives encoded duration. Only the marked route-loading cut is omitted; not continuous real-time.', cuts,
+      sampleTimings: frames.map(({ name, time, timeline, duration }) => ({ name, time, timeline, duration })),
       captionFrames: frames.filter((frame, i) => i === 0 || frame.title !== frames[i - 1].title),
     };
   };
+  finish.pause = async () => { paused = true; await sampling; cuts.push({ reason: 'Dashboard → Skills: unrelated route loading omitted', start: performance.now(), afterFrame: frames.at(-1).name }); };
+  finish.resume = async () => {
+    cuts.at(-1).end = performance.now(); paused = false;
+    const previous = frames.length;
+    while (frames.length === previous && !stop) await page.waitForTimeout(25);
+    if (recordingError) throw recordingError;
+    assert.ok(frames.length > previous, 'Resume must capture the loaded Skills chapter before its first action');
+  };
+  return finish;
 }
 
 async function session(side, group, size, locale, fixtureNames = names) {
@@ -197,7 +235,7 @@ async function session(side, group, size, locale, fixtureNames = names) {
   const fixture = await makeFixture(path.join(stateRoot, group), app, path.join(process.env.RUNNER_TEMP, `pr880-${side}`), fixtureNames);
   activeFixture = fixture;
   const url = await fixture.start(side === 'before' ? 19421 : 19422);
-  const context = await browser.newContext({ viewport: size, deviceScaleFactor: 1, colorScheme: 'dark', locale: locale === 'de' ? 'de-DE' : 'en-US', serviceWorkers: 'block' });
+  const context = await browser.newContext({ viewport: { ...size, height: size.height - annotationHeight }, deviceScaleFactor: 1, colorScheme: 'dark', locale: locale === 'de' ? 'de-DE' : 'en-US', serviceWorkers: 'block' });
   activeContext = context;
   await context.addInitScript(locale => {
     localStorage.setItem('skillshare-theme-preference', 'dark');
@@ -262,6 +300,7 @@ async function session(side, group, size, locale, fixtureNames = names) {
 
 function row(page, name) { return page.locator('.ss-r').filter({ has: page.getByText(name.replace(/^_/, ''), { exact: true }) }); }
 async function openConfirmation(s, name) {
+  await caption(s.page, `Open ${name} actions, then select Uninstall`);
   await click(s.page, row(s.page, name).getByRole('button', { name: s.t('dashboard.trackedRepos.actions'), exact: true }));
   await click(s.page, s.page.getByRole('menuitem', { name: s.t('dashboard.trackedRepos.uninstall'), exact: true }));
   await s.page.getByRole('dialog').waitFor();
@@ -274,6 +313,7 @@ function assertRepoIntent(response, recordOnly, force = false) {
   assert.equal(params.get('force'), force ? 'true' : null, 'Only explicit checkout force confirmation may send force=true');
 }
 async function deleteClick(s, recordOnly = false) {
+  await caption(s.page, recordOnly ? 'Confirm record removal: files stay in place' : 'Confirm checkout removal: move skills to trash');
   const response = s.page.waitForResponse(response => response.request().method() === 'DELETE' && response.url().includes('/api/repos/'));
   await click(s.page, s.page.getByRole('dialog').getByRole('button', { name: s.t('dashboard.trackedRepos.uninstall'), exact: true }));
   const result = await response;
@@ -352,6 +392,7 @@ async function desktop(side) {
     assert.ok(JSON.parse(await readFile(fixture.metadata, 'utf8')).entries._blocked);
     await shot(page, side, 'blocked-error', 'Synthetic nonforceable failure: record stays, no force action', { dialog: true });
     await page.waitForTimeout(2000);
+    await caption(page, 'Cancel the failed record removal; keep the repository record');
     await click(page, page.getByRole('dialog').getByRole('button', { name: s.t('common.cancel'), exact: true }));
     check('after: labelled synthetic nonforceable error keeps record/row and offers no force');
 
@@ -381,6 +422,8 @@ async function desktop(side) {
       assert.equal(await readFile(fixture.ignore, 'utf8'), currentIgnore);
       assert.equal((await s.trash()).some(item => item.name === name), false);
       assert.equal(requests().length, 1, 'Restore guard must not automatically retry or force checkout removal');
+      await page.waitForTimeout(2000);
+      await page.getByText(s.t('dashboard.trackedRepos.checkoutRestored'), { exact: true }).waitFor({ state: 'hidden', timeout: 15000 });
 
       // A separate menu selection and ordinary confirmation explicitly authorize checkout removal.
       await openConfirmation(s, name);
@@ -417,6 +460,7 @@ async function desktop(side) {
         assert.equal(await readFile(fixture.ignore, 'utf8'), currentIgnore);
         assert.equal((await s.trash()).some(item => item.name === name), false);
         const retried = page.waitForResponse(r => r.request().method() === 'DELETE' && r.url().includes(`/api/repos/${name}`));
+        await caption(page, 'Explicitly confirm Retry with Force for this checkout');
         await click(page, dialog.getByRole('button', { name: s.t('resources.uninstall.retryForce'), exact: true }));
         response = await retried;
         assert.equal(new URL(response.url()).searchParams.get('force'), 'true');
@@ -443,6 +487,7 @@ async function desktop(side) {
       await retry.waitFor();
       await shot(page, side, 'dirty-refusal', 'Real dirty checkout: changes require explicit force confirmation', { dialog: true });
       const result = page.waitForResponse(r => r.request().method() === 'DELETE' && r.url().includes('/api/repos/_dirty'));
+      await caption(page, 'Explicitly confirm Retry with Force for the dirty checkout');
       await click(page, retry);
       response = await result;
       assert.equal(new URL(response.url()).searchParams.get('force'), 'true');
@@ -464,8 +509,14 @@ async function desktop(side) {
 async function unlinkFolders(s, side) {
   const { page, fixture } = s;
   // Use the actual Resources route and its existing UnlinkFolderDialog owner.
+  if (recorder) await recorder.pause();
   await click(page, page.getByRole('link', { name: s.t('layout.nav.skills'), exact: true }));
   await page.getByRole('heading', { name: s.t('layout.nav.skills'), exact: true }).waitFor();
+  for (const link of fixture.links) await page.locator('.ss-gh').filter({ has: page.getByText(link.name, { exact: true }) }).waitFor();
+  await page.evaluate(() => document.fonts.ready);
+  await settleCapture(page, false);
+  await caption(page, 'Skills loaded: review linked folders before Unlink');
+  if (recorder) { await recorder.resume(); await page.waitForTimeout(1000); }
   for (const link of fixture.links) {
     const synthetic = link.name === 'unlink-warning';
     const endpoint = `/api/source-links/${link.name}`;
@@ -494,6 +545,7 @@ async function unlinkFolders(s, side) {
         } });
       });
     }
+    await caption(page, `Open ${link.name} Unlink confirmation; target folder stays`);
     await click(page, group.getByRole('button', { name: s.t('sourceLinks.unlink'), exact: true }));
     const dialog = page.getByRole('dialog', { name: s.t('sourceLinks.unlinkTitle', { name: link.name }), exact: true });
     await dialog.waitFor();
@@ -506,6 +558,7 @@ async function unlinkFolders(s, side) {
       ? 'Synthetic warning response fixture: actual Unlink confirmation'
       : 'Healthy unlink: target stays; only the source link goes to trash', { dialog: true });
     const pending = page.waitForResponse(response => response.request().method() === 'DELETE' && new URL(response.url()).pathname === endpoint);
+    await caption(page, `Confirm Unlink for ${link.name}; preserve the target folder`);
     await click(page, dialog.getByRole('button', { name: s.t('sourceLinks.unlink'), exact: true }));
     const response = await pending;
     assert.equal(response.status(), 200);
@@ -570,6 +623,17 @@ async function localized(side) {
 try {
   manifest.ciHead = command('git', ['-C', path.join(workspace, 'harness'), 'rev-parse', 'HEAD']).trim();
   manifest.tools = { node: process.version, pnpm: command('pnpm', ['--version']).trim(), go: command('go', ['version']).trim(), ffmpeg: command('ffmpeg', ['-version']).split('\n')[0] };
+  assert.match(command('ffmpeg', ['-hide_banner', '-filters']), /\bdrawtext\b/, 'Installed ffmpeg must support caption rendering');
+  // Playwright --with-deps in the existing Ubuntu capture workflow installs fonts-liberation.
+  let fontSource;
+  let font;
+  for (const candidate of ['/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf']) {
+    try { font = await readFile(candidate); fontSource = candidate; break; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  assert.ok(font, 'Existing capture dependencies must provide Liberation Sans');
+  await writeFile(path.join(output, 'caption-font.ttf'), font);
+  manifest.presentation.font = { source: fontSource, file: 'caption-font.ttf', sha256: createHash('sha256').update(font).digest('hex'), size: 20 };
   manifest.tools.playwright = JSON.parse(await readFile(new URL('./package.json', pathToFileURL(process.env.CAPTURE_PLAYWRIGHT)), 'utf8')).version;
   manifest.sourceHashes = {};
   for (const file of ['.github/workflows/pr880-hosted-ui.yml', 'scripts/ci-ui/capture.mjs', 'scripts/ci-ui/fixture.mjs', 'scripts/ci-ui/cleanup.mjs']) {

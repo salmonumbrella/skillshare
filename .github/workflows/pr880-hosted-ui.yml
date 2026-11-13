@@ -1,0 +1,133 @@
+name: PR880 hosted UI evidence
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/pr880-hosted-ui.yml
+      - scripts/ci-ui/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr880-ui-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  BEFORE_SHA: b7c34d6af5ebf881ee2cce70023d33bddce80964
+  AFTER_SHA: 2c27e52c8e7ed9ddca638771dc9ebbcb55c3f05d
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 2c27e52c8e7ed9ddca638771dc9ebbcb55c3f05d
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.6.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Verify product pin
+        run: test "$(git rev-parse HEAD)" = "$AFTER_SHA"
+      - name: Install UI dependencies
+        id: ui-deps
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+      - name: UI lint
+        if: ${{ !cancelled() && steps.ui-deps.outcome == 'success' }}
+        working-directory: ui
+        run: pnpm run lint
+      - name: Dashboard, invalidation and i18n coverage
+        if: ${{ !cancelled() && steps.ui-deps.outcome == 'success' }}
+        working-directory: ui
+        run: pnpm run test -- src/pages/DashboardPage.test.tsx src/lib/queryEvents.test.ts src/i18n
+      - name: UI production build
+        if: ${{ !cancelled() && steps.ui-deps.outcome == 'success' }}
+        working-directory: ui
+        run: pnpm run build
+      - name: Website frozen dependency install and build
+        if: ${{ !cancelled() }}
+        working-directory: website
+        run: |
+          npm ci
+          npm run build
+
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout capture source at the CI PR head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: harness
+          persist-credentials: false
+      - name: Checkout actual before app
+        uses: actions/checkout@v7
+        with:
+          ref: b7c34d6af5ebf881ee2cce70023d33bddce80964
+          path: before
+          persist-credentials: false
+      - name: Checkout actual after app
+        uses: actions/checkout@v7
+        with:
+          ref: 2c27e52c8e7ed9ddca638771dc9ebbcb55c3f05d
+          path: after
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.6.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: after/go.mod
+          cache-dependency-path: after/go.sum
+      - name: Build both pinned apps without changing product source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C before rev-parse HEAD)" = "$BEFORE_SHA"
+          test "$(git -C after rev-parse HEAD)" = "$AFTER_SHA"
+          mkdir -p evidence
+          for side in before after; do
+            (
+              cd "$side"
+              pnpm --dir ui install --frozen-lockfile
+              pnpm --dir ui run build
+              go build -o "$RUNNER_TEMP/pr880-$side" ./cmd/skillshare
+            ) 2>&1 | tee "evidence/$side-build.log"
+          done
+      - name: Install isolated capture tools (no product dependency changes)
+        run: |
+          npm install --prefix "$RUNNER_TEMP/pr880-tools" --no-save --no-package-lock --ignore-scripts playwright@1.56.1
+          node "$RUNNER_TEMP/pr880-tools/node_modules/playwright/cli.js" install --with-deps chromium
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+      - name: Capture real dashboard controls and removal sequence
+        env:
+          CAPTURE_PLAYWRIGHT: ${{ runner.temp }}/pr880-tools/node_modules/playwright/index.mjs
+          CAPTURE_STATE_ROOT: ${{ runner.temp }}/pr880-fixtures
+        run: node harness/scripts/ci-ui/capture.mjs 2>&1 | tee evidence/capture.log
+      - name: Stop owned backends and remove synthetic homes even after interruption
+        if: always()
+        run: |
+          mkdir -p evidence
+          node harness/scripts/ci-ui/cleanup.mjs
+      - name: Upload evidence, traces, source identities and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr880-ui-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14

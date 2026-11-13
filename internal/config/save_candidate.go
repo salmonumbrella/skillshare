@@ -50,6 +50,9 @@ func PrepareSave(path string, next *Config) (*SaveCandidate, error) {
 
 func serializeConfig(path string, next *Config) ([]byte, error) {
 	payload := next.withoutProjectTargets()
+	if err := sharedSavePayload(payload); err != nil {
+		return nil, err
+	}
 	if next.PreserveTildeOnSave {
 		payload = payload.cloneForSave()
 	}

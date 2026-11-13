@@ -82,6 +82,11 @@ func PrepareProjectLayers(path string, cfg *Config, edit func(*ProjectLayers) er
 		c.Err = fmt.Errorf("cannot prepare projects for a nil config")
 		return c, c.Err
 	}
+	probe := cfg.withoutProjectTargets()
+	if err := sharedSavePayload(probe); err != nil {
+		c.Err = err
+		return c, err
+	}
 	o, err := projectSnapshot(path, cfg)
 	if err != nil {
 		c.Err = err

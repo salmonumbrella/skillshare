@@ -408,6 +408,8 @@ type Config struct {
 	Targets      map[string]TargetConfig `yaml:"targets"`
 	// Projects are project folders synced from this config, keyed by root as written.
 	Projects       map[string]ManagedProject `yaml:"projects,omitempty"`
+	sharedLayer    *sharedLayer
+	Shared         *SharedPointer `yaml:"shared,omitempty"`
 	projectOverlay *projectOverlay
 	Extras         []ExtraConfig       `yaml:"extras,omitempty"`
 	Ignore         []string            `yaml:"ignore,omitempty"`
@@ -781,11 +783,15 @@ func decodeConfig(path string, data []byte, persist bool) (*Config, error) {
 	// Project candidates must not discard this raw section while loading in place.
 	var legacy struct {
 		Skills yaml.Node `yaml:"skills"`
+		Shared yaml.Node `yaml:"shared"`
 	}
 	if err := yaml.Unmarshal(data, &legacy); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 	cfg.legacySkills = legacy.Skills
+	if legacy.Shared.Kind != 0 && cfg.Shared == nil {
+		return nil, fmt.Errorf("shared.path is required")
+	}
 
 	threshold, err := normalizeAuditBlockThreshold(cfg.Audit.BlockThreshold)
 	if err != nil {
@@ -883,6 +889,10 @@ func decodeConfig(path string, data []byte, persist bool) (*Config, error) {
 		}
 	}
 
+	if err := cfg.loadShared(path); err != nil {
+		return nil, err
+	}
+
 	// Cache SourceRoot so callers don't re-walk .git/ on every LoadRegistry call.
 	// Use EffectiveSkillsSource so configs using the new sources.skills field
 	// (without a legacy source: top-level) still resolve a registry root.
@@ -900,17 +910,14 @@ func decodeConfig(path string, data []byte, persist bool) (*Config, error) {
 func (c *Config) Save() error {
 	path := ConfigPath()
 
-	// Ensure directory exists
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create config directory: %w", err)
-	}
-
 	// fork patch: fold $HOME prefixes back to ~ so serialized paths are
 	// machine-agnostic (dotfiles-friendly). Opt-in via preserve_tilde_on_save.
 	// The in-memory config is left untouched; we marshal a shallow copy with
 	// folded path fields.
 	payload := c.withoutProjectTargets()
+	if err := sharedSavePayload(payload); err != nil {
+		return err
+	}
 	if c.PreserveTildeOnSave {
 		payload = payload.cloneForSave()
 	}
@@ -919,6 +926,9 @@ func (c *Config) Save() error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("failed to write config: %w", err)
 	}
@@ -941,6 +951,12 @@ func (c *Config) cloneForSave() *Config {
 	}
 
 	fold := func(p string) string { return utils.FoldHomePathWith(p, home) }
+
+	if c.Shared != nil {
+		pointer := *c.Shared
+		pointer.Path = fold(pointer.Path)
+		out.Shared = &pointer
+	}
 
 	out.Source = fold(out.Source)
 	out.AgentsSource = fold(out.AgentsSource)

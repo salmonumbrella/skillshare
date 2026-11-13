@@ -7,6 +7,25 @@
   "additionalProperties": false,
   "allOf": [{"not": {"required": ["sources", "mcp"], "properties": {"sources": {"required": ["mcp"]}, "mcp": {"required": ["servers"]}}}}],
   "properties": {
+    "shared": {
+      "type": "object",
+      "description": "Opt in to portable shared extras. Relative paths resolve beside config.yaml.",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "skip": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "extras": {"type": "array", "items": {"type": "string"}},
+            "hooks": {"type": "array", "items": {"type": "string"}},
+            "mcp": {"type": "array", "items": {"type": "string"}},
+            "plugins": {"type": "array", "items": {"type": "string"}}
+          }
+        }
+      }
+    },
     "mcp": {"$ref": "mcp.schema.json#/$defs/globalConfiguration"},
     "hooks": {"$ref": "hooks.schema.json#/$defs/globalConfiguration"},
     "source": {

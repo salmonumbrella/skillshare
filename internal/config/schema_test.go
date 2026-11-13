@@ -479,3 +479,24 @@ func TestSchema_TargetConfigAllowsOpenCodeAgent(t *testing.T) {
 		t.Fatalf("targetConfig.agent enum missing opencode: %v", enums)
 	}
 }
+
+func TestSchema_SharedPointerIsStrict(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(findRepoRoot(t), "schemas/config.schema.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			AdditionalProperties bool                       `json:"additionalProperties"`
+			Required             []string                   `json:"required"`
+			Properties           map[string]json.RawMessage `json:"properties"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(data, &schema); err != nil {
+		t.Fatal(err)
+	}
+	shared, ok := schema.Properties["shared"]
+	if !ok || shared.AdditionalProperties || !slices.Contains(shared.Required, "path") || len(shared.Properties) != 2 {
+		t.Fatal("shared pointer schema must require path and allow only path/skip")
+	}
+}

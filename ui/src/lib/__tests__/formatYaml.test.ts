@@ -53,3 +53,9 @@ describe('formatYaml', () => {
     expect(formatYaml(formatted, { organizeConfig: true })).toBe(formatted);
   });
 });
+
+it('places shared after projects in config order', () => {
+  const result = formatYaml('hub: {}\nshared: {path: ./team.yaml}\nprojects: {}\n', { organizeConfig: true });
+  expect(result.indexOf('projects:')).toBeLessThan(result.indexOf('shared:'));
+  expect(result.indexOf('shared:')).toBeLessThan(result.indexOf('hub:'));
+});

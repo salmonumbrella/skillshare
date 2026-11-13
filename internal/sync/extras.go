@@ -15,6 +15,7 @@ import (
 
 // ExtraResult holds the result of an extras sync operation.
 type ExtraResult struct {
+	written      []string      // outputs actually written, never pre-existing identical files
 	Preserved    int           // Skipped files whose identical local content was kept
 	Synced       int           // Files synced (new + already correct)
 	Skipped      int           // Files skipped (local conflict, no --force)
@@ -77,8 +78,9 @@ func DiscoverExtraFiles(sourcePath string) ([]string, error) {
 
 // ExtraSyncOptions holds the run flags of one extras sync or collect.
 type ExtraSyncOptions struct {
-	DryRun bool
-	Force  bool
+	Protected map[string]bool
+	DryRun    bool
+	Force     bool
 	// ProjectRoot decides relative links; empty in global mode.
 	ProjectRoot string
 }
@@ -105,7 +107,7 @@ func syncExtraDir(sourcePath, targetPath, mode string, target config.ExtraTarget
 		if mode != "" && mode != "copy" {
 			return nil, fmt.Errorf("extension %q requires copy mode, got %q", spec.Name, mode)
 		}
-		return syncExtraTransform(sourcePath, targetPath, target, spec, opts.DryRun, opts.Force)
+		return syncExtraTransform(sourcePath, targetPath, target, spec, opts)
 	}
 	if mode == "" {
 		mode = "merge"
@@ -121,7 +123,7 @@ func syncExtraDir(sourcePath, targetPath, mode string, target config.ExtraTarget
 	case "symlink":
 		return syncExtraSymlinkMode(sourcePath, targetPath, opts.DryRun, opts.Force, opts.ProjectRoot)
 	case "merge", "copy":
-		return syncExtraPerFile(sourcePath, targetPath, mode, target, opts.DryRun, opts.Force, opts.ProjectRoot)
+		return syncExtraPerFile(sourcePath, targetPath, mode, target, opts)
 	default:
 		return nil, fmt.Errorf("unsupported extras sync mode: %q", mode)
 	}
@@ -131,7 +133,8 @@ func syncExtraDir(sourcePath, targetPath, mode string, target config.ExtraTarget
 // transformed output into targetPath using copy semantics. Output files are
 // renamed per spec.OutputExt. It does not prune output-looking orphans because
 // copy targets do not carry ownership metadata.
-func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTargetConfig, spec *ExtensionSpec, dryRun, force bool) (*ExtraResult, error) {
+func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTargetConfig, spec *ExtensionSpec, opts ExtraSyncOptions) (*ExtraResult, error) {
+	dryRun, force := opts.DryRun, opts.Force
 	result := &ExtraResult{}
 
 	files, warnings, err := DiscoverExtraTargetFiles(sourcePath, "", target)
@@ -161,6 +164,11 @@ func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTarget
 		}
 		tgtRel = ApplyOutputExt(tgtRel, spec.OutputExt)
 		tgtFile := filepath.Join(targetPath, tgtRel)
+		if protectedOutput(tgtFile, opts.Protected) {
+			result.Skipped++
+			result.Warnings = append(result.Warnings, "kept: edited by you")
+			continue
+		}
 
 		// Dry-run reports the outcome without spawning the extension and without
 		// touching the filesystem. The transformed output can only be produced by
@@ -238,6 +246,7 @@ func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTarget
 			continue
 		}
 		result.Synced++
+		result.written = append(result.written, tgtRel)
 	}
 
 	return result, nil
@@ -320,7 +329,8 @@ func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool, pro
 // syncExtraPerFile handles merge (symlink) and copy modes on a per-file basis.
 // Merge copies instead when file links are unavailable; those copies are
 // tracked so later syncs keep them updated and pruned like links.
-func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTargetConfig, dryRun, force bool, projectRoot string) (*ExtraResult, error) {
+func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTargetConfig, opts ExtraSyncOptions) (*ExtraResult, error) {
+	dryRun, force, projectRoot := opts.DryRun, opts.Force, opts.ProjectRoot
 	result := &ExtraResult{}
 
 	var copies *copyTracker
@@ -364,7 +374,7 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 		}
 		tgtFile := filepath.Join(targetPath, tgtRel)
 
-		synced, skipped, syncErr := syncOneExtraFile(srcFile, tgtFile, mode, dryRun, force, relative, copies, tgtRel)
+		synced, skipped, syncErr := syncOneExtraFile(srcFile, tgtFile, mode, dryRun, force, relative, copies, tgtRel, opts.Protected, &result.written)
 		if syncErr != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", rel, syncErr))
 			continue
@@ -372,6 +382,9 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 		result.Synced += synced
 		result.Skipped += skipped
 		if skipped > 0 {
+			if protectedOutput(tgtFile, opts.Protected) {
+				result.Warnings = append(result.Warnings, "kept: edited by you")
+			}
 			if info, err := os.Lstat(tgtFile); err == nil && info.Mode().IsRegular() && contentEqual(srcFile, tgtFile) {
 				result.Preserved += skipped
 			}
@@ -390,6 +403,11 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 		} else {
 			for _, f := range files {
 				sourceSet[f] = true
+			}
+		}
+		for path := range opts.Protected {
+			if rel, err := filepath.Rel(targetPath, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
+				sourceSet[rel] = true
 			}
 		}
 		if mode == "merge" {
@@ -418,7 +436,10 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 // syncOneExtraFile syncs a single file. Returns (synced, skipped, error).
 // copies, when set, tracks copies made in place of merge-mode links under
 // the target-relative name tgtRel.
-func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force, relative bool, copies *copyTracker, tgtRel string) (int, int, error) {
+func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force, relative bool, copies *copyTracker, tgtRel string, protected map[string]bool, written *[]string) (int, int, error) {
+	if protectedOutput(tgtFile, protected) {
+		return 0, 1, nil
+	}
 	// Ensure parent directory exists
 	if !dryRun {
 		if err := os.MkdirAll(filepath.Dir(tgtFile), 0755); err != nil {
@@ -493,6 +514,9 @@ func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force, relative boo
 		if copies != nil {
 			copies.record(tgtRel)
 		}
+	}
+	if written != nil {
+		*written = append(*written, tgtRel)
 	}
 
 	return 1, 0, nil

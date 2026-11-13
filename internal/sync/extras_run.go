@@ -11,8 +11,9 @@ import (
 
 // ExtraRunOptions holds what differs between the callers of RunExtraTargets.
 type ExtraRunOptions struct {
-	DryRun bool
-	Force  bool
+	Protected map[string]bool
+	DryRun    bool
+	Force     bool
 	// ProjectRoot is passed to the sync; empty in global mode.
 	ProjectRoot string
 	// ResolvePath turns a configured target path into the path to sync.
@@ -107,7 +108,7 @@ func runExtraTarget(extra config.ExtraConfig, t config.ExtraTargetConfig, source
 		}
 	}
 
-	tr.Result, tr.Err = SyncExtraTarget(extra, t, sourceDir, tr.Path, tr.Mode, spec, ExtraSyncOptions{DryRun: opts.DryRun, Force: opts.Force, ProjectRoot: opts.ProjectRoot})
+	tr.Result, tr.Err = SyncExtraTarget(extra, t, sourceDir, tr.Path, tr.Mode, spec, ExtraSyncOptions{DryRun: opts.DryRun, Force: opts.Force, ProjectRoot: opts.ProjectRoot, Protected: opts.Protected})
 	tr.Mode = ExtraTargetMode(tr.Mode, extra.File != "")
 	return tr
 }
@@ -115,6 +116,13 @@ func runExtraTarget(extra config.ExtraConfig, t config.ExtraTargetConfig, source
 // SyncExtraTarget syncs one target of an extra. Single-file extras (file:)
 // sync just that file to <target>/<as or file>; others sync the directory.
 func SyncExtraTarget(extra config.ExtraConfig, target config.ExtraTargetConfig, sourceDir, targetPath, mode string, spec *ExtensionSpec, opts ExtraSyncOptions) (*ExtraResult, error) {
+	output := targetPath
+	if extra.File != "" {
+		output = NewExtraFile(sourceDir, extra.File, targetPath, target.As, mode).Target
+	}
+	if (extra.File != "" || EffectiveMode(mode) == "symlink") && protectedOutput(output, opts.Protected) {
+		return keptExtraResult(), nil
+	}
 	if extra.File == "" {
 		return syncExtraDir(sourceDir, targetPath, mode, target, spec, opts)
 	}

@@ -190,11 +190,6 @@ func cmdExtrasRemoveTarget(args []string) error {
 }
 
 func managedExtraTargetFiles(target config.ExtraTargetConfig, sourceDir, extensionsDir string) (map[string]bool, error) {
-	files, _, err := sync.DiscoverExtraTargetFiles(sourceDir, "", target)
-	if err != nil {
-		return nil, err
-	}
-
 	outputExt := ""
 	if target.Extension != "" {
 		spec, err := resolveExtension(target.Extension, extensionsDir)
@@ -206,16 +201,7 @@ func managedExtraTargetFiles(target config.ExtraTargetConfig, sourceDir, extensi
 		}
 	}
 
-	seen := make(map[string]bool)
-	managed := make(map[string]bool)
-	for _, rel := range files {
-		tgtRel, ok := sync.FlattenRel(rel, target.Flatten, seen)
-		if !ok {
-			continue
-		}
-		managed[sync.ApplyOutputExt(tgtRel, outputExt)] = true
-	}
-	return managed, nil
+	return sync.ManagedExtraTargetFiles(target, sourceDir, outputExt)
 }
 
 func printExtrasRemoveTargetHelp() {

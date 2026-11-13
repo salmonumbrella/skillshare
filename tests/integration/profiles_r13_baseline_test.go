@@ -41,7 +41,8 @@ func TestProfiles_BaselinePruneRisk(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(entry, "SKILL.md"), []byte("# Target edit"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	sb.RunCLI("target", "claude", "--mode", "merge", "--add-exclude", "edit-me").AssertSuccess(t)
+	sb.RunCLI("target", "claude", "--mode", "merge").AssertSuccess(t)
+	sb.RunCLI("target", "claude", "--add-exclude", "edit-me").AssertSuccess(t)
 	sb.RunCLI("sync").AssertSuccess(t)
 	if _, err := os.Lstat(entry); !os.IsNotExist(err) {
 		t.Fatalf("edited target entry was not removed: %v", err)

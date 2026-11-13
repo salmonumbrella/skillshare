@@ -365,13 +365,14 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 
 	var copies *copyTracker
 	if mode == "merge" {
-		copies = loadCopyTracker(targetPath)
 		if opts.place != nil {
 			var err error
 			copies, err = loadSharedCopyTracker(targetPath)
 			if err != nil {
 				return nil, opts.shared.latch(err)
 			}
+		} else {
+			copies = loadCopyTracker(targetPath)
 		}
 		if !canCreateFileLink() {
 			mode = "copy"
@@ -570,7 +571,6 @@ func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force, relative boo
 		if mode == "copy" {
 			change.metadata["fallback"] = after
 		}
-		change.fallback = mode == "copy"
 	}
 	if err := placeExtra(place, change, func() error {
 		if err := os.MkdirAll(filepath.Dir(tgtFile), 0755); err != nil {

@@ -89,6 +89,12 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 	defer sharedRun.Close()
 	if sharedRun != nil {
 		cfg = sharedRun.Config()
+		if _, _, err := config.ValidateConfigForSync(cfg); err != nil {
+			if jsonOutput {
+				return writeJSONError(err)
+			}
+			return err
+		}
 	}
 	totals := extrasSyncTotals{width: extrasRowWidth(cfg.Extras)}
 	jsonEntries := sharedDetachEntries(sharedRun.Detach(config.ExpandPath), jsonOutput, &totals)

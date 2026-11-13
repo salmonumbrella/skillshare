@@ -698,6 +698,9 @@ func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult,
 	defer session.Close()
 	if session != nil {
 		cfg = session.Config()
+		if err := cfg.ValidateExtras(); err != nil {
+			return nil, err
+		}
 	}
 	extras := cfg.Extras
 	if s.IsProjectMode() {

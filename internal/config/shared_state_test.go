@@ -302,7 +302,7 @@ func TestSharedStateRefusesSymlink(t *testing.T) {
 }
 
 func TestSharedPointerHistoryAllWriters(t *testing.T) {
-	for _, writer := range []string{"save", "prepare", "raw"} {
+	for _, writer := range []string{"save", "prepare", "raw", "project"} {
 		for _, transition := range []string{"change", "remove", "set"} {
 			t.Run(writer+"/"+transition, func(t *testing.T) {
 				sb, cfg := sharedFixture(t, "", "version: 1\n")
@@ -313,6 +313,7 @@ func TestSharedPointerHistoryAllWriters(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				state.State.Pending = fixtureSharedIntent(t, sb)
 				state.State.Extras = []SharedPlacement{{Name: "fromEnv", Declaration: fixtureDeclaration(t), Receipt: SharedReceipt{Source: filepath.Join(sb.Home, "rules")}}}
 				if err := state.Save(); err != nil {
 					t.Fatal(err)
@@ -340,6 +341,15 @@ func TestSharedPointerHistoryAllWriters(t *testing.T) {
 					if err == nil {
 						err = candidate.Write()
 					}
+				case "project":
+					var candidate *SaveCandidate
+					candidate, err = PrepareProjectLayers(sb.ConfigPath, cfg, func(layers *ProjectLayers) error {
+						layers.SetShared(filepath.Join(sb.Root, "project"), ManagedProject{Targets: []string{"claude"}})
+						return nil
+					})
+					if err == nil {
+						err = candidate.Write()
+					}
 				case "raw":
 					raw := "# exact raw editor bytes\nsource: " + filepath.ToSlash(sb.SourcePath) + "\ntargets: {}\n"
 					if next != "" {
@@ -357,6 +367,13 @@ func TestSharedPointerHistoryAllWriters(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				fresh, err := LoadReadOnlyPath(sb.ConfigPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := fresh.RecordSharedPointer(sb.SourcePath, false); err != nil {
+					t.Fatal(err)
+				}
 				loaded, err := LoadSharedState(sb.ConfigPath, sb.SourcePath, filepath.Join(sb.Root, "team"))
 				if err != nil {
 					t.Fatal(err)
@@ -366,7 +383,7 @@ func TestSharedPointerHistoryAllWriters(t *testing.T) {
 						t.Fatalf("forgot %s: %v", p, loaded.State.Pointers)
 					}
 				}
-				if loaded.State.Pointer != next || len(loaded.State.Extras) != 1 {
+				if loaded.State.Pointer != next || len(loaded.State.Extras) != 1 || loaded.State.Pending == nil {
 					t.Fatalf("history/placements=%+v", loaded.State)
 				}
 			})

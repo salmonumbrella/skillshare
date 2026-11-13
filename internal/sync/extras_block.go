@@ -290,6 +290,9 @@ func applyExtraBlock(f ExtraFile, dryRun, overwriteEdited bool) (*ExtraResult, e
 	case contentBlockHash(found.body) != found.hash && !overwriteEdited:
 		return nil, fmt.Errorf("the managed block of %s in %s was edited by hand; collect the edit into the source or remove the block before syncing", f.Source, f.Target)
 	case found.body == body && contentBlockHash(found.body) == found.hash:
+		if err := checkpointUnchangedExtra(f, dryRun); err != nil {
+			return nil, err
+		}
 		return result, nil
 	default:
 		block := strings.Split(strings.TrimSuffix(renderContentBlock(f.blockSrc(), body, eol), "\n"), "\n")

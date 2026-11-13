@@ -150,6 +150,9 @@ func syncExtraFileReplace(f ExtraFile, dryRun bool, projectRoot string) (*ExtraR
 		return nil, fmt.Errorf("failed to inspect target: %w", err)
 	case utils.IsSymlinkOrJunction(f.Target):
 		if !copyMode && f.isOurLink() && fileLinkUsable(f.Target) {
+			if err := checkpointUnchangedExtra(f, dryRun); err != nil {
+				return nil, err
+			}
 			dest, _ := os.Readlink(f.Target)
 			if linkNeedsReformat(dest, relative) && !dryRun {
 				if err := placeExtra(f.place, placementChange{path: f.Target, before: f.before, after: placementLinkAfter(f.place, f.Source), retainOnly: true}, func() error { return reformatLink(f.Target, f.Source, relative) }); err != nil {
@@ -231,6 +234,9 @@ func syncExtraFileReplace(f ExtraFile, dryRun bool, projectRoot string) (*ExtraR
 		}
 		same := contentEqual(f.Source, f.Target)
 		if copyMode && same {
+			if err := checkpointUnchangedExtra(f, dryRun); err != nil {
+				return nil, err
+			}
 			if !dryRun && f.place == nil && attached && !isOurExtraCopy(f.Target) {
 				_ = recordExtraWritten(f.Target) // best effort: only saves a later drift backup
 			}
@@ -340,7 +346,7 @@ func syncExtraFileReplace(f ExtraFile, dryRun bool, projectRoot string) (*ExtraR
 		}
 		change.metadata[extraWritten] = "absent"
 		if copyMode {
-			change.metadata[extraWritten] = after
+			change.metadata[extraWritten] = extraContentFingerprint([]byte(strings.TrimPrefix(after, "file:")))
 		}
 	}
 	if err := placeExtra(f.place, change, func() error {
@@ -530,6 +536,9 @@ func syncExtraImport(f ExtraFile, dryRun bool) (*ExtraResult, error) {
 	}
 	if !changed {
 		if f.place != nil {
+			if err := checkpointUnchangedExtra(f, dryRun); err != nil {
+				return nil, err
+			}
 			return result, nil
 		}
 		clearExtraImportBase(f.Target)

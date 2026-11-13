@@ -49,7 +49,6 @@ type SharedExtraIntent struct {
 	Parents        map[string]string   `yaml:"parents,omitempty"`
 	MetadataBefore map[string]string   `yaml:"metadata_before,omitempty"`
 	MetadataAfter  map[string]string   `yaml:"metadata_after,omitempty"`
-	Fallback       bool                `yaml:"fallback,omitempty"`
 	RetainOnly     bool                `yaml:"retain_only,omitempty"`
 }
 type SharedExtraEffect struct {

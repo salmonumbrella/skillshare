@@ -317,9 +317,6 @@ func TestSharedExtrasAPILastRemoval(t *testing.T) {
 	for _, remove := range []bool{false, true} {
 		if remove {
 			sb.WriteFile(shared, "version: 1\n")
-			if err := s.reloadConfig(); err != nil {
-				t.Fatal(err)
-			}
 		}
 		rr := httptest.NewRecorder()
 		s.handleExtrasSync(rr, httptest.NewRequest(http.MethodPost, "/api/extras/sync", strings.NewReader(`{}`)))
@@ -416,9 +413,6 @@ func TestNamedSharedExtrasSyncProtectsEditedReplacement(t *testing.T) {
 	replacement := filepath.Join(sb.Root, "replacement")
 	sb.WriteFile(filepath.Join(replacement, "fixture.md"), "replacement\n")
 	sb.WriteFile(shared, strings.ReplaceAll(sb.ReadFile(shared), filepath.ToSlash(source), filepath.ToSlash(replacement)))
-	if err := s.reloadConfig(); err != nil {
-		t.Fatal(err)
-	}
 	results, err := s.syncExtras("rules", false, true)
 	if err != nil {
 		t.Fatal(err)

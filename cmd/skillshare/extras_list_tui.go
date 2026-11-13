@@ -1048,20 +1048,35 @@ func (m extrasListTUIModel) doSync(name, targetPath string) (string, error) {
 		m.cfg = cfg
 		scope := sync.SharedExtrasScope{Name: name}
 		if targetPath != "" {
-			scope.Target = config.ExpandPath(targetPath)
+			scope.Target = canonicalExtraTargetPath(modeGlobal, "", targetPath)
 		}
 		session, err = sync.BeginSharedExtras(cfg, false, scope)
+		defer session.Close()
 		if err != nil {
 			return "", err
 		}
 		if session != nil {
 			m.cfg = session.Config()
+			if err := m.cfg.ValidateExtras(name); err != nil {
+				return "", err
+			}
 		}
 	}
-	defer session.Close()
 	extra, targets, err := m.resolveExtraWithTargets(name, targetPath)
 	if err != nil {
 		return "", err
+	}
+	if targetPath != "" {
+		targets = nil
+		for _, target := range extra.Targets {
+			if target.Path == targetPath || m.projCfg == nil && canonicalExtraTargetPath(modeGlobal, "", target.Path) == canonicalExtraTargetPath(modeGlobal, "", targetPath) {
+				targets = []config.ExtraTargetConfig{target}
+				break
+			}
+		}
+		if len(targets) == 0 {
+			return "", fmt.Errorf("extra %q target changed; refresh the list", name)
+		}
 	}
 	selected := *extra
 	selected.Targets = targets
@@ -1078,7 +1093,7 @@ func (m extrasListTUIModel) doSync(name, targetPath string) (string, error) {
 	}
 	var detached []sync.DetachResult
 	if targetPath != "" {
-		detached = session.DetachTarget(config.ExpandPath, name, targetPath)
+		detached = session.DetachTarget(func(path string) string { return canonicalExtraTargetPath(modeGlobal, "", path) }, name, targetPath)
 	} else {
 		detached = session.Detach(config.ExpandPath, name)
 	}

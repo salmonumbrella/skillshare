@@ -109,6 +109,7 @@ internal/config/save_candidate.go	(*SaveCandidate).write	os.MkdirAll	dir	config
 internal/config/save_candidate.go	(*SaveCandidate).write	os.OpenFile	tmpPath	config
 internal/config/save_candidate.go	(*SaveCandidate).write	os.Remove	tmp.Name()	config
 internal/config/save_candidate.go	(*SaveCandidate).write	os.Rename	tmp.Name(), dest	config
+internal/config/shared_state.go	(*sharedWriteGuard).acquire	os.MkdirAll	filepath.Dir(f.path)	config
 internal/git/info.go	resolveMetadataConflicts	os.WriteFile	filepath.Join(dir, path)	source-unmigrated
 internal/git/scope.go	DisableNestedRepo	os.Rename	gitDir, disabled	source-unmigrated
 internal/git/scope.go	InitScopeRepo	os.MkdirAll	dir	source-unmigrated
@@ -367,14 +368,13 @@ internal/sync/extras.go	pruneExtraManagedFiles	os.Remove	path	target
 internal/sync/extras.go	pruneExtraOrphans	os.Remove	path	target
 internal/sync/extras.go	pruneExtraSymlinkTarget	os.Remove	targetPath	target
 internal/sync/extras.go	syncExtraSymlinkMode	os.MkdirAll	filepath.Dir(targetPath)	target
-internal/sync/extras.go	syncExtraSymlinkMode	os.Remove	targetPath	target
 internal/sync/extras.go	syncExtraSymlinkMode	os.RemoveAll	targetPath	target
 internal/sync/extras.go	syncExtraTransform	os.MkdirAll	filepath.Dir(tgtFile)	target
-internal/sync/extras.go	syncExtraTransform	os.Remove	tgtFile	target
 internal/sync/extras.go	syncExtraTransform	os.RemoveAll	tgtFile	target
 internal/sync/extras.go	syncExtraTransform	os.WriteFile	tgtFile	target
 internal/sync/extras.go	syncOneExtraFile	os.MkdirAll	filepath.Dir(tgtFile)	target
 internal/sync/extras.go	syncOneExtraFile	os.Remove	tgtFile	target
+internal/sync/extras.go	syncOneExtraFile	os.WriteFile	tgtFile	target
 internal/sync/extras_backup.go	backupExtraDrift	os.MkdirAll	dir	backup
 internal/sync/extras_backup.go	backupExtraDrift	os.WriteFile	filepath.Join(dir, name)	backup
 internal/sync/extras_backup.go	backupExtraDrift	os.WriteFile	filepath.Join(extraBackupDir(path), "path")	backup
@@ -384,6 +384,7 @@ internal/sync/extras_backup.go	clearExtraWritten	os.Remove	filepath.Join(extraBa
 internal/sync/extras_backup.go	pruneExtraBackups	os.Remove	filepath.Join(dir, names[0])	backup
 internal/sync/extras_backup.go	putBackExtraRestorePoint	os.Symlink	string(dest), path	backup
 internal/sync/extras_backup.go	putBackExtraRestorePoint	os.WriteFile	path	backup
+internal/sync/extras_backup.go	reconcileSharedNative	os.Remove	filepath.Join(extraBackupDir(path), name)	backup
 internal/sync/extras_backup.go	recordExtraAttach	os.MkdirAll	dir	backup
 internal/sync/extras_backup.go	recordExtraAttach	os.WriteFile	filepath.Join(dir, "path")	backup
 internal/sync/extras_backup.go	recordExtraAttach	os.WriteFile	filepath.Join(dir, name)	backup
@@ -411,6 +412,7 @@ internal/sync/extras_file.go	restoreExtraImport	os.WriteFile	f.Target	target
 internal/sync/extras_file.go	syncExtraFileReplace	os.MkdirAll	filepath.Dir(f.Target)	target
 internal/sync/extras_file.go	syncExtraFileReplace	os.Remove	f.Target	target
 internal/sync/extras_file.go	syncExtraFileReplace	os.Remove	f.Target	target
+internal/sync/extras_file.go	syncExtraFileReplace	os.WriteFile	f.Target	target
 internal/sync/extras_file.go	syncExtraFileReplace	os.WriteFile	f.Target	target
 internal/sync/extras_file.go	syncExtraImport	os.MkdirAll	filepath.Dir(f.Target)	target
 internal/sync/extras_file.go	syncExtraImport	os.Remove	f.Target	target

@@ -437,10 +437,11 @@ func (r *SharedExtrasRun) mergePlacement(next config.SharedPlacement) {
 }
 
 type placementChange struct {
-	path, before, after  string
-	effects              []config.SharedExtraEffect
-	metadata             map[string]string
-	fallback, retainOnly bool
+	path, before, after string
+	effects             []config.SharedExtraEffect
+	metadata            map[string]string
+	retainOnly          bool
+	acquireOnly         bool
 }
 type placementWriter func(placementChange, func() error) error
 
@@ -466,6 +467,37 @@ func (r *SharedExtrasRun) writer(extra config.ExtraConfig, source string, target
 		if r.failed != nil {
 			return r.failed
 		}
+		if change.acquireOnly {
+			for _, old := range r.state.State.Extras {
+				if old.Name != extra.Name || old.Receipt.Source != source || old.Receipt.File != extra.File {
+					continue
+				}
+				for _, previous := range old.Receipt.Targets {
+					if previous.Path == target.Path && previous.As == target.As {
+						for name, expected := range previous.Native {
+							if change.metadata[name] != expected {
+								return r.latch(fmt.Errorf("native restore proof changed"))
+							}
+						}
+						return nil
+					}
+				}
+			}
+			attach := 0
+			for _, name := range []string{attachCreated, attachRestore, attachRestoreLink, attachRestoreJunction} {
+				if change.metadata[name] != "absent" {
+					attach++
+				}
+			}
+			if attach == 0 && target.Mode == "copy" && !strings.HasPrefix(change.before, "link:") {
+				return nil // identical unowned regular files remain user-owned
+			}
+			written := extraContentFingerprint([]byte(strings.TrimPrefix(change.before, "file:")))
+			if attach != 1 || change.metadata[attachCreated] != "absent" && change.metadata[attachCreated] != extraContentFingerprint(nil) || target.Mode == "copy" && change.metadata[extraWritten] != written {
+				return r.latch(fmt.Errorf("shared ownership requires intact native restore proof; kept %s", change.path))
+			}
+		}
+
 		declaration, ok := r.cfg.SharedExtraDeclaration(extra.Name)
 		if !ok {
 			return r.latch(fmt.Errorf("shared declaration disappeared"))
@@ -484,7 +516,7 @@ func (r *SharedExtrasRun) writer(extra config.ExtraConfig, source string, target
 		if change.before != "" && before != change.before {
 			return r.latch(fmt.Errorf("shared destination changed before placement: %s", change.path))
 		}
-		p := &config.SharedExtraIntent{Placement: config.SharedPlacement{Name: extra.Name, Declaration: declaration, DeclarationDir: filepath.Dir(r.cfg.SharedStatus().Path), Receipt: config.SharedReceipt{Source: source, File: extra.File, Targets: []config.SharedPlacedTarget{target}}}, Relative: filepath.ToSlash(rel), Effects: append([]config.SharedExtraEffect{{Path: change.path, Before: before, After: change.after}}, change.effects...), MetadataAfter: change.metadata, Fallback: change.fallback, RetainOnly: change.retainOnly}
+		p := &config.SharedExtraIntent{Placement: config.SharedPlacement{Name: extra.Name, Declaration: declaration, DeclarationDir: filepath.Dir(r.cfg.SharedStatus().Path), Receipt: config.SharedReceipt{Source: source, File: extra.File, Targets: []config.SharedPlacedTarget{target}}}, Relative: filepath.ToSlash(rel), Effects: append([]config.SharedExtraEffect{{Path: change.path, Before: before, After: change.after}}, change.effects...), MetadataAfter: change.metadata, RetainOnly: change.retainOnly}
 		p.Parents = map[string]string{}
 		for _, effect := range p.Effects {
 			for parent := filepath.Dir(effect.Path); ; parent = filepath.Dir(parent) {
@@ -502,6 +534,13 @@ func (r *SharedExtrasRun) writer(extra config.ExtraConfig, source string, target
 			p.MetadataBefore, err = sharedNativeFacts(p)
 			if err != nil {
 				return r.latch(err)
+			}
+		}
+		if change.acquireOnly {
+			for name, expected := range p.MetadataAfter {
+				if p.MetadataBefore[name] != expected {
+					return r.latch(fmt.Errorf("native restore proof changed before adoption"))
+				}
 			}
 		}
 		if r.state.State.Pending != nil {

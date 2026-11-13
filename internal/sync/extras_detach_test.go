@@ -875,3 +875,402 @@ func TestSharedFallbackRecoveryRefusesMalformedNativeMetadata(t *testing.T) {
 		t.Fatal("refusal changed evidence")
 	}
 }
+
+func TestSharedReceiptRecoveryNativeModes(t *testing.T) {
+	for _, single := range []bool{false, true} {
+		for _, mode := range []string{"copy", "merge", "symlink", "import", "prepend", "append"} {
+			if !single && (mode == "import" || isContentBlockMode(mode)) {
+				continue
+			}
+			t.Run(fmt.Sprintf("single=%v/%s", single, mode), func(t *testing.T) {
+				if (mode == "merge" || mode == "symlink") && !CanCreateFileLink() {
+					t.Skip("link token coverage is root-hosted")
+				}
+				sb, cfg, source, target := sharedRunFixture(t, mode, single)
+				output := filepath.Join(target, "fixture.md")
+				if single {
+					sb.WriteFile(output, "original user lines\n")
+				}
+				session, err := BeginSharedExtras(cfg, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(session.Close)
+				session.state.SetWriteFaultForTest(func() error {
+					if session.state.State.Pending == nil {
+						return errors.New("promotion fault")
+					}
+					return nil
+				})
+				RunExtraTargets(cfg.Extras[0], source, ExtraRunOptions{ResolvePath: config.ExpandPath, Shared: session})
+				if session.failed == nil || session.state.State.Pending == nil {
+					t.Fatal("native completion did not leave durable recovery evidence")
+				}
+				session.Close()
+				// Recovery uses saved output/metadata facts after both inputs disappear.
+				if err := os.RemoveAll(source); err != nil {
+					t.Fatal(err)
+				}
+				sb.WriteFile(filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml"), "version: 1\nextras: []\n")
+				cfg, err = config.LoadReadOnlyPath(sb.ConfigPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				retry, err := BeginSharedExtras(cfg, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer retry.Close()
+				if retry.state.State.Pending != nil {
+					t.Fatal("receipt was not promoted before detach")
+				}
+				results := retry.Detach(config.ExpandPath)
+				if len(results) != 1 || len(results[0].Errors) != 0 {
+					t.Fatalf("detach=%+v", results)
+				}
+				if single {
+					if got := sb.ReadFile(output); got != "original user lines\n" {
+						t.Fatalf("restore=%q", got)
+					}
+				} else {
+					if mode == "symlink" {
+						output = target
+					}
+					if _, err := os.Lstat(output); !os.IsNotExist(err) {
+						t.Fatalf("owned output remained: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestSharedIntentFailureAndAmbiguousRetryPreserveEvidence(t *testing.T) {
+	for _, boundary := range []string{"intent", "content", "parent", "detach-checkpoint"} {
+		t.Run(boundary, func(t *testing.T) {
+			sb, cfg, source, target := sharedRunFixture(t, "copy", false)
+			session, err := BeginSharedExtras(cfg, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(session.Close)
+			session.state.SetWriteFaultForTest(func() error {
+				if boundary == "intent" || session.state.State.Pending == nil {
+					return errors.New("state fault")
+				}
+				return nil
+			})
+			RunExtraTargets(cfg.Extras[0], source, ExtraRunOptions{ResolvePath: config.ExpandPath, Shared: session})
+			session.Close()
+			output := filepath.Join(target, "fixture.md")
+			if boundary == "intent" {
+				if _, err := os.Lstat(output); !os.IsNotExist(err) {
+					t.Fatal("intent fault allowed native placement")
+				}
+				return
+			}
+			if boundary == "detach-checkpoint" {
+				retry, err := BeginSharedExtras(cfg, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				retry.Close()
+				replacement := filepath.Join(sb.Root, "replacement")
+				sb.WriteFile(filepath.Join(replacement, "fixture.md"), "replacement\n")
+				shared := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
+				sb.WriteFile(shared, strings.ReplaceAll(sb.ReadFile(shared), filepath.ToSlash(source), filepath.ToSlash(replacement)))
+				cfg, err = config.LoadReadOnlyPath(sb.ConfigPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				retry, err = BeginSharedExtras(cfg, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer retry.Close()
+				retry.state.SetWriteFaultForTest(func() error { return errors.New("detach checkpoint fault") })
+				if results := retry.Detach(config.ExpandPath); len(results) < 2 || retry.failed == nil {
+					t.Fatalf("checkpoint=%+v", results)
+				}
+				RunExtraTargets(cfg.Extras[0], replacement, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Shared: retry})
+				if _, err := os.Lstat(output); !os.IsNotExist(err) {
+					t.Fatal("apply followed failed detach checkpoint")
+				}
+				return
+			}
+			if boundary == "content" {
+				sb.WriteFile(output, "user changed it\n")
+			} else {
+				if !CanCreateFileLink() {
+					t.Skip("requires directory links")
+				}
+				native := filepath.Join(sb.Root, "native")
+				sb.WriteFile(filepath.Join(native, "fixture.md"), "managed content\n")
+				if err := os.Rename(target, target+"-old"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(native, target); err != nil {
+					t.Fatal(err)
+				}
+			}
+			statePath, _ := config.SharedStatePath(sb.ConfigPath)
+			before := sb.ReadFile(statePath)
+			if retry, err := BeginSharedExtras(cfg, false); err == nil {
+				retry.Close()
+				t.Fatal("ambiguous recovery proceeded")
+			}
+			if sb.ReadFile(statePath) != before {
+				t.Fatal("refusal discarded pending evidence")
+			}
+		})
+	}
+}
+
+func TestSharedRecoveredTransformDoesNotExecuteTwice(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell transform fixture")
+	}
+	sb, _, source, target := sharedRunFixture(t, "copy", false)
+	shared := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
+	sb.WriteFile(shared, strings.ReplaceAll(sb.ReadFile(shared), "mode: copy", "mode: copy, flatten: true, extension: convert"))
+	cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := filepath.Join(sb.Root, "extension-count")
+	t.Setenv("SHARED_RECEIPT_COUNT", count)
+	opts := ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, ResolveExtension: func(string) (*ExtensionSpec, error) {
+		return &ExtensionSpec{Name: "convert", Dir: source, OutputExt: "txt", Run: []string{"sh", "-c", `printf 'run\n' >> "$SHARED_RECEIPT_COUNT"; cat`}}, nil
+	}}
+	session, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.state.SetWriteFaultForTest(func() error {
+		if session.state.State.Pending == nil {
+			return errors.New("promotion fault")
+		}
+		return nil
+	})
+	opts.Shared = session
+	RunExtraTargets(cfg.Extras[0], source, opts)
+	session.Close()
+	retry, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retry.Close()
+	opts.Shared = retry
+	RunExtraTargets(retry.Config().Extras[0], source, opts)
+	if sb.ReadFile(count) != "run\n" || sb.ReadFile(filepath.Join(target, "fixture.txt")) != "managed content\n" {
+		t.Fatal("recovery reran the extension or lost frozen output")
+	}
+}
+
+func TestSharedIdempotentAdoptionRequiresNativeRestoreProof(t *testing.T) {
+	for _, mode := range []string{"copy", "merge"} {
+		for _, proof := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/proof=%v", mode, proof), func(t *testing.T) {
+				if mode == "merge" && !CanCreateFileLink() {
+					t.Skip("requires file links")
+				}
+				sb, cfg, source, target := sharedRunFixture(t, mode, true)
+				f := NewExtraFile(source, "fixture.md", target, "", mode)
+				if proof {
+					if _, err := SyncExtraFile(f, false, ""); err != nil {
+						t.Fatal(err)
+					}
+				} else if mode == "copy" {
+					sb.WriteFile(f.Target, "managed content\n")
+				} else {
+					if err := os.MkdirAll(target, 0755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(f.Source, f.Target); err != nil {
+						t.Fatal(err)
+					}
+				}
+				session, err := BeginSharedExtras(cfg, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer session.Close()
+				RunExtraTargets(cfg.Extras[0], source, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Shared: session})
+				if proof && (session.failed != nil || len(session.state.State.Extras) != 1) {
+					t.Fatalf("proven output not adopted: %v", session.failed)
+				}
+				if !proof && (len(session.state.State.Extras) != 0 || session.state.State.Pending != nil || mode == "merge" && session.failed == nil) {
+					t.Fatal("unproven native output acquired or unmarked link not reported")
+				}
+				if sb.ReadFile(f.Target) != "managed content\n" {
+					t.Fatal("adoption changed native content")
+				}
+			})
+		}
+	}
+}
+
+func TestSharedPartialPromotionRetainsSuccessfulAndSkippedOutputs(t *testing.T) {
+	sb, cfg, source, target := sharedRunFixture(t, "copy", false)
+	if err := os.Rename(filepath.Join(source, "fixture.md"), filepath.Join(source, "a.md")); err != nil {
+		t.Fatal(err)
+	}
+	sb.WriteFile(filepath.Join(source, "b.md"), "shared b\n")
+	sb.WriteFile(filepath.Join(target, "b.md"), "user b\n")
+	sb.WriteFile(filepath.Join(source, "z.md"), "shared z\n")
+	session, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.state.SetWriteFaultForTest(func() error {
+		if session.state.State.Pending == nil && len(session.state.State.Extras) > 0 && len(session.state.State.Extras[0].Receipt.Targets[0].Files) == 2 {
+			return errors.New("second receipt fault")
+		}
+		return nil
+	})
+	RunExtraTargets(cfg.Extras[0], source, ExtraRunOptions{ResolvePath: config.ExpandPath, Shared: session})
+	session.Close()
+	state, err := config.LoadSharedState(sb.ConfigPath, cfg.EffectiveGitRoot(), filepath.Dir(cfg.SharedStatus().Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.State.Pending == nil || len(state.State.Extras) != 1 || len(state.State.Extras[0].Receipt.Targets[0].Files) != 1 {
+		t.Fatal("later failure lost prior receipt")
+	}
+	statePath, _ := config.SharedStatePath(sb.ConfigPath)
+	before := sb.ReadFile(statePath)
+	if other, err := BeginSharedExtras(cfg, false, SharedExtrasScope{Name: "unselected"}); err == nil {
+		other.Close()
+		t.Fatal("out-of-scope pending recovered")
+	}
+	if sb.ReadFile(statePath) != before {
+		t.Fatal("selected refusal changed evidence")
+	}
+	sb.WriteFile(filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml"), "version: 1\n")
+	cfg, err = config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retry.Close()
+	retry.Detach(config.ExpandPath)
+	for _, name := range []string{"a.md", "z.md"} {
+		if _, err := os.Lstat(filepath.Join(target, name)); !os.IsNotExist(err) {
+			t.Fatalf("partial output remains: %s", name)
+		}
+	}
+	if sb.ReadFile(filepath.Join(target, "b.md")) != "user b\n" {
+		t.Fatal("skipped user output was detached")
+	}
+}
+
+func TestSharedForeignLinkReferentRecovery(t *testing.T) {
+	if !CanCreateFileLink() {
+		t.Skip("requires file links")
+	}
+	for _, mode := range []string{"import", "append", "copy"} {
+		for _, edited := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/edited=%v", mode, edited), func(t *testing.T) {
+				sb, cfg, source, target := sharedRunFixture(t, mode, true)
+				f := NewExtraFile(source, "fixture.md", target, "", mode)
+				referent := filepath.Join(sb.Root, "own.md")
+				base := "own lines\n"
+				content := base
+				if mode == "copy" {
+					content, _ = addImportLine(base, f.importLine())
+				}
+				sb.WriteFile(referent, content)
+				if err := os.MkdirAll(target, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(referent, f.Target); err != nil {
+					t.Fatal(err)
+				}
+				session, err := BeginSharedExtras(cfg, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				session.state.SetWriteFaultForTest(func() error {
+					if session.state.State.Pending == nil {
+						return errors.New("receipt fault")
+					}
+					return nil
+				})
+				RunExtraTargets(cfg.Extras[0], source, ExtraRunOptions{ResolvePath: config.ExpandPath, Shared: session})
+				if session.failed == nil {
+					t.Fatal("missing receipt fault")
+				}
+				session.Close()
+				if mode == "copy" && sb.ReadFile(referent) != base {
+					t.Fatal("leaving import did not strip old referent")
+				}
+				if edited {
+					sb.WriteFile(referent, "external edit\n")
+				}
+				statePath, _ := config.SharedStatePath(sb.ConfigPath)
+				before := sb.ReadFile(statePath)
+				sb.WriteFile(filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml"), "version: 1\n")
+				cfg, err = config.LoadReadOnlyPath(sb.ConfigPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				retry, err := BeginSharedExtras(cfg, false)
+				if edited {
+					if err == nil {
+						retry.Close()
+						t.Fatal("changed referent acquired")
+					}
+					if sb.ReadFile(statePath) != before || sb.ReadFile(referent) != "external edit\n" {
+						t.Fatal("refusal changed evidence or referent")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer retry.Close()
+				for _, result := range retry.Detach(config.ExpandPath) {
+					if len(result.Errors) != 0 {
+						t.Fatal(result.Errors)
+					}
+				}
+				if sb.ReadFile(referent) != base {
+					t.Fatal("detach changed user referent")
+				}
+				if raw, err := os.Readlink(f.Target); err != nil || raw != referent {
+					t.Fatalf("user link not preserved/restored: %q %v", raw, err)
+				}
+			})
+		}
+	}
+}
+
+func TestSharedBeforeStateCancelsOnlyAttemptMetadata(t *testing.T) {
+	_, cfg, source, target := sharedRunFixture(t, "copy", true)
+	session, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	f := NewExtraFile(source, "fixture.md", target, "", "copy")
+	place := session.writer(cfg.Extras[0], source, config.SharedPlacedTarget{Path: target, Mode: "copy"})
+	fault := errors.New("native stopped before output")
+	err = place(placementChange{path: f.Target, before: "absent", after: extraContentFingerprint([]byte("managed content\n")), metadata: map[string]string{attachCreated: extraContentFingerprint(nil)}}, func() error {
+		if err := markExtraCreated(f.Target); err != nil {
+			return err
+		}
+		return fault
+	})
+	if !errors.Is(err, fault) {
+		t.Fatalf("native error lost: %v", err)
+	}
+	if session.state.State.Pending != nil || len(session.state.State.Extras) != 0 || extraAttached(f.Target) {
+		t.Fatal("unused intent acquired output or left attempt metadata")
+	}
+	if _, err := os.Lstat(f.Target); !os.IsNotExist(err) {
+		t.Fatal("cancellation wrote output")
+	}
+}

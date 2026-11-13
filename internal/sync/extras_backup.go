@@ -194,18 +194,9 @@ func recordExtraRestorePoint(f ExtraFile) error {
 	}
 	data, err := os.ReadFile(path)
 	if err == nil {
-		// What this extra put there before the mode switch (an import line or
-		// a content block) is not the user's file; restoring must not bring it back.
-		if stripped, changed := removeImportLine(string(data), f.importLine()); changed {
-			data = []byte(stripped)
-		}
-		// A damaged block cannot be told apart from the user's lines; keeping it
-		// in the restore point would bring it back on detach.
-		if _, findErr := f.findContentBlock(strings.Split(string(data), "\n")); findErr != nil {
-			return findErr
-		}
-		if stripped, changed := f.removeContentBlock(string(data)); changed {
-			data = []byte(stripped)
+		data, err = f.restorePointContent(data)
+		if err != nil {
+			return err
 		}
 		err = recordExtraAttach(path, attachRestore, data, 0600)
 	}
@@ -495,6 +486,21 @@ func (f ExtraFile) sharedChange(after string, follow bool) (placementChange, err
 	return change, nil
 }
 
+func (f ExtraFile) restorePointContent(data []byte) ([]byte, error) {
+	// Keep the native attach owner's import and block stripping identical to
+	// the bytes fingerprinted before a shared placement.
+	if stripped, changed := removeImportLine(string(data), f.importLine()); changed {
+		data = []byte(stripped)
+	}
+	if _, err := f.findContentBlock(strings.Split(string(data), "\n")); err != nil {
+		return nil, err
+	}
+	if stripped, changed := f.removeContentBlock(string(data)); changed {
+		data = []byte(stripped)
+	}
+	return data, nil
+}
+
 func (f ExtraFile) sharedRestoreFingerprint(kind string) (string, error) {
 	if kind == attachRestoreLink || kind == attachRestoreJunction {
 		link, err := os.Readlink(f.Target)
@@ -504,14 +510,26 @@ func (f ExtraFile) sharedRestoreFingerprint(kind string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if stripped, changed := f.removeImport(string(data)); changed {
-		data = []byte(stripped)
+	data, err = f.restorePointContent(data)
+	return extraContentFingerprint(data), err
+}
+
+// checkpointUnchangedExtra adopts only native-owned output with a proven
+// restore disposition. Matching content or a bare source link cannot supply it.
+func checkpointUnchangedExtra(f ExtraFile, dryRun bool) error {
+	if dryRun || f.place == nil {
+		return nil
 	}
-	if _, err := f.findContentBlock(strings.Split(string(data), "\n")); err != nil {
-		return "", err
+	change, err := f.sharedChange(f.before, false)
+	if err != nil {
+		return err
 	}
-	if stripped, changed := f.removeContentBlock(string(data)); changed {
-		data = []byte(stripped)
+	if f.referentBefore != "" && (f.Mode == "import" || isContentBlockMode(f.Mode)) {
+		change, err = f.sharedChange(f.referentBefore, true)
+		if err != nil {
+			return err
+		}
 	}
-	return extraContentFingerprint(data), nil
+	change.acquireOnly = true
+	return placeExtra(f.place, change, func() error { return nil })
 }

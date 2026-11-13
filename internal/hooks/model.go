@@ -1,0 +1,656 @@
+// Package hooks manages Agent hook declarations and their native configuration.
+// It never executes hook commands or extension code and never changes native trust.
+package hooks
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Entry is one named hook under hooks.entries.
+type Entry struct {
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+	// Enabled defaults to true. A disabled entry keeps its definition and publishes nothing.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Bindings are keyed by canonical Agent name or a global account target. An empty map publishes nothing.
+	Bindings map[string]Binding `yaml:"bindings" json:"bindings"`
+}
+
+// Project is what a project's own config would hold under hooks, declared in the
+// global config under hooks.projects so one sync reaches every root.
+type Project struct {
+	Entries map[string]Entry `yaml:"entries" json:"entries"`
+}
+
+// Binding is what one Agent receives. Command Agents use Events and Files, code Agents Code.
+type Binding struct {
+	// Events is the Agent's own event map, written without translation.
+	Events map[string]any `yaml:"events,omitempty" json:"events,omitempty"`
+	// Code is one standalone native TypeScript/JavaScript extension or plugin.
+	Code string `yaml:"code,omitempty" json:"code,omitempty"`
+	// CodeFile is a path relative to the config's folder whose contents become Code
+	// when the config is read. Saving keeps the reference, never the inline code.
+	CodeFile string `yaml:"codeFile,omitempty" json:"codeFile,omitempty"`
+	// Files are script files written to <Agent config dir>/hooks/skillshare/<entry>/.
+	// In YAML a value may be {from: path}, read like CodeFile into Files.
+	Files map[string]string `yaml:"files,omitempty" json:"files,omitempty"`
+	// FilesFrom maps a file name to the path its contents were read from.
+	FilesFrom map[string]string `yaml:"-" json:"filesFrom,omitempty"`
+	// Commands are Git's native hook.<name> definitions.
+	Commands map[string]GitCommand `yaml:"commands,omitempty" json:"commands,omitempty"`
+	// Scripts is reserved for Git whole-file hooks, which are not supported yet.
+	Scripts map[string]string `yaml:"scripts,omitempty" json:"scripts,omitempty"`
+}
+
+type fileRef struct {
+	From string `yaml:"from"`
+}
+
+// fileRefMark prefixes a files value that was written as {from: path} until the
+// decoded entry moves the path into FilesFrom.
+const fileRefMark = "\x00skillshare-from\x00"
+
+// markFileRefs replaces each files value written as {from: path} under one entry node
+// with a marked string, so one strict decode reads the rest. A binding shared through
+// an anchor shares the replaced node, so every alias of it keeps the reference.
+func markFileRefs(entry *yaml.Node) error {
+	bindings := field(entry, "bindings")
+	if bindings == nil || bindings.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(bindings.Content); i += 2 {
+		files := field(bindings.Content[i+1], "files")
+		if files == nil || files.Kind != yaml.MappingNode {
+			continue
+		}
+		for j := 0; j+1 < len(files.Content); j += 2 {
+			if value := files.Content[j+1]; value.Kind == yaml.MappingNode {
+				var ref fileRef
+				if err := strictDecode(value, &ref); err != nil || ref.From == "" {
+					return fmt.Errorf("%s: files.%s: use the contents or {from: path}", bindings.Content[i].Value, files.Content[j].Value)
+				}
+				// Rewrite in place, keeping the anchor, so an alias of this value follows it.
+				*value = yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fileRefMark + ref.From, Anchor: value.Anchor}
+			}
+		}
+	}
+	return nil
+}
+
+// UnmarshalJSON accepts a files value as contents or {"from": path}, like YAML. It
+// decodes strictly, as every caller of a JSON entry does.
+func (b *Binding) UnmarshalJSON(data []byte) error {
+	type binding Binding
+	var raw struct {
+		*binding
+		Files map[string]json.RawMessage `json:"files,omitempty"`
+	}
+	raw.binding = (*binding)(b)
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&raw); err != nil {
+		return err
+	}
+	if raw.Files == nil {
+		return nil
+	}
+	b.Files = map[string]string{}
+	for _, name := range sortedKeys(raw.Files) {
+		var contents string
+		if json.Unmarshal(raw.Files[name], &contents) == nil {
+			b.Files[name] = contents
+			continue
+		}
+		var ref struct {
+			From string `json:"from"`
+		}
+		d := json.NewDecoder(bytes.NewReader(raw.Files[name]))
+		d.DisallowUnknownFields()
+		if err := d.Decode(&ref); err != nil || ref.From == "" {
+			return fmt.Errorf("files.%s: use the contents or {\"from\": path}", name)
+		}
+		if b.FilesFrom == nil {
+			b.FilesFrom = map[string]string{}
+		}
+		b.Files[name], b.FilesFrom[name] = fileRefMark, ref.From
+	}
+	return nil
+}
+
+// takeFileRefs moves marked files values into FilesFrom and leaves the bare mark, so
+// resolveRefs can tell contents still to read from an empty file sent with its reference.
+func (e Entry) takeFileRefs() {
+	for target, b := range e.Bindings {
+		for name, value := range b.Files {
+			if from, ok := strings.CutPrefix(value, fileRefMark); ok {
+				if b.FilesFrom == nil {
+					b.FilesFrom = map[string]string{}
+				}
+				b.Files[name], b.FilesFrom[name] = fileRefMark, from
+			}
+		}
+		e.Bindings[target] = b
+	}
+}
+
+func strictDecode(n *yaml.Node, out any) error {
+	data, err := yaml.Marshal(n)
+	if err != nil {
+		return err
+	}
+	d := yaml.NewDecoder(bytes.NewReader(data))
+	d.KnownFields(true)
+	return d.Decode(out)
+}
+
+// MarshalYAML writes codeFile and {from: path} references instead of the contents read from them.
+func (b Binding) MarshalYAML() (any, error) {
+	type plain Binding
+	if b.CodeFile != "" {
+		b.Code = ""
+	}
+	var n yaml.Node
+	if err := n.Encode(plain(b)); err != nil {
+		return nil, err
+	}
+	if files := field(&n, "files"); files != nil {
+		for i := 0; i+1 < len(files.Content); i += 2 {
+			if from, ok := b.FilesFrom[files.Content[i].Value]; ok {
+				var ref yaml.Node
+				if err := ref.Encode(fileRef{From: from}); err != nil {
+					return nil, err
+				}
+				files.Content[i+1] = &ref
+			}
+		}
+	}
+	return &n, nil
+}
+
+// checkCodeFile rejects a config binding that sets code and codeFile as written.
+func (e Entry) checkCodeFile() error {
+	for _, target := range sortedKeys(e.Bindings) {
+		if b := e.Bindings[target]; b.Code != "" && b.CodeFile != "" {
+			return fmt.Errorf("%s: set code or codeFile, not both", target)
+		}
+	}
+	return nil
+}
+
+// resolveRefs reads codeFile and files {from} paths, relative to dir, into Code and
+// Files. Contents already set, as in an entry echoed back from list or the dashboard,
+// must match the file.
+func (e Entry) resolveRefs(dir string) error {
+	for _, target := range sortedKeys(e.Bindings) {
+		b := e.Bindings[target]
+		if b.CodeFile != "" {
+			// Code is never empty, so empty means it was not sent.
+			data, err := readRef(dir, b.CodeFile, b.Code, b.Code != "")
+			if err != nil {
+				return fmt.Errorf("%s: codeFile: %w", target, err)
+			}
+			b.Code = data
+		}
+		if len(b.FilesFrom) > 0 {
+			files, from := maps.Clone(b.Files), map[string]string{}
+			for _, name := range sortedKeys(b.FilesFrom) {
+				current, kept := files[name]
+				if !kept {
+					// The file was removed; its reference goes with it.
+					continue
+				}
+				data, err := readRef(dir, b.FilesFrom[name], current, current != fileRefMark)
+				if err != nil {
+					return fmt.Errorf("%s: files.%s: %w", target, name, err)
+				}
+				files[name], from[name] = data, b.FilesFrom[name]
+			}
+			b.Files, b.FilesFrom = files, nil
+			if len(from) > 0 {
+				b.FilesFrom = from
+			}
+		}
+		e.Bindings[target] = b
+	}
+	return nil
+}
+
+func readRef(dir, ref, current string, sent bool) (string, error) {
+	path := filepath.Join(dir, filepath.FromSlash(ref))
+	if !filepath.IsLocal(filepath.FromSlash(ref)) || checkPath(dir, path) != nil {
+		return "", fmt.Errorf("%q must be a relative path inside %s without symlinks", ref, dir)
+	}
+	if info, err := os.Stat(path); err == nil && !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s must be a regular file", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if sent && current != string(data) {
+		return "", fmt.Errorf("contents differ from %s; edit the file, or drop the reference to save the contents inline", ref)
+	}
+	return string(data), nil
+}
+
+// GitCommand describes one friendly name, which Git may run for several events.
+type GitCommand struct {
+	Events   []string `yaml:"events" json:"events"`
+	Command  string   `yaml:"command" json:"command"`
+	Parallel *bool    `yaml:"parallel,omitempty" json:"parallel,omitempty"`
+}
+
+// IsEnabled reports the effective enabled state.
+func (e Entry) IsEnabled() bool { return e.Enabled == nil || *e.Enabled }
+
+// Target kinds.
+const (
+	KindCommand = "command"
+	KindCode    = "code"
+	KindGit     = "git"
+)
+
+// TargetDef describes one supported Agent.
+type TargetDef struct {
+	Name  string `json:"name"`
+	Agent string `json:"agent,omitempty"`
+	Kind  string `json:"kind"`
+	// Note is static loading and trust guidance; Skillshare never infers loaded state.
+	Note string `json:"note"`
+}
+
+// Targets are the supported Agents in display order.
+var Targets = []TargetDef{
+	{Name: "git", Kind: KindGit, Note: "Git 2.54+ runs config-based hooks (hook.<name>). Skillshare writes its own included file and helper scripts. Git reads configuration on every command; management never executes hooks."},
+	{Name: "claude", Kind: KindCommand, Note: "Claude Code runs settings.json hooks only after the workspace trust dialog is accepted; /hooks lists them read-only."},
+	{Name: "codex", Kind: KindCommand, Note: "Codex loads hooks.json together with inline [hooks] in config.toml, which Skillshare leaves untouched and lists as an additional source. Review and trust each new or changed hook in /hooks; project hooks load only when the project's .codex folder is trusted."},
+	{Name: "gemini", Kind: KindCommand, Note: "Gemini CLI reads hooks from settings.json. Project hooks are fingerprinted and warn until trusted again after any change; manage them with /hooks panel."},
+	{Name: "copilot", Kind: KindCommand, Note: "GitHub Copilot loads every JSON file in its hooks folder (COPILOT_HOME/hooks, or .github/hooks in a project, which loads only in a trusted folder). Skillshare writes one skillshare-<entry>.json per hook."},
+	{Name: "cursor", Kind: KindCommand, Note: "Cursor reads hooks.json (version 1, lowerCamelCase events) and reloads it when it changes; project hooks need a trusted workspace."},
+	{Name: "droid", Kind: KindCommand, Note: "Factory Droid reads hooks.json, and settings.json hooks only while hooks.json is absent, so Skillshare never creates hooks.json over inline hooks. Droid snapshots hooks at startup; review changes in /hooks."},
+	{Name: "qwen", Kind: KindCommand, Note: "Qwen Code reads hooks from settings.json; project hooks load only in trusted folders. Opening /hooks reloads the definitions."},
+	{Name: "antigravity", Kind: KindCommand, Note: "Antigravity and its CLI (agy) share hooks.json: ~/.gemini/config/hooks.json globally and .agents/hooks.json in a project, where hooks load only in a trusted folder. Each hook is a named block; Skillshare writes one block per hook, named after it. The CLI can also read hooks from ~/.gemini/antigravity-cli/settings.json, which Skillshare leaves untouched."},
+	{Name: "pi", Kind: KindCode, Note: "Pi discovers extensions at startup; project extensions load only after project trust is granted. The code must use the extension API of your installed Pi version."},
+	{Name: "omp", Kind: KindCode, Note: "Oh My Pi discovers extensions at startup from its agent directory (~/.omp/agent/extensions, or PI_CODING_AGENT_DIR, which Pi reads too) and from .omp/extensions in a project. OMP has no project trust gate, so the next startup can execute the code. Its own hooks/pre and hooks/post factories are left untouched and listed as additional sources. The code must use the extension API of your installed OMP version."},
+	{Name: "amp", Kind: KindCode, Note: "Amp runs plugins from its plugins folder with Bun; run 'plugins: reload' after sync. The code must use your Amp version's plugin API."},
+	{Name: "opencode", Kind: KindCode, Note: "OpenCode loads plugins from its plugins folder. v1 plugins are named exports and v2 plugins export default Plugin.define(...); Skillshare writes your code as given and never converts between them."},
+}
+
+// targetAliases are accepted spellings of canonical Agent names.
+var targetAliases = map[string]string{"factory": "droid", "antigravity-cli": "antigravity", "agy": "antigravity"}
+
+func targetDef(name string) (TargetDef, bool) {
+	for _, t := range Targets {
+		if t.Name == name {
+			return t, true
+		}
+	}
+	return TargetDef{}, false
+}
+
+// canonicalTarget resolves aliases; unknown names are returned unchanged.
+func canonicalTarget(name string) string {
+	if alias, ok := targetAliases[name]; ok {
+		return alias
+	}
+	return name
+}
+
+var (
+	entryName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+	fileName  = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+	eventName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
+)
+
+// Errors that the HTTP layer maps to 409.
+var (
+	ErrStaleRevision = errors.New("hooks configuration changed since preview; preview again")
+	ErrConflict      = errors.New("hooks conflicts found; no files changed")
+)
+
+// ParseEntry reads one Entry from a JSON or YAML document and validates it.
+func ParseEntry(data []byte) (Entry, error) {
+	var entry Entry
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		d := json.NewDecoder(bytes.NewReader(trimmed))
+		d.DisallowUnknownFields()
+		if err := d.Decode(&entry); err != nil {
+			return Entry{}, fmt.Errorf("invalid hook entry JSON: %w", err)
+		}
+		if d.Decode(new(any)) != io.EOF {
+			return Entry{}, fmt.Errorf("hook entry must contain one JSON document")
+		}
+	} else {
+		var tree yaml.Node
+		// Decode the original bytes: a block scalar ending the file keeps its final newline only if it is still there.
+		d := yaml.NewDecoder(bytes.NewReader(data))
+		if err := d.Decode(&tree); err != nil {
+			return Entry{}, fmt.Errorf("invalid hook entry YAML: %w", err)
+		}
+		if d.Decode(new(yaml.Node)) != io.EOF {
+			return Entry{}, fmt.Errorf("hook entry must contain one YAML document")
+		}
+		if err := markFileRefs(&tree); err != nil {
+			return Entry{}, err
+		}
+		if err := strictDecode(&tree, &entry); err != nil {
+			return Entry{}, fmt.Errorf("invalid hook entry YAML: %w", err)
+		}
+		entry.takeFileRefs()
+	}
+	if err := entry.normalize(); err != nil {
+		return Entry{}, err
+	}
+	return entry, entry.validate("entry", nil, validateParse)
+}
+
+// normalize resolves aliases and gives events their JSON shape, so YAML integers and
+// maps compare and hash the same as JSON ones.
+func (e *Entry) normalize() error {
+	if e.Bindings == nil {
+		e.Bindings = map[string]Binding{}
+	}
+	bindings := map[string]Binding{}
+	for name, b := range e.Bindings {
+		canonical := canonicalTarget(name)
+		if _, dup := bindings[canonical]; dup {
+			return fmt.Errorf("duplicate binding for %s", canonical)
+		}
+		if b.Events != nil {
+			data, err := json.Marshal(b.Events)
+			if err != nil {
+				return fmt.Errorf("%s events: %w", canonical, err)
+			}
+			b.Events = map[string]any{}
+			if err := json.Unmarshal(data, &b.Events); err != nil {
+				return err
+			}
+		}
+		bindings[canonical] = b
+	}
+	e.Bindings = bindings
+	return nil
+}
+
+// Validate checks an entry against each Agent's native schema without executing it.
+type validationScope int
+
+const (
+	validateGlobal validationScope = iota
+	validateProject
+	validateParse
+)
+
+var accountName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+func (e Entry) Validate(name string) error { return e.validate(name, nil, validateGlobal) }
+
+func (e Entry) validate(name string, accounts map[string]string, scope validationScope) error {
+	if !entryName.MatchString(name) {
+		return fmt.Errorf("invalid hook name %q: use letters, digits, dots, underscores or hyphens", name)
+	}
+	for _, target := range sortedKeys(e.Bindings) {
+		agent := target
+		def, ok := targetDef(agent)
+		if !ok {
+			if a := accounts[target]; a != "" && slices.Contains(accountAgents, a) {
+				if scope == validateProject {
+					return fmt.Errorf("hook %s: %s is an account of %s, and every account reads the same project files; bind %s", name, target, a, a)
+				}
+				agent = a
+				def, ok = targetDef(agent)
+			}
+			if !ok {
+				if scope == validateParse && accountName.MatchString(target) {
+					continue
+				}
+				return fmt.Errorf("hook %s: unsupported Agent %q: it is neither an Agent nor a target with agent and config_dir", name, target)
+			}
+		}
+		b := e.Bindings[target]
+		if def.Kind == KindGit {
+			if err := validateGit(b); err != nil {
+				return fmt.Errorf("hook %s: git: %w", name, err)
+			}
+			continue
+		}
+		if b.Commands != nil || b.Scripts != nil {
+			return fmt.Errorf("hook %s: %s does not accept Git commands or scripts", name, target)
+		}
+		if def.Kind == KindCode {
+			if len(b.Events) > 0 || len(b.Files) > 0 {
+				return fmt.Errorf("hook %s: %s takes code only, not events or files", name, target)
+			}
+			// A parsed entry's codeFile is read when the draft is saved.
+			if strings.TrimSpace(b.Code) == "" && (scope != validateParse || b.CodeFile == "") {
+				return fmt.Errorf("hook %s: %s requires code", name, target)
+			}
+			continue
+		}
+		if b.Code != "" || b.CodeFile != "" {
+			return fmt.Errorf("hook %s: %s takes events, not code", name, target)
+		}
+		if len(b.Events) == 0 {
+			return fmt.Errorf("hook %s: %s requires at least one event", name, target)
+		}
+		if err := validateEvents(agent, b.Events); err != nil {
+			return fmt.Errorf("hook %s: %s: %w", name, target, err)
+		}
+		for file := range b.Files {
+			if !fileName.MatchString(file) || !filepath.IsLocal(file) {
+				return fmt.Errorf("hook %s: %s: file %q must be a plain file name", name, target, file)
+			}
+		}
+	}
+	return nil
+}
+
+// validateEvents checks the structure every Agent documents, leaving event names,
+// matchers, timeouts and payloads exactly as the Agent defines them.
+func validateEvents(target string, events map[string]any) error {
+	for _, event := range sortedKeys(events) {
+		if !eventName.MatchString(event) {
+			return fmt.Errorf("invalid event name %q", event)
+		}
+		if target == "cursor" && (event[0] < 'a' || event[0] > 'z') {
+			return fmt.Errorf("event %q: Cursor uses lowerCamelCase event names", event)
+		}
+		items, ok := events[event].([]any)
+		if !ok || len(items) == 0 {
+			return fmt.Errorf("event %s must be a non-empty array", event)
+		}
+		for i, item := range items {
+			obj, ok := item.(map[string]any)
+			if !ok {
+				return fmt.Errorf("event %s[%d] must be an object", event, i)
+			}
+			if err := validateElement(target, event, obj); err != nil {
+				return fmt.Errorf("event %s[%d]: %w", event, i, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateElement(target, event string, obj map[string]any) error {
+	switch target {
+	case "cursor":
+		if kind, set := obj["type"]; set && kind != "command" && kind != "prompt" {
+			return fmt.Errorf("type must be command or prompt")
+		}
+		if obj["type"] == "prompt" {
+			return requireString(obj, "prompt")
+		}
+		return requireString(obj, "command")
+	case "copilot":
+		return validateCopilot(event, obj)
+	case "antigravity":
+		return validateAntigravity(obj)
+	}
+	// Matcher groups: Claude, Codex, Gemini, Qwen and Droid.
+	if matcher, set := obj["matcher"]; set {
+		if _, ok := matcher.(string); !ok {
+			return fmt.Errorf("matcher must be a string")
+		}
+	}
+	handlers, ok := obj["hooks"].([]any)
+	if !ok || len(handlers) == 0 {
+		return fmt.Errorf("requires a non-empty hooks array")
+	}
+	for i, h := range handlers {
+		handler, ok := h.(map[string]any)
+		if !ok {
+			return fmt.Errorf("hooks[%d] must be an object", i)
+		}
+		if err := requireString(handler, "type"); err != nil {
+			return fmt.Errorf("hooks[%d]: %w", i, err)
+		}
+		if handler["type"] == "command" {
+			if err := requireString(handler, "command"); err != nil {
+				return fmt.Errorf("hooks[%d]: %w", i, err)
+			}
+		}
+		if timeout, set := handler["timeout"]; set {
+			if n, ok := timeout.(float64); !ok || n <= 0 {
+				return fmt.Errorf("hooks[%d]: timeout must be a positive number", i)
+			}
+		}
+	}
+	return nil
+}
+
+// validateAntigravity checks a matcher group (PreToolUse, PostToolUse) or, for the other
+// events, a handler listed directly under the event. type defaults to command.
+func validateAntigravity(obj map[string]any) error {
+	handlers := []any{obj}
+	if _, grouped := obj["hooks"]; grouped {
+		if matcher, set := obj["matcher"]; set {
+			if _, ok := matcher.(string); !ok {
+				return fmt.Errorf("matcher must be a string")
+			}
+		}
+		list, ok := obj["hooks"].([]any)
+		if !ok || len(list) == 0 {
+			return fmt.Errorf("requires a non-empty hooks array")
+		}
+		handlers = list
+	}
+	for i, h := range handlers {
+		handler, ok := h.(map[string]any)
+		if !ok {
+			return fmt.Errorf("hooks[%d] must be an object", i)
+		}
+		if kind, set := handler["type"]; set && kind != "command" {
+			return fmt.Errorf("hooks[%d]: type must be command", i)
+		}
+		if err := requireString(handler, "command"); err != nil {
+			return fmt.Errorf("hooks[%d]: %w", i, err)
+		}
+		if timeout, set := handler["timeout"]; set {
+			if n, ok := timeout.(float64); !ok || n <= 0 {
+				return fmt.Errorf("hooks[%d]: timeout must be a positive number", i)
+			}
+		}
+	}
+	return nil
+}
+
+// validateCopilot checks the required fields and exclusive forms of Copilot's flat
+// handlers, leaving every field as written.
+func validateCopilot(event string, obj map[string]any) error {
+	for _, key := range []string{"timeoutSec", "timeout"} {
+		if value, set := obj[key]; set {
+			if n, ok := value.(float64); !ok || n <= 0 {
+				return fmt.Errorf("%s must be a positive number", key)
+			}
+		}
+	}
+	switch obj["type"] {
+	case "http":
+		if err := requireString(obj, "url"); err != nil {
+			return err
+		}
+		u, err := url.Parse(obj["url"].(string))
+		if err != nil || u.Host == "" || u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("url must be an http:// or https:// URL")
+		}
+		_, envVars := obj["allowedEnvVars"]
+		if u.Scheme != "https" && (envVars || event == "preToolUse" || event == "permissionRequest" || event == "PreToolUse" || event == "PermissionRequest") {
+			return fmt.Errorf("url must use https:// here")
+		}
+		return nil
+	case "prompt":
+		if !strings.EqualFold(event, "sessionStart") {
+			return fmt.Errorf("prompt hooks are only supported on sessionStart")
+		}
+		return requireString(obj, "prompt")
+	case nil, "command":
+	default:
+		return fmt.Errorf("type must be command, http or prompt")
+	}
+	shell := false
+	for _, key := range []string{"bash", "powershell", "command"} {
+		if _, set := obj[key]; set {
+			if err := requireString(obj, key); err != nil {
+				return err
+			}
+			shell = true
+		}
+	}
+	if _, set := obj["exec"]; set {
+		if shell {
+			return fmt.Errorf("exec cannot be combined with bash, powershell or command")
+		}
+		if err := requireString(obj, "exec"); err != nil {
+			return err
+		}
+		if args, set := obj["args"]; set {
+			list, ok := args.([]any)
+			for _, arg := range list {
+				if _, isString := arg.(string); !isString {
+					ok = false
+				}
+			}
+			if !ok {
+				return fmt.Errorf("args must be an array of strings")
+			}
+		}
+		return nil
+	}
+	if _, set := obj["args"]; set {
+		return fmt.Errorf("args are passed to exec only")
+	}
+	if !shell {
+		return fmt.Errorf("requires bash, powershell, command or exec")
+	}
+	return nil
+}
+
+func requireString(obj map[string]any, key string) error {
+	if s, ok := obj[key].(string); !ok || strings.TrimSpace(s) == "" {
+		return fmt.Errorf("%s must be a non-empty string", key)
+	}
+	return nil
+}
+
+func sortedKeys[T any](m map[string]T) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}

@@ -54,11 +54,16 @@ func TargetName(name string) error {
 	return nil
 }
 
+// reservedSkillNames are names that cannot be used as skill names
+// because they conflict with resource kind directories or commands.
+var reservedSkillNames = []string{"agents"}
+
 // SkillName validates a skill name.
 // Rules:
 //   - Must start with a letter or number
 //   - Can contain letters, numbers, underscores, and hyphens
 //   - Length 1-64 characters
+//   - Cannot be a reserved skill name (e.g. "agents")
 func SkillName(name string) error {
 	if name == "" {
 		return fmt.Errorf("skill name cannot be empty")
@@ -70,6 +75,12 @@ func SkillName(name string) error {
 
 	if !validSkillNameRegex.MatchString(name) {
 		return fmt.Errorf("skill name must start with a letter or number and contain only letters, numbers, underscores, and hyphens")
+	}
+
+	for _, r := range reservedSkillNames {
+		if strings.EqualFold(name, r) {
+			return fmt.Errorf("'%s' is a reserved name and cannot be used as a skill name", name)
+		}
 	}
 
 	return nil
@@ -131,29 +142,10 @@ func TargetPath(path string) (warnings []string, err error) {
 }
 
 // IsLikelySkillsPath checks if a path looks like a skills directory.
-// Returns true if the path ends with "skills", "skill", or is a known CLI skills path.
+// Returns true if the path's last segment is "skills" or "skill".
 func IsLikelySkillsPath(path string) bool {
 	base := filepath.Base(path)
-	if base == "skills" || base == "skill" {
-		return true
-	}
-
-	// Check for known CLI patterns
-	knownPatterns := []string{
-		".claude/skills",
-		".codex/skills",
-		".cursor/skills",
-		".gemini/antigravity/skills",
-		".config/opencode/skills",
-	}
-
-	for _, pattern := range knownPatterns {
-		if strings.HasSuffix(path, pattern) {
-			return true
-		}
-	}
-
-	return false
+	return base == "skills" || base == "skill"
 }
 
 // FlatSkillName validates a flat skill name (used in target directories).

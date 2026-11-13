@@ -56,6 +56,10 @@ skills/                         ~/.claude/skills/
 - Per-target include/exclude filtering
 - Manifest-based orphan cleanup (safely removes non-symlink residue after uninstall)
 
+:::info Relative symlinks in project mode
+In project mode (`-p`), symlinks are created as **relative paths** (e.g., `../../.skillshare/skills/my-skill`) instead of absolute paths. This makes the project portable — move or rename the directory and symlinks continue to work. In global mode, absolute paths are used since source and targets are in different locations.
+:::
+
 **When to use:**
 - You want some skills only in specific AI CLIs
 - You want to try local skills before syncing
@@ -182,6 +186,8 @@ skillshare target claude --mode merge
 skillshare sync
 ```
 
+Unedited copies that copy mode made are replaced with links on that sync, without `--force`. Everything else is kept until you run `sync --force`: a folder you made yourself (the manifest does not record it) and a copy you edited after copy mode made it. A copy whose `name:` copy mode rewrote for `prefixed` naming also counts as edited. If the same sync also changes `target_naming`, a copy gets a new entry name and is removed as an orphan, edited or not; the backup of a plain `sync` holds it.
+
 ### By-target overrides (recommended)
 
 You do not need one global mode for every target. A common pattern is:
@@ -226,6 +232,60 @@ targets:
 
 ---
 
+## Target Naming
+
+Controls how skill directories are named in targets when using merge or copy mode.
+
+| Naming | Behavior |
+|--------|----------|
+| `flat` (default) | Nested skills flattened with `__` separators: `frontend/dev` → `frontend__dev` |
+| `standard` | Uses the SKILL.md `name` field: `frontend/dev` → `dev` |
+| `prefixed` | Copy mode only. `standard` rules, except that `name:` need not match the folder, plus the tracked repo name in front: `_mattpocock-skills/skills/prototype` → `mattpocock-skills-prototype` |
+
+Set globally or per-target:
+
+```yaml
+target_naming: standard    # global default
+targets:
+  claude:
+    skills:
+      target_naming: flat  # per-target override
+```
+
+Or via CLI:
+
+```bash
+skillshare target claude --target-naming standard
+skillshare sync
+```
+
+**Standard mode** follows the [Agent Skills specification](https://agentskills.io/specification), which requires the SKILL.md `name` field to match the parent directory name. A valid name has at most 64 lowercase letters (in any script), digits and single hyphens, and does not start or end with `-`; underscores are not allowed. Skills with invalid names or name collisions are warned and skipped.
+
+**Prefixed mode** is for tracked repos that ship skills with the same name. Under `standard` two `prototype` skills from different repos collide and both are skipped; under `prefixed` each skill inside a tracked repo becomes `<repo>-<name>`, so both reach the tool. `<repo>` is the tracked repo folder without its leading `_`, lowercased, with every character other than a letter or digit (in any script) turned into `-`. The prefixed name is used for the folder and written to `name:` in the copied `SKILL.md`; the source is never changed.
+
+- A name that already starts with the repo name is not prefixed again: `_bmad/skills/bmad-ux` stays `bmad-ux`.
+- Skills outside tracked repos keep their name.
+- The source skill's `name:` must follow the `standard` naming rules, but it does not have to match its folder, since the copy's `name:` is rewritten: a tracked repo that is itself a skill (`_ooux` with `name: ooux`) syncs as `ooux`. Sync lists the skills named this way. A prefixed name longer than 64 characters is skipped with a warning, and names that still collide are skipped as in `standard`. A tracked skill cannot be renamed in `SKILL.md`, so sync then suggests renaming the other skill or re-tracking the repo with `--name`.
+- For a shorter prefix, track the repo under a short name: `skillshare install <repo> --track --name mp` gives `mp-prototype`.
+- Relative links to sibling skills (`../other-skill/`) are not rewritten, the same as `flat` in copy mode.
+- The name becomes what the tool shows; in Claude Code it is the slash command, e.g. `/mattpocock-skills-prototype`.
+
+`prefixed` needs copy mode because merge links point at the source, where `name:` cannot change. A target that resolves to `prefixed` in merge or symlink mode fails validation and is skipped by sync. When a new target would inherit `prefixed` in a mode other than copy (a project target defaults to merge), `target add` gives it copy mode. `target add` says so when it does, and `status` and `doctor` flag a target that resolves to `prefixed` without copy mode before you sync, and so does `target list` for the targets in `targets:`; the fix is `mode: copy` on the target, or `projects.<root>.skills.mode: copy` for a target a `projects:` entry expands into.
+
+```yaml
+targets:
+  universal:
+    skills:
+      mode: copy
+      target_naming: prefixed
+```
+
+**Migration**: Switching between `flat`, `standard` and `prefixed` renames existing managed entries in place. In copy mode the manifest records which naming made each copy, so a renamed copy is copied again and its `name:` matches the new naming, even when the source did not change. If a local skill already occupies the new name, the old managed entry is preserved. When you switch away from `prefixed`, a skill whose `name:` differs from its folder is copied again under its new name and its old copy is removed.
+
+**Symlink mode**: `flat` and `standard` are ignored — the entire directory is linked as-is. `prefixed` fails validation, as above.
+
+---
+
 ## Mode Comparison
 
 | Aspect | Merge | Copy | Symlink |
@@ -252,9 +312,36 @@ This means that after `uninstall` + `sync`, even non-symlink residue (e.g., dire
 
 ```
 $ skillshare sync
-✓ claude: merged (5 linked, 2 local, 0 updated, 1 pruned)
-✓ cursor: copied (3 new, 2 skipped, 0 updated, 1 pruned)
+✓ claude    5 linked · 2 local · 1 pruned
+✓ cursor    3 copied · 2 up to date · 1 pruned
 ```
+
+:::info Agents follow the same modes
+All three modes (merge, copy, symlink) apply to agent sync as well. Agent orphan cleanup, per-target include/exclude filtering, and mode conversion behave identically to skills — the only difference is that agents are single `.md` files instead of directories. Agent-capable targets (Claude, Cursor, Augment, OpenCode) honor the same `mode` setting on their `agents:` sub-key. See [Agents](./agents.md) for details.
+:::
+
+---
+
+## Extras Sync Modes
+
+Extras (non-skill resources like rules, commands, prompts) also use merge and copy modes. Each extras target can specify its own mode:
+
+```yaml
+extras:
+  - name: rules
+    targets:
+      - path: ~/.claude/rules          # merge (default): per-file symlinks
+      - path: ~/.cursor/rules
+        mode: copy                     # copy: real file copies
+```
+
+The behavior is the same as skill sync modes — merge creates per-file symlinks, copy creates real file copies.
+
+:::note Windows without Developer Mode
+Merge mode links single files, which Windows allows only with Developer Mode. Without it, agents and extras in merge mode are copied instead, and those copies are updated and pruned like links. Skills are folders, so they are linked (with junctions) either way. See [Windows troubleshooting](/docs/troubleshooting/windows#file-links-need-windows-developer-mode-copying-instead).
+
+Identical local files that skillshare does not own are preserved. In copy fallback, agent counts show them separately as `local preserved`, for example `0/1 linked, 1 local preserved`.
+:::
 
 ---
 

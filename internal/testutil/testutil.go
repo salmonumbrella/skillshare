@@ -23,6 +23,13 @@ func NewSandbox(t *testing.T) *Sandbox {
 	t.Helper()
 
 	root := t.TempDir()
+	// macOS temp paths can pass through symlinks such as /var -> /private/var.
+	// Keep sandbox paths aligned with the canonical cwd reported by subprocesses.
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("failed to resolve sandbox root %s: %v", root, err)
+	}
+	root = resolvedRoot
 	home := filepath.Join(root, "home")
 
 	sb := &Sandbox{
@@ -74,6 +81,7 @@ func NewSandbox(t *testing.T) *Sandbox {
 
 	// Override environment
 	sb.SetEnv("HOME", home)
+	sb.SetEnv("USERPROFILE", home) // os.UserHomeDir on Windows
 	sb.SetEnv("SKILLSHARE_CONFIG", sb.ConfigPath)
 
 	// Point XDG variables into the sandbox so config.BaseDir()/DataDir()/
@@ -156,8 +164,12 @@ func (sb *Sandbox) CreateTarget(name string) string {
 		path = filepath.Join(sb.Home, ".codex", "skills")
 	case "cursor":
 		path = filepath.Join(sb.Home, ".cursor", "skills")
+	case "antigravity":
+		path = filepath.Join(sb.Home, ".gemini", "config", "skills")
+	case "antigravity-cli":
+		path = filepath.Join(sb.Home, ".gemini", "antigravity-cli", "skills")
 	case "gemini":
-		path = filepath.Join(sb.Home, ".gemini", "antigravity", "skills")
+		path = filepath.Join(sb.Home, ".gemini", "skills")
 	case "opencode":
 		path = filepath.Join(sb.Home, ".config", "opencode", "skills")
 	default:
@@ -276,7 +288,7 @@ func (sb *Sandbox) SetupProjectDir(targets ...string) string {
 	knownPaths := map[string]string{
 		"claude":      ".claude/skills",
 		"claude-code": ".claude/skills", // legacy alias
-		"cursor":      ".cursor/skills",
+		"cursor":      ".agents/skills",
 		"codex":       ".agents/skills",
 	}
 	for _, t := range targets {

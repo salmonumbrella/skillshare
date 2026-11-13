@@ -5,12 +5,15 @@ package oplog
 import (
 	"bufio"
 	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"time"
 
 	"skillshare/internal/config"
 	"skillshare/internal/install"
+	"skillshare/internal/projectdir"
+	"skillshare/internal/utils"
 )
 
 const (
@@ -29,18 +32,55 @@ type Entry struct {
 }
 
 // LogDir returns the logs directory derived from a config file path.
-// For project mode: .skillshare/logs/ (alongside project config)
+// For project mode: <project-dir>/logs/ (alongside project config)
 // For global mode: $XDG_STATE_HOME/skillshare/logs/
 func LogDir(configPath string) string {
-	configDir := filepath.Dir(configPath)
-	if filepath.Base(configDir) == ".skillshare" {
-		return filepath.Join(configDir, "logs")
+	if dir, ok := projectConfigDir(configPath); ok {
+		return filepath.Join(dir, "logs")
 	}
 	return filepath.Join(config.StateDir(), "logs")
 }
 
-// Write appends a single JSONL entry to the named log file.
+// projectConfigDir returns the project directory holding configPath, if any.
+//
+// The visible project directory shares its name with the global config
+// directory (<config-home>/skillshare), so a name match alone is ambiguous and
+// the canonical and selected global locations are excluded by full path.
+func projectConfigDir(configPath string) (string, bool) {
+	configDir := filepath.Dir(configPath)
+	if !projectdir.IsName(filepath.Base(configDir)) {
+		return "", false
+	}
+	if utils.PathsEqual(configDir, config.BaseDir()) ||
+		utils.PathsEqual(configPath, config.ReadOnlyConfigPath()) {
+		return "", false
+	}
+	return configDir, true
+}
+
+// IsProjectConfig reports whether a config routes to project-local logs.
+// Both readers and writers must use the same global/selected-config exclusions.
+func IsProjectConfig(configPath string) bool {
+	_, ok := projectConfigDir(configPath)
+	return ok
+}
+
+// sourceArgs are the args that hold a source as the user typed it.
+var sourceArgs = []string{"source", "oldSource", "newSource"}
+
+// Write appends a single JSONL entry to the named log file. A source keeps no
+// credentials: its userinfo and query are dropped, also where the message
+// echoes them.
 func Write(configPath, filename string, e Entry) error {
+	e.Args = maps.Clone(e.Args)
+	for _, key := range sourceArgs {
+		if source, ok := e.Args[key].(string); ok {
+			clean, redact := install.RedactRepoURL(source)
+			e.Args[key] = clean
+			e.Message = redact.Replace(e.Message)
+		}
+	}
+
 	dir := LogDir(configPath)
 	dirInfo, statErr := os.Stat(dir)
 	logsDirMissing := os.IsNotExist(statErr)
@@ -70,8 +110,8 @@ func Write(configPath, filename string, e Entry) error {
 }
 
 func ensureProjectLogGitignore(configPath string) {
-	configDir := filepath.Dir(configPath)
-	if filepath.Base(configDir) != ".skillshare" {
+	configDir, ok := projectConfigDir(configPath)
+	if !ok {
 		return
 	}
 	_ = install.UpdateGitIgnore(configDir, "logs")

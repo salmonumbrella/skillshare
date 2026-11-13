@@ -8,15 +8,19 @@ import (
 
 	"skillshare/internal/config"
 	"skillshare/internal/install"
+	"skillshare/internal/projectdir"
+	"skillshare/internal/theme"
 	"skillshare/internal/ui"
 )
 
 type projectInitOptions struct {
-	dryRun    bool
-	targets   []string // Non-interactive target list
-	discover  bool
-	selectArg string // Non-interactive selection for --discover
-	mode      string // default mode for new targets: merge|copy|symlink
+	dryRun     bool
+	targets    []string // Non-interactive target list
+	discover   bool
+	selectArg  string // Non-interactive selection for --discover
+	mode       string // default mode for new targets: merge|copy|symlink
+	configMode string // "local" to gitignore config.yaml (shared skills repo)
+	visible    bool   // create a visible skillshare/ directory instead of .skillshare/
 }
 
 type detectedProjectTarget struct {
@@ -28,23 +32,23 @@ type detectedProjectTarget struct {
 }
 
 func printProjectInitUsage() {
-	fmt.Println("Usage: skillshare init -p [flags]")
-	fmt.Println()
-	fmt.Println("Initialize project-level skillshare config in the current repository.")
-	fmt.Println()
-	fmt.Println("FLAGS")
-	fmt.Println("  --targets <list>          Comma-separated target names to add")
-	fmt.Println("  --discover, -d            Detect and add new project targets to existing config")
-	fmt.Println("  --select <list>           Select specific targets to add (requires --discover)")
-	fmt.Println("  --mode, -m <mode>         Set sync mode (merge, copy, symlink; default: merge).")
-	fmt.Println("                            With --discover, applies only to newly added targets")
-	fmt.Println("  --dry-run, -n             Preview without making changes")
-	fmt.Println("  --help, -h                Show this help")
-	fmt.Println()
-	fmt.Println("EXAMPLES")
-	fmt.Println("  skillshare init -p")
-	fmt.Println("  skillshare init -p --targets claude,cursor --mode copy")
-	fmt.Println("  skillshare init -p --discover --select cursor --mode copy")
+	printHelp("skillshare init -p [options]", "Initialize project-level skillshare config in the current repository.",
+		helpGroup{title: "Options", rows: []helpRow{
+			{"--targets <list>", "Comma-separated target names to add"},
+			{"-d, --discover", "Detect and add new project targets to existing config"},
+			{"--select <list>", "Select specific targets to add (requires --discover)"},
+			{"-m, --mode <mode>", "Set sync mode (merge, copy, symlink; default: merge).\nWith --discover, applies only to newly added targets"},
+			{"--config local", "Gitignore config.yaml (each developer manages own targets)"},
+			{"--visible", "Create a visible skillshare/ directory instead of .skillshare/"},
+			{"-n, --dry-run", "Preview without making changes"},
+		}},
+		helpExamples(
+			helpRow{"skillshare init -p", ""},
+			helpRow{"skillshare init -p --targets claude,cursor --mode copy", ""},
+			helpRow{"skillshare init -p --discover --select cursor --mode copy", ""},
+			helpRow{"skillshare init -p --visible", ""},
+		),
+	)
 }
 
 func parseProjectInitArgs(args []string) (projectInitOptions, bool, error) {
@@ -54,6 +58,8 @@ func parseProjectInitArgs(args []string) (projectInitOptions, bool, error) {
 		switch {
 		case arg == "--dry-run" || arg == "-n":
 			opts.dryRun = true
+		case arg == "--visible":
+			opts.visible = true
 		case arg == "--help" || arg == "-h":
 			return opts, true, nil
 		case arg == "--discover" || arg == "-d":
@@ -70,12 +76,23 @@ func parseProjectInitArgs(args []string) (projectInitOptions, bool, error) {
 			}
 			i++
 			opts.targets = strings.Split(args[i], ",")
+		case arg == "--config":
+			if i+1 >= len(args) {
+				return opts, false, fmt.Errorf("--config requires a value (local)")
+			}
+			i++
+			if args[i] != "local" {
+				return opts, false, fmt.Errorf("--config only supports 'local'")
+			}
+			opts.configMode = args[i]
 		case arg == "--mode" || arg == "-m":
 			if i+1 >= len(args) {
 				return opts, false, fmt.Errorf("--mode requires a value (merge, copy, or symlink)")
 			}
 			i++
 			opts.mode = normalizeSyncMode(args[i])
+		case arg == "--git-root" || arg == "--git" || arg == "--no-git" || arg == "--remote":
+			return opts, false, fmt.Errorf("%s is a global-only flag; project mode has no git integration. Run it in global mode: skillshare init -g %s", arg, arg)
 		case strings.HasPrefix(arg, "-"):
 			return opts, false, fmt.Errorf("unknown option: %s", arg)
 		}
@@ -110,8 +127,17 @@ func cmdInitProject(args []string) error {
 }
 
 func performProjectInit(root string, opts projectInitOptions) error {
-	projectDir := filepath.Join(root, ".skillshare")
-	configPath := config.ProjectConfigPath(root)
+	// An already-initialized or partially-initialized project keeps its own
+	// directory; only a brand new project honours --visible.
+	projectDir, existing := projectdir.Find(root)
+	if !existing {
+		projectDir, existing = projectdir.FindPartial(root)
+	}
+	if !existing {
+		projectDir = filepath.Join(root, projectdir.Name(opts.visible))
+	}
+	dirName := filepath.Base(projectDir)
+	configPath := filepath.Join(projectDir, projectdir.ConfigFileName)
 	partialInitRepair := false
 	if info, err := os.Stat(projectDir); err == nil {
 		if !info.IsDir() {
@@ -128,17 +154,34 @@ func performProjectInit(root string, opts projectInitOptions) error {
 		return fmt.Errorf("failed to check project directory: %w", err)
 	}
 
-	ui.Logo(version)
-	ui.Header("Initializing project-level skills")
+	interactive := runningInInteractiveTTY()
+	detected := detectProjectCLIDirectories(root)
+	printProjectBanner(root, detected, interactive)
+
+	sharedRepoFlow := false
 	if partialInitRepair {
-		ui.Warning("Detected partial project initialization; repairing missing config")
+		gitignored, err := isConfigGitignored(projectDir)
+		if err != nil {
+			ui.Warning("Could not check for shared repo config: %v", err)
+		}
+		if gitignored {
+			// Shared skills repo: cloned from a teammate who used --config local.
+			// Generate empty config so each developer manages their own targets.
+			sharedRepoFlow = true
+			ui.Warning("Detected shared skills directory (from git clone)")
+		} else {
+			ui.Warning("Detected partial project initialization; repairing missing config")
+		}
 	}
 
 	var selected []config.ProjectTargetEntry
 	selectedMode := opts.mode
 
-	// If --targets provided, skip interactive prompt
-	if len(opts.targets) > 0 {
+	if sharedRepoFlow {
+		// Empty targets — developer will add their own via `target add`
+		selected = nil
+	} else if len(opts.targets) > 0 {
+		// --targets provided, skip interactive prompt
 		selected = make([]config.ProjectTargetEntry, 0, len(opts.targets))
 		for _, name := range opts.targets {
 			name = strings.TrimSpace(name)
@@ -146,60 +189,71 @@ func performProjectInit(root string, opts projectInitOptions) error {
 				selected = append(selected, config.ProjectTargetEntry{Name: name})
 			}
 		}
+	} else if partialInitRepair || !interactive {
+		// No one to ask: every detected tool, as Enter would choose.
+		selected = projectEntries(detected)
 	} else {
-		detected := detectProjectCLIDirectories(root)
 		available := detected
 		if len(available) == 0 {
-			ui.Warning("No AI CLI directories detected.")
 			available = listAllProjectTargets()
 		}
-
-		if partialInitRepair {
-			for _, target := range available {
-				if target.exists || target.parentExists {
-					selected = append(selected, config.ProjectTargetEntry{Name: target.name})
-				}
-			}
-		} else {
-			var err error
-			selected, err = promptProjectTargets(available)
-			if err != nil {
-				return err
-			}
+		var err error
+		if selected, err = promptProjectTargets(available); err != nil {
+			return initCancelled(err)
 		}
 	}
-	if selectedMode == "" && len(opts.targets) == 0 && !partialInitRepair && runningInInteractiveTTY() {
-		selectedMode = promptSyncModeSelection()
+	if selectedMode == "" && len(opts.targets) == 0 && !sharedRepoFlow && !partialInitRepair && interactive {
+		mode, err := promptSyncMode()
+		if err != nil {
+			return initCancelled(err)
+		}
+		selectedMode = mode
 	}
 	if selectedMode == "" {
 		selectedMode = "merge"
 	}
+	if !interactive {
+		ui.Answered("Targets", describeTools(entryNames(selected))+" "+theme.Dim().Render("(--targets)"))
+		ui.Answered("Sync", selectedMode+" "+theme.Dim().Render("(--mode)"))
+	}
 	for i := range selected {
-		selected[i].Mode = modeOverrideForTarget(selectedMode, "merge")
+		if m := modeOverrideForTarget(selectedMode, "merge"); m != "" {
+			selected[i].EnsureSkills().Mode = m
+		}
 	}
 
 	if opts.dryRun {
-		ui.Header("Dry run complete (project)")
-		ui.Info("Would create .skillshare/skills/")
-		ui.Info("Would write config: %s", configPath)
+		fmt.Println()
+		ui.Row(ui.MarkNone, "Skills", "would create "+dirName+"/skills/", ui.RowWidth())
+		ui.Row(ui.MarkNone, "Config", "would write "+shortenPath(configPath), ui.RowWidth())
+		fmt.Println()
+		ui.DryRun()
 		return nil
 	}
 
-	if err := os.MkdirAll(filepath.Join(root, ".skillshare", "skills"), 0755); err != nil {
-		return fmt.Errorf("failed to create .skillshare/skills: %w", err)
+	if err := os.MkdirAll(filepath.Join(projectDir, "skills"), 0755); err != nil {
+		return fmt.Errorf("failed to create %s/skills: %w", dirName, err)
+	}
+	if err := os.MkdirAll(filepath.Join(projectDir, "agents"), 0755); err != nil {
+		return fmt.Errorf("failed to create %s/agents: %w", dirName, err)
 	}
 
-	if err := ensureProjectGitignore(root); err != nil {
+	if err := ensureProjectGitignore(projectDir, opts.configMode == "local"); err != nil {
 		return err
 	}
 
 	cfg := &config.ProjectConfig{
 		Targets: selected,
+		Ignore: []string{
+			".DS_Store",
+			".git/",
+			"__pycache__/",
+		},
 		Audit: config.AuditConfig{
 			BlockThreshold: "CRITICAL",
 		},
 	}
-	if err := cfg.Save(root); err != nil {
+	if err := cfg.SaveIn(projectDir); err != nil {
 		return err
 	}
 
@@ -207,25 +261,79 @@ func performProjectInit(root string, opts projectInitOptions) error {
 		return err
 	}
 
-	ui.Success("Created .skillshare/config.yaml")
-	ui.Success("Created .skillshare/skills/")
-	ui.Success("Added %d target(s)", len(selected))
 	fmt.Println()
+	cfgLine := dirName + "/" + projectdir.ConfigFileName
+	if opts.configMode == "local" {
+		cfgLine += " " + theme.Dim().Render("(gitignored: each developer manages own targets)")
+	}
+	ui.Answered("Config", cfgLine)
+	ui.Answered("Skills", dirName+"/skills/")
+	if !sharedRepoFlow {
+		ui.Answered("Targets", describeTools(entryNames(selected)))
+	}
 
-	ui.Header("Initialized successfully (project)")
-	ui.Success("Source: .skillshare/skills/")
-	ui.Success("Config: %s", config.ProjectConfigPath(root))
 	fmt.Println()
-	ui.Info("Next steps:")
-	fmt.Printf("  %sskillshare install <skill> -p%s    %s# Install a skill%s\n", ui.Yellow, ui.Reset, ui.Dim, ui.Reset)
-	fmt.Printf("  %sskillshare sync%s                  %s# Sync to all targets%s\n", ui.Yellow, ui.Reset, ui.Dim, ui.Reset)
-
+	fmt.Println(theme.Primary().Bold(true).Render("Next"))
+	cmd := func(c, note string) {
+		fmt.Printf("  %s %s\n", theme.Accent().Render(fmt.Sprintf("%-38s", c)), theme.Dim().Render(note))
+	}
+	if sharedRepoFlow || opts.configMode == "local" {
+		cmd("skillshare target add <name> <path> -p", "add a tool to sync")
+		cmd("skillshare sync -p", "sync skills to your tools")
+	} else {
+		cmd("skillshare install <repo> -p", "add skills to this project")
+		cmd("skillshare sync -p", "sync skills to your tools")
+	}
 	return nil
 }
 
-func detectProjectCLIDirectories(root string) []detectedProjectTarget {
-	ui.Header("Detecting AI CLI directories")
+// printProjectBanner shows the logo with the project and the tools found in it.
+func printProjectBanner(root string, detected []detectedProjectTarget, animate bool) {
+	found := "No AI tools found in this project yet"
+	if n := len(detected); n > 0 {
+		found = "Found " + plural(n, "AI tool") + " here"
+	}
+	fmt.Println()
+	ui.LogoBanner(version, []string{
+		"Project " + filepath.Base(root),
+		theme.Dim().Render(found),
+	}, animate)
+	fmt.Println()
+}
 
+// promptSyncMode asks how skills reach the tools; Enter keeps merge.
+func promptSyncMode() (string, error) {
+	mode, err := ui.Select("How should skills reach your tools?", []ui.Option{
+		{Label: "merge     link each skill  " + theme.Dim().Render("(default)"), Value: "merge"},
+		{Label: "copy      real files  " + theme.Dim().Render("· for tools that can't follow links"), Value: "copy"},
+		{Label: "symlink   link the whole folder", Value: "symlink"},
+	}, "merge")
+	if err != nil {
+		return "", err
+	}
+	ui.Answered("Sync", mode+" "+theme.Dim().Render("("+syncModeNotes[mode]+")"))
+	return mode, nil
+}
+
+func projectEntries(targets []detectedProjectTarget) []config.ProjectTargetEntry {
+	entries := make([]config.ProjectTargetEntry, 0, len(targets))
+	for _, t := range targets {
+		entries = append(entries, config.ProjectTargetEntry{Name: t.name})
+	}
+	return entries
+}
+
+func entryNames(entries []config.ProjectTargetEntry) []string {
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name)
+	}
+	return names
+}
+
+// detectProjectCLIDirectories finds the tools set up in the project. It
+// only reads the disk and prints nothing.
+func detectProjectCLIDirectories(root string) []detectedProjectTarget {
 	grouped := config.GroupedProjectTargets()
 
 	var detected []detectedProjectTarget
@@ -241,11 +349,6 @@ func detectProjectCLIDirectories(root string) []detectedProjectTarget {
 
 		if info, err := os.Stat(fullPath); err == nil && info.IsDir() {
 			entry.exists = true
-			if len(g.Members) > 0 {
-				ui.Success("Found: %s (%s) — %s", g.Name, relPath, strings.Join(g.Members, ", "))
-			} else {
-				ui.Success("Found: %s (%s)", g.Name, relPath)
-			}
 			detected = append(detected, entry)
 			continue
 		}
@@ -255,7 +358,6 @@ func detectProjectCLIDirectories(root string) []detectedProjectTarget {
 			parentPath := filepath.Join(root, parentRel)
 			if _, err := os.Stat(parentPath); err == nil {
 				entry.parentExists = true
-				ui.Info("Found: %s (not initialized)", g.Name)
 				detected = append(detected, entry)
 			}
 		}
@@ -278,47 +380,32 @@ func listAllProjectTargets() []detectedProjectTarget {
 	return available
 }
 
+// promptProjectTargets asks which tools to sync; detected ones start checked.
 func promptProjectTargets(available []detectedProjectTarget) ([]config.ProjectTargetEntry, error) {
-	ui.Header("Select targets to sync")
-
-	items := make([]checklistItemData, len(available))
-	for i, target := range available {
-		label := fmt.Sprintf("%-14s %s", target.name, target.path)
-		if len(target.members) > 0 {
-			label += fmt.Sprintf("  (%s)", strings.Join(target.members, ", "))
+	options := make([]ui.Option, len(available))
+	var checked []string
+	for i, t := range available {
+		note := filepath.ToSlash(t.path)
+		if len(t.members) > 0 {
+			note += " · " + strings.Join(t.members, ", ")
 		}
-		if !target.exists && target.parentExists {
-			label += " (not initialized)"
+		if !t.exists && t.parentExists {
+			note += " · not set up yet"
 		}
-		items[i] = checklistItemData{
-			label:       label,
-			preSelected: target.exists || target.parentExists,
+		options[i] = ui.Option{Label: fmt.Sprintf("%-14s %s", t.name, theme.Dim().Render(note)), Value: t.name}
+		if t.exists || t.parentExists {
+			checked = append(checked, t.name)
 		}
 	}
-
-	selectedIndices, err := runChecklistTUI(checklistConfig{
-		title:    "Select targets to sync",
-		items:    items,
-		itemName: "target",
-	})
-	if err != nil || selectedIndices == nil {
-		return nil, nil
+	names, err := ui.MultiSelect("Sync skills to which tools?", options, checked)
+	if err != nil {
+		return nil, err
 	}
-
-	selected := make([]config.ProjectTargetEntry, 0, len(selectedIndices))
-	names := make([]string, 0, len(selectedIndices))
-	for _, idx := range selectedIndices {
-		name := available[idx].name
+	ui.Answered("Targets", describeTools(names))
+	selected := make([]config.ProjectTargetEntry, 0, len(names))
+	for _, name := range names {
 		selected = append(selected, config.ProjectTargetEntry{Name: name})
-		names = append(names, name)
 	}
-
-	if len(selected) > 0 {
-		ui.Success("Added %d target(s): %s", len(selected), strings.Join(names, ", "))
-	} else {
-		ui.Info("No targets selected")
-	}
-
 	return selected, nil
 }
 
@@ -331,7 +418,10 @@ func createProjectTargetDirs(root string, targets []config.ProjectTargetEntry) e
 
 	for _, target := range targets {
 		name := target.Name
-		path := target.Path
+		if !target.SkillsConfig().IsEnabled() {
+			continue
+		}
+		path := target.SkillsConfig().Path
 		if path == "" {
 			if known, ok := config.LookupProjectTarget(name); ok {
 				path = known.Path
@@ -362,9 +452,6 @@ func createProjectTargetDirs(root string, targets []config.ProjectTargetEntry) e
 // Uses path-based dedup so that e.g. an existing "amp" entry (which maps to .agents/skills)
 // correctly prevents the "agents" group from appearing as "new".
 func reinitProjectWithDiscover(root string, opts projectInitOptions) error {
-	ui.Logo(version)
-	ui.Header("Discovering new targets")
-
 	cfg, err := config.LoadProject(root)
 	if err != nil {
 		return err
@@ -374,8 +461,8 @@ func reinitProjectWithDiscover(root string, opts projectInitOptions) error {
 	existingPaths := make(map[string]bool)
 	for _, t := range cfg.Targets {
 		name := strings.TrimSpace(t.Name)
-		if t.Path != "" {
-			existingPaths[filepath.FromSlash(t.Path)] = true
+		if sc := t.SkillsConfig(); sc.Path != "" {
+			existingPaths[filepath.FromSlash(sc.Path)] = true
 		} else if known, ok := config.LookupProjectTarget(name); ok {
 			existingPaths[filepath.FromSlash(known.Path)] = true
 		}
@@ -383,7 +470,8 @@ func reinitProjectWithDiscover(root string, opts projectInitOptions) error {
 
 	// Detect AI CLI directories (already grouped by shared paths)
 	detected := detectProjectCLIDirectories(root)
-	if len(detected) == 0 {
+	noneFound := len(detected) == 0
+	if noneFound {
 		detected = listAllProjectTargets()
 	}
 
@@ -396,13 +484,14 @@ func reinitProjectWithDiscover(root string, opts projectInitOptions) error {
 	}
 
 	if len(newTargets) == 0 {
-		ui.Info("No new targets detected")
+		fmt.Println("No new AI tools found")
 		return nil
 	}
 
-	ui.Success("Found %d new target(s)", len(newTargets))
+	discoverFound(len(newTargets))
 
 	var selected []config.ProjectTargetEntry
+	asked := false
 
 	// Non-interactive: --select (accepts canonical or member names)
 	if opts.selectArg != "" {
@@ -416,44 +505,46 @@ func reinitProjectWithDiscover(root string, opts projectInitOptions) error {
 			target := findGroupedTarget(newTargets, name)
 			if target == nil {
 				if known, ok := config.LookupProjectTarget(name); ok && existingPaths[filepath.FromSlash(known.Path)] {
-					ui.Info("Target already covered: %s (skipped)", name)
+					fmt.Printf("  %s is already set up (skipped)\n", name)
 				} else {
-					ui.Warning("Target not detected: %s (skipped)", name)
+					ui.Warning("%s was not found in this project (skipped)", name)
 				}
 				continue
 			}
 			if !seen[target.name] {
 				seen[target.name] = true
-				selected = append(selected, config.ProjectTargetEntry{
-					Name: target.name,
-					Mode: modeOverrideForTarget(opts.mode, "merge"),
-				})
+				entry := config.ProjectTargetEntry{Name: target.name}
+				if m := modeOverrideForTarget(opts.mode, "merge"); m != "" {
+					entry.Skills = &config.ResourceTargetConfig{Mode: m}
+				}
+				selected = append(selected, entry)
 			}
 		}
-	} else {
-		// Interactive selection
+	} else if runningInInteractiveTTY() {
+		asked = true
 		var err error
-		selected, err = promptProjectTargets(newTargets)
-		if err != nil {
-			return err
+		if selected, err = promptProjectTargets(newTargets); err != nil {
+			return initCancelled(err)
 		}
+	} else if !noneFound {
+		// No one to ask: add every new tool found, as Enter would choose.
+		selected = projectEntries(newTargets)
 	}
 
 	if len(selected) == 0 {
-		ui.Info("No new targets added")
+		fmt.Println("No AI tools added")
 		return nil
 	}
 	if opts.mode != "" {
 		for i := range selected {
-			selected[i].Mode = modeOverrideForTarget(opts.mode, "merge")
+			if m := modeOverrideForTarget(opts.mode, "merge"); m != "" {
+				selected[i].EnsureSkills().Mode = m
+			}
 		}
 	}
 
 	if opts.dryRun {
-		ui.Warning("Dry run - would add %d target(s) to config", len(selected))
-		for _, t := range selected {
-			fmt.Printf("  + %s\n", t.Name)
-		}
+		printDiscoverResult("", entryNames(selected), asked, true, "")
 		return nil
 	}
 
@@ -468,11 +559,8 @@ func reinitProjectWithDiscover(root string, opts projectInitOptions) error {
 		return err
 	}
 
-	ui.Success("Added %d target(s) to config", len(selected))
-	for _, t := range selected {
-		fmt.Printf("  + %s\n", t.Name)
-	}
-	ui.Info("Run 'skillshare sync' to sync skills to new targets")
+	cfgPath := projectdir.ConfigPath(root)
+	printDiscoverResult(filepath.Base(filepath.Dir(cfgPath))+"/"+projectdir.ConfigFileName, entryNames(selected), asked, false, "skillshare sync -p")
 
 	return nil
 }
@@ -492,18 +580,33 @@ func findGroupedTarget(targets []detectedProjectTarget, name string) *detectedPr
 	return nil
 }
 
-func ensureProjectGitignore(root string) error {
-	gitignoreDir := filepath.Join(root, ".skillshare")
+// isConfigGitignored checks if config.yaml is gitignored in the project
+// directory's .gitignore, indicating this is a shared skills repo where each
+// developer manages their own config.
+func isConfigGitignored(projectDir string) (bool, error) {
+	path := filepath.Join(projectDir, ".gitignore")
+	return install.GitignoreContains(path, "config.yaml")
+}
+
+func ensureProjectGitignore(gitignoreDir string, gitignoreConfig bool) error {
+	dirName := filepath.Base(gitignoreDir)
 	gitignorePath := filepath.Join(gitignoreDir, ".gitignore")
 	if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
 		if err := os.WriteFile(gitignorePath, []byte(""), 0644); err != nil {
-			return fmt.Errorf("failed to create .skillshare/.gitignore: %w", err)
+			return fmt.Errorf("failed to create %s/.gitignore: %w", dirName, err)
 		}
 	}
 
-	// Always ignore project logs to avoid committing operational noise.
-	if err := install.UpdateGitIgnore(gitignoreDir, "logs"); err != nil {
-		return fmt.Errorf("failed to update .skillshare/.gitignore: %w", err)
+	// Always ignore operational directories to avoid committing noise.
+	if err := install.UpdateGitIgnoreBatch(gitignoreDir, []string{"logs", "trash", "backups"}); err != nil {
+		return fmt.Errorf("failed to update %s/.gitignore: %w", dirName, err)
+	}
+
+	// --config local: gitignore config.yaml so each developer manages own targets.
+	if gitignoreConfig {
+		if err := install.UpdateGitIgnoreFiles(gitignoreDir, []string{"config.yaml"}); err != nil {
+			return fmt.Errorf("failed to gitignore config.yaml: %w", err)
+		}
 	}
 
 	return nil

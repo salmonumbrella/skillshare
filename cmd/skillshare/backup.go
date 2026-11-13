@@ -2,28 +2,49 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"time"
-
-	"github.com/pterm/pterm"
 
 	"skillshare/internal/backup"
 	"skillshare/internal/config"
 	"skillshare/internal/oplog"
+	"skillshare/internal/theme"
 	"skillshare/internal/trash"
 	"skillshare/internal/ui"
+	"skillshare/internal/utils"
 )
 
 func cmdBackup(args []string) error {
-	mode, args, err := parseModeArgs(args)
+	mode, args, err := parseModeArgs(args, "--target", "-t", "--delete")
 	if err != nil {
 		return err
 	}
-	if mode == modeProject {
-		return fmt.Errorf("backup is not supported in project mode")
+
+	if len(args) > 0 && args[0] == "files" {
+		return cmdBackupFiles(mode, args[1:])
 	}
+
+	cwd, _ := os.Getwd()
+
+	// --delete works on either mode's snapshot folders, so it is handled
+	// before the project-mode restriction below.
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--delete" {
+			if i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+				return fmt.Errorf("--delete requires a backup timestamp (see backup --list)")
+			}
+			applyModeLabel(mode)
+			return backupDelete(mode, cwd, args[i+1], hasFlag(args, "--dry-run") || hasFlag(args, "-n"))
+		}
+	}
+
+	// Extract kind filter (e.g. "skillshare backup agents" or "--all").
+	kind, args := parseKindArgWithAll(args)
 
 	start := time.Now()
 	var targetName string
@@ -52,18 +73,43 @@ func cmdBackup(args []string) error {
 		}
 	}
 
-	if doList {
-		return backupList()
+	if mode == modeAuto && kind == kindAgents && projectConfigExists(cwd) {
+		mode = modeProject
 	}
+	applyModeLabel(mode)
 
-	if doCleanup {
-		if dryRun {
-			return backupCleanupDryRun()
+	// Listing and cleanup work on the project's snapshots too (agents only).
+	if doList || doCleanup {
+		backupDir := backup.BackupDir()
+		if mode == modeProject {
+			backupDir = backup.ProjectBackupDir(cwd)
 		}
-		return backupCleanup()
+		if doList {
+			return backupList(backupDir)
+		}
+		// Retention limits come from the global config; project snapshots keep the defaults.
+		retention := backup.DefaultCleanupConfig()
+		if mode != modeProject {
+			if cfg, err := config.Load(); err == nil {
+				retention = backup.RetentionConfig(cfg)
+			}
+		}
+		if dryRun {
+			return backupCleanupDryRun(backupDir, retention)
+		}
+		return backupCleanup(backupDir, retention)
 	}
 
-	err = createBackup(targetName, dryRun)
+	// Project mode is only supported for agents.
+	if mode == modeProject && kind != kindAgents && kind != kindAll {
+		return fmt.Errorf("backup is not supported in project mode (except for agents)")
+	}
+
+	if kind == kindAgents {
+		err = createAgentBackup(mode, cwd, targetName, dryRun)
+	} else {
+		err = createBackup(targetName, dryRun)
+	}
 
 	if !dryRun {
 		e := oplog.NewEntry("backup", statusFromErr(err), time.Since(start))
@@ -94,55 +140,78 @@ func createBackup(targetName string, dryRun bool) error {
 		}
 	}
 
-	ui.Header("Creating backup")
+	names := slices.Sorted(maps.Keys(targets))
+	width := ui.RowWidth(names...)
 	if dryRun {
-		ui.Warning("Dry run mode - no backups will be created")
-		for name, target := range targets {
-			if err := previewBackup(name, target.Path); err != nil {
-				ui.Warning("Failed to inspect %s: %v", name, err)
+		for _, name := range names {
+			target := targets[name]
+			if err := previewBackup(name, target.SkillsConfig().Path, width); err != nil {
+				ui.Row(ui.MarkWarn, name, fmt.Sprintf("could not inspect: %v", err), width)
 			}
 		}
+		fmt.Println()
+		ui.DryRun()
 		return nil
 	}
 
+	type backupResult struct {
+		name       string
+		backupPath string
+		errMsg     string
+	}
+
+	spinner := ui.StartSpinner("Backing up targets...")
+	var results []backupResult
 	created := 0
-	skipped := 0
-	for name, target := range targets {
-		backupPath, err := backup.Create(name, target.Path)
+	failed := 0
+	for _, name := range names {
+		spinner.Update(fmt.Sprintf("Backing up %s...", name))
+		target := targets[name]
+		backupPath, err := backup.Create(name, target.SkillsConfig().Path)
 		if err != nil {
-			ui.Warning("Failed to backup %s: %v", name, err)
+			results = append(results, backupResult{name: name, errMsg: err.Error()})
+			failed++
 			continue
 		}
 		if backupPath != "" {
-			ui.StepDone(name, backupPath)
+			results = append(results, backupResult{name: name, backupPath: backupPath})
 			created++
 		} else {
-			ui.StepSkip(name, "nothing to backup (empty or symlink)")
-			skipped++
+			results = append(results, backupResult{name: name})
+		}
+	}
+	spinner.Stop()
+
+	for _, r := range results {
+		if r.errMsg != "" {
+			ui.Row(ui.MarkFail, r.name, r.errMsg, width)
+		} else if r.backupPath != "" {
+			ui.Row(ui.MarkOK, r.name, utils.FoldHomePath(r.backupPath), width)
+		} else {
+			ui.Row(ui.MarkNone, r.name, ui.DimText("nothing to back up (empty or symlink)"), width)
 		}
 	}
 
-	ui.OperationSummary("Backup", 0,
-		ui.Metric{Label: "created", Count: created, HighlightColor: pterm.Green},
-		ui.Metric{Label: "skipped", Count: skipped, HighlightColor: pterm.Yellow},
-	)
-
-	// List recent backups
-	backups, _ := backup.List()
-	if len(backups) > 0 {
-		fmt.Println()
-		ui.Header("Recent backups")
-		limit := min(5, len(backups))
-		for i := 0; i < limit; i++ {
-			b := backups[i]
-			ui.ListItem("info", b.Timestamp, fmt.Sprintf("%s (%s)", strings.Join(b.Targets, ", "), b.Path))
-		}
-	}
-
+	fmt.Println()
+	printBackupDone(created, failed, "", spinner.Started())
 	return nil
 }
 
-func previewBackup(targetName, targetPath string) error {
+// printBackupDone closes a backup run; what names the backed-up folders
+// ("" for skills, "agents of " for agent backups).
+func printBackupDone(created, failed int, what string, start time.Time) {
+	switch {
+	case failed > 0:
+		ui.Done(ui.MarkFail, fmt.Sprintf("Backed up %s%s, %d failed", what, plural(created, "target"), failed), time.Since(start))
+	case created == 0:
+		ui.Done(ui.MarkNone, "Nothing to back up", 0)
+	default:
+		ui.Done(ui.MarkOK, fmt.Sprintf("Backed up %s%s", what, plural(created, "target")), time.Since(start))
+		ui.Next("skillshare restore <target>", "roll a target back")
+	}
+}
+
+func previewBackup(targetName, targetPath string, width int) error {
 	backupDir := backup.BackupDir()
 	if backupDir == "" {
 		return fmt.Errorf("cannot determine backup directory: home directory not found")
@@ -151,160 +220,175 @@ func previewBackup(targetName, targetPath string) error {
 	info, err := os.Lstat(targetPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			ui.StepSkip(targetName, "nothing to backup (missing)")
+			ui.Row(ui.MarkNone, targetName, ui.DimText("nothing to back up (missing)"), width)
 			return nil
 		}
 		return err
 	}
 
-	if info.Mode()&os.ModeSymlink != 0 {
-		ui.StepSkip(targetName, "nothing to backup (symlink)")
+	if utils.IsLinkMode(targetPath, info.Mode()) {
+		ui.Row(ui.MarkNone, targetName, ui.DimText("nothing to back up (symlink)"), width)
 		return nil
 	}
 
 	entries, err := os.ReadDir(targetPath)
 	if err != nil || len(entries) == 0 {
-		ui.StepSkip(targetName, "nothing to backup (empty)")
+		ui.Row(ui.MarkNone, targetName, ui.DimText("nothing to back up (empty)"), width)
 		return nil
 	}
 
 	timestamp := time.Now().Format("2006-01-02_15-04-05")
 	backupPath := filepath.Join(backupDir, timestamp, targetName)
-	ui.Info("%s: would backup to %s", targetName, backupPath)
+	ui.Row(ui.MarkNone, targetName, "would back up to "+utils.FoldHomePath(backupPath), width)
 
 	return nil
 }
 
-func backupList() error {
-	backups, err := backup.List()
+func backupList(backupDir string) error {
+	backups, err := backup.ListInDir(backupDir)
 	if err != nil {
 		return err
 	}
 
 	if len(backups) == 0 {
-		ui.Info("No backups found")
+		ui.Done(ui.MarkNone, "No backups found", 0)
 		return nil
 	}
 
-	totalSize, _ := backup.TotalSize()
-	ui.Header(fmt.Sprintf("All backups (%s total)", formatBytes(totalSize)))
-
+	fmt.Println(theme.Primary().Bold(true).Render("Backups") + "  " + utils.FoldHomePath(backupDir))
+	width := ui.RowWidth(backups[0].Timestamp)
 	for _, b := range backups {
-		size := backup.Size(b.Path)
-		fmt.Printf("  %s  %-20s  %8s  %s\n",
-			b.Timestamp,
-			strings.Join(b.Targets, ", "),
-			formatBytes(size),
-			b.Path)
+		ui.Row(ui.MarkNone, b.Timestamp, strings.Join(b.Targets, ", ")+ui.DimText(" · "+formatBytes(backup.Size(b.Path))), width)
 	}
-
+	totalSize, _ := backup.TotalSizeInDir(backupDir)
+	fmt.Println()
+	ui.Done(ui.MarkNone, fmt.Sprintf("%s, %s", plural(len(backups), "backup"), formatBytes(totalSize)), 0)
+	ui.Next("skillshare restore <target> --from <timestamp>", "roll a target back")
 	return nil
 }
 
-func backupCleanup() error {
-	ui.Header("Cleaning up old backups")
+// backupDelete removes one snapshot folder: the global one, or the project's
+// (agents only) with -p.
+func backupDelete(mode runMode, cwd, timestamp string, dryRun bool) error {
+	start := time.Now()
+	backupDir := backup.BackupDir()
+	if mode == modeProject {
+		backupDir = backup.ProjectBackupDir(cwd)
+	}
+	if !backup.ValidTimestamp(timestamp) {
+		return fmt.Errorf("invalid backup timestamp %q (expected e.g. 2024-01-15_14-30-45)", timestamp)
+	}
+	info, err := backup.GetBackupByTimestampInDir(backupDir, timestamp)
+	if err != nil {
+		return err
+	}
+	size := backup.Size(info.Path)
+	if dryRun {
+		ui.Done(ui.MarkNone, "Would delete backup "+timestamp, 0)
+		ui.Note(fmt.Sprintf("%s · %s", strings.Join(info.Targets, ", "), formatBytes(size)))
+		fmt.Println()
+		ui.DryRun()
+		return nil
+	}
 
-	// Show current state
-	backups, err := backup.List()
+	err = backup.DeleteInDir(backupDir, timestamp)
+	e := oplog.NewEntry("backup", statusFromErr(err), time.Since(start))
+	e.Args = map[string]any{"action": "delete", "timestamp": timestamp}
+	if err != nil {
+		e.Message = err.Error()
+	}
+	oplog.WriteWithLimit(config.ConfigPath(), oplog.OpsFile, e, logMaxEntries()) //nolint:errcheck
+	if err != nil {
+		return err
+	}
+	ui.Done(ui.MarkOK, fmt.Sprintf("Deleted backup %s, freed %s", timestamp, formatBytes(size)), time.Since(start))
+	return nil
+}
+
+func backupCleanup(backupDir string, cfg backup.CleanupConfig) error {
+	start := time.Now()
+	backups, err := backup.ListInDir(backupDir)
 	if err != nil {
 		return err
 	}
 
-	if len(backups) == 0 {
-		ui.Info("No backups to clean up")
-		return nil
+	totalSize, err := backup.TotalSizeInDir(backupDir)
+	if err != nil {
+		return err
 	}
-
-	totalSize, _ := backup.TotalSize()
-	ui.Info("Current: %d backups, %s total", len(backups), formatBytes(totalSize))
-
-	// Use default cleanup config
-	cfg := backup.DefaultCleanupConfig()
-	removed, err := backup.Cleanup(cfg)
+	removed, freed, err := backup.CleanupWithStatsInDir(backupDir, cfg)
 	if err != nil {
 		return err
 	}
 
 	if removed > 0 {
-		newSize, _ := backup.TotalSize()
-		ui.Success("Removed %d old backups (freed %s)",
-			removed,
-			formatBytes(totalSize-newSize))
+		newSize, _ := backup.TotalSizeInDir(backupDir)
+		remaining, err := backup.ListInDir(backupDir)
+		if err != nil {
+			return err
+		}
+		ui.Done(ui.MarkOK, fmt.Sprintf("Removed %s, freed %s", plural(removed, "backup directory"), formatBytes(freed)), time.Since(start))
+		ui.Note(fmt.Sprintf("%s left, %s", plural(len(remaining), "backup"), formatBytes(newSize)))
+	} else if len(backups) == 0 && totalSize == 0 {
+		ui.Done(ui.MarkNone, "No backups to clean up", 0)
 	} else {
-		ui.Info("No backups needed to be removed")
+		ui.Done(ui.MarkNone, "No old backups to remove", 0)
+		ui.Note(fmt.Sprintf("%s, %s", plural(len(backups), "backup"), formatBytes(totalSize)))
 	}
 
 	return nil
 }
 
-func backupCleanupDryRun() error {
-	ui.Header("Cleaning up old backups")
-
-	backups, err := backup.List()
+func backupCleanupDryRun(backupDir string, cfg backup.CleanupConfig) error {
+	backups, err := backup.ListInDir(backupDir)
 	if err != nil {
 		return err
 	}
 
-	if len(backups) == 0 {
-		ui.Info("No backups to clean up")
-		return nil
+	totalSize, err := backup.TotalSizeInDir(backupDir)
+	if err != nil {
+		return err
 	}
-
-	totalSize, _ := backup.TotalSize()
-	ui.Info("Current: %d backups, %s total", len(backups), formatBytes(totalSize))
-
-	cfg := backup.DefaultCleanupConfig()
-	removed, freed := planBackupCleanup(backups, cfg, time.Now())
+	removed, freed, err := backup.PreviewCleanupInDir(backupDir, cfg)
+	if err != nil {
+		return err
+	}
 	if removed > 0 {
-		ui.Warning("Dry run - would remove %d old backups (free %s)", removed, formatBytes(freed))
+		ui.Done(ui.MarkNone, fmt.Sprintf("Would remove %s, freeing %s", plural(removed, "backup directory"), formatBytes(freed)), 0)
+	} else if len(backups) == 0 && totalSize == 0 {
+		ui.Done(ui.MarkNone, "No backups to clean up", 0)
 	} else {
-		ui.Info("Dry run - no backups needed to be removed")
+		ui.Done(ui.MarkNone, "No old backups to remove", 0)
 	}
-
+	ui.Note(fmt.Sprintf("%s, %s", plural(len(backups), "backup"), formatBytes(totalSize)))
+	fmt.Println()
+	ui.DryRun()
 	return nil
-}
-
-func planBackupCleanup(backups []backup.BackupInfo, cfg backup.CleanupConfig, now time.Time) (int, int64) {
-	removed := 0
-	var removedSize int64
-	var totalSize int64
-
-	for i, backupInfo := range backups {
-		shouldRemove := false
-
-		if cfg.MaxAge > 0 && now.Sub(backupInfo.Date) > cfg.MaxAge {
-			shouldRemove = true
-		}
-
-		if cfg.MaxCount > 0 && i >= cfg.MaxCount {
-			shouldRemove = true
-		}
-
-		size := backup.Size(backupInfo.Path)
-		totalSize += size
-		if cfg.MaxSizeMB > 0 && totalSize > cfg.MaxSizeMB*1024*1024 {
-			shouldRemove = true
-		}
-
-		if shouldRemove {
-			removed++
-			removedSize += size
-		}
-	}
-
-	return removed, removedSize
 }
 
 func cmdRestore(args []string) error {
-	mode, args, err := parseModeArgs(args)
+	mode, args, err := parseModeArgs(args, "--from", "-f")
 	if err != nil {
 		return err
 	}
-	if mode == modeProject {
-		return fmt.Errorf("restore is not supported in project mode")
+
+	// Extract kind filter (e.g. "skillshare restore agents").
+	// Extract kind filter (e.g. "skillshare restore agents" or "--all").
+	kind, args := parseKindArgWithAll(args)
+
+	// Project mode is only supported for agents.
+	if mode == modeProject && kind != kindAgents && kind != kindAll {
+		return fmt.Errorf("restore is not supported in project mode (except for agents)")
 	}
 
+	cwd, _ := os.Getwd()
+	if mode == modeAuto && kind == kindAgents && projectConfigExists(cwd) {
+		mode = modeProject
+	}
+	applyModeLabel(mode)
+
 	start := time.Now()
+	_ = start // used below
 
 	var targetName string
 	var fromTimestamp string
@@ -335,6 +419,11 @@ func cmdRestore(args []string) error {
 		}
 	}
 
+	// Agent restore uses agent-specific backup entries (name suffixed with "-agents")
+	if kind == kindAgents {
+		return restoreAgentBackup(mode, cwd, targetName, fromTimestamp, force, dryRun)
+	}
+
 	// No target specified → TUI dispatch (or plain text fallback)
 	if targetName == "" && fromTimestamp == "" && !dryRun {
 		return restoreTUIDispatch(noTUI)
@@ -355,26 +444,21 @@ func cmdRestore(args []string) error {
 		return fmt.Errorf("target '%s' not found in config", targetName)
 	}
 
-	ui.Header(fmt.Sprintf("Restoring %s", targetName))
-
-	if dryRun {
-		ui.Warning("Dry run mode - no changes will be made")
-	}
-
 	opts := backup.RestoreOptions{Force: force}
 
+	sc := target.SkillsConfig()
 	if dryRun {
 		if fromTimestamp != "" {
-			return previewRestoreFromTimestamp(targetName, target.Path, fromTimestamp, opts)
+			return previewRestoreFromTimestamp(targetName, sc.Path, fromTimestamp, opts)
 		}
-		return previewRestoreFromLatest(targetName, target.Path, opts)
+		return previewRestoreFromLatest(targetName, sc.Path, opts)
 	}
 
 	var restoreErr error
 	if fromTimestamp != "" {
-		restoreErr = restoreFromTimestamp(targetName, target.Path, fromTimestamp, opts)
+		restoreErr = restoreFromTimestamp(targetName, sc.Path, fromTimestamp, opts)
 	} else {
-		restoreErr = restoreFromLatest(targetName, target.Path, opts)
+		restoreErr = restoreFromLatest(targetName, sc.Path, opts)
 	}
 
 	e := oplog.NewEntry("restore", statusFromErr(restoreErr), time.Since(start))
@@ -398,17 +482,17 @@ func restoreTUIDispatch(noTUI bool) error {
 	}
 
 	if !shouldLaunchTUI(noTUI, cfg) {
-		return backupList()
+		return backupList(backup.BackupDir())
 	}
 
 	// Step 1: Source picker — Backup or Trash
 	selected, err := runChecklistTUI(checklistConfig{
-		title:        "Restore — choose source",
+		title:        "Restore from",
 		singleSelect: true,
 		itemName:     "source",
 		items: []checklistItemData{
-			{label: "Backup Restore", desc: "Restore a target from backup snapshot"},
-			{label: "Trash Restore", desc: "Restore deleted skills from trash"},
+			{label: "Backup", desc: "restore a target from a snapshot"},
+			{label: "Trash", desc: "restore deleted skills"},
 		},
 	})
 	if err != nil {
@@ -426,7 +510,7 @@ func restoreTUIDispatch(noTUI bool) error {
 			return err
 		}
 		if len(summaries) == 0 {
-			ui.Info("No backups found")
+			ui.Done(ui.MarkNone, "No backups found", 0)
 			return nil
 		}
 		return runRestoreTUI(summaries, backupDir, cfg.Targets, config.ConfigPath())
@@ -437,22 +521,46 @@ func restoreTUIDispatch(noTUI bool) error {
 		if projectConfigExists(cwd) {
 			mode = modeProject
 		}
-		trashBase := resolveTrashBase(mode, cwd)
-		items := trash.List(trashBase)
+		skillTrashBase := resolveTrashBase(mode, cwd, kindSkills)
+		agentTrashBase := resolveTrashBase(mode, cwd, kindAgents)
+
+		// Merge skill + agent trash
+		var items []trash.TrashEntry
+		for _, e := range trash.List(skillTrashBase) {
+			e.Kind = "skill"
+			items = append(items, e)
+		}
+		for _, e := range trash.List(agentTrashBase) {
+			e.Kind = "agent"
+			items = append(items, e)
+		}
 		if len(items) == 0 {
-			ui.Info("Trash is empty")
+			ui.Done(ui.MarkNone, "Trash is empty", 0)
 			return nil
 		}
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].Date.After(items[j].Date)
+		})
+
 		modeLabel := "global"
 		if mode == modeProject {
 			modeLabel = "project"
 		}
 		cfgPath := resolveTrashCfgPath(mode, cwd)
-		destDir, err := resolveSourceDir(mode, cwd)
+		destDir, err := resolveSourceDir(mode, cwd, kindSkills)
 		if err != nil {
 			return err
 		}
-		return runTrashTUI(items, trashBase, destDir, cfgPath, modeLabel)
+		agentDestDir, err := resolveSourceDir(mode, cwd, kindAgents)
+		if err != nil {
+			return err
+		}
+		follow, err := resolveTrashFollow(mode, cwd)
+		if err != nil {
+			return err
+		}
+		return runTrashTUI(items, skillTrashBase, agentTrashBase, destDir, agentDestDir, cfgPath, modeLabel, follow,
+			func() error { return reconcileRestoredSkills(mode, cwd) })
 	}
 
 	return nil
@@ -467,7 +575,7 @@ func restoreFromTimestamp(targetName, targetPath, timestamp string, opts backup.
 	if err := backup.RestoreToPath(backupInfo.Path, targetName, targetPath, opts); err != nil {
 		return err
 	}
-	ui.Success("Restored %s from backup %s", targetName, timestamp)
+	ui.Done(ui.MarkOK, fmt.Sprintf("Restored %s from backup %s", targetName, timestamp), 0)
 	return nil
 }
 
@@ -476,7 +584,29 @@ func restoreFromLatest(targetName, targetPath string, opts backup.RestoreOptions
 	if err != nil {
 		return err
 	}
-	ui.Success("Restored %s from latest backup (%s)", targetName, timestamp)
+	ui.Done(ui.MarkOK, fmt.Sprintf("Restored %s from the latest backup, %s", targetName, timestamp), 0)
+	return nil
+}
+
+func restoreFromTimestampInDir(backupDir, targetName, targetPath, timestamp string, opts backup.RestoreOptions) error {
+	backupInfo, err := backup.GetBackupByTimestampInDir(backupDir, timestamp)
+	if err != nil {
+		return err
+	}
+
+	if err := backup.RestoreToPath(backupInfo.Path, targetName, targetPath, opts); err != nil {
+		return err
+	}
+	ui.Done(ui.MarkOK, fmt.Sprintf("Restored %s from backup %s", targetName, timestamp), 0)
+	return nil
+}
+
+func restoreFromLatestInDir(backupDir, targetName, targetPath string, opts backup.RestoreOptions) error {
+	timestamp, err := backup.RestoreLatestInDir(backupDir, targetName, targetPath, opts)
+	if err != nil {
+		return err
+	}
+	ui.Done(ui.MarkOK, fmt.Sprintf("Restored %s from the latest backup, %s", targetName, timestamp), 0)
 	return nil
 }
 
@@ -490,7 +620,9 @@ func previewRestoreFromTimestamp(targetName, targetPath, timestamp string, opts 
 		return err
 	}
 
-	ui.Info("Would restore %s from backup %s", targetName, timestamp)
+	ui.Done(ui.MarkNone, fmt.Sprintf("Would restore %s from backup %s", targetName, timestamp), 0)
+	fmt.Println()
+	ui.DryRun()
 	return nil
 }
 
@@ -509,54 +641,66 @@ func previewRestoreFromLatest(targetName, targetPath string, opts backup.Restore
 		return err
 	}
 
-	ui.Info("Would restore %s from latest backup (%s)", targetName, latest.Timestamp)
+	ui.Done(ui.MarkNone, fmt.Sprintf("Would restore %s from the latest backup, %s", targetName, latest.Timestamp), 0)
+	fmt.Println()
+	ui.DryRun()
 	return nil
 }
 
 func printBackupHelp() {
-	fmt.Println(`Usage: skillshare backup [target] [options]
-
-Create a snapshot of target skill directories.
-Without arguments, backs up all targets.
-
-Arguments:
-  target               Target name to backup (optional; backs up all if omitted)
-
-Options:
-  --list, -l           List all existing backups
-  --cleanup, -c        Remove old backups based on retention policy
-  --dry-run, -n        Preview what would be backed up or cleaned up
-  --target, -t <name>  Specify target name (alternative to positional arg)
-  --help, -h           Show this help
-
-Examples:
-  skillshare backup                         # Backup all targets
-  skillshare backup claude                  # Backup only claude
-  skillshare backup --list                  # List all backups
-  skillshare backup --cleanup               # Remove old backups
-  skillshare backup --cleanup --dry-run     # Preview cleanup`)
+	printHelp("skillshare backup [agents] [target] [options]\n       skillshare backup files [list|show|restore] ...", "Create a snapshot of target skill directories.\nWithout arguments, backs up all targets.",
+		helpGroup{title: "Arguments", rows: []helpRow{
+			{"target", "Target name to backup (optional; backs up all if omitted)"},
+		}},
+		helpGroup{title: "Options", rows: []helpRow{
+			{"--all", "Backup both skills and agents"},
+			{"-p, --project", "Use project mode (.skillshare/backups/); agents only"},
+			{"-g, --global", "Use global mode (default for skills)"},
+			{"-l, --list", "List all existing backups"},
+			{"-c, --cleanup", "Remove backups beyond retention limits and abandoned incomplete directories"},
+			{"--delete <ts>", "Delete one backup (timestamp from --list); with -p,\nfrom the project's .skillshare/backups/"},
+			{"-n, --dry-run", "Preview what would be backed up, cleaned up, or deleted"},
+			{"-t, --target <name>", "Specify target name (alternative to positional arg)"},
+		}},
+		helpExamples(
+			helpRow{"skillshare backup", "Backup all targets"},
+			helpRow{"skillshare backup claude", "Backup only claude"},
+			helpRow{"skillshare backup --list", "List all backups"},
+			helpRow{"skillshare backup --cleanup", "Remove old backups and abandoned incomplete directories"},
+			helpRow{"skillshare backup --cleanup --dry-run", "Preview cleanup"},
+			helpRow{"skillshare backup --list -p", "List this project's (agents) backups"},
+			helpRow{"skillshare backup --delete 2024-01-15_14-30-45", ""},
+			helpRow{"skillshare backup files", "Files skillshare saved before rewriting them"},
+			helpRow{"skillshare backup agents", "Backup all agent targets"},
+			helpRow{"skillshare backup agents -p", "Backup project agent targets"},
+			helpRow{"skillshare backup --all", "Backup skills + agents"},
+		),
+	)
 }
 
 func printRestoreHelp() {
-	fmt.Println(`Usage: skillshare restore [target] [options]
-
-Restore target skills from a backup snapshot.
-Without arguments, launches an interactive TUI.
-
-Arguments:
-  target               Target name to restore (optional)
-
-Options:
-  --from, -f <ts>      Restore from specific timestamp (e.g. 2024-01-15_14-30-45)
-  --force              Overwrite non-empty target directory
-  --dry-run, -n        Preview what would be restored without making changes
-  --no-tui             Skip interactive TUI, show backup list instead
-  --help, -h           Show this help
-
-Examples:
-  skillshare restore                        # Interactive TUI
-  skillshare restore claude                 # Restore claude from latest backup
-  skillshare restore claude --from 2024-01-15_14-30-45
-  skillshare restore claude --dry-run       # Preview restore
-  skillshare restore --no-tui               # List backups (no TUI)`)
+	printHelp("skillshare restore [agents] [target] [options]", "Restore target skills from a backup snapshot.\nWithout arguments, launches an interactive TUI.",
+		helpGroup{title: "Arguments", rows: []helpRow{
+			{"target", "Target name to restore (optional)"},
+		}},
+		helpGroup{title: "Options", rows: []helpRow{
+			{"--all", "Restore both skills and agents"},
+			{"-p, --project", "Use project mode (.skillshare/backups/); agents only"},
+			{"-g, --global", "Use global mode (default for skills)"},
+			{"-f, --from <ts>", "Restore from specific timestamp (e.g. 2024-01-15_14-30-45)"},
+			{"--force", "Overwrite non-empty target directory"},
+			{"-n, --dry-run", "Preview what would be restored without making changes"},
+			{"--no-tui", "Skip interactive TUI, show backup list instead"},
+		}},
+		helpExamples(
+			helpRow{"skillshare restore", "Interactive TUI"},
+			helpRow{"skillshare restore claude", "Restore claude from latest backup"},
+			helpRow{"skillshare restore claude --from 2024-01-15_14-30-45", ""},
+			helpRow{"skillshare restore claude --dry-run", "Preview restore"},
+			helpRow{"skillshare restore --no-tui", "List backups (no TUI)"},
+			helpRow{"skillshare restore agents claude", "Restore agents claude target"},
+			helpRow{"skillshare restore agents claude -p", "Restore project agents"},
+			helpRow{"skillshare restore --all claude", "Restore skills + agents"},
+		),
+	)
 }

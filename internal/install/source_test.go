@@ -4,6 +4,35 @@ import (
 	"testing"
 )
 
+// Windows drive-letter and backslash-relative paths must be treated as local
+// sources instead of falling through to git URL parsing (issue #269).
+func TestParseSource_WindowsLocalPath(t *testing.T) {
+	for _, input := range []string{
+		`D:\folder`,
+		`C:\Users\me\skills\my-skill`,
+		"C:/Users/me/skills/my-skill",
+		`.\my-skill`,
+		`..\my-skill`,
+	} {
+		if !isLocalPath(input) {
+			t.Errorf("isLocalPath(%q) = false, want true", input)
+		}
+		source, err := ParseSource(input)
+		if err != nil {
+			t.Errorf("ParseSource(%q) error: %v", input, err)
+			continue
+		}
+		if source.Type != SourceTypeLocalPath {
+			t.Errorf("ParseSource(%q) type = %v, want SourceTypeLocalPath", input, source.Type)
+		}
+	}
+
+	// Plain owner/repo shorthand must keep expanding to GitHub.
+	if isLocalPath("owner/repo") {
+		t.Error("isLocalPath(owner/repo) = true, want false")
+	}
+}
+
 func TestParseSource_LocalPath(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -60,6 +89,8 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 		wantCloneURL string
 		wantSubdir   string
 		wantName     string
+		wantExplicit bool
+		wantBranch   string
 	}{
 		{
 			name:         "basic github shorthand",
@@ -67,6 +98,7 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			wantCloneURL: "https://github.com/user/repo.git",
 			wantSubdir:   "",
 			wantName:     "repo",
+			wantExplicit: false,
 		},
 		{
 			name:         "github shorthand with .git",
@@ -74,6 +106,7 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			wantCloneURL: "https://github.com/user/repo.git",
 			wantSubdir:   "",
 			wantName:     "repo",
+			wantExplicit: false,
 		},
 		{
 			name:         "github with subdirectory",
@@ -81,6 +114,7 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			wantCloneURL: "https://github.com/user/repo.git",
 			wantSubdir:   "path/to/skill",
 			wantName:     "skill",
+			wantExplicit: false,
 		},
 		{
 			name:         "github with https prefix",
@@ -88,6 +122,7 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			wantCloneURL: "https://github.com/user/repo.git",
 			wantSubdir:   "",
 			wantName:     "repo",
+			wantExplicit: false,
 		},
 		{
 			name:         "github https with .git",
@@ -95,6 +130,7 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			wantCloneURL: "https://github.com/user/repo.git",
 			wantSubdir:   "",
 			wantName:     "repo",
+			wantExplicit: false,
 		},
 		{
 			name:         "github web URL with tree/main",
@@ -102,6 +138,8 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			wantCloneURL: "https://github.com/user/repo.git",
 			wantSubdir:   "path/to/skill",
 			wantName:     "skill",
+			wantExplicit: false,
+			wantBranch:   "main",
 		},
 		{
 			name:         "github web URL with tree/master",
@@ -109,6 +147,8 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			wantCloneURL: "https://github.com/user/repo.git",
 			wantSubdir:   "skills/my-skill",
 			wantName:     "my-skill",
+			wantExplicit: false,
+			wantBranch:   "master",
 		},
 		{
 			name:         "github web URL with blob (file view)",
@@ -116,6 +156,8 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			wantCloneURL: "https://github.com/user/repo.git",
 			wantSubdir:   "path/to/skill",
 			wantName:     "skill",
+			wantExplicit: false,
+			wantBranch:   "main",
 		},
 		{
 			name:         "github web URL tree/branch only (no subdir)",
@@ -123,6 +165,8 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			wantCloneURL: "https://github.com/user/repo.git",
 			wantSubdir:   "",
 			wantName:     "repo",
+			wantExplicit: false,
+			wantBranch:   "main",
 		},
 		{
 			name:         "github dot subdir normalized to root",
@@ -130,6 +174,60 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			wantCloneURL: "https://github.com/user/repo.git",
 			wantSubdir:   "",
 			wantName:     "repo",
+			wantExplicit: false,
+		},
+		// issue #124: blob URLs pointing directly at SKILL.md should resolve
+		// to the containing skill directory instead of a literal "SKILL.md" name.
+		{
+			name:         "github blob URL at root SKILL.md",
+			input:        "https://github.com/iOfficeAI/OfficeCLI/blob/main/SKILL.md",
+			wantCloneURL: "https://github.com/iOfficeAI/OfficeCLI.git",
+			wantSubdir:   "",
+			wantName:     "OfficeCLI",
+			wantExplicit: true,
+			wantBranch:   "main",
+		},
+		{
+			name:         "github blob URL at nested SKILL.md",
+			input:        "https://github.com/user/repo/blob/main/skills/foo/SKILL.md",
+			wantCloneURL: "https://github.com/user/repo.git",
+			wantSubdir:   "skills/foo",
+			wantName:     "foo",
+			wantExplicit: true,
+			wantBranch:   "main",
+		},
+		{
+			name:         "github blob URL at SKILL.md lowercase (case-insensitive)",
+			input:        "https://github.com/user/repo/blob/main/skill.md",
+			wantCloneURL: "https://github.com/user/repo.git",
+			wantSubdir:   "",
+			wantName:     "repo",
+			wantExplicit: true,
+			wantBranch:   "main",
+		},
+		{
+			name:         "github web URL pinned to a tag",
+			input:        "https://github.com/user/repo/tree/v1.2.0/skills/foo",
+			wantCloneURL: "https://github.com/user/repo.git",
+			wantSubdir:   "skills/foo",
+			wantName:     "foo",
+			wantBranch:   "v1.2.0",
+		},
+		{
+			name:         "github web URL pinned to a commit SHA",
+			input:        "github.com/user/repo/tree/8f14e45fceea167a5a36dedd4bea2543ce848564/skills/foo",
+			wantCloneURL: "https://github.com/user/repo.git",
+			wantSubdir:   "skills/foo",
+			wantName:     "foo",
+			wantBranch:   "8f14e45fceea167a5a36dedd4bea2543ce848564",
+		},
+		{
+			name:         "github web URL at HEAD uses the default branch",
+			input:        "https://github.com/user/repo/tree/HEAD",
+			wantCloneURL: "https://github.com/user/repo.git",
+			wantSubdir:   "",
+			wantName:     "repo",
+			wantBranch:   "",
 		},
 	}
 
@@ -150,6 +248,12 @@ func TestParseSource_GitHubShorthand(t *testing.T) {
 			}
 			if source.Name != tt.wantName {
 				t.Errorf("Name = %v, want %v", source.Name, tt.wantName)
+			}
+			if source.Branch != tt.wantBranch {
+				t.Errorf("Branch = %q, want %q", source.Branch, tt.wantBranch)
+			}
+			if source.TargetsExplicitSkill() != tt.wantExplicit {
+				t.Errorf("TargetsExplicitSkill() = %v, want %v", source.TargetsExplicitSkill(), tt.wantExplicit)
 			}
 		})
 	}
@@ -174,6 +278,24 @@ func TestParseSource_GitSSH(t *testing.T) {
 			input:        "git@gitlab.com:user/repo.git",
 			wantCloneURL: "git@gitlab.com:user/repo.git",
 			wantName:     "repo",
+		},
+		{
+			name:         "custom ssh username",
+			input:        "acme@acme.ghe.com:MyOrg/my-skills.git",
+			wantCloneURL: "acme@acme.ghe.com:MyOrg/my-skills.git",
+			wantName:     "my-skills",
+		},
+		{
+			name:         "custom ssh username without .git",
+			input:        "acme@acme.ghe.com:MyOrg/my-skills",
+			wantCloneURL: "acme@acme.ghe.com:MyOrg/my-skills.git",
+			wantName:     "my-skills",
+		},
+		{
+			name:         "gitlab ssh nested subgroup",
+			input:        "git@gitlab.example.com:org/subgroup/my-skills.git",
+			wantCloneURL: "git@gitlab.example.com:org/subgroup/my-skills.git",
+			wantName:     "my-skills",
 		},
 		{
 			name:         "ssh without .git",
@@ -209,6 +331,13 @@ func TestParseSource_GitSSH(t *testing.T) {
 			wantSubdir:   "pdf",
 			wantName:     "pdf",
 		},
+		{
+			name:         "custom ssh username with subpath",
+			input:        "acme@acme.ghe.com:MyOrg/my-skills.git//agents/reviewer",
+			wantCloneURL: "acme@acme.ghe.com:MyOrg/my-skills.git",
+			wantSubdir:   "agents/reviewer",
+			wantName:     "reviewer",
+		},
 	}
 
 	for _, tt := range tests {
@@ -233,6 +362,58 @@ func TestParseSource_GitSSH(t *testing.T) {
 	}
 }
 
+func TestSSHIdentity(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantUser string
+		wantHost string
+		wantOK   bool
+	}{
+		{
+			name:     "scp style",
+			input:    "acme@acme.ghe.com:Org/skills.git//hubs/team.json",
+			wantUser: "acme",
+			wantHost: "acme.ghe.com",
+			wantOK:   true,
+		},
+		{
+			name:     "ssh scheme",
+			input:    "ssh://git@ghe.corp.com/Org/skills.git//skillshare-hub.json",
+			wantUser: "git",
+			wantHost: "ghe.corp.com",
+			wantOK:   true,
+		},
+		{
+			name:   "https",
+			input:  "https://ghe.corp.com/Org/skills",
+			wantOK: false,
+		},
+		{
+			name:   "ssh scheme without user",
+			input:  "ssh://ghe.corp.com/Org/skills.git",
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			user, host, ok := SSHIdentity(tt.input)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok {
+				if user != tt.wantUser {
+					t.Errorf("user = %q, want %q", user, tt.wantUser)
+				}
+				if host != tt.wantHost {
+					t.Errorf("host = %q, want %q", host, tt.wantHost)
+				}
+			}
+		})
+	}
+}
+
 func TestParseSource_GitHTTPS(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -240,24 +421,29 @@ func TestParseSource_GitHTTPS(t *testing.T) {
 		wantCloneURL string
 		wantSubdir   string
 		wantName     string
+		wantBranch   string
+		wantExplicit bool
 	}{
 		{
 			name:         "gitlab https",
 			input:        "https://gitlab.com/user/repo",
 			wantCloneURL: "https://gitlab.com/user/repo.git",
 			wantName:     "repo",
+			wantExplicit: false,
 		},
 		{
 			name:         "bitbucket https",
 			input:        "https://bitbucket.org/user/repo.git",
 			wantCloneURL: "https://bitbucket.org/user/repo.git",
 			wantName:     "repo",
+			wantExplicit: false,
 		},
 		{
 			name:         "gitlab https dot subdir normalized to root",
 			input:        "https://gitlab.com/user/repo/.",
 			wantCloneURL: "https://gitlab.com/user/repo.git",
 			wantName:     "repo",
+			wantExplicit: false,
 		},
 		{
 			name:         "bitbucket web URL with src/main",
@@ -265,6 +451,8 @@ func TestParseSource_GitHTTPS(t *testing.T) {
 			wantCloneURL: "https://bitbucket.org/team/skills.git",
 			wantSubdir:   "learn-and-update",
 			wantName:     "learn-and-update",
+			wantBranch:   "main",
+			wantExplicit: false,
 		},
 		{
 			name:         "bitbucket web URL with src/main trailing slash",
@@ -272,12 +460,16 @@ func TestParseSource_GitHTTPS(t *testing.T) {
 			wantCloneURL: "https://bitbucket.org/team/skills.git",
 			wantSubdir:   "learn-and-update",
 			wantName:     "learn-and-update",
+			wantBranch:   "main",
+			wantExplicit: false,
 		},
 		{
 			name:         "bitbucket web URL src/branch only (no subdir)",
 			input:        "https://bitbucket.org/team/skills/src/main",
 			wantCloneURL: "https://bitbucket.org/team/skills.git",
 			wantName:     "skills",
+			wantBranch:   "main",
+			wantExplicit: false,
 		},
 		{
 			name:         "bitbucket web URL nested subdir",
@@ -285,6 +477,8 @@ func TestParseSource_GitHTTPS(t *testing.T) {
 			wantCloneURL: "https://bitbucket.org/team/skills.git",
 			wantSubdir:   "frontend/react",
 			wantName:     "react",
+			wantBranch:   "develop",
+			wantExplicit: false,
 		},
 		{
 			name:         "gitlab web URL with -/tree/main",
@@ -292,6 +486,8 @@ func TestParseSource_GitHTTPS(t *testing.T) {
 			wantCloneURL: "https://gitlab.com/user/repo.git",
 			wantSubdir:   "path/to/skill",
 			wantName:     "skill",
+			wantBranch:   "main",
+			wantExplicit: false,
 		},
 		{
 			name:         "gitlab web URL with -/blob/main",
@@ -299,12 +495,61 @@ func TestParseSource_GitHTTPS(t *testing.T) {
 			wantCloneURL: "https://gitlab.com/user/repo.git",
 			wantSubdir:   "path/to/skill",
 			wantName:     "skill",
+			wantBranch:   "main",
+			wantExplicit: false,
 		},
 		{
 			name:         "gitlab web URL -/tree/branch only",
 			input:        "https://gitlab.com/user/repo/-/tree/main",
 			wantCloneURL: "https://gitlab.com/user/repo.git",
 			wantName:     "repo",
+			wantBranch:   "main",
+			wantExplicit: false,
+		},
+		// issue #124: blob URLs pointing directly at SKILL.md should resolve
+		// to the containing skill directory instead of a literal "SKILL.md" name.
+		{
+			name:         "gitlab blob URL at root SKILL.md",
+			input:        "https://gitlab.com/user/repo/-/blob/main/SKILL.md",
+			wantCloneURL: "https://gitlab.com/user/repo.git",
+			wantSubdir:   "",
+			wantName:     "repo",
+			wantBranch:   "main",
+			wantExplicit: true,
+		},
+		{
+			name:         "gitlab blob URL at nested SKILL.md",
+			input:        "https://gitlab.com/user/repo/-/blob/main/skills/foo/SKILL.md",
+			wantCloneURL: "https://gitlab.com/user/repo.git",
+			wantSubdir:   "skills/foo",
+			wantName:     "foo",
+			wantBranch:   "main",
+			wantExplicit: true,
+		},
+		{
+			name:         "gitlab web URL pinned to a tag",
+			input:        "https://gitlab.com/user/repo/-/tree/v1.2.0/skills/foo",
+			wantCloneURL: "https://gitlab.com/user/repo.git",
+			wantSubdir:   "skills/foo",
+			wantName:     "foo",
+			wantBranch:   "v1.2.0",
+		},
+		{
+			name:         "bitbucket web URL pinned to a commit SHA",
+			input:        "https://bitbucket.org/team/repo/src/0123abc/skills/foo",
+			wantCloneURL: "https://bitbucket.org/team/repo.git",
+			wantSubdir:   "skills/foo",
+			wantName:     "foo",
+			wantBranch:   "0123abc",
+		},
+		{
+			name:         "bitbucket src URL at nested SKILL.md",
+			input:        "https://bitbucket.org/team/repo/src/main/skills/foo/SKILL.md",
+			wantCloneURL: "https://bitbucket.org/team/repo.git",
+			wantSubdir:   "skills/foo",
+			wantName:     "foo",
+			wantBranch:   "main",
+			wantExplicit: true,
 		},
 	}
 
@@ -326,6 +571,12 @@ func TestParseSource_GitHTTPS(t *testing.T) {
 			if source.Name != tt.wantName {
 				t.Errorf("Name = %v, want %v", source.Name, tt.wantName)
 			}
+			if source.Branch != tt.wantBranch {
+				t.Errorf("Branch = %v, want %v", source.Branch, tt.wantBranch)
+			}
+			if source.TargetsExplicitSkill() != tt.wantExplicit {
+				t.Errorf("TargetsExplicitSkill() = %v, want %v", source.TargetsExplicitSkill(), tt.wantExplicit)
+			}
 		})
 	}
 }
@@ -342,6 +593,13 @@ func TestParseSource_FileURL(t *testing.T) {
 			name:         "file url",
 			input:        "file:///path/to/repo",
 			wantCloneURL: "file:///path/to/repo",
+			wantName:     "repo",
+		},
+		{
+			// On Windows filepath.Clean would otherwise emit `file://\C:\...`.
+			name:         "file url with a drive path keeps URL separators",
+			input:        "file:///C:/path/to/repo",
+			wantCloneURL: "file:///C:/path/to/repo",
 			wantName:     "repo",
 		},
 		{
@@ -509,6 +767,21 @@ func TestSource_TrackName(t *testing.T) {
 			raw:  "openai/skills/skills/pdf",
 			want: "openai-skills",
 		},
+		{
+			name: "gitlab subgroup HTTPS",
+			raw:  "https://gitlab.com/group/subgroup/project",
+			want: "group-subgroup-project",
+		},
+		{
+			name: "gitlab deep subgroup shorthand",
+			raw:  "onprem.gitlab.internal/org/sub1/sub2/project",
+			want: "org-sub1-sub2-project",
+		},
+		{
+			name: "file URL keeps basename",
+			raw:  "file:///tmp/remotes/team-repo",
+			want: "team-repo",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -524,29 +797,43 @@ func TestSource_TrackName(t *testing.T) {
 	}
 }
 
-func TestStripGitBranchPrefix(t *testing.T) {
+func TestSplitGitWebRef(t *testing.T) {
 	tests := []struct {
-		name   string
-		host   string
-		subdir string
-		want   string
+		name     string
+		host     string
+		subdir   string
+		want     string
+		wantRef  string
+		explicit bool
 	}{
-		{"empty", "bitbucket.org", "", ""},
-		{"bitbucket src/main/path", "bitbucket.org", "src/main/learn-and-update", "learn-and-update"},
-		{"bitbucket src/main/nested", "bitbucket.org", "src/develop/a/b/c", "a/b/c"},
-		{"bitbucket src/branch only", "bitbucket.org", "src/main", ""},
-		{"bitbucket trailing slash", "bitbucket.org", "src/main/skill/", "skill"},
-		{"gitlab -/tree/main/path", "gitlab.com", "-/tree/main/path/to/skill", "path/to/skill"},
-		{"gitlab -/blob/main/path", "gitlab.com", "-/blob/main/path/to/skill", "path/to/skill"},
-		{"gitlab -/tree/branch only", "gitlab.com", "-/tree/main", ""},
-		{"non-platform passthrough", "example.com", "some/path", "some/path"},
-		{"bitbucket host variant", "bitbucket.mycompany.com", "src/main/skill", "skill"},
+		{"empty", "bitbucket.org", "", "", "", false},
+		{"bitbucket src/main/path", "bitbucket.org", "src/main/learn-and-update", "learn-and-update", "main", false},
+		{"bitbucket src/main/nested", "bitbucket.org", "src/develop/a/b/c", "a/b/c", "develop", false},
+		{"bitbucket src/branch only", "bitbucket.org", "src/main", "", "main", false},
+		{"bitbucket trailing slash", "bitbucket.org", "src/main/skill/", "skill", "main", false},
+		{"gitlab -/tree/main/path", "gitlab.com", "-/tree/main/path/to/skill", "path/to/skill", "main", false},
+		{"gitlab -/blob/main/path", "gitlab.com", "-/blob/main/path/to/skill", "path/to/skill", "main", false},
+		{"gitlab blob SKILL target", "gitlab.com", "-/blob/main/skills/foo/SKILL.md", "skills/foo", "main", true},
+		{"gitlab -/tree/branch only", "gitlab.com", "-/tree/main", "", "main", false},
+		{"gitlab tag", "gitlab.com", "-/tree/v1.2.0/skills/foo", "skills/foo", "v1.2.0", false},
+		{"non-platform passthrough", "example.com", "some/path", "some/path", "", false},
+		{"bitbucket host variant", "bitbucket.mycompany.com", "src/main/skill", "skill", "main", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := stripGitBranchPrefix(tt.host, tt.subdir)
+			var s Source
+			got := tt.subdir
+			if w, ok := splitGitWebRef(tt.host, tt.subdir); ok {
+				got = s.applyWebRef(w)
+			}
 			if got != tt.want {
-				t.Errorf("stripGitBranchPrefix(%q, %q) = %q, want %q", tt.host, tt.subdir, got, tt.want)
+				t.Errorf("subdir = %q, want %q", got, tt.want)
+			}
+			if s.Branch != tt.wantRef {
+				t.Errorf("Branch = %q, want %q", s.Branch, tt.wantRef)
+			}
+			if s.ExplicitSkill != tt.explicit {
+				t.Errorf("explicit = %v, want %v", s.ExplicitSkill, tt.explicit)
 			}
 		})
 	}
@@ -576,8 +863,16 @@ func TestParseSource_DomainShorthand(t *testing.T) {
 			wantName:     "repo",
 		},
 		{
-			name:         "gitlab with subdir",
+			name:         "gitlab multi-segment path (treated as repo)",
 			input:        "gitlab.com/user/repo/path/to/skill",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://gitlab.com/user/repo/path/to/skill.git",
+			wantSubdir:   "",
+			wantName:     "skill",
+		},
+		{
+			name:         "gitlab with .git subdir boundary",
+			input:        "gitlab.com/user/repo.git/path/to/skill",
 			wantType:     SourceTypeGitHTTPS,
 			wantCloneURL: "https://gitlab.com/user/repo.git",
 			wantSubdir:   "path/to/skill",
@@ -654,6 +949,14 @@ func TestParseSource_GitHubEnterprise(t *testing.T) {
 			wantName:     "my-skill",
 		},
 		{
+			name:         "GHE Server with .git subdir boundary",
+			input:        "https://github.mycompany.com/org/repo.git/skills/my-skill",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://github.mycompany.com/org/repo.git",
+			wantSubdir:   "skills/my-skill",
+			wantName:     "my-skill",
+		},
+		{
 			name:         "GHE Server different company",
 			input:        "github.acme.com/team/project",
 			wantType:     SourceTypeGitHTTPS,
@@ -683,6 +986,14 @@ func TestParseSource_GitHubEnterprise(t *testing.T) {
 			wantSubdir:   "frontend/react",
 			wantName:     "react",
 		},
+		{
+			name:         "GHE Cloud with .git subdir boundary",
+			input:        "https://enterprise.github.com/team/skills.git/frontend/react",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://enterprise.github.com/team/skills.git",
+			wantSubdir:   "frontend/react",
+			wantName:     "react",
+		},
 		// SSH format
 		{
 			name:         "GHE Server SSH",
@@ -697,6 +1008,13 @@ func TestParseSource_GitHubEnterprise(t *testing.T) {
 			wantType:     SourceTypeGitSSH,
 			wantCloneURL: "git@mycompany.github.com:team/skills.git",
 			wantName:     "skills",
+		},
+		{
+			name:         "GHE Data Residency SSH",
+			input:        "acme@acme.ghe.com:MyOrg/my-skills.git",
+			wantType:     SourceTypeGitSSH,
+			wantCloneURL: "acme@acme.ghe.com:MyOrg/my-skills.git",
+			wantName:     "my-skills",
 		},
 		{
 			name:         "GHE SSH with subdir",
@@ -751,6 +1069,11 @@ func TestParseSource_GitHubEnterprise_TrackName(t *testing.T) {
 			raw:  "git@github.mycompany.com:org/skills.git",
 			want: "org-skills",
 		},
+		{
+			name: "GHE Data Residency SSH",
+			raw:  "acme@acme.ghe.com:MyOrg/my-skills.git",
+			want: "MyOrg-my-skills",
+		},
 	}
 
 	for _, tt := range tests {
@@ -793,6 +1116,18 @@ func TestSource_GitHubOwnerRepo(t *testing.T) {
 			wantRepo:  "repo",
 		},
 		{
+			name:      "ghe data residency https",
+			raw:       "https://acme.ghe.com/MyOrg/my-skills/agents/reviewer",
+			wantOwner: "MyOrg",
+			wantRepo:  "my-skills",
+		},
+		{
+			name:      "ghe data residency ssh",
+			raw:       "acme@acme.ghe.com:MyOrg/my-skills.git//agents/reviewer",
+			wantOwner: "MyOrg",
+			wantRepo:  "my-skills",
+		},
+		{
 			name:      "non-github host",
 			raw:       "https://gitlab.com/team/repo",
 			wantOwner: "",
@@ -811,6 +1146,105 @@ func TestSource_GitHubOwnerRepo(t *testing.T) {
 			}
 			if got := source.GitHubRepo(); got != tt.wantRepo {
 				t.Fatalf("GitHubRepo() = %q, want %q", got, tt.wantRepo)
+			}
+		})
+	}
+}
+
+func TestParseSource_GitLabSubgroups(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		wantType     SourceType
+		wantCloneURL string
+		wantSubdir   string
+		wantName     string
+	}{
+		{
+			name:         "gitlab two-level subgroup",
+			input:        "https://gitlab.com/group/subgroup/project",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://gitlab.com/group/subgroup/project.git",
+			wantName:     "project",
+		},
+		{
+			name:         "onprem gitlab deep subgroup (issue #72)",
+			input:        "onprem.gitlab.internal/org-group/subgroup-1/subgroup-2/project",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://onprem.gitlab.internal/org-group/subgroup-1/subgroup-2/project.git",
+			wantName:     "project",
+		},
+		{
+			name:         "gitlab subgroup with .git subdir boundary",
+			input:        "https://gitlab.com/group/subgroup/project.git/skills/my-skill",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://gitlab.com/group/subgroup/project.git",
+			wantSubdir:   "skills/my-skill",
+			wantName:     "my-skill",
+		},
+		{
+			name:         "gitlab subgroup shorthand",
+			input:        "gitlab.com/group/subgroup/project",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://gitlab.com/group/subgroup/project.git",
+			wantName:     "project",
+		},
+		{
+			name:         "gitlab subgroup with .git suffix",
+			input:        "https://gitlab.com/group/subgroup/project.git",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://gitlab.com/group/subgroup/project.git",
+			wantName:     "project",
+		},
+		{
+			name:         "gitlab subgroup web URL with -/tree",
+			input:        "https://gitlab.com/group/subgroup/project/-/tree/main/skills/react",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://gitlab.com/group/subgroup/project.git",
+			wantSubdir:   "skills/react",
+			wantName:     "react",
+		},
+		{
+			name:         "jihulab nested subgroup",
+			input:        "https://jihulab.com/group/subgroup/project",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://jihulab.com/group/subgroup/project.git",
+			wantName:     "project",
+		},
+		{
+			name:         "jihulab shorthand",
+			input:        "jihulab.com/team/frontend/ui",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://jihulab.com/team/frontend/ui.git",
+			wantName:     "ui",
+		},
+		{
+			name:         "jihulab web URL with -/tree",
+			input:        "https://jihulab.com/org/sub/project/-/tree/main/skills/x",
+			wantType:     SourceTypeGitHTTPS,
+			wantCloneURL: "https://jihulab.com/org/sub/project.git",
+			wantSubdir:   "skills/x",
+			wantName:     "x",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source, err := ParseSource(tt.input)
+			if err != nil {
+				t.Fatalf("ParseSource(%q) error = %v", tt.input, err)
+			}
+			if source.Type != tt.wantType {
+				t.Errorf("Type = %v, want %v", source.Type, tt.wantType)
+			}
+			if source.CloneURL != tt.wantCloneURL {
+				t.Errorf("CloneURL = %q, want %q", source.CloneURL, tt.wantCloneURL)
+			}
+			if source.Subdir != tt.wantSubdir {
+				t.Errorf("Subdir = %q, want %q", source.Subdir, tt.wantSubdir)
+			}
+			if source.Name != tt.wantName {
+				t.Errorf("Name = %q, want %q", source.Name, tt.wantName)
 			}
 		})
 	}
@@ -1132,6 +1566,225 @@ func TestParseSource_AzureDevOps_TrackName(t *testing.T) {
 	}
 }
 
+func TestParseSourceWithOptions_GitLabHosts(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		hosts    []string
+		wantURL  string
+		wantName string
+	}{
+		{
+			name:     "custom host treated as GitLab",
+			input:    "git.company.com/group/sub/project",
+			hosts:    []string{"git.company.com"},
+			wantURL:  "https://git.company.com/group/sub/project.git",
+			wantName: "project",
+		},
+		{
+			name:     "same URL without opts uses 2-segment split",
+			input:    "git.company.com/group/sub/project",
+			hosts:    nil,
+			wantURL:  "https://git.company.com/group/sub.git",
+			wantName: "project", // "project" is treated as subdir of owner/repo
+		},
+		{
+			name:     "case-insensitive host match",
+			input:    "Git.Company.Com/group/sub/project",
+			hosts:    []string{"git.company.com"},
+			wantURL:  "https://Git.Company.Com/group/sub/project.git", // host case preserved in URL
+			wantName: "project",
+		},
+		{
+			name:     ".git suffix still wins over host heuristic",
+			input:    "git.company.com/owner/repo.git/subdir",
+			hosts:    []string{"git.company.com"},
+			wantURL:  "https://git.company.com/owner/repo.git",
+			wantName: "subdir",
+		},
+		{
+			name:     "/-/ marker still wins over host heuristic",
+			input:    "git.company.com/group/sub/project/-/tree/main/skills/pdf",
+			hosts:    []string{"git.company.com"},
+			wantURL:  "https://git.company.com/group/sub/project.git",
+			wantName: "pdf",
+		},
+		{
+			name:     "built-in gitlab.com detection unchanged",
+			input:    "gitlab.com/group/sub/project",
+			hosts:    nil,
+			wantURL:  "https://gitlab.com/group/sub/project.git",
+			wantName: "project",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := ParseOptions{GitLabHosts: tt.hosts}
+			source, err := ParseSourceWithOptions(tt.input, opts)
+			if err != nil {
+				t.Fatalf("ParseSourceWithOptions(%q) error = %v", tt.input, err)
+			}
+			if source.CloneURL != tt.wantURL {
+				t.Errorf("CloneURL = %q, want %q", source.CloneURL, tt.wantURL)
+			}
+			if source.Name != tt.wantName {
+				t.Errorf("Name = %q, want %q", source.Name, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestParseSourceWithOptions_CNBGiteaHosts(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		opts         ParseOptions
+		wantCloneURL string
+		wantSubdir   string
+		wantName     string
+	}{
+		{
+			name:         "cnb root repo keeps two segment repo",
+			input:        "https://cnb.cool/org/repo",
+			wantCloneURL: "https://cnb.cool/org/repo.git",
+			wantName:     "repo",
+		},
+		{
+			name:         "cnb subdir uses owner repo split",
+			input:        "https://cnb.cool/org/repo/skills/foo",
+			wantCloneURL: "https://cnb.cool/org/repo.git",
+			wantSubdir:   "skills/foo",
+			wantName:     "foo",
+		},
+		{
+			name:         "custom cnb host uses configured host",
+			input:        "https://git.corp.example/org/repo/skills/foo",
+			opts:         ParseOptions{CNBHosts: []string{"git.corp.example"}},
+			wantCloneURL: "https://git.corp.example/org/repo.git",
+			wantSubdir:   "skills/foo",
+			wantName:     "foo",
+		},
+		{
+			name:         "custom gitea host uses configured host",
+			input:        "https://git.example.com/org/repo/skills/foo",
+			opts:         ParseOptions{GiteaHosts: []string{"git.example.com"}},
+			wantCloneURL: "https://git.example.com/org/repo.git",
+			wantSubdir:   "skills/foo",
+			wantName:     "foo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source, err := ParseSourceWithOptions(tt.input, tt.opts)
+			if err != nil {
+				t.Fatalf("ParseSourceWithOptions(%q) error = %v", tt.input, err)
+			}
+			if source.CloneURL != tt.wantCloneURL {
+				t.Errorf("CloneURL = %q, want %q", source.CloneURL, tt.wantCloneURL)
+			}
+			if source.Subdir != tt.wantSubdir {
+				t.Errorf("Subdir = %q, want %q", source.Subdir, tt.wantSubdir)
+			}
+			if source.Name != tt.wantName {
+				t.Errorf("Name = %q, want %q", source.Name, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestParseSourceWithOptions_AzureHosts(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		hosts        []string
+		wantCloneURL string
+		wantSubdir   string
+		wantName     string
+	}{
+		{
+			name:         "on-prem URL with host in azure_hosts",
+			input:        "https://azuredevops.mycompany.com/Org/Project/_git/Repo",
+			hosts:        []string{"azuredevops.mycompany.com"},
+			wantCloneURL: "https://azuredevops.mycompany.com/Org/Project/_git/Repo",
+			wantSubdir:   "",
+			wantName:     "Repo",
+		},
+		{
+			name:         "on-prem URL with subdir",
+			input:        "https://azuredevops.mycompany.com/Org/Project/_git/Repo/skills/react",
+			hosts:        []string{"azuredevops.mycompany.com"},
+			wantCloneURL: "https://azuredevops.mycompany.com/Org/Project/_git/Repo",
+			wantSubdir:   "skills/react",
+			wantName:     "react",
+		},
+		{
+			name:         "on-prem URL with .git suffix stripped",
+			input:        "https://azuredevops.mycompany.com/Org/Project/_git/Repo.git",
+			hosts:        []string{"azuredevops.mycompany.com"},
+			wantCloneURL: "https://azuredevops.mycompany.com/Org/Project/_git/Repo",
+			wantSubdir:   "",
+			wantName:     "Repo",
+		},
+		{
+			name:         "case-insensitive host match",
+			input:        "https://AzureDevOps.MyCompany.COM/Org/Project/_git/Repo",
+			hosts:        []string{"azuredevops.mycompany.com"},
+			wantCloneURL: "https://AzureDevOps.MyCompany.COM/Org/Project/_git/Repo",
+			wantSubdir:   "",
+			wantName:     "Repo",
+		},
+		{
+			name:         "/_git/ URL without azure_hosts falls through",
+			input:        "https://azuredevops.mycompany.com/Org/Project/_git/Repo",
+			hosts:        nil,
+			wantCloneURL: "https://azuredevops.mycompany.com/Org/Project.git",
+			wantSubdir:   "_git/Repo",
+			wantName:     "Repo",
+		},
+		{
+			name:         "dev.azure.com still uses hardcoded pattern",
+			input:        "https://dev.azure.com/org/proj/_git/repo",
+			hosts:        nil,
+			wantCloneURL: "https://dev.azure.com/org/proj/_git/repo",
+			wantSubdir:   "",
+			wantName:     "repo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := ParseOptions{AzureHosts: tt.hosts}
+			source, err := ParseSourceWithOptions(tt.input, opts)
+			if err != nil {
+				t.Fatalf("ParseSourceWithOptions(%q) error = %v", tt.input, err)
+			}
+			if source.CloneURL != tt.wantCloneURL {
+				t.Errorf("CloneURL = %q, want %q", source.CloneURL, tt.wantCloneURL)
+			}
+			if source.Subdir != tt.wantSubdir {
+				t.Errorf("Subdir = %q, want %q", source.Subdir, tt.wantSubdir)
+			}
+			if source.Name != tt.wantName {
+				t.Errorf("Name = %q, want %q", source.Name, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestTrackName_AzureOnPrem(t *testing.T) {
+	opts := ParseOptions{AzureHosts: []string{"azuredevops.mycompany.com"}}
+	source, err := ParseSourceWithOptions("https://azuredevops.mycompany.com/Org/Project/_git/Repo", opts)
+	if err != nil {
+		t.Fatalf("ParseSourceWithOptions() error: %v", err)
+	}
+	got := source.TrackName()
+	if got != "Org-Project-Repo" {
+		t.Errorf("TrackName() = %q, want %q", got, "Org-Project-Repo")
+	}
+}
+
 func TestParseSource_AzureDevOps_GitHubOwnerEmpty(t *testing.T) {
 	// Azure DevOps sources should return empty GitHubOwner/GitHubRepo
 	inputs := []string{
@@ -1151,6 +1804,36 @@ func TestParseSource_AzureDevOps_GitHubOwnerEmpty(t *testing.T) {
 			}
 			if got := source.GitHubRepo(); got != "" {
 				t.Errorf("GitHubRepo() = %q, want empty", got)
+			}
+		})
+	}
+}
+
+func TestSource_GitHubAPIBase(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"github.com shorthand", "owner/repo", "https://api.github.com"},
+		{"github.com full URL", "https://github.com/owner/repo", "https://api.github.com"},
+		{"github.com SSH", "git@github.com:owner/repo.git", "https://api.github.com"},
+		{"GHE Server", "https://github.mycompany.com/org/repo", "https://github.mycompany.com/api/v3"},
+		{"GHE Server shorthand", "github.acme.com/team/project", "https://github.acme.com/api/v3"},
+		{"GHE Cloud .ghe.com", "https://octocorp.ghe.com/org/repo", "https://api.octocorp.ghe.com"},
+		{"GHE SSH", "git@github.mycompany.com:org/repo.git", "https://github.mycompany.com/api/v3"},
+		{"GitLab is not GitHub", "https://gitlab.com/group/project", ""},
+		{"Bitbucket is not GitHub", "https://bitbucket.org/team/repo", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source, err := ParseSource(tt.input)
+			if err != nil {
+				t.Fatalf("ParseSource(%q) error: %v", tt.input, err)
+			}
+			if got := source.GitHubAPIBase(); got != tt.want {
+				t.Errorf("GitHubAPIBase() = %q, want %q", got, tt.want)
 			}
 		})
 	}

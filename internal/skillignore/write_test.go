@@ -1,0 +1,251 @@
+package skillignore
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestAddPattern_CreatesFileIfMissing(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+
+	if _, err := AddPattern(fp, "my-skill"); err != nil {
+		t.Fatalf("AddPattern: %v", err)
+	}
+
+	data, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(data) != "my-skill\n" {
+		t.Errorf("got %q, want %q", string(data), "my-skill\n")
+	}
+}
+
+func TestAddPattern_AppendsToExisting(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("existing-skill\n"), 0644)
+
+	if _, err := AddPattern(fp, "new-skill"); err != nil {
+		t.Fatalf("AddPattern: %v", err)
+	}
+
+	data, _ := os.ReadFile(fp)
+	want := "existing-skill\nnew-skill\n"
+	if string(data) != want {
+		t.Errorf("got %q, want %q", string(data), want)
+	}
+}
+
+func TestAddPattern_NoDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("my-skill\n"), 0644)
+
+	if _, err := AddPattern(fp, "my-skill"); err != nil {
+		t.Fatalf("AddPattern: %v", err)
+	}
+
+	data, _ := os.ReadFile(fp)
+	if string(data) != "my-skill\n" {
+		t.Errorf("got %q, want %q — duplicate was added", string(data), "my-skill\n")
+	}
+}
+
+func TestAddPattern_PreservesCommentsAndBlanks(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("# comment\n\nexisting\n"), 0644)
+
+	if _, err := AddPattern(fp, "new-skill"); err != nil {
+		t.Fatalf("AddPattern: %v", err)
+	}
+
+	data, _ := os.ReadFile(fp)
+	want := "# comment\n\nexisting\nnew-skill\n"
+	if string(data) != want {
+		t.Errorf("got %q, want %q", string(data), want)
+	}
+}
+
+func TestAddPattern_NoTrailingNewline(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("existing"), 0644)
+
+	if _, err := AddPattern(fp, "new-skill"); err != nil {
+		t.Fatalf("AddPattern: %v", err)
+	}
+
+	data, _ := os.ReadFile(fp)
+	want := "existing\nnew-skill\n"
+	if string(data) != want {
+		t.Errorf("got %q, want %q", string(data), want)
+	}
+}
+
+func TestRemovePattern_RemovesExact(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("skill-a\nskill-b\nskill-c\n"), 0644)
+
+	removed, err := RemovePattern(fp, "skill-b")
+	if err != nil {
+		t.Fatalf("RemovePattern: %v", err)
+	}
+	if !removed {
+		t.Error("expected removed=true")
+	}
+
+	data, _ := os.ReadFile(fp)
+	want := "skill-a\nskill-c\n"
+	if string(data) != want {
+		t.Errorf("got %q, want %q", string(data), want)
+	}
+}
+
+func TestRemovePattern_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("skill-a\n"), 0644)
+
+	removed, err := RemovePattern(fp, "nonexistent")
+	if err != nil {
+		t.Fatalf("RemovePattern: %v", err)
+	}
+	if removed {
+		t.Error("expected removed=false for nonexistent pattern")
+	}
+}
+
+func TestRemovePattern_FileNotExist(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+
+	removed, err := RemovePattern(fp, "anything")
+	if err != nil {
+		t.Fatalf("RemovePattern: %v", err)
+	}
+	if removed {
+		t.Error("expected removed=false for missing file")
+	}
+}
+
+func TestRemovePattern_PreservesOtherContent(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("# header\n\nskill-a\ntarget-skill\nskill-c\n"), 0644)
+
+	RemovePattern(fp, "target-skill")
+
+	data, _ := os.ReadFile(fp)
+	want := "# header\n\nskill-a\nskill-c\n"
+	if string(data) != want {
+		t.Errorf("got %q, want %q", string(data), want)
+	}
+}
+
+func TestRemovePattern_GlobPattern(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("draft-*\nskill-a\n"), 0644)
+
+	removed, _ := RemovePattern(fp, "draft-*")
+	if !removed {
+		t.Error("expected removed=true for glob pattern")
+	}
+
+	data, _ := os.ReadFile(fp)
+	want := "skill-a\n"
+	if string(data) != want {
+		t.Errorf("got %q, want %q", string(data), want)
+	}
+}
+
+func TestHasPattern_Exact(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("skill-a\nskill-b\n"), 0644)
+
+	if !HasPattern(fp, "skill-a") {
+		t.Error("expected true for existing pattern")
+	}
+	if HasPattern(fp, "nonexistent") {
+		t.Error("expected false for missing pattern")
+	}
+}
+
+func TestHasPattern_MissingFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+
+	if HasPattern(fp, "anything") {
+		t.Error("expected false for missing file")
+	}
+}
+
+// --- CRLF line endings ---
+
+func TestHasPattern_CRLF(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("my-skill\r\nother\r\n"), 0644)
+
+	if !HasPattern(fp, "my-skill") {
+		t.Error("HasPattern should find a pattern in a CRLF file")
+	}
+}
+
+func TestAddPattern_CRLFDoesNotDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("my-skill\r\n"), 0644)
+
+	added, err := AddPattern(fp, "my-skill")
+	if err != nil {
+		t.Fatalf("AddPattern: %v", err)
+	}
+	if added {
+		t.Error("pattern already present in a CRLF file should not be added again")
+	}
+}
+
+func TestRemovePattern_CRLF(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, ".skillignore")
+	os.WriteFile(fp, []byte("keep\r\nmy-skill\r\n"), 0644)
+
+	removed, err := RemovePattern(fp, "my-skill")
+	if err != nil {
+		t.Fatalf("RemovePattern: %v", err)
+	}
+	if !removed {
+		t.Fatal("pattern in a CRLF file should be found and removed")
+	}
+	if HasPattern(fp, "my-skill") {
+		t.Error("pattern should be gone")
+	}
+	if !HasPattern(fp, "keep") {
+		t.Error("other patterns must be kept")
+	}
+}
+
+func TestRenamePatterns_KeepsLinePlacement(t *testing.T) {
+	// A negation naming a moved path follows it too, or it would stop undoing
+	// the rule that disabled its neighbours.
+	content := "# note\ndemo\n!other \nglob*\ndemo/sub\n"
+
+	got, changed := RenamePatterns(content, map[string]string{"demo": "grp/demo", "other": "grp/other", "demo/sub": "grp/demo/sub"})
+
+	if want := "# note\ngrp/demo\n!grp/other\nglob*\ngrp/demo/sub\n"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if !changed {
+		t.Error("changed = false for a file with literal matches")
+	}
+	if _, changed := RenamePatterns(content, map[string]string{"absent": "x"}); changed {
+		t.Error("changed = true without a matching line")
+	}
+}

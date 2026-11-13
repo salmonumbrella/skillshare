@@ -7,83 +7,299 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"skillshare/internal/config"
+	"skillshare/internal/install"
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/version"
 )
 
 // Server holds the HTTP server state
 type Server struct {
-	cfg      *config.Config
-	registry *config.Registry
-	addr     string
-	mux      *http.ServeMux
-	handler  http.Handler
-	mu       sync.Mutex // protects write operations and config reloads
+	cfg         *config.Config
+	skillsStore *install.MetadataStore
+	agentsStore *install.MetadataStore
+	addr        string
+	// trustedOrigins are the origins besides localhost and IP addresses the dashboard answers at.
+	trustedOrigins []string
+	// refusedHosts are the Hosts servedHandler has logged, so each is logged once.
+	refusedMu    sync.Mutex
+	refusedHosts map[string]bool
+	mux          *http.ServeMux
+	handler      http.Handler
+	mu           sync.RWMutex // protects config: Lock for writes/reloads, RLock for reads
 
 	startTime time.Time // for uptime reporting in health check
+
+	// follow is nil while follow_source_links is off; see snapshotFollow.
+	follow atomic.Pointer[followConfig]
+
+	// pluginStop asks the running plugin batch update to start no further plugins.
+	pluginStop atomic.Bool
 
 	// Project mode fields (empty/nil for global mode)
 	projectRoot string
 	projectCfg  *config.ProjectConfig
+	// unresolvedTargets are project targets left out of cfg.Targets because
+	// they cannot resolve (no path); sync reports them as failed.
+	unresolvedTargets map[string]error
 
 	// uiDistDir, when non-empty, serves UI from this disk directory
 	// instead of the embedded SPA. Used for runtime-downloaded UI assets.
 	uiDistDir string
+
+	// basePath is the URL prefix under which the UI and API are served
+	// (e.g. "/app"). Empty means serve at root.
+	basePath string
 
 	// onReady is called after the listener is bound but before serving.
 	// Used to open the browser only after the port is confirmed available.
 	onReady func()
 }
 
+// NormalizeBasePath ensures the base path starts with "/" and has no trailing slash.
+// An empty or "/" input returns "".
+func NormalizeBasePath(p string) string {
+	p = strings.TrimRight(p, "/")
+	if p == "" {
+		return ""
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
+}
+
+// wrapBasePath wraps the handler chain with StripPrefix and bare-path redirect
+// when basePath is set. Skips wrapping in dev mode (no uiDistDir) and prints a warning.
+func (s *Server) wrapBasePath() {
+	if s.basePath == "" {
+		return
+	}
+	if s.uiDistDir == "" {
+		fmt.Fprintf(os.Stderr, "Warning: --base-path is ignored in dev mode (no UI assets). Start Vite without base path.\n")
+		s.basePath = ""
+		return
+	}
+	stripped := http.StripPrefix(s.basePath, s.handler)
+	s.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == s.basePath {
+			http.Redirect(w, r, s.basePath+"/", http.StatusMovedPermanently)
+			return
+		}
+		stripped.ServeHTTP(w, r)
+	})
+}
+
 // New creates a new Server for global mode.
 // uiDistDir, when non-empty, serves UI from disk instead of the embedded SPA.
-func New(cfg *config.Config, addr, uiDistDir string) *Server {
-	reg, _ := config.LoadRegistry(filepath.Dir(config.ConfigPath()))
-	if reg == nil {
-		reg = &config.Registry{}
+func New(cfg *config.Config, addr, basePath, uiDistDir string) *Server {
+	skillsStore, _ := install.LoadMetadataWithMigration(cfg.EffectiveSkillsSource(), "")
+	if skillsStore == nil {
+		skillsStore = install.NewMetadataStore()
+	}
+	agentsStore, _ := install.LoadMetadataWithMigration(cfg.EffectiveAgentsSource(), "agent")
+	if agentsStore == nil {
+		agentsStore = install.NewMetadataStore()
 	}
 	s := &Server{
-		cfg:       cfg,
-		registry:  reg,
-		addr:      addr,
-		mux:       http.NewServeMux(),
-		uiDistDir: uiDistDir,
+		cfg:         cfg,
+		skillsStore: skillsStore,
+		agentsStore: agentsStore,
+		addr:        addr,
+		mux:         http.NewServeMux(),
+		basePath:    NormalizeBasePath(basePath),
+		uiDistDir:   uiDistDir,
 	}
+	s.snapshotFollow()
 	s.registerRoutes()
-	s.handler = s.withConfigAutoReload(s.mux)
+	s.handler = rejectCrossSiteWrites(s.withConfigAutoReload(s.mux))
+	s.wrapBasePath()
 	return s
 }
 
 // NewProject creates a new Server for project mode.
 // uiDistDir, when non-empty, serves UI from disk instead of the embedded SPA.
-func NewProject(cfg *config.Config, projectCfg *config.ProjectConfig, projectRoot, addr, uiDistDir string) *Server {
-	reg, _ := config.LoadRegistry(filepath.Join(projectRoot, ".skillshare"))
-	if reg == nil {
-		reg = &config.Registry{}
+func NewProject(cfg *config.Config, projectCfg *config.ProjectConfig, projectRoot, addr, basePath, uiDistDir string) *Server {
+	skillsDir := projectCfg.EffectiveSkillsSource(projectRoot)
+	agentsDir := projectCfg.EffectiveAgentsSource(projectRoot)
+	skillsStore, _ := install.LoadMetadataWithMigration(skillsDir, "")
+	if skillsStore == nil {
+		skillsStore = install.NewMetadataStore()
+	}
+	agentsStore, _ := install.LoadMetadataWithMigration(agentsDir, "agent")
+	if agentsStore == nil {
+		agentsStore = install.NewMetadataStore()
 	}
 	s := &Server{
 		cfg:         cfg,
-		registry:    reg,
+		skillsStore: skillsStore,
+		agentsStore: agentsStore,
 		addr:        addr,
 		mux:         http.NewServeMux(),
+		basePath:    NormalizeBasePath(basePath),
 		projectRoot: projectRoot,
 		projectCfg:  projectCfg,
 		uiDistDir:   uiDistDir,
 	}
+	_, s.unresolvedTargets = config.ResolveValidProjectTargets(projectRoot, projectCfg)
+	s.snapshotFollow()
 	s.registerRoutes()
-	s.handler = s.withConfigAutoReload(s.mux)
+	s.handler = rejectCrossSiteWrites(s.withConfigAutoReload(s.mux))
+	s.wrapBasePath()
 	return s
 }
 
 // IsProjectMode returns true when serving a project-scoped dashboard
 func (s *Server) IsProjectMode() bool {
 	return s.projectRoot != ""
+}
+
+// skillEntry returns a copy of the skills metadata entry for relPath, or nil.
+// It takes s.mu.RLock, so the caller must not hold s.mu.
+func (s *Server) skillEntry(relPath string) *install.MetadataEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return copyMetadataEntry(s.skillsStore.GetByPath(relPath))
+}
+
+// discoveredSkillEntry returns a copy of the metadata entry for a discovered
+// skill. A skill nested inside a tracked repo has no entry of its own, so it
+// falls back to the repo's entry, which carries the repo source. repoRelPath is
+// the skill's tracked repo root from discovery, empty outside a repo.
+func (s *Server) discoveredSkillEntry(relPath, repoRelPath string) *install.MetadataEntry {
+	if repoRelPath == "" {
+		return s.skillEntry(relPath)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// GetByPath also matches a bare basename key, which for a nested repo skill
+	// can be an unrelated top-level skill of the same name. Only an exact or
+	// group-matched entry belongs to the skill itself.
+	if e := s.skillsStore.GetByPath(relPath); e != nil && (e.Group != "" || s.skillsStore.Has(relPath)) {
+		return copyMetadataEntry(e)
+	}
+	if e := s.skillsStore.Get(repoRelPath); e != nil && e.Tracked {
+		return copyMetadataEntry(e)
+	}
+	return nil
+}
+
+// agentEntry returns a copy of the agents metadata entry for key, or nil.
+// It takes s.mu.RLock, so the caller must not hold s.mu.
+func (s *Server) agentEntry(key string) *install.MetadataEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return copyMetadataEntry(s.agentsStore.GetByPath(key))
+}
+
+// copyMetadataEntry returns a shallow copy so callers can read the entry after
+// s.mu is released while other requests replace or mutate the store.
+func copyMetadataEntry(e *install.MetadataEntry) *install.MetadataEntry {
+	if e == nil {
+		return nil
+	}
+	c := *e
+	return &c
+}
+
+// skillsSource returns the skills source directory for the current mode.
+// Caller must hold s.mu (RLock or Lock) when accessing s.cfg.
+func (s *Server) skillsSource() string {
+	if s.IsProjectMode() {
+		return s.projectCfg.EffectiveSkillsSource(s.projectRoot)
+	}
+	return s.cfg.EffectiveSkillsSource()
+}
+
+// followConfig is the config skillsWalk reads, copied whenever the config is
+// loaded, reloaded, or saved, so handlers can build a policy without s.mu.
+type followConfig struct {
+	source  string
+	targets map[string]config.TargetConfig
+}
+
+// snapshotFollow records the current mode's follow_source_links setting.
+// Caller must hold s.mu or own s exclusively.
+func (s *Server) snapshotFollow() {
+	enabled := s.cfg.FollowSourceLinks
+	if s.IsProjectMode() {
+		enabled = s.projectCfg.FollowSourceLinks
+	}
+	if !enabled {
+		s.follow.Store(nil)
+		return
+	}
+	s.follow.Store(&followConfig{source: s.skillsSource(), targets: s.cloneTargets()})
+}
+
+// skillsWalk returns a fresh skills source traversal policy for one request,
+// following first-level source links when the current mode's config enables it.
+func (s *Server) skillsWalk() sourcewalk.Options {
+	f := s.follow.Load()
+	if f == nil {
+		return sourcewalk.Options{}
+	}
+	return config.SkillsWalk(true, f.source, f.targets)
+}
+
+// agentsSource returns the agents source directory for the current mode.
+// Caller must hold s.mu (RLock or Lock) when accessing s.cfg.
+func (s *Server) agentsSource() string {
+	if s.IsProjectMode() {
+		return s.projectCfg.EffectiveAgentsSource(s.projectRoot)
+	}
+	return s.cfg.EffectiveAgentsSource()
+}
+
+// cloneTargets returns a shallow copy of the Targets map.
+// Callers must hold s.mu (RLock or Lock).
+func (s *Server) cloneTargets() map[string]config.TargetConfig {
+	targets := make(map[string]config.TargetConfig, len(s.cfg.Targets))
+	for k, v := range s.cfg.Targets {
+		targets[k] = v
+	}
+	return config.WithSharedSkillsTargets(targets, s.cfg.Mode)
+}
+
+// parseOpts returns install.ParseOptions from the current config.
+// In project mode, project config is used unconditionally (not a fallback to global).
+func (s *Server) parseOpts() install.ParseOptions {
+	if s.IsProjectMode() && s.projectCfg != nil {
+		return install.ParseOptions{
+			GitLabHosts: s.projectCfg.EffectiveGitLabHosts(),
+			AzureHosts:  s.projectCfg.EffectiveAzureHosts(),
+			CNBHosts:    s.projectCfg.EffectiveCNBHosts(),
+			GiteaHosts:  s.projectCfg.EffectiveGiteaHosts(),
+		}
+	}
+	return install.ParseOptions{
+		GitLabHosts: s.cfg.EffectiveGitLabHosts(),
+		AzureHosts:  s.cfg.EffectiveAzureHosts(),
+		CNBHosts:    s.cfg.EffectiveCNBHosts(),
+		GiteaHosts:  s.cfg.EffectiveGiteaHosts(),
+	}
+}
+
+// gitignoreDir returns the directory containing the managed .gitignore.
+// In project mode this is .skillshare/ (entries are "skills/<name>/");
+// in global mode this is the source skill directory.
+func (s *Server) gitignoreDir() string {
+	if s.IsProjectMode() {
+		dir, _ := config.ProjectGitignoreTarget(s.projectRoot, s.skillsSource())
+		return dir
+	}
+	return s.cfg.EffectiveSkillsSource()
+}
+
+func (s *Server) projectGitignorePrefix() string {
+	_, prefix := config.ProjectGitignoreTarget(s.projectRoot, s.skillsSource())
+	return prefix
 }
 
 // configPath returns the config file path for the current mode
@@ -96,10 +312,23 @@ func (s *Server) configPath() string {
 
 // saveConfig persists the config for the current mode
 func (s *Server) saveConfig() error {
+	s.snapshotFollow()
 	if s.IsProjectMode() {
 		return s.projectCfg.Save(s.projectRoot)
 	}
 	return s.cfg.Save()
+}
+
+// saveAndReloadConfig persists config to disk then reloads it into memory.
+// Callers must hold s.mu.
+func (s *Server) saveAndReloadConfig() error {
+	if err := s.saveConfig(); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+	if err := s.reloadConfig(); err != nil {
+		return fmt.Errorf("failed to reload config: %w", err)
+	}
+	return nil
 }
 
 // reloadConfig reloads the config for the current mode
@@ -110,25 +339,39 @@ func (s *Server) reloadConfig() error {
 			return err
 		}
 		s.projectCfg = pcfg
-		targets, err := config.ResolveProjectTargets(s.projectRoot, pcfg)
-		if err != nil {
-			return err
+		s.cfg.Targets, s.unresolvedTargets = config.ResolveValidProjectTargets(s.projectRoot, pcfg)
+		skillsDir := pcfg.EffectiveSkillsSource(s.projectRoot)
+		agentsDir := pcfg.EffectiveAgentsSource(s.projectRoot)
+		s.cfg.Source = skillsDir
+		s.cfg.AgentsSource = agentsDir
+		if st, err := install.LoadMetadata(skillsDir); err == nil {
+			s.skillsStore = st
 		}
-		s.cfg.Targets = targets
-		if reg, err := config.LoadRegistry(filepath.Join(s.projectRoot, ".skillshare")); err == nil {
-			s.registry = reg
+		if st, err := install.LoadMetadata(agentsDir); err == nil {
+			s.agentsStore = st
 		}
+		s.snapshotFollow()
 		return nil
 	}
 	newCfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	s.cfg = newCfg
-	if reg, err := config.LoadRegistry(filepath.Dir(config.ConfigPath())); err == nil {
-		s.registry = reg
-	}
+	s.installGlobalConfig(newCfg)
 	return nil
+}
+
+// installGlobalConfig refreshes dependent state from an already expanded config.
+// Callers must hold s.mu.
+func (s *Server) installGlobalConfig(newCfg *config.Config) {
+	s.cfg = newCfg
+	if st, err := install.LoadMetadata(newCfg.EffectiveSkillsSource()); err == nil {
+		s.skillsStore = st
+	}
+	if st, err := install.LoadMetadata(newCfg.EffectiveAgentsSource()); err == nil {
+		s.agentsStore = st
+	}
+	s.snapshotFollow()
 }
 
 func (s *Server) refreshConfig() error {
@@ -141,7 +384,12 @@ func (s *Server) shouldAutoReloadConfig(path string) bool {
 	if !strings.HasPrefix(path, "/api/") {
 		return false
 	}
-	if path == "/api/health" {
+	if path == "/api/health" || path == "/api/update-settings" {
+		return false
+	}
+	// Project handlers reload without persisting legacy migrations, after taking
+	// the shared project lock for mutations.
+	if path == "/api/projects" || strings.HasPrefix(path, "/api/projects/") {
 		return false
 	}
 	// Keep config editor recoverable even if config file is temporarily invalid.
@@ -187,14 +435,18 @@ func (s *Server) StartWithContext(ctx context.Context) error {
 		return err
 	}
 
-	fmt.Printf("Skillshare UI running at http://%s\n", s.addr)
+	if s.basePath != "" {
+		fmt.Printf("Skillshare UI running at http://%s%s/\n", s.addr, s.basePath)
+	} else {
+		fmt.Printf("Skillshare UI running at http://%s\n", s.addr)
+	}
 
 	if s.onReady != nil {
 		s.onReady()
 	}
 
 	srv := &http.Server{
-		Handler:           s.handler,
+		Handler:           s.servedHandler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -227,21 +479,80 @@ func (s *Server) StartWithContext(ctx context.Context) error {
 func (s *Server) registerRoutes() {
 	// Health check
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
+	s.mux.HandleFunc("GET /api/update-settings", s.handleUpdatePolicy)
 
 	// Overview
 	s.mux.HandleFunc("GET /api/overview", s.handleOverview)
 
-	// Skills
-	s.mux.HandleFunc("GET /api/skills", s.handleListSkills)
-	s.mux.HandleFunc("GET /api/skills/{name}", s.handleGetSkill)
-	s.mux.HandleFunc("GET /api/skills/{name}/files/{filepath...}", s.handleGetSkillFile)
-	s.mux.HandleFunc("DELETE /api/skills/{name}", s.handleUninstallSkill)
+	// Resources (skills + agents)
+	s.mux.HandleFunc("GET /api/resources", s.handleListSkills)
+	s.mux.HandleFunc("GET /api/resources/templates", s.handleGetTemplates)
+	s.mux.HandleFunc("GET /api/resources/templates/preview", s.handlePreviewSkill)
+	s.mux.HandleFunc("POST /api/resources", s.handleCreateSkill)
+	s.mux.HandleFunc("GET /api/resources/{name}", s.handleGetSkill)
+	s.mux.HandleFunc("GET /api/resources/{name}/files/{filepath...}", s.handleGetSkillFile)
+	s.mux.HandleFunc("GET /api/resources/{name}/local-changes", s.handleSkillLocalChanges)
+	s.mux.HandleFunc("PUT /api/resources/{name}/content", s.handlePutSkillContent)
+	s.mux.HandleFunc("PATCH /api/resources/{name}/source", s.handlePatchSkillSource)
+	s.mux.HandleFunc("POST /api/resources/{name}/open-in-editor", s.handleOpenSkillInEditor)
+	s.mux.HandleFunc("POST /api/resources/{name}/disable", s.handleDisableSkill)
+	s.mux.HandleFunc("POST /api/resources/{name}/enable", s.handleEnableSkill)
+	s.mux.HandleFunc("DELETE /api/resources/{name}", s.handleUninstallSkill)
+	s.mux.HandleFunc("POST /api/resources/batch/targets", s.handleBatchSetTargets)
+	s.mux.HandleFunc("POST /api/resources/batch/toggle", s.handleBatchToggleSkills)
+	s.mux.HandleFunc("POST /api/resources/batch/move", s.handleBatchMove)
+	s.mux.HandleFunc("PATCH /api/resources/{name}/targets", s.handleSetSkillTargets)
 
 	// Targets
 	s.mux.HandleFunc("GET /api/targets", s.handleListTargets)
 	s.mux.HandleFunc("POST /api/targets", s.handleAddTarget)
 	s.mux.HandleFunc("PATCH /api/targets/{name}", s.handleUpdateTarget)
 	s.mux.HandleFunc("DELETE /api/targets/{name}", s.handleRemoveTarget)
+	s.mux.HandleFunc("GET /api/targets/{name}/skills-off-preview", s.handleSkillsOffPreview)
+	s.mux.HandleFunc("GET /api/targets/{name}/instructions", s.handleGetTargetInstructions)
+	s.mux.HandleFunc("PUT /api/targets/{name}/instructions", s.handlePutTargetInstructions)
+	s.mux.HandleFunc("POST /api/targets/{name}/instructions/convert", s.handleConvertTargetInstructions)
+	s.mux.HandleFunc("PUT /api/targets/{name}/instructions/setup", s.handlePutTargetInstructionsSetup)
+	s.mux.HandleFunc("DELETE /api/targets/{name}/instructions/setup", s.handleDeleteTargetInstructionsSetup)
+	s.mux.HandleFunc("GET /api/targets/{name}/files", s.handleListTargetFiles)
+	s.mux.HandleFunc("POST /api/targets/{name}/files", s.handleAddTargetFile)
+	s.mux.HandleFunc("DELETE /api/targets/{name}/files", s.handleRemoveTargetFile)
+	s.mux.HandleFunc("GET /api/targets/{name}/files/content", s.handleGetTargetFileContent)
+	s.mux.HandleFunc("PUT /api/targets/{name}/files/content", s.handlePutTargetFileContent)
+	s.mux.HandleFunc("GET /api/targets/{name}/omp-extensions", s.requireLocalPlugin(s.handleOMPExtensions))
+	s.mux.HandleFunc("POST /api/targets/{name}/omp-extensions/preview", s.requireLocalPlugin(s.handleOMPExtensionsPreview))
+	s.mux.HandleFunc("POST /api/targets/{name}/omp-extensions/apply", s.requireLocalPlugin(s.handleOMPExtensionsApply))
+	s.mux.HandleFunc("GET /api/targets/{name}/pi-extensions", s.requireLocalPlugin(s.handlePiExtensions))
+	s.mux.HandleFunc("POST /api/targets/{name}/pi-extensions/preview", s.requireLocalPlugin(s.handlePiExtensionsPreview))
+	s.mux.HandleFunc("POST /api/targets/{name}/pi-extensions/apply", s.requireLocalPlugin(s.handlePiExtensionsApply))
+
+	// Instruction files: shared files (tool targets are global only) and the project AGENTS.md
+	s.mux.HandleFunc("GET /api/instructions", s.handleListSharedInstructions)
+	s.mux.HandleFunc("POST /api/instructions", s.handleCreateSharedInstructions)
+	s.mux.HandleFunc("POST /api/instructions/assign", s.requireGlobalInstructions(s.handleAssignSharedInstructions))
+	s.mux.HandleFunc("GET /api/instructions/{name}/content", s.handleGetSharedInstructionsContent)
+	s.mux.HandleFunc("PUT /api/instructions/{name}/content", s.handlePutSharedInstructionsContent)
+	s.mux.HandleFunc("POST /api/instructions/{name}/restore", s.requireGlobalInstructions(s.handleRestoreSharedInstructions))
+	s.mux.HandleFunc("POST /api/instructions/{name}/resolve", s.handleResolveSharedInstructions)
+	s.mux.HandleFunc("GET /api/instructions/{name}/restore-preview", s.requireGlobalInstructions(s.handleSharedInstructionsRestorePreview))
+	s.mux.HandleFunc("PUT /api/instructions/{name}/targets/{target}/mode", s.requireGlobalInstructions(s.handlePutSharedInstructionsMode))
+	s.mux.HandleFunc("POST /api/instructions/{name}/locations", s.handleAddSharedInstructionsLocation)
+	s.mux.HandleFunc("DELETE /api/instructions/{name}/locations", s.handleDeleteSharedInstructionsLocation)
+	s.mux.HandleFunc("PUT /api/instructions/{name}/locations/mode", s.handlePutSharedInstructionsLocationMode)
+	s.mux.HandleFunc("GET /api/instructions/{name}/locations/restore-preview", s.handleSharedInstructionsLocationRestorePreview)
+	s.mux.HandleFunc("GET /api/instructions/project", s.requireProjectInstructions(s.handleGetProjectInstructions))
+	s.mux.HandleFunc("PUT /api/instructions/project", s.requireProjectInstructions(s.handlePutProjectInstructions))
+	s.mux.HandleFunc("POST /api/instructions/project/shim", s.requireProjectInstructions(s.handleProjectInstructionsShim))
+
+	// Projects (global config only)
+	s.mux.HandleFunc("GET /api/projects", s.requireGlobalProjects(s.handleListProjects))
+	s.mux.HandleFunc("PUT /api/projects", s.requireGlobalProjects(s.handleSaveProject))
+	s.mux.HandleFunc("DELETE /api/projects", s.requireGlobalProjects(s.handleRemoveProject))
+	s.mux.HandleFunc("POST /api/projects/convert", s.requireGlobalProjects(s.handleConvertProject))
+
+	// Sync matrix
+	s.mux.HandleFunc("GET /api/sync-matrix", s.handleSyncMatrix)
+	s.mux.HandleFunc("POST /api/sync-matrix/preview", s.handleSyncMatrixPreview)
 
 	// Sync
 	s.mux.HandleFunc("POST /api/sync", s.handleSync)
@@ -253,36 +564,65 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("POST /api/collect", s.handleCollect)
 
 	// Hub
+	s.mux.HandleFunc("GET /api/hub/drafts", s.handleHubDrafts)
+	s.mux.HandleFunc("POST /api/hub/drafts", s.handleHubDrafts)
+	s.mux.HandleFunc("GET /api/hub/drafts/candidates", s.handleHubDraftCandidates)
+	s.mux.HandleFunc("POST /api/hub/drafts/import", s.handleHubDraftImport)
+	s.mux.HandleFunc("GET /api/hub/drafts/{id}", s.handleHubDraft)
+	s.mux.HandleFunc("PUT /api/hub/drafts/{id}", s.handleHubDraft)
+	s.mux.HandleFunc("DELETE /api/hub/drafts/{id}", s.handleHubDraft)
+	s.mux.HandleFunc("POST /api/hub/drafts/{id}/export", s.handleHubDraftExport)
 	s.mux.HandleFunc("GET /api/hub/index", s.handleHubIndex)
+	s.mux.HandleFunc("POST /api/hub/refs", s.handleHubRefs)
 	s.mux.HandleFunc("GET /api/hub/saved", s.handleGetHubSaved)
 	s.mux.HandleFunc("PUT /api/hub/saved", s.handlePutHubSaved)
 	s.mux.HandleFunc("POST /api/hub/saved", s.handlePostHubSaved)
 	s.mux.HandleFunc("DELETE /api/hub/saved/{label}", s.handleDeleteHubSaved)
 
 	// Search & Install
-	s.mux.HandleFunc("GET /api/search", s.handleSearch)
+	s.mux.HandleFunc("GET /api/search", requireSameOrigin(s.handleSearch))
+	s.mux.HandleFunc("GET /api/preview", requireSameOrigin(s.handlePreview))
 	s.mux.HandleFunc("POST /api/discover", s.handleDiscover)
 	s.mux.HandleFunc("POST /api/install", s.handleInstall)
 	s.mux.HandleFunc("POST /api/install/batch", s.handleInstallBatch)
+	s.mux.HandleFunc("GET /api/install/missing", s.handleMissingConfigEntries)
+	s.mux.HandleFunc("POST /api/install/from-config", s.handleInstallFromConfig)
+	s.mux.HandleFunc("POST /api/uninstall/batch", s.handleBatchUninstall)
+	s.mux.HandleFunc("POST /api/source-links", s.handleCreateSourceLink)
+	s.mux.HandleFunc("DELETE /api/source-links/{name}", s.handleRemoveSourceLink)
 
 	// Update & Check
 	s.mux.HandleFunc("POST /api/update", s.handleUpdate)
-	s.mux.HandleFunc("GET /api/update/stream", s.handleUpdateStream)
+	s.mux.HandleFunc("GET /api/update/stream", requireSameOrigin(s.handleUpdateStream))
 	s.mux.HandleFunc("GET /api/check/stream", s.handleCheckStream)
 	s.mux.HandleFunc("GET /api/check", s.handleCheck)
 
 	// Repo uninstall
 	s.mux.HandleFunc("DELETE /api/repos/{name}", s.handleUninstallRepo)
 
-	// Version check
+	// Version check / app lifecycle
 	s.mux.HandleFunc("GET /api/version", s.handleVersionCheck)
+	s.mux.HandleFunc("POST /api/upgrade", s.handleUpgrade)
+	s.mux.HandleFunc("POST /api/restart", s.handleRestart)
+
+	// Doctor (health check)
+	s.mux.HandleFunc("GET /api/doctor", s.handleDoctor)
+	s.mux.HandleFunc("GET /api/doctor/stream", s.handleDoctorStream)
 
 	// Backups
 	s.mux.HandleFunc("GET /api/backups", s.handleListBackups)
+	s.mux.HandleFunc("DELETE /api/backups", s.handleDeleteAllBackups)
+	s.mux.HandleFunc("DELETE /api/backups/{timestamp}", s.handleDeleteBackup)
 	s.mux.HandleFunc("POST /api/backup", s.handleCreateBackup)
 	s.mux.HandleFunc("POST /api/backup/cleanup", s.handleCleanupBackups)
 	s.mux.HandleFunc("POST /api/restore", s.handleRestore)
 	s.mux.HandleFunc("POST /api/restore/validate", s.handleValidateRestore)
+
+	// File history (backups of single files skillshare rewrote)
+	s.mux.HandleFunc("GET /api/file-backups", s.handleListFileBackups)
+	s.mux.HandleFunc("GET /api/file-backups/versions", s.handleFileBackupVersions)
+	s.mux.HandleFunc("GET /api/file-backups/version", s.handleFileBackupVersion)
+	s.mux.HandleFunc("POST /api/file-backups/restore", s.handleRestoreFileBackup)
 
 	// Trash
 	s.mux.HandleFunc("GET /api/trash", s.handleListTrash)
@@ -290,13 +630,76 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("DELETE /api/trash/{name}", s.handleDeleteTrash)
 	s.mux.HandleFunc("POST /api/trash/empty", s.handleEmptyTrash)
 
+	// Extras
+	s.mux.HandleFunc("GET /api/plugins", s.requireLocalPlugin(s.handlePluginList))
+	s.mux.HandleFunc("GET /api/plugins/{name}/files", s.requireLocalPlugin(s.handlePluginFiles))
+	s.mux.HandleFunc("GET /api/plugins/{name}/files/{filepath...}", s.requireLocalPlugin(s.handlePluginFile))
+	s.mux.HandleFunc("POST /api/plugins/discover", s.requireLocalPlugin(s.handlePluginDiscover))
+	s.mux.HandleFunc("POST /api/plugins/preview", s.requireLocalPlugin(s.handlePluginPreview))
+	s.mux.HandleFunc("POST /api/plugins/apply", s.requireLocalPlugin(s.handlePluginApply))
+	s.mux.HandleFunc("GET /api/plugins/check/stream", s.requireLocalPlugin(s.handlePluginCheckStream))
+	s.mux.HandleFunc("POST /api/plugins/update/stream", s.requireLocalPlugin(s.handlePluginUpdateStream))
+	s.mux.HandleFunc("POST /api/plugins/update/stop", s.requireLocalPlugin(s.handlePluginUpdateStop))
+	s.mux.HandleFunc("GET /api/mcp", s.requireLocalMCP(s.handleMCPList))
+	s.mux.HandleFunc("POST /api/mcp", s.requireLocalMCP(s.handleMCPConfigure))
+	s.mux.HandleFunc("GET /api/mcp/check", s.requireLocalMCP(s.handleMCPCheck))
+	s.mux.HandleFunc("POST /api/mcp/probe", s.requireLocalMCP(s.handleMCPProbe))
+	s.mux.HandleFunc("POST /api/mcp/preview", s.requireLocalMCP(s.handleMCPPreview))
+	s.mux.HandleFunc("POST /api/mcp/render", s.requireLocalMCP(s.handleMCPRender))
+	s.mux.HandleFunc("POST /api/mcp/import", s.requireLocalMCP(s.handleMCPImport))
+	s.mux.HandleFunc("POST /api/mcp/restore", s.requireLocalMCP(s.handleMCPRestore))
+	s.mux.HandleFunc("POST /api/mcp/open", s.requireLocalMCP(s.handleMCPOpen))
+	s.mux.HandleFunc("GET /api/hooks", s.requireLocalHooks(s.handleHooksList))
+	s.mux.HandleFunc("POST /api/hooks", s.requireLocalHooks(s.handleHooksConfigure))
+	s.mux.HandleFunc("POST /api/hooks/preview", s.requireLocalHooks(s.handleHooksPreview))
+	s.mux.HandleFunc("POST /api/hooks/render", s.requireLocalHooks(s.handleHooksRender))
+	s.mux.HandleFunc("POST /api/hooks/import", s.requireLocalHooks(s.handleHooksImport))
+	s.mux.HandleFunc("POST /api/hooks/restore", s.requireLocalHooks(s.handleHooksRestore))
+	s.mux.HandleFunc("GET /api/hooks/catalog", s.requireLocalHooks(s.handleHooksCatalog))
+	s.mux.HandleFunc("GET /api/extras", s.handleExtras)
+	s.mux.HandleFunc("GET /api/extras/memory/notes", s.handleMemoryNotes)
+	s.mux.HandleFunc("GET /api/extras/memory/recent", s.handleMemoryRecent)
+	s.mux.HandleFunc("POST /api/extras/memory/init", s.handleMemoryInit)
+	s.mux.HandleFunc("PUT /api/extras/memory/index", s.handleMemoryIndex)
+	s.mux.HandleFunc("POST /api/extras/memory/move", s.handleMemoryMove)
+	s.mux.HandleFunc("GET /api/extras/memory/notes/content", s.handleMemoryContent)
+	s.mux.HandleFunc("PUT /api/extras/memory/notes/content", s.handleMemoryWrite)
+	s.mux.HandleFunc("DELETE /api/extras/memory/notes/content", s.handleMemoryDelete)
+	s.mux.HandleFunc("GET /api/extras/memory/guidance", s.handleMemoryGuidance)
+	s.mux.HandleFunc("POST /api/extras/memory/guidance/plan", s.handleMemoryGuidancePlan)
+	s.mux.HandleFunc("POST /api/extras/memory/guidance/apply", s.handleMemoryGuidanceApply)
+	s.mux.HandleFunc("GET /api/extras/extensions", s.handleExtrasExtensions)
+	s.mux.HandleFunc("GET /api/extras/diff", s.handleExtrasDiff)
+	s.mux.HandleFunc("POST /api/extras", s.handleExtrasCreate)
+	s.mux.HandleFunc("POST /api/extras/sync", s.handleExtrasSync)
+	s.mux.HandleFunc("PATCH /api/extras/{name}/mode", s.handleExtrasMode)
+	s.mux.HandleFunc("DELETE /api/extras/{name}", s.handleExtrasDelete)
+	s.mux.HandleFunc("POST /api/extras/{name}/targets", s.handleExtrasAddTarget)
+	s.mux.HandleFunc("DELETE /api/extras/{name}/targets", s.handleExtrasRemoveTarget)
+	s.mux.HandleFunc("PUT /api/extras/{name}/targets", s.handleExtrasEditTarget)
+	s.mux.HandleFunc("POST /api/extras/{name}/preview", s.handleExtrasPreview)
+	s.mux.HandleFunc("PATCH /api/extras/{name}", s.handleExtrasEdit)
+
+	// Extensions (transform extensions management)
+	s.mux.HandleFunc("GET /api/extensions", s.handleExtensionsList)
+	s.mux.HandleFunc("POST /api/extensions/install", s.handleExtensionsInstall)
+	s.mux.HandleFunc("POST /api/extensions/open", s.handleExtensionsOpen)
+	s.mux.HandleFunc("DELETE /api/extensions/{name}", s.handleExtensionsRemove)
+
 	// Git
 	s.mux.HandleFunc("GET /api/git/status", s.handleGitStatus)
+	s.mux.HandleFunc("POST /api/git/root", s.handleSetGitRoot)
+	s.mux.HandleFunc("GET /api/git/branches", s.handleGitBranches)
+	s.mux.HandleFunc("POST /api/git/checkout", s.handleGitCheckout)
+	s.mux.HandleFunc("POST /api/git/commit", s.handleGitCommit)
+	s.mux.HandleFunc("POST /api/git/discard", s.handleGitDiscard)
+	s.mux.HandleFunc("POST /api/git/absorb-nested", s.handleAbsorbNested)
 	s.mux.HandleFunc("POST /api/push", s.handlePush)
 	s.mux.HandleFunc("POST /api/pull", s.handlePull)
 
 	// Audit
 	s.mux.HandleFunc("GET /api/audit/stream", s.handleAuditStream)
+	s.mux.HandleFunc("PATCH /api/audit/policy", s.handleAuditPolicy)
 	s.mux.HandleFunc("GET /api/audit/rules/compiled", s.handleGetCompiledRules)
 	s.mux.HandleFunc("POST /api/audit/rules/toggle", s.handleToggleRule)
 	s.mux.HandleFunc("POST /api/audit/rules/reset", s.handleResetRules)
@@ -306,6 +709,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/audit", s.handleAuditAll)
 	s.mux.HandleFunc("GET /api/audit/{name}", s.handleAuditSkill)
 
+	// Analyze (context-window budget)
+	s.mux.HandleFunc("GET /api/analyze", s.handleAnalyze)
+
 	// Log
 	s.mux.HandleFunc("GET /api/log", s.handleListLog)
 	s.mux.HandleFunc("GET /api/log/stats", s.handleLogStats)
@@ -314,11 +720,20 @@ func (s *Server) registerRoutes() {
 	// Config
 	s.mux.HandleFunc("GET /api/config", s.handleGetConfig)
 	s.mux.HandleFunc("PUT /api/config", s.handlePutConfig)
+	s.mux.HandleFunc("PATCH /api/config", s.handlePatchConfig)
 	s.mux.HandleFunc("GET /api/config/available-targets", s.handleAvailableTargets)
+
+	// Skillignore
+	s.mux.HandleFunc("GET /api/skillignore", s.handleGetSkillignore)
+	s.mux.HandleFunc("PUT /api/skillignore", s.handlePutSkillignore)
+
+	// Agentignore
+	s.mux.HandleFunc("GET /api/agentignore", s.handleGetAgentignore)
+	s.mux.HandleFunc("PUT /api/agentignore", s.handlePutAgentignore)
 
 	// SPA fallback — must be last
 	if s.uiDistDir != "" {
-		s.mux.Handle("/", spaHandlerFromDisk(s.uiDistDir))
+		s.mux.Handle("/", spaHandlerFromDisk(s.uiDistDir, s.basePath))
 	} else {
 		s.mux.Handle("/", uiPlaceholderHandler())
 	}

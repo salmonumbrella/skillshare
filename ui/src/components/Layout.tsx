@@ -1,174 +1,243 @@
-import { NavLink, Outlet } from 'react-router-dom';
-import { useState, useMemo, useEffect } from 'react';
+import { Link, Outlet, useNavigate, useLocation } from 'react-router-dom';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   LayoutDashboard,
-  Puzzle,
-  Target,
   RefreshCw,
-  ArrowDownToLine,
-  Archive,
-  Trash2,
   GitBranch,
-  Search,
-  Download,
-  ArrowUpCircle,
+  Puzzle,
+  Bot,
+  FolderPlus,
+  Folders,
+  Plug,
+  Webhook,
+  Package,
+  Target,
   ShieldCheck,
-  ScrollText,
   Settings,
+  Keyboard,
+  Compass,
   Menu,
   X,
-  Sun,
-  Moon,
 } from 'lucide-react';
-import { wobbly, shadows } from '../design';
+import { api, type AuditAllResponse } from '../api/client';
+import { queryKeys, staleTimes } from '../lib/queryKeys';
+import { pendingCount } from './sync/syncView';
 import { useAppContext } from '../context/AppContext';
-import { useTheme } from '../context/ThemeContext';
+import { useGlobalShortcuts } from '../hooks/useGlobalShortcuts';
+import KeyboardShortcutsModal from './KeyboardShortcutsModal';
+import DialogShell from './DialogShell';
+import IconButton from './IconButton';
+import ShortcutHUD from './ShortcutHUD';
+import ScrollToTop from './ScrollToTop';
+import { TargetAgents } from './targetAgents';
+import CopyButton from './CopyButton';
+import ThemePopover from './ThemePopover';
+import LanguagePopover from './LanguagePopover';
+import { useTour } from './tour';
+import UpdateDialog from './UpdateDialog';
+import { useT } from '../i18n';
+import { shortenHome } from '../lib/paths';
+import { useDiffQuery, useHooksQuery, useMcpQuery, useOverviewQuery, useSyncedTargetsQuery } from '../hooks/useSharedQueries';
 
-const allNavItems = [
-  { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
-  { to: '/skills', icon: Puzzle, label: 'Skills' },
-  { to: '/targets', icon: Target, label: 'Targets' },
-  { to: '/search', icon: Search, label: 'Search' },
-  { to: '/install', icon: Download, label: 'Install' },
-  { to: '/update', icon: ArrowUpCircle, label: 'Update' },
-  { to: '/collect', icon: ArrowDownToLine, label: 'Collect' },
-  { to: '/sync', icon: RefreshCw, label: 'Sync' },
-  { to: '/git', icon: GitBranch, label: 'Git Sync' },
-  { to: '/backup', icon: Archive, label: 'Backup' },
-  { to: '/trash', icon: Trash2, label: 'Trash' },
-  { to: '/audit', icon: ShieldCheck, label: 'Audit' },
-  { to: '/log', icon: ScrollText, label: 'Log' },
-  { to: '/config', icon: Settings, label: 'Config' },
+interface NavItem {
+  to: string;
+  icon: React.ElementType;
+  labelKey: string;
+  /** Legacy routes that belong to this item until their pages move under it. */
+  also?: string[];
+  hideInProject?: boolean;
+}
+
+const navGroups: { labelKey?: string; items: NavItem[] }[] = [
+  {
+    items: [
+      { to: '/', icon: LayoutDashboard, labelKey: 'layout.nav.dashboard' },
+      { to: '/sync', icon: RefreshCw, labelKey: 'layout.nav.sync' },
+      { to: '/git', icon: GitBranch, labelKey: 'layout.nav.gitSync', hideInProject: true },
+    ],
+  },
+  {
+    labelKey: 'layout.group.library',
+    items: [
+      { to: '/skills', icon: Puzzle, labelKey: 'layout.nav.skills', also: ['/hubs'] },
+      { to: '/agents', icon: Bot, labelKey: 'layout.nav.agents' },
+      { to: '/extras', icon: FolderPlus, labelKey: 'layout.nav.extras' },
+      { to: '/mcp', icon: Plug, labelKey: 'mcp.title' },
+      { to: '/hooks', icon: Webhook, labelKey: 'hooks.title' },
+      { to: '/plugins', icon: Package, labelKey: 'plugins.title' },
+    ],
+  },
+  {
+    labelKey: 'layout.group.destinations',
+    items: [
+      { to: '/targets', icon: Target, labelKey: 'layout.nav.targets', also: ['/collect'] },
+      { to: '/projects', icon: Folders, labelKey: 'projects.title', hideInProject: true },
+    ],
+  },
+  {
+    labelKey: 'layout.group.maintain',
+    items: [
+      { to: '/audit', icon: ShieldCheck, labelKey: 'layout.nav.audit' },
+      { to: '/settings', icon: Settings, labelKey: 'layout.nav.settings', also: ['/config', '/backup', '/log', '/doctor'] },
+    ],
+  },
 ];
 
-export default function Layout() {
-  const [mobileOpen, setMobileOpen] = useState(false);
-  const { isProjectMode } = useAppContext();
-  const { theme, toggleTheme } = useTheme();
+function isActive(item: NavItem, pathname: string): boolean {
+  if (item.to === '/') return pathname === '/';
+  return [item.to, ...(item.also ?? [])].some((p) => pathname === p || pathname.startsWith(`${p}/`));
+}
 
-  const navItems = useMemo(() => {
-    if (isProjectMode) {
-      return allNavItems.filter((item) => item.to !== '/git' && item.to !== '/backup');
-    }
-    return allNavItems;
-  }, [isProjectMode]);
+export default function Layout() {
+  const t = useT();
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const location = useLocation();
+  const [navigationOpen, setNavigationOpen] = useState(false);
+  const [navigationLocation, setNavigationLocation] = useState(location);
+  if (navigationLocation !== location) {
+    setNavigationLocation(location);
+    setNavigationOpen(false);
+  }
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const closeNavigation = useCallback(() => {
+    setNavigationOpen(false);
+    menuButton.current?.focus();
+  }, []);
 
   useEffect(() => {
-    document.body.style.overflow = mobileOpen ? 'hidden' : '';
-    return () => { document.body.style.overflow = ''; };
-  }, [mobileOpen]);
+    const desktop = window.matchMedia('(min-width: 768px)');
+    const onResize = () => { if (desktop.matches) setNavigationOpen(false); };
+    desktop.addEventListener('change', onResize);
+    return () => desktop.removeEventListener('change', onResize);
+  }, []);
+  const { isProjectMode, projectRoot } = useAppContext();
+  const { startTour } = useTour();
+  const nav = useNavigate();
+  const toggleShortcuts = useCallback(() => {
+    if (navigationOpen) closeNavigation();
+    setShortcutsOpen((v) => !v);
+  }, [navigationOpen, closeNavigation]);
+  const handleNavigate = useCallback((path: string) => {
+    if (navigationOpen) closeNavigation();
+    nav(path);
+  }, [navigationOpen, closeNavigation, nav]);
+  const { modifierHeld } = useGlobalShortcuts({ onToggleHelp: toggleShortcuts, onNavigate: handleNavigate });
 
-  return (
-    <div className="flex min-h-screen">
-      {/* Mobile menu button */}
-      <button
-        onClick={() => setMobileOpen(!mobileOpen)}
-        className="fixed top-4 left-4 z-50 md:hidden w-10 h-10 flex items-center justify-center bg-surface border-2 border-pencil"
-        style={{
-          borderRadius: wobbly.sm,
-          boxShadow: shadows.sm,
-        }}
-        aria-label={mobileOpen ? 'Close menu' : 'Open menu'}
-      >
-        {mobileOpen ? <X size={20} strokeWidth={2.5} /> : <Menu size={20} strokeWidth={2.5} />}
-      </button>
+  const { data: overview } = useOverviewQuery();
+  const version = overview?.version;
+  const home = isProjectMode ? projectRoot : overview?.configDir;
+  const counts = useNavCounts(isProjectMode);
+  const { data: targets } = useQuery({ queryKey: queryKeys.targets.all, queryFn: () => api.listTargets(), staleTime: staleTimes.targets });
+  // Shares the badge query, so this costs no request.
+  const { data: synced } = useSyncedTargetsQuery();
+  const targetAgents = useMemo(() => Object.fromEntries([...(synced?.targets ?? []), ...(targets?.targets ?? [])].flatMap((x) => (x.agent ? [[x.name, x.agent]] : []))), [synced, targets]);
 
-      {/* Mobile overlay */}
-      {mobileOpen && (
-        <div
-          className="fixed inset-0 bg-pencil/30 z-30 md:hidden"
-          onClick={() => setMobileOpen(false)}
-        />
-      )}
-
-      {/* Sidebar */}
-      <aside
-        className={`
-          fixed md:sticky top-0 left-0 z-40 h-screen w-60 shrink-0
-          bg-paper-warm border-r-2 border-dashed border-pencil-light
-          flex flex-col
-          transition-transform duration-200 md:translate-x-0
-          ${mobileOpen ? 'translate-x-0' : '-translate-x-full'}
-        `}
-      >
-        {/* Logo */}
-        <div className="p-5 pb-4 border-b-2 border-dashed border-muted-dark">
-          <h1
-            className="text-2xl font-bold text-pencil tracking-wide"
-            style={{ fontFamily: 'var(--font-heading)' }}
-          >
-            skillshare
-          </h1>
-          <div className="flex items-center gap-2 mt-0.5">
-            <p
-              className="text-sm text-pencil-light"
-              style={{ fontFamily: 'var(--font-hand)' }}
-            >
-              Web Dashboard
-            </p>
-            {isProjectMode && (
-              <span
-                className="text-xs px-1.5 py-0.5 bg-info-light text-blue border border-blue font-medium"
-                style={{ borderRadius: wobbly.sm, fontFamily: 'var(--font-hand)' }}
-              >
-                Project
-              </span>
-            )}
+  const sidebar = (
+    <>
+        <div className="ss-wm">
+          <b>{t('app.name')}</b>
+          <svg className="ss-squig ss-only-playful" width="112" height="7" viewBox="0 0 112 7" aria-hidden="true">
+            <path d="M1 4 Q 8 0 15 4 T 29 4 T 43 4 T 57 4 T 71 4 T 85 4 T 99 4 T 111 4" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" />
+          </svg>
+          <div className="group flex items-center gap-1 min-w-0">
+            <span className="truncate" title={home}>{t(isProjectMode ? 'app.project' : 'app.global')}{home && ` · ${shortenHome(home)}`}</span>
+            {/* The label is truncated, so the tooltip is the only place the full path shows — copying saves retyping it. */}
+            {home && <CopyButton value={home} title={t('common.copyPath')} copiedLabel="" className="md:pointer-fine:opacity-0 group-hover:opacity-100 focus-visible:opacity-100" />}
           </div>
         </div>
 
-        {/* Navigation */}
-        <nav className="flex-1 min-h-0 overflow-y-auto py-3 px-2">
-          {navItems.map(({ to, icon: Icon, label }) => (
-            <NavLink
-              key={to}
-              to={to}
-              end={to === '/'}
-              onClick={() => setMobileOpen(false)}
-              className={({ isActive }) =>
-                `flex items-center gap-3 px-4 py-2.5 mb-1 text-base transition-all duration-100 ${
-                  isActive
-                    ? 'bg-surface border-2 border-pencil text-pencil font-medium'
-                    : 'text-pencil-light hover:text-pencil hover:bg-surface/60 border-2 border-transparent'
-                }`
-              }
-              style={({ isActive }) => ({
-                borderRadius: wobbly.sm,
-                boxShadow: isActive ? shadows.sm : 'none',
-                fontFamily: 'var(--font-hand)',
-              })}
-            >
-              <Icon size={18} strokeWidth={2.5} />
-              {label}
-            </NavLink>
-          ))}
+        <nav className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
+          {navGroups.map((group, i) => {
+            const items = group.items.filter((item) => !(isProjectMode && item.hideInProject));
+            return (
+              <div key={i}>
+                {group.labelKey && <div className="ss-nvg">{t(group.labelKey)}</div>}
+                {items.map((item) => {
+                  const Icon = item.icon;
+                  const active = isActive(item, location.pathname);
+                  return (
+                    <Link key={item.to} to={item.to} onClick={() => { if (navigationOpen) closeNavigation(); }} className={`ss-nv ${active ? 'on' : ''}`} aria-current={active ? 'page' : undefined}>
+                      <Icon size={16} />
+                      <span>{t(item.labelKey)}</span>
+                      {counts[item.to] > 0 && <span className="n">{counts[item.to]}</span>}
+                    </Link>
+                  );
+                })}
+              </div>
+            );
+          })}
         </nav>
 
-      </aside>
+        <div className="ss-sidefoot">
+          <span className="flex items-center gap-0.5">
+            <ThemePopover />
+            <LanguagePopover />
+            <button type="button" className="ss-ib" data-tour="shortcuts-btn" onClick={toggleShortcuts} aria-label={t('shortcuts.title')} title={t('shortcuts.title')} aria-keyshortcuts="?">
+              <Keyboard size={16} />
+            </button>
+            <button type="button" className="ss-ib" onClick={() => { if (navigationOpen) closeNavigation(); startTour(); }} aria-label={t('layout.tools.quickTour')} title={t('layout.tools.quickTour')}>
+              <Compass size={16} />
+            </button>
+          </span>
+          {version && <span className="font-mono text-[11px] text-ink-3">{/^\d/.test(version) ? `v${version}` : version}</span>}
+        </div>
+    </>
+  );
 
-      {/* Main content */}
-      <main className="flex-1 min-w-0 p-4 md:p-8 pt-16 md:pt-8 relative">
-        {/* Theme toggle — top right */}
-        <button
-          onClick={toggleTheme}
-          className="fixed top-4 right-4 z-50 w-10 h-10 flex items-center justify-center bg-surface border-2 border-pencil text-pencil-light hover:text-pencil transition-all duration-100 cursor-pointer"
-          style={{
-            borderRadius: wobbly.sm,
-            boxShadow: shadows.sm,
-          }}
-          aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
-          title={theme === 'light' ? 'Dark Mode' : 'Light Mode'}
-        >
-          {theme === 'light' ? (
-            <Moon size={18} strokeWidth={2.5} />
-          ) : (
-            <Sun size={18} strokeWidth={2.5} />
-          )}
+  return (
+    <div className="min-h-screen">
+      <aside className="ss-side fixed top-0 left-0 z-30 h-screen hidden md:flex">{sidebar}</aside>
+      <header className="flex items-center gap-3 px-4 py-3 border-b border-line bg-side md:hidden">
+        <button ref={menuButton} type="button" className="ss-ib" aria-label={t('layout.navigation')} aria-expanded={navigationOpen} aria-controls="mobile-navigation" onClick={() => setNavigationOpen(true)}>
+          <Menu size={20} />
         </button>
-        <div className="max-w-5xl mx-auto">
-          <Outlet />
+        <b>{t('app.name')}</b>
+      </header>
+      <DialogShell open={navigationOpen} onClose={closeNavigation} ariaLabel={t('layout.navigation')} maxWidth="sm" padding="none" className="ss-side !w-full h-[calc(100dvh-2rem)]">
+        <div id="mobile-navigation" className="flex flex-col flex-1 min-h-0">
+          <div className="flex justify-end">
+            <IconButton icon={<X size={18} />} label={t('common.close')} onClick={closeNavigation} />
+          </div>
+          {sidebar}
+        </div>
+      </DialogShell>
+
+      <main className="min-w-0 px-4 py-6 md:ml-[232px] md:px-12 md:py-10">
+        <div className="max-w-[1080px] mx-auto">
+          <TargetAgents.Provider value={targetAgents}><Outlet /></TargetAgents.Provider>
         </div>
       </main>
+
+      <KeyboardShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+      {/* Hidden on Config where Cmd+S means Save */}
+      <ScrollToTop />
+      <ShortcutHUD visible={modifierHeld && !location.pathname.startsWith('/config')} />
+      <UpdateDialog />
     </div>
   );
+}
+
+// ponytail: polling keeps the badges (and the pages sharing these queries) current after CLI or
+// file changes; server push would avoid the requests if they ever get heavy.
+const live = { refetchInterval: 15_000, refetchOnWindowFocus: true } as const;
+
+/** Sidebar badges: pending sync changes, git work to share, and skills a cached audit scan blocks. */
+function useNavCounts(isProjectMode: boolean): Record<string, number> {
+  const targets = useSyncedTargetsQuery(live);
+  const diff = useDiffQuery(live);
+  const extras = useQuery({ queryKey: queryKeys.extrasDiff(), queryFn: () => api.diffExtras(), staleTime: staleTimes.extras, ...live });
+  const mcp = useMcpQuery({ staleTime: staleTimes.extras, ...live });
+  const hooks = useHooksQuery({ staleTime: staleTimes.extras, ...live });
+  const git = useQuery({ queryKey: queryKeys.gitStatus, queryFn: () => api.gitStatus(), staleTime: staleTimes.gitStatus, enabled: !isProjectMode, ...live });
+  // Scans are expensive, so the badge only reads one the Audit page already ran.
+  const auditSkills = useQuery<AuditAllResponse>({ queryKey: queryKeys.audit.all('skills'), queryFn: () => api.auditAll('skills'), enabled: false });
+  const auditAgents = useQuery<AuditAllResponse>({ queryKey: queryKeys.audit.all('agents'), queryFn: () => api.auditAll('agents'), enabled: false });
+
+  const status = git.data;
+  return {
+    '/sync': diff.data ? pendingCount(diff.data.diffs, targets.data?.targets ?? [], extras.data?.extras ?? [], mcp.data?.plan, hooks.data?.plan) : 0,
+    '/git': !status?.isRepo ? 0 : status.isDirty ? status.files.length : status.hasRemote ? status.ahead : 0,
+    '/audit': (auditSkills.data?.summary.failed ?? 0) + (auditAgents.data?.summary.failed ?? 0),
+  };
 }

@@ -1,0 +1,377 @@
+package server
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"skillshare/internal/install"
+)
+
+func TestHandlePutSkillContent_WritesFile(t *testing.T) {
+	s, src := newTestServer(t)
+	addSkill(t, src, "my-skill")
+
+	body := skillContentRequest{Content: "---\nname: my-skill\ndescription: edited\n---\n# Updated"}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPut, "/api/resources/my-skill/content", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp skillContentResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response decode: %v", err)
+	}
+	if resp.BytesWritten != len(body.Content) {
+		t.Errorf("expected %d bytes written, got %d", len(body.Content), resp.BytesWritten)
+	}
+
+	on := filepath.Join(src, "my-skill", "SKILL.md")
+	got, err := os.ReadFile(on)
+	if err != nil {
+		t.Fatalf("read saved file: %v", err)
+	}
+	if string(got) != body.Content {
+		t.Errorf("file content mismatch:\nwant: %q\ngot:  %q", body.Content, got)
+	}
+}
+
+func TestHandlePutSkillContent_NotFound(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	body := skillContentRequest{Content: "foo"}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPut, "/api/resources/nope/content", bytes.NewReader(raw))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandlePutSkillContent_InvalidJSON(t *testing.T) {
+	s, src := newTestServer(t)
+	addSkill(t, src, "my-skill")
+
+	req := httptest.NewRequest(http.MethodPut, "/api/resources/my-skill/content", strings.NewReader("not-json"))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandlePutSkillContent_TooLarge(t *testing.T) {
+	s, src := newTestServer(t)
+	addSkill(t, src, "my-skill")
+
+	// Assemble a 3 MiB body — exceeds the 2 MiB ceiling.
+	huge := make([]byte, 3*1024*1024)
+	for i := range huge {
+		huge[i] = 'x'
+	}
+	body := skillContentRequest{Content: string(huge)}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPut, "/api/resources/my-skill/content", bytes.NewReader(raw))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d", rr.Code)
+	}
+}
+
+func TestHandlePutSkillContent_AtomicTempCleanup(t *testing.T) {
+	s, src := newTestServer(t)
+	addSkill(t, src, "my-skill")
+
+	body := skillContentRequest{Content: "new content"}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPut, "/api/resources/my-skill/content", bytes.NewReader(raw))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected %d", rr.Code)
+	}
+
+	entries, err := os.ReadDir(filepath.Join(src, "my-skill"))
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".skillshare-") {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
+	}
+}
+
+func TestHandlePutSkillContent_RefusesLinkedSkillFile(t *testing.T) {
+	s, src := newTestServer(t)
+	addSkill(t, src, "my-skill")
+	shared := filepath.Join(t.TempDir(), "shared.md")
+	if err := os.WriteFile(shared, []byte("---\nname: my-skill\n---\n# Shared"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	skillFile := filepath.Join(src, "my-skill", "SKILL.md")
+	if err := os.Remove(skillFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(shared, skillFile); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, _ := json.Marshal(skillContentRequest{Content: "replaced"})
+	req := httptest.NewRequest(http.MethodPut, "/api/resources/my-skill/content", bytes.NewReader(raw))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "is a link; edit its target directly") {
+		t.Fatalf("expected 409 link refusal, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if fi, err := os.Lstat(skillFile); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("SKILL.md is no longer a link: %v", err)
+	}
+	if got, _ := os.ReadFile(shared); !strings.Contains(string(got), "# Shared") {
+		t.Fatalf("shared file was modified: %q", got)
+	}
+}
+
+func TestHandlePutSkillContent_RejectsTraversal(t *testing.T) {
+	// The route only exposes {name}; Go's mux rejects a literal "/" inside
+	// {name}, but we still want to confirm `..` as a name doesn't escape.
+	s, src := newTestServer(t)
+	addSkill(t, src, "victim")
+
+	body := skillContentRequest{Content: "boom"}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPut, "/api/resources/..%2Fescape/content", bytes.NewReader(raw))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	// Any of: 400 / 404 is acceptable — what matters is that the victim's file
+	// is untouched.
+	got, err := os.ReadFile(filepath.Join(src, "victim", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read victim: %v", err)
+	}
+	if !strings.Contains(string(got), "# victim") {
+		t.Errorf("victim content was modified: %q", got)
+	}
+}
+
+func TestHandlePatchSkillSource_RemoteUpdateFailureDoesNotPersistMetadata(t *testing.T) {
+	s, src := newTestServer(t)
+
+	repoDir := filepath.Join(src, "_team-repo")
+	skillDir := filepath.Join(repoDir, "skill-a")
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatalf("create .git dir: %v", err)
+	}
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("create skill dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: skill-a\n---\n# skill-a"), 0o644); err != nil {
+		t.Fatalf("write skill: %v", err)
+	}
+
+	s.skillsStore = install.NewMetadataStore()
+	s.skillsStore.Set("_team-repo/skill-a", &install.MetadataEntry{
+		Source:  "https://github.com/old/repo/skill-a",
+		RepoURL: "https://github.com/old/repo.git",
+		Tracked: true,
+	})
+	if err := s.skillsStore.Save(src); err != nil {
+		t.Fatalf("save metadata: %v", err)
+	}
+
+	body := patchSourceRequest{Source: "https://github.com/new/repo/skill-a"}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPatch, "/api/resources/_team-repo__skill-a/source", bytes.NewReader(raw))
+	req.SetPathValue("name", "_team-repo__skill-a")
+	rr := httptest.NewRecorder()
+	s.handlePatchSkillSource(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "failed to update git remote URL") {
+		t.Fatalf("response %q does not mention remote update failure", rr.Body.String())
+	}
+
+	store, err := install.LoadMetadata(src)
+	if err != nil {
+		t.Fatalf("load metadata: %v", err)
+	}
+	entry := store.Get("_team-repo/skill-a")
+	if entry == nil {
+		t.Fatal("metadata entry missing")
+	}
+	if entry.Source != "https://github.com/old/repo/skill-a" {
+		t.Fatalf("metadata Source = %q, want old source", entry.Source)
+	}
+	if entry.RepoURL != "https://github.com/old/repo.git" {
+		t.Fatalf("metadata RepoURL = %q, want old repo URL", entry.RepoURL)
+	}
+}
+
+func TestHandlePatchSkillSource_UpdatesRemoteAndMetadata(t *testing.T) {
+	s, src := newTestServer(t)
+
+	repoDir := filepath.Join(src, "_team-repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatalf("create repo dir: %v", err)
+	}
+	initGitRepo(t, repoDir)
+	cmd := exec.Command("git", "remote", "add", "origin", "https://github.com/old/repo.git")
+	cmd.Dir = repoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add failed: %v\n%s", err, out)
+	}
+
+	skillDir := filepath.Join(repoDir, "skill-a")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatalf("create skill dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: skill-a\n---\n# skill-a"), 0o644); err != nil {
+		t.Fatalf("write skill: %v", err)
+	}
+
+	s.skillsStore = install.NewMetadataStore()
+	s.skillsStore.Set("_team-repo/skill-a", &install.MetadataEntry{
+		Source:  "https://github.com/old/repo/skill-a",
+		RepoURL: "https://github.com/old/repo.git",
+		Tracked: true,
+	})
+	if err := s.skillsStore.Save(src); err != nil {
+		t.Fatalf("save metadata: %v", err)
+	}
+
+	body := patchSourceRequest{Source: "https://github.com/new/repo/skill-a"}
+	raw, _ := json.Marshal(body)
+	req := httptest.NewRequest(http.MethodPatch, "/api/resources/_team-repo__skill-a/source", bytes.NewReader(raw))
+	req.SetPathValue("name", "_team-repo__skill-a")
+	rr := httptest.NewRecorder()
+	s.handlePatchSkillSource(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	cmd = exec.Command("git", "remote", "get-url", "origin")
+	cmd.Dir = repoDir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git remote get-url failed: %v", err)
+	}
+	if got := strings.TrimSpace(string(out)); got != "https://github.com/new/repo.git" {
+		t.Fatalf("remote URL = %q, want %q", got, "https://github.com/new/repo.git")
+	}
+
+	store, err := install.LoadMetadata(src)
+	if err != nil {
+		t.Fatalf("load metadata: %v", err)
+	}
+	entry := store.Get("_team-repo/skill-a")
+	if entry == nil {
+		t.Fatal("metadata entry missing")
+	}
+	if entry.Source != "https://github.com/new/repo/skill-a" {
+		t.Fatalf("metadata Source = %q, want new source", entry.Source)
+	}
+	if entry.RepoURL != "https://github.com/new/repo.git" {
+		t.Fatalf("metadata RepoURL = %q, want new repo URL", entry.RepoURL)
+	}
+}
+
+// TestFindRepoRoot_ExcludesSourceRoot guards the origin-hijack regression: when
+// the skills source root is itself a git repo (e.g. GitSync-backed), a nested
+// non-tracked skill must NOT resolve the source root as its tracked repo —
+// otherwise editing that skill's source rewrites the source root repo's origin.
+func TestFindRepoRoot_ExcludesSourceRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(root, "frontend", "react", "react-doctor")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nested skill with no .git of its own: source root must be ignored.
+	if got := findRepoRoot(nested, root); got != "" {
+		t.Fatalf("findRepoRoot resolved source root as tracked repo: %q", got)
+	}
+
+	// A real tracked repo (.git in a subdirectory) is still found.
+	tracked := filepath.Join(root, "_repo")
+	if err := os.MkdirAll(filepath.Join(tracked, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := findRepoRoot(tracked, root); got != tracked {
+		t.Fatalf("findRepoRoot(%q) = %q, want %q", tracked, got, tracked)
+	}
+
+	// Sibling dir sharing a name prefix must not be treated as inside root.
+	sibling := root + "-extra"
+	if err := os.MkdirAll(filepath.Join(sibling, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := findRepoRoot(filepath.Join(sibling, "skill"), root); got != "" {
+		t.Fatalf("findRepoRoot leaked into sibling dir: %q", got)
+	}
+}
+
+func TestHandlePutSkillContent_FollowedSourceLink(t *testing.T) {
+	for _, follow := range []bool{true, false} {
+		s, src := newTestServer(t)
+		checkout := filepath.Join(t.TempDir(), "checkout")
+		if err := os.MkdirAll(filepath.Join(checkout, "foo"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		original := "---\nname: foo\n---\n# Foo"
+		if err := os.WriteFile(filepath.Join(checkout, "foo", "SKILL.md"), []byte(original), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(checkout, filepath.Join(src, "_dev-skills")); err != nil {
+			t.Fatal(err)
+		}
+		if follow {
+			cfgPath := os.Getenv("SKILLSHARE_CONFIG")
+			raw, _ := os.ReadFile(cfgPath)
+			if err := os.WriteFile(cfgPath, append(raw, "follow_source_links: true\n"...), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.reloadConfig(); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		edited := "---\nname: foo\ndescription: edited\n---\n# Foo"
+		raw, _ := json.Marshal(skillContentRequest{Content: edited})
+		req := httptest.NewRequest(http.MethodPut, "/api/resources/_dev-skills__foo/content", bytes.NewReader(raw))
+		rr := httptest.NewRecorder()
+		s.handler.ServeHTTP(rr, req)
+
+		got, _ := os.ReadFile(filepath.Join(checkout, "foo", "SKILL.md"))
+		if follow {
+			if rr.Code != http.StatusOK || string(got) != edited {
+				t.Fatalf("follow on: %d %s, checkout = %q", rr.Code, rr.Body.String(), got)
+			}
+		} else if rr.Code == http.StatusOK || string(got) != original {
+			t.Fatalf("follow off must refuse: %d, checkout = %q", rr.Code, got)
+		}
+	}
+}

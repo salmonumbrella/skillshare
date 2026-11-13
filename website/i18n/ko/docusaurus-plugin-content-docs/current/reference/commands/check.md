@@ -1,0 +1,238 @@
+---
+sidebar_position: 3
+---
+
+# check
+
+변경 사항을 적용하지 않고, 추적 중인 저장소와 설치된 skill에 사용 가능한 업데이트가 있는지 확인합니다.
+
+```bash
+skillshare check                      # Check all repos and skills
+skillshare check my-skill             # Check a single skill
+skillshare check a b c                # Check multiple skills
+skillshare check --group frontend     # Check all skills in frontend/
+skillshare check x -G backend         # Mix names and groups
+skillshare check --json               # Machine-readable output
+skillshare check my-skill --diff      # Show what you changed in a skill since install
+```
+
+## 언제 사용하나요
+
+### 업데이트 전에
+
+`update`를 실행하기 전에 무엇이 변경될지 미리 확인합니다.
+
+```bash
+skillshare check         # See what has updates
+skillshare update --all  # Apply updates
+skillshare sync          # Distribute changes
+```
+
+### CI/CD 파이프라인
+
+CI에서 오래된 skill을 확인합니다.
+
+```bash
+result=$(skillshare check --json)
+# Parse JSON to detect outdated skills
+```
+
+## 종료 상태
+
+검사한 항목 중 하나라도 상태가 `error`이면(예: 원격 저장소에 연결할 수 없거나 로컬 소스가 없음) `check`는 코드 `1`로 종료합니다. 사용 가능한 업데이트, 오래된 항목, 로컬 수정만으로는 실패하지 않습니다. `--json`을 사용해도 stdout에 전체 결과가 출력됩니다. 각 항목의 `status`와 `message`를 확인하세요. 지정한 이름이나 group에 확인할 대상이 하나도 없으면 `check`는 코드 `1`로 종료하며, `--json`에서는 결과 대신 `{"error": "..."}`를 출력합니다. `--json`을 사용할 때 일부 이름만 건너뛰면 해당 이름은 결과의 `warnings` 배열에 포함됩니다. `--json`을 사용할 때의 다른 실패(잘못된 플래그 조합이나 설정 파일 없음 등)도 같은 `error` 객체로 보고됩니다.
+
+`--exit-code`를 지정하면 모든 항목을 확인할 수 있었더라도 최신이 아닌 항목이 있을 때 종료 코드 `1`로 종료합니다. 사용 가능한 업데이트, stale이거나 로컬에서 수정된 skill, 뒤처졌거나 커밋되지 않은 변경이 있거나 없어진 추적 저장소가 해당합니다. 제외되는 것은 상태가 `local`(비교 대상 없음)인 항목뿐입니다. 로컬 경로에서 설치한 skill의 소스가 변경되면 사용 가능한 업데이트로 셉니다. `check agents`와 `check --all`에도 동일하게 적용되며, 설치 이후 파일이 변경된 agent도 해당합니다. `--json`과 함께 사용할 수 있으며 `--diff`와는 함께 사용할 수 없습니다.
+
+## 동작 내용
+
+`check`는 source 디렉터리를 검사하여 다음 항목의 업데이트 상태를 보고합니다.
+
+1. **추적 중인 저장소** — origin에서 fetch하고, 몇 커밋 뒤처져 있는지 표시
+2. **메타데이터가 있는 설치된 skill** — 설치된 버전을 remote HEAD와 비교
+3. **오래된(stale) skill** — 업스트림 저장소에서 하위 디렉터리가 삭제된 skill 감지
+4. **로컬에서 수정된 skill** — 저장소에서 설치한 skill의 파일을 설치 시 기록된 파일과 비교하고, 파일을 편집·추가·삭제했다면 `"status": "modified"`로 보고
+5. **로컬 경로 설치** — 설치한 경로의 파일을 설치 시 기록된 파일과 비교([로컬 경로 설치](#local-path-installs) 참고)
+6. **로컬 skill** — 설치 메타데이터가 없는 skill을 "local source"로 표시(비교할 대상 없음)
+7. **skill 수준 `targets` 검증** — SKILL.md의 `targets` frontmatter 필드에 있는 알 수 없는 target 이름에 대해 경고
+
+`update`와 달리 `check`는 어떤 파일도 수정하지 않습니다.
+
+## 로컬 경로 설치 {#local-path-installs}
+
+디스크의 디렉터리에서 설치한 skill(`skillshare install /path/to/skill`)은 해당 경로와 복사한 모든 파일의 해시를 기록합니다. `check`는 그 경로의 파일을 다시 해시하여 다음과 같이 보고합니다.
+
+- **up to date** — 파일이 설치 시점과 일치함
+- **update available** — 원본 경로에서 파일이 변경, 추가 또는 삭제됨
+- **error** — 원본 경로가 더 이상 존재하지 않음(`local source not found: <path>`)
+
+앱 번들 안의 skill처럼 다른 애플리케이션이 배포하고 업데이트하는 skill에 유용합니다.
+
+```bash
+skillshare install /Applications/Surge.app/Contents/Resources/Skills/surge
+
+# 앱 업데이트 후:
+skillshare check surge     # → Update available
+skillshare update surge    # 경로에서 다시 복사하고 보안 감사를 실행
+skillshare sync
+```
+
+파일 해시가 기록되기 전에 설치된 skill은 update하거나 다시 설치할 때까지 "local source" 상태로 남습니다. Project mode에서는 상대 경로(`./vendor/my-skill` 등)를 project root 기준으로 해석합니다.
+
+대시보드에서 하위 skill이 있는 디렉터리의 루트를 설치하면 그 루트의 `SKILL.md`만 복사합니다. 이 경우 `check`는 `SKILL.md`만 비교하고, `update`도 `SKILL.md`만 다시 복사합니다.
+
+## 출력 예시
+
+```
+$ skillshare check
+! _shared-rules   3 commits behind
+! _design-system  uncommitted changes
+! commit          update available · github.com/anthropics/skills
+! old-helper      stale — no longer in the upstream repository
+
+! Updates available for 1 repo, 1 skill, 2 up to date, 1 local skipped, 1 stale · 3.4s
+
+Next
+  skillshare update --all          pull the updates
+  skillshare update --all --prune  remove stale skills
+```
+
+## 특정 skill 확인
+
+전체를 스캔하는 대신 이름으로 하나 이상의 skill을 확인할 수 있습니다.
+
+```bash
+skillshare check my-skill                # Single skill
+skillshare check skill-a skill-b         # Multiple skills
+```
+
+`follow_source_links: true`이면 연결된 Git 체크아웃도 링크 이름으로 확인할 수 있습니다. 예: `skillshare check _dev-skills`.
+
+group 디렉터리 안의 업데이트 가능한 모든 skill을 확인하려면 `--group` / `-G`를 사용하세요.
+
+```bash
+skillshare check --group frontend        # All skills under frontend/
+skillshare check -G frontend -G backend  # Multiple groups
+skillshare check my-skill -G frontend    # Mix names and groups
+```
+
+위치 인자로 지정한 이름이 (저장소나 skill 자체가 아닌) group 디렉터리와 일치하면 자동으로 확장됩니다.
+
+```bash
+skillshare check frontend               # Auto-detected as group
+```
+
+메타데이터가 없는(로컬 전용) skill은 group을 확장할 때 건너뜁니다.
+
+## 옵션
+
+| Flag | Description |
+|------|-------------|
+| `--all` | skill과 함께 agent도 확인. 이름이나 `--group`과 함께 사용할 수 없음 |
+| `--group`, `-G` `<name>` | group 안의 업데이트 가능한 모든 skill 확인(반복 가능) |
+| `--project`, `-p` | project 수준 skill 확인(`.skillshare/`) |
+| `--global`, `-g` | global skill 확인(`~/.config/skillshare`) |
+| `--json` | JSON으로 출력(스크립팅/CI용) |
+| `--diff` | 지정한 skill에 대해 설치 이후 변경된 각 파일을 설치된 버전과의 줄 단위 diff로 보여줍니다. 이름 또는 `--group`이 필요하며 `--json`과 함께 사용할 수 없습니다 |
+| `--exit-code` | 최신이 아닌 항목이 하나라도 있으면 종료 코드 `1`로 종료합니다(CI용). `--diff`와 함께 사용할 수 없습니다 |
+| `--help`, `-h` | 도움말 표시 |
+
+:::tip Auto-detection
+`--project`와 `--global` 중 어느 것도 지정하지 않으면 skillshare가 자동으로 감지합니다: 현재 디렉터리에 `.skillshare/config.yaml`이 존재하면 project mode를, 그렇지 않으면 global mode를 기본값으로 사용합니다.
+:::
+
+## JSON 출력
+
+```bash
+skillshare check --json
+```
+
+```json
+{
+  "tracked_repos": [
+    {"name": "_team-skills", "status": "up_to_date", "behind": 0, "branch": "main"},
+    {"name": "_shared-rules", "status": "behind", "behind": 3, "branch": "develop"}
+  ],
+  "skills": [
+    {"name": "pdf", "source": "anthropics/skills", "version": "a1b2c3d",
+     "status": "up_to_date", "installed_at": "2024-06-01T10:00:00Z"},
+    {"name": "commit", "source": "anthropics/skills", "version": "x9y8z7w",
+     "status": "update_available", "installed_at": "2024-05-15T08:30:00Z"},
+    {"name": "old-helper", "source": "anthropics/skills", "version": "d4e5f6g",
+     "status": "stale", "installed_at": "2024-03-10T09:00:00Z"},
+    {"name": "my-review", "source": "anthropics/skills", "version": "a1b2c3d",
+     "status": "modified", "installed_at": "2024-06-01T10:00:00Z",
+     "message": "local changes since install"},
+    {"name": "local-skill", "source": "", "version": "",
+     "status": "local", "installed_at": "2024-04-20T12:00:00Z"}
+  ]
+}
+```
+
+`"status": "error"`인 skill에는 원인을 알 수 있을 때 `message` 필드가 포함됩니다. 예: `"message": "local source not found: /path/to/skill"`.
+
+## 상태 표시자
+
+| Icon | Meaning |
+|------|---------|
+| `✓` | 최신 상태 |
+| `⬇` | 업데이트 사용 가능(추적 저장소: 뒤처진 커밋 수; skill: 새 버전) |
+| `⚠` | Stale — 업스트림에서 하위 디렉터리가 삭제되거나 이름이 변경됨 |
+| `!` | 커밋되지 않은 변경 사항 있음(tracked repo) 또는 설치 이후 로컬 변경 사항 있음(skill) |
+| `•` | 로컬 source(비교할 설치 메타데이터 없음) |
+
+:::info Stale skills
+skill의 하위 디렉터리가 업스트림에서 이름이 바뀌거나 삭제된 경우, `check`는 이를 **stale**로 보고합니다. stale skill을 정리하려면 `update --prune`을 사용하세요.
+:::
+
+:::info 로컬에서 수정된 skills
+설치한 뒤 편집한 skill은 upstream에 더 새로운 버전이 있어도 **modified**로 보고되며, 이때 `message`는 `update available upstream`으로 끝납니다. `update`는 `skillshare update <name> --force`를 실행하기 전까지 이 skill을 건드리지 않습니다. 이 명령은 변경 사항을 버리고 다시 설치합니다. OS 메타데이터 파일(`.DS_Store`, `Thumbs.db`, `desktop.ini`)은 로컬 변경으로 보지 않습니다.
+
+먼저 변경 사항을 보려면 `skillshare check <name> --diff`를 실행하세요. skill이 설치된 commit을 가져오므로 upstream이 앞서 나가 있어도 diff에는 직접 수정한 내용만 표시됩니다:
+
+```
+! my-skill  2 files changed since install
+            modified SKILL.md
+                # My Skill
+              - Run the tests.
+              + Run the tests with -race.
+            added NOTES.md
+              + my notes
+```
+:::
+
+:::tip Monorepo awareness
+하위 디렉터리에서 설치된 skill의 경우, `check`는 해당 특정 디렉터리가 변경되었을 때만 "update available"로 보고합니다 — 저장소의 관련 없는 부분에 새 커밋이 있는 경우는 해당하지 않습니다.
+:::
+
+## Project Mode
+
+```bash
+skillshare check -p                    # Check all project skills
+skillshare check -p my-skill           # Check specific project skill
+skillshare check -p --group frontend   # Check project group
+skillshare check -p --json             # JSON output for project
+```
+
+## Agent 지원
+
+`skillshare check agents`는 확인 범위를 agent로 한정하여, agent source 디렉터리의 `.md` 파일에 대한 drift와 업데이트 상태를 보고합니다.
+
+```bash
+skillshare check agents              # Check all agents
+skillshare check agents --json       # JSON output for agents
+skillshare check agents -p           # Check project agents
+skillshare check --all               # Check skills and agents together
+```
+
+각 agent는 설치한 branch와 비교됩니다. 이전 `update agents`로 기록된 source를 잃은 agent는 `error`를 보고하고 다시 설치하라고 안내합니다. [문제 해결](/docs/troubleshooting/common-errors#agent-source-lost)을 참고하세요.
+
+`agents` 인자나 `--all` 없이 실행하면 `check`는 skill에 대해서만 동작합니다(기본 동작). 배경 지식은 [Agents](/docs/understand/agents)를 참고하세요.
+
+`--all`을 지정하면 skill과 agent를 한 번에 확인합니다. 텍스트 출력은 Skills와 Agents 섹션으로 나뉘고, `--json`은 `tracked_repos`와 `skills` 옆에 `agents` 배열을 추가하며, `--exit-code`는 둘 다 셉니다. `--all`은 이름이나 `--group`과 함께 사용할 수 없습니다.
+
+## 참고 항목
+
+- [update](/docs/reference/commands/update) — 업데이트 적용
+- [list](/docs/reference/commands/list) — 설치된 skill 확인
+- [status](/docs/reference/commands/status) — 동기화 상태 표시
+- [Agents](/docs/understand/agents) — agent 개념

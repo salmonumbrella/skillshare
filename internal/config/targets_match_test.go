@@ -11,7 +11,7 @@ func TestMatchesTargetName_SameName(t *testing.T) {
 }
 
 func TestMatchesTargetName_CrossMode(t *testing.T) {
-	// "claude" is global_name/project_name, "claude-code" is an alias for the same spec
+	// "claude" is the canonical name, "claude-code" is an alias for the same spec
 	if !MatchesTargetName("claude", "claude-code") {
 		t.Error("claude should match claude-code (cross-mode)")
 	}
@@ -33,7 +33,7 @@ func TestMatchesTargetName_UnknownName(t *testing.T) {
 }
 
 func TestMatchesTargetName_SharedProjectPath(t *testing.T) {
-	// codex and universal share project_path ".agents/skills"
+	// codex and universal share skills.project ".agents/skills"
 	if !MatchesTargetName("codex", "universal") {
 		t.Error("codex should match universal (shared project path)")
 	}
@@ -43,7 +43,7 @@ func TestMatchesTargetName_SharedProjectPath(t *testing.T) {
 }
 
 func TestMatchesTargetName_SharedPath_NoFalsePositive(t *testing.T) {
-	// claude and cursor have different paths — must not match via path fallback
+	// claude (.claude/skills) and cursor (.agents/skills) have different project and global paths
 	if MatchesTargetName("claude", "cursor") {
 		t.Error("claude should not match cursor (different paths)")
 	}

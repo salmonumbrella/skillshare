@@ -34,7 +34,7 @@ targets: {}
 
 	result := sb.RunCLI("push")
 
-	result.AssertSuccess(t) // Command succeeds but shows error message
+	result.AssertFailure(t)
 	result.AssertOutputContains(t, "not a git repository")
 }
 
@@ -55,7 +55,7 @@ targets: {}
 
 	result := sb.RunCLI("push")
 
-	result.AssertSuccess(t)
+	result.AssertFailure(t)
 	result.AssertOutputContains(t, "No git remote")
 }
 
@@ -76,8 +76,8 @@ targets: {}
 	result := sb.RunCLI("push", "--dry-run")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "dry-run")
-	result.AssertOutputContains(t, "Would stage")
+	result.AssertOutputContains(t, "Dry run — nothing was written")
+	result.AssertOutputContains(t, "would commit 1 file")
 }
 
 func TestPush_NoChanges_ShowsNoChanges(t *testing.T) {
@@ -95,7 +95,7 @@ targets: {}
 	result := sb.RunCLI("push", "--dry-run")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "No changes")
+	result.AssertOutputContains(t, "nothing to commit")
 }
 
 func TestPush_CustomMessage(t *testing.T) {
@@ -161,48 +161,7 @@ targets: {}
 	result := sb.RunCLI("push", "-m", "Test push")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Push complete")
-}
-
-func TestPush_NoUpstream_AutoSetsUpstream(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets: {}
-`)
-
-	// Create bare repo as "remote"
-	bareRepo := filepath.Join(sb.Home, "remote.git")
-	cmd := exec.Command("git", "init", "--bare", bareRepo)
-	if err := cmd.Run(); err != nil {
-		t.Skip("git not available")
-	}
-
-	// Initialize git and add remote — but do NOT set upstream tracking
-	cmd = exec.Command("git", "init")
-	cmd.Dir = sb.SourcePath
-	cmd.Run()
-
-	cmd = exec.Command("git", "remote", "add", "origin", bareRepo)
-	cmd.Dir = sb.SourcePath
-	cmd.Run()
-
-	testutil.ConfigureGitUser(t, sb.SourcePath)
-
-	// Create initial commit (simulates what skillshare init does)
-	cmd = exec.Command("git", "commit", "--allow-empty", "-m", "initial")
-	cmd.Dir = sb.SourcePath
-	cmd.Run()
-
-	// Create a skill (uncommitted)
-	sb.CreateSkill("first-push-skill", map[string]string{"SKILL.md": "# First Push"})
-
-	// Push should succeed even without upstream tracking
-	result := sb.RunCLI("push", "-m", "first push")
-
-	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Push complete")
+	result.AssertOutputContains(t, "✓ Push")
 }
 
 func TestPush_NoUpstream_RemoteMain_LocalMaster_PushesToMain_NoMasterCreated(t *testing.T) {
@@ -229,7 +188,7 @@ targets: {}
 
 	result := sb.RunCLI("push", "-m", "sync to main")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Push complete")
+	result.AssertOutputContains(t, "✓ Push")
 
 	refs := testutil.RunGit(t, bareRepo, "for-each-ref", "--format=%(refname:short)", "refs/heads")
 	if !strings.Contains(refs, "main") {
@@ -264,7 +223,7 @@ targets: {}
 
 	result := sb.RunCLI("push", "-m", "sync to trunk")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Push complete")
+	result.AssertOutputContains(t, "✓ Push")
 
 	upstream := testutil.RunGit(t, sb.SourcePath, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	if upstream != "origin/trunk" {
@@ -300,7 +259,7 @@ targets: {}
 
 	result := sb.RunCLI("push", "-m", "first push")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Push complete")
+	result.AssertOutputContains(t, "✓ Push")
 
 	refs := testutil.RunGit(t, bareRepo, "for-each-ref", "--format=%(refname:short)", "refs/heads")
 	if !strings.Contains(refs, localBranch) {
@@ -328,4 +287,33 @@ func initGitWithRemote(t *testing.T, sb *testutil.Sandbox) {
 func commitAll(t *testing.T, dir, message string) {
 	testutil.RunGit(t, dir, "add", "-A")
 	testutil.RunGit(t, dir, "commit", "-m", message, "--allow-empty")
+}
+
+// Git exports GIT_DIR to hooks; push run from one must commit in the source
+// repo, not the hook's repository (#852).
+func TestPush_IgnoresCallerGitDir(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+	bareRepo := filepath.Join(sb.Home, "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", bareRepo)
+	testutil.RunGit(t, sb.SourcePath, "init")
+	testutil.RunGit(t, sb.SourcePath, "remote", "add", "origin", bareRepo)
+	testutil.ConfigureGitUser(t, sb.SourcePath)
+
+	caller := filepath.Join(sb.Home, "caller")
+	testutil.RunGit(t, "", "init", caller)
+	testutil.ConfigureGitUser(t, caller)
+	testutil.RunGit(t, caller, "remote", "add", "origin", filepath.Join(sb.Home, "caller-remote.git"))
+	testutil.RunGit(t, caller, "commit", "--allow-empty", "-m", "caller")
+
+	sb.CreateSkill("pushed-skill", map[string]string{"SKILL.md": "# Pushed"})
+	sb.RunCLIEnv(map[string]string{"GIT_DIR": filepath.Join(caller, ".git")}, "push", "-m", "Test push")
+
+	if got := testutil.RunGit(t, caller, "rev-list", "--count", "HEAD"); got != "1" {
+		t.Errorf("caller repository has %s commits, want 1", got)
+	}
 }

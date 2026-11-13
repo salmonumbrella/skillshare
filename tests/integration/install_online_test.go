@@ -3,11 +3,10 @@
 package integration
 
 import (
-	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	"skillshare/internal/install"
 	"skillshare/internal/testutil"
 )
 
@@ -24,7 +23,7 @@ targets: {}
 	result := sb.RunCLI("install", "runkids/skillshare/skills/skillshare", "--dry-run")
 
 	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "dry-run")
+	result.AssertAnyOutputContains(t, "Dry run — nothing was written")
 }
 
 // TestInstall_RemoteGitHub_Clone installs a real skill from GitHub and verifies the files land.
@@ -87,11 +86,11 @@ func TestInstall_GitHubSubdirViaAPI(t *testing.T) {
 targets: {}
 `)
 
-	source := "majiayu000/claude-skill-registry/skills/documents/atlassian-search"
+	source := "runkids/skillshare/skills/skillshare"
 	result := sb.RunCLI("install", source)
 	result.AssertSuccess(t)
 
-	skillDir := filepath.Join(sb.SourcePath, "atlassian-search")
+	skillDir := filepath.Join(sb.SourcePath, "skillshare")
 	if !sb.FileExists(skillDir) {
 		t.Fatalf("expected skill directory %s to exist", skillDir)
 	}
@@ -102,16 +101,19 @@ targets: {}
 		t.Fatalf("did not expect .git directory for subdir API install")
 	}
 
-	metaPath := filepath.Join(skillDir, ".skillshare-meta.json")
-	metaRaw, err := os.ReadFile(metaPath)
-	if err != nil {
-		t.Fatalf("failed to read metadata: %v", err)
+	// Verify metadata in centralized .metadata.json store
+	store, storeErr := install.LoadMetadata(sb.SourcePath)
+	if storeErr != nil {
+		t.Fatalf("failed to load metadata store: %v", storeErr)
 	}
-	meta := string(metaRaw)
-	if !strings.Contains(meta, "\"source\": \"github.com/majiayu000/claude-skill-registry/skills/documents/atlassian-search\"") {
-		t.Fatalf("expected metadata source to preserve subdir source, got: %s", meta)
+	entry := store.Get("skillshare")
+	if entry == nil {
+		t.Fatal("expected metadata entry for skillshare in centralized store")
 	}
-	if !strings.Contains(meta, "\"subdir\": \"skills/documents/atlassian-search\"") {
-		t.Fatalf("expected metadata subdir to match install path, got: %s", meta)
+	if entry.Source != "github.com/runkids/skillshare/skills/skillshare" {
+		t.Fatalf("expected source to preserve subdir, got: %s", entry.Source)
+	}
+	if entry.Subdir != "skills/skillshare" {
+		t.Fatalf("expected subdir to match install path, got: %s", entry.Subdir)
 	}
 }

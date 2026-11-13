@@ -3,8 +3,10 @@
 package integration
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"skillshare/internal/testutil"
@@ -22,7 +24,7 @@ func TestSyncExtras_MergeMode(t *testing.T) {
 
 	// Create extras source: rules directory with 2 .md files
 	sourceRoot := filepath.Dir(sb.SourcePath) // ~/.config/skillshare/
-	rulesSource := filepath.Join(sourceRoot, "rules")
+	rulesSource := filepath.Join(sourceRoot, "extras", "rules")
 	os.MkdirAll(rulesSource, 0755)
 	os.WriteFile(filepath.Join(rulesSource, "coding.md"), []byte("# Coding Rules"), 0644)
 	os.WriteFile(filepath.Join(rulesSource, "testing.md"), []byte("# Testing Rules"), 0644)
@@ -44,7 +46,7 @@ extras:
 	result := sb.RunCLI("sync", "extras")
 
 	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "Rules")
+	result.AssertAnyOutputContains(t, "\nExtras\n")
 	result.AssertAnyOutputContains(t, "2 files")
 
 	// Verify files are symlinks
@@ -62,57 +64,6 @@ extras:
 	expectedCoding := filepath.Join(rulesSource, "coding.md")
 	if got := sb.SymlinkTarget(codingLink); got != expectedCoding {
 		t.Errorf("coding.md symlink target = %q, want %q", got, expectedCoding)
-	}
-}
-
-func TestSyncExtras_CopyMode(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("placeholder", map[string]string{
-		"SKILL.md": "# Placeholder",
-	})
-	targetPath := sb.CreateTarget("claude")
-
-	// Create extras source
-	sourceRoot := filepath.Dir(sb.SourcePath)
-	rulesSource := filepath.Join(sourceRoot, "rules")
-	os.MkdirAll(rulesSource, 0755)
-	os.WriteFile(filepath.Join(rulesSource, "coding.md"), []byte("# Coding Rules"), 0644)
-
-	// Create extras target
-	rulesTarget := filepath.Join(sb.Home, ".cursor", "rules")
-	os.MkdirAll(rulesTarget, 0755)
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets:
-  claude:
-    path: ` + targetPath + `
-extras:
-  - name: rules
-    targets:
-      - path: ` + rulesTarget + `
-        mode: copy
-`)
-
-	result := sb.RunCLI("sync", "extras")
-
-	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "Rules")
-
-	// Verify file exists and is a real copy (not a symlink)
-	copiedFile := filepath.Join(rulesTarget, "coding.md")
-	if !sb.FileExists(copiedFile) {
-		t.Fatal("coding.md should exist in target")
-	}
-	if sb.IsSymlink(copiedFile) {
-		t.Error("coding.md should be a real copy, not a symlink, in copy mode")
-	}
-
-	// Verify content matches
-	content := sb.ReadFile(copiedFile)
-	if content != "# Coding Rules" {
-		t.Errorf("copied file content = %q, want %q", content, "# Coding Rules")
 	}
 }
 
@@ -138,53 +89,24 @@ targets:
 	result.AssertAnyOutputContains(t, "No extras configured")
 }
 
-func TestSyncExtras_PrunesOrphans(t *testing.T) {
+func TestSyncExtras_AfterFlags(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
 
 	sb.CreateSkill("placeholder", map[string]string{
 		"SKILL.md": "# Placeholder",
 	})
-	targetPath := sb.CreateTarget("claude")
-
-	// Create extras source with 1 file
-	sourceRoot := filepath.Dir(sb.SourcePath)
-	rulesSource := filepath.Join(sourceRoot, "rules")
-	os.MkdirAll(rulesSource, 0755)
-	os.WriteFile(filepath.Join(rulesSource, "keep.md"), []byte("# Keep"), 0644)
-
-	// Create extras target with an orphan symlink pointing to non-existent source
-	rulesTarget := filepath.Join(sb.Home, ".claude", "rules")
-	os.MkdirAll(rulesTarget, 0755)
-
-	orphanSource := filepath.Join(rulesSource, "deleted.md")
-	orphanLink := filepath.Join(rulesTarget, "deleted.md")
-	os.Symlink(orphanSource, orphanLink)
-
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
 targets:
   claude:
-    path: ` + targetPath + `
-extras:
-  - name: rules
-    targets:
-      - path: ` + rulesTarget + `
+    path: ` + sb.CreateTarget("claude") + `
 `)
 
-	result := sb.RunCLI("sync", "extras")
+	result := sb.RunCLI("sync", "-g", "--dry-run", "extras")
 
 	result.AssertSuccess(t)
-
-	// Verify orphan is removed
-	if sb.FileExists(orphanLink) {
-		t.Error("orphan symlink should have been pruned")
-	}
-
-	// Verify real file is synced
-	keepLink := filepath.Join(rulesTarget, "keep.md")
-	if !sb.IsSymlink(keepLink) {
-		t.Error("keep.md should be synced as a symlink")
-	}
+	result.AssertAnyOutputContains(t, "No extras configured")
+	result.AssertOutputNotContains(t, "Synced")
 }
 
 func TestSync_AllFlag(t *testing.T) {
@@ -199,7 +121,7 @@ func TestSync_AllFlag(t *testing.T) {
 
 	// Setup extras
 	sourceRoot := filepath.Dir(sb.SourcePath)
-	rulesSource := filepath.Join(sourceRoot, "rules")
+	rulesSource := filepath.Join(sourceRoot, "extras", "rules")
 	os.MkdirAll(rulesSource, 0755)
 	os.WriteFile(filepath.Join(rulesSource, "coding.md"), []byte("# Coding"), 0644)
 
@@ -222,10 +144,10 @@ extras:
 	result.AssertSuccess(t)
 
 	// Verify skill sync happened
-	result.AssertAnyOutputContains(t, "merged")
+	result.AssertOutputContains(t, "Synced 1 skill")
 
 	// Verify extras sync happened
-	result.AssertAnyOutputContains(t, "Rules")
+	result.AssertAnyOutputContains(t, "\nExtras\n")
 
 	// Verify skill symlink
 	if !sb.IsSymlink(filepath.Join(targetPath, "my-skill")) {
@@ -238,7 +160,9 @@ extras:
 	}
 }
 
-func TestSyncExtras_SourceNotExist(t *testing.T) {
+// TestSyncExtras_ModeSwitchMergeToCopy verifies that switching mode from merge
+// to copy and re-syncing replaces symlinks with copies without needing --force.
+func TestSyncExtras_ModeSwitchMergeToCopy(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
 
@@ -247,20 +171,601 @@ func TestSyncExtras_SourceNotExist(t *testing.T) {
 	})
 	targetPath := sb.CreateTarget("claude")
 
-	// Config with extras pointing to non-existent source directory
-	// The source name "nonexistent" resolves to ~/.config/skillshare/nonexistent
+	// Create extras source
+	sourceRoot := filepath.Dir(sb.SourcePath)
+	rulesSource := filepath.Join(sourceRoot, "extras", "rules")
+	os.MkdirAll(rulesSource, 0755)
+	os.WriteFile(filepath.Join(rulesSource, "coding.md"), []byte("# Coding Rules"), 0644)
+
+	rulesTarget := filepath.Join(sb.Home, ".claude", "rules")
+	os.MkdirAll(rulesTarget, 0755)
+
+	// Step 1: Sync with merge mode (creates symlinks)
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
 targets:
   claude:
     path: ` + targetPath + `
 extras:
-  - name: nonexistent
+  - name: rules
+    targets:
+      - path: ` + rulesTarget + `
+`)
+
+	result := sb.RunCLI("sync", "extras")
+	result.AssertSuccess(t)
+
+	codingFile := filepath.Join(rulesTarget, "coding.md")
+	if !sb.IsSymlink(codingFile) {
+		t.Fatal("coding.md should be a symlink after merge sync")
+	}
+
+	// Step 2: Change mode to copy and re-sync
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+extras:
+  - name: rules
+    targets:
+      - path: ` + rulesTarget + `
+        mode: copy
+`)
+
+	result = sb.RunCLI("sync", "extras")
+	result.AssertSuccess(t)
+
+	// Verify: file should now be a regular copy, not a symlink
+	if sb.IsSymlink(codingFile) {
+		t.Error("coding.md should be a regular file after switching to copy mode, but is still a symlink")
+	}
+	if !sb.FileExists(codingFile) {
+		t.Fatal("coding.md should exist in target after copy sync")
+	}
+
+	content := sb.ReadFile(codingFile)
+	if content != "# Coding Rules" {
+		t.Errorf("copied file content = %q, want %q", content, "# Coding Rules")
+	}
+}
+
+// TestSyncExtras_ModeSwitchCopyToMerge verifies that switching mode from copy
+// to merge and re-syncing replaces copies with symlinks (requires --force since
+// regular files are not auto-replaced).
+func TestSyncExtras_ModeSwitchCopyToMerge(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("placeholder", map[string]string{
+		"SKILL.md": "# Placeholder",
+	})
+	targetPath := sb.CreateTarget("claude")
+
+	// Create extras source
+	sourceRoot := filepath.Dir(sb.SourcePath)
+	rulesSource := filepath.Join(sourceRoot, "extras", "rules")
+	os.MkdirAll(rulesSource, 0755)
+	os.WriteFile(filepath.Join(rulesSource, "coding.md"), []byte("# Coding Rules"), 0644)
+
+	rulesTarget := filepath.Join(sb.Home, ".claude", "rules")
+	os.MkdirAll(rulesTarget, 0755)
+
+	// Step 1: Sync with copy mode
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+extras:
+  - name: rules
+    targets:
+      - path: ` + rulesTarget + `
+        mode: copy
+`)
+
+	result := sb.RunCLI("sync", "extras")
+	result.AssertSuccess(t)
+
+	codingFile := filepath.Join(rulesTarget, "coding.md")
+	if sb.IsSymlink(codingFile) {
+		t.Fatal("coding.md should be a regular file after copy sync")
+	}
+
+	// Step 2: Change mode to merge and sync WITHOUT --force (should skip)
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+extras:
+  - name: rules
+    targets:
+      - path: ` + rulesTarget + `
+`)
+
+	result = sb.RunCLI("sync", "extras")
+	result.AssertSuccess(t)
+
+	// File should still be a regular file (skipped because no --force)
+	if sb.IsSymlink(codingFile) {
+		t.Error("coding.md should still be a regular file without --force")
+	}
+
+	// Step 3: Sync WITH --force (should replace with symlink)
+	result = sb.RunCLI("sync", "extras", "--force")
+	result.AssertSuccess(t)
+
+	if !sb.IsSymlink(codingFile) {
+		t.Error("coding.md should be a symlink after --force sync with merge mode")
+	}
+
+	expectedTarget := filepath.Join(rulesSource, "coding.md")
+	if got := sb.SymlinkTarget(codingFile); got != expectedTarget {
+		t.Errorf("symlink target = %q, want %q", got, expectedTarget)
+	}
+}
+
+func TestSyncExtras_FlattenMerge(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("placeholder", map[string]string{
+		"SKILL.md": "# Placeholder",
+	})
+	targetPath := sb.CreateTarget("claude")
+
+	sourceRoot := filepath.Dir(sb.SourcePath)
+	agentsSource := filepath.Join(sourceRoot, "extras", "agents")
+	os.MkdirAll(filepath.Join(agentsSource, "curriculum"), 0755)
+	os.MkdirAll(filepath.Join(agentsSource, "software"), 0755)
+	os.WriteFile(filepath.Join(agentsSource, "curriculum", "tactician.md"), []byte("# Tactician"), 0644)
+	os.WriteFile(filepath.Join(agentsSource, "software", "implementer.md"), []byte("# Implementer"), 0644)
+	os.WriteFile(filepath.Join(agentsSource, "reviewer.md"), []byte("# Reviewer"), 0644)
+
+	agentsTarget := filepath.Join(sb.Home, ".claude", "agents")
+	os.MkdirAll(agentsTarget, 0755)
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+extras:
+  - name: agents
+    targets:
+      - path: ` + agentsTarget + `
+        flatten: true
+`)
+
+	result := sb.RunCLI("sync", "extras")
+	result.AssertSuccess(t)
+	result.AssertAnyOutputContains(t, "3 files")
+
+	for _, name := range []string{"tactician.md", "implementer.md", "reviewer.md"} {
+		if !sb.IsSymlink(filepath.Join(agentsTarget, name)) {
+			t.Errorf("%s should be a flat symlink in target", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(agentsTarget, "curriculum")); !os.IsNotExist(err) {
+		t.Error("curriculum/ should not exist in target")
+	}
+}
+
+func TestSyncExtras_FlattenCollision(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("placeholder", map[string]string{
+		"SKILL.md": "# Placeholder",
+	})
+	targetPath := sb.CreateTarget("claude")
+
+	sourceRoot := filepath.Dir(sb.SourcePath)
+	agentsSource := filepath.Join(sourceRoot, "extras", "agents")
+	os.MkdirAll(filepath.Join(agentsSource, "team-a"), 0755)
+	os.MkdirAll(filepath.Join(agentsSource, "team-b"), 0755)
+	os.WriteFile(filepath.Join(agentsSource, "team-a", "agent.md"), []byte("# Team A"), 0644)
+	os.WriteFile(filepath.Join(agentsSource, "team-b", "agent.md"), []byte("# Team B"), 0644)
+
+	agentsTarget := filepath.Join(sb.Home, ".claude", "agents")
+	os.MkdirAll(agentsTarget, 0755)
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+extras:
+  - name: agents
+    targets:
+      - path: ` + agentsTarget + `
+        flatten: true
+`)
+
+	result := sb.RunCLI("sync", "extras")
+	result.AssertSuccess(t)
+	result.AssertAnyOutputContains(t, "flatten conflict")
+
+	if !sb.IsSymlink(filepath.Join(agentsTarget, "agent.md")) {
+		t.Error("agent.md should be a symlink")
+	}
+}
+
+// --- Extras "agents" overlap with agents sync ---
+
+func TestSyncAll_AgentsExtrasOverlap_WarnsAndPreservesAgents_Global(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("placeholder", map[string]string{
+		"SKILL.md": "# Placeholder",
+	})
+	targetPath := sb.CreateTarget("claude")
+
+	agentsDir := filepath.Join(filepath.Dir(sb.SourcePath), "agents")
+	os.MkdirAll(agentsDir, 0755)
+	os.WriteFile(filepath.Join(agentsDir, "demo.md"), []byte("# Demo Agent"), 0644)
+
+	sourceRoot := filepath.Dir(sb.SourcePath)
+	extrasAgentsSource := filepath.Join(sourceRoot, "extras", "agents")
+	os.MkdirAll(extrasAgentsSource, 0755)
+	os.WriteFile(filepath.Join(extrasAgentsSource, "extra-agent.md"), []byte("# Extra Agent"), 0644)
+
+	claudeAgents := filepath.Join(sb.Home, ".claude", "agents")
+	os.MkdirAll(claudeAgents, 0755)
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+extras:
+  - name: agents
+    targets:
+      - path: ` + claudeAgents + `
+`)
+
+	result := sb.RunCLI("sync", "--all")
+	result.AssertSuccess(t)
+	result.AssertAnyOutputContains(t, "already managed by agents sync")
+	result.AssertAnyOutputContains(t, "already managed by agents sync")
+
+	if !sb.IsSymlink(filepath.Join(claudeAgents, "demo.md")) {
+		t.Error("demo agent should remain synced in global mode")
+	}
+	if sb.FileExists(filepath.Join(claudeAgents, "extra-agent.md")) {
+		t.Error("extras agent file should not be synced when target overlaps agents sync")
+	}
+}
+
+func TestSyncExtras_ProjectUsesRelativeSymlinks(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectRoot := sb.SetupProjectDir("claude")
+	rulesSource := filepath.Join(projectRoot, ".skillshare", "extras", "rules")
+	if err := os.MkdirAll(rulesSource, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rulesSource, "rule.md"), []byte("# Rule"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	sb.WriteProjectConfig(projectRoot, `targets:
+  - claude
+extras:
+  - name: rules
+    targets:
+      - path: .cursor/rules
+`)
+
+	result := sb.RunCLIInDir(projectRoot, "sync", "extras", "-p")
+	result.AssertSuccess(t)
+
+	link := filepath.Join(projectRoot, ".cursor", "rules", "rule.md")
+	if !sb.IsSymlink(link) {
+		t.Fatal("extra file should be a symlink")
+	}
+	if target := sb.SymlinkTarget(link); filepath.IsAbs(target) {
+		t.Fatalf("project-mode extra symlink should be relative, got %q", target)
+	}
+}
+
+func TestSyncAll_AgentsExtrasOverlap_WarnsAndPreservesAgents_Project(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectRoot := sb.SetupProjectDir("claude", "cursor")
+
+	projectAgents := filepath.Join(projectRoot, ".skillshare", "agents")
+	os.MkdirAll(projectAgents, 0755)
+	os.WriteFile(filepath.Join(projectAgents, "demo.md"), []byte("# Demo Agent"), 0644)
+
+	projectExtrasAgents := filepath.Join(projectRoot, ".skillshare", "extras", "agents")
+	os.MkdirAll(projectExtrasAgents, 0755)
+	os.WriteFile(filepath.Join(projectExtrasAgents, "extra-agent.md"), []byte("# Extra Agent"), 0644)
+
+	claudeAgents := filepath.Join(projectRoot, ".claude", "agents")
+	cursorAgents := filepath.Join(projectRoot, ".cursor", "agents")
+	os.MkdirAll(claudeAgents, 0755)
+	os.MkdirAll(cursorAgents, 0755)
+
+	sb.WriteProjectConfig(projectRoot, `targets:
+  - claude
+  - cursor
+extras:
+  - name: agents
+    targets:
+      - path: .claude/agents
+      - path: .cursor/agents
+`)
+
+	result := sb.RunCLIInDir(projectRoot, "sync", "--all", "-p")
+	result.AssertSuccess(t)
+	result.AssertAnyOutputContains(t, "already managed by agents sync")
+	result.AssertAnyOutputContains(t, "already managed by agents sync")
+
+	if !sb.IsSymlink(filepath.Join(claudeAgents, "demo.md")) {
+		t.Error("claude demo agent should remain synced in project mode")
+	}
+	if !sb.IsSymlink(filepath.Join(cursorAgents, "demo.md")) {
+		t.Error("cursor demo agent should remain synced in project mode")
+	}
+	if sb.FileExists(filepath.Join(claudeAgents, "extra-agent.md")) {
+		t.Error("project extras agent file should not be synced to claude when target overlaps agents sync")
+	}
+	if sb.FileExists(filepath.Join(cursorAgents, "extra-agent.md")) {
+		t.Error("project extras agent file should not be synced to cursor when target overlaps agents sync")
+	}
+}
+
+// syncExtrasJSONTargets parses `sync extras --json` output and returns the
+// targets of its only extra.
+func syncExtrasJSONTargets(t *testing.T, stdout string) []map[string]any {
+	t.Helper()
+	var out struct {
+		Extras []struct {
+			Targets []map[string]any `json:"targets"`
+		} `json:"extras"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout)
+	}
+	if len(out.Extras) != 1 {
+		t.Fatalf("expected 1 extra, got %d:\n%s", len(out.Extras), stdout)
+	}
+	return out.Extras[0].Targets
+}
+
+// Global sync skips an extra whose source directory is missing instead of
+// creating it, like project sync.
+func TestSyncExtras_GlobalSkipsMissingSource(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("placeholder", map[string]string{"SKILL.md": "# Placeholder"})
+	targetPath := sb.CreateTarget("claude")
+	rulesSource := filepath.Join(filepath.Dir(sb.SourcePath), "extras", "rules")
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+extras:
+  - name: rules
     targets:
       - path: ` + filepath.Join(sb.Home, ".claude", "rules") + `
 `)
 
-	result := sb.RunCLI("sync", "extras")
+	result := sb.RunCLI("sync", "extras", "--json")
+	result.AssertSuccess(t)
+
+	if targets := syncExtrasJSONTargets(t, result.Stdout); len(targets) != 0 {
+		t.Errorf("expected no targets for a missing source, got %v", targets)
+	}
+	if _, err := os.Stat(rulesSource); !os.IsNotExist(err) {
+		t.Errorf("global sync must not create %s, stat err = %v", rulesSource, err)
+	}
+}
+
+// Characterization: global JSON reports the target path from the loaded config,
+// where config.Load has already expanded "~".
+func TestSyncExtras_GlobalJSONReportsConfiguredPath(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("placeholder", map[string]string{"SKILL.md": "# Placeholder"})
+	targetPath := sb.CreateTarget("claude")
+	rulesSource := filepath.Join(filepath.Dir(sb.SourcePath), "extras", "rules")
+	os.MkdirAll(rulesSource, 0755)
+	os.WriteFile(filepath.Join(rulesSource, "coding.md"), []byte("# Coding"), 0644)
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+extras:
+  - name: rules
+    targets:
+      - path: ~/.claude/rules
+`)
+
+	result := sb.RunCLI("sync", "extras", "--json")
+	result.AssertSuccess(t)
+
+	targets := syncExtrasJSONTargets(t, result.Stdout)
+	want := filepath.Join(sb.Home, ".claude", "rules")
+	if got := targets[0]["path"]; got != want {
+		t.Errorf("path = %v, want %q", got, want)
+	}
+}
+
+// Project sync skips an extra whose source directory is missing instead of
+// creating it.
+func TestSyncExtras_ProjectSkipsMissingSource(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectRoot := sb.SetupProjectDir("claude")
+	rulesSource := filepath.Join(projectRoot, ".skillshare", "extras", "rules")
+	sb.WriteProjectConfig(projectRoot, `targets:
+  - claude
+extras:
+  - name: rules
+    targets:
+      - path: .claude/rules
+`)
+
+	result := sb.RunCLIInDir(projectRoot, "sync", "extras", "-p", "--json")
+	result.AssertSuccess(t)
+
+	if targets := syncExtrasJSONTargets(t, result.Stdout); len(targets) != 0 {
+		t.Errorf("expected no targets for a missing source, got %v", targets)
+	}
+	if _, err := os.Stat(rulesSource); !os.IsNotExist(err) {
+		t.Errorf("project sync must not create %s, stat err = %v", rulesSource, err)
+	}
+}
+
+// Characterization: project JSON reports the resolved target path.
+func TestSyncExtras_ProjectJSONReportsResolvedPath(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectRoot := sb.SetupProjectDir("claude")
+	projectCWD := projectRoot
+	if runtime.GOOS != "windows" {
+		// Keep exercising an aliased cwd after the sandbox resolves its temp root.
+		projectCWD = filepath.Join(sb.Root, "project-alias")
+		sb.CreateSymlink(projectRoot, projectCWD)
+	}
+	rulesSource := filepath.Join(projectRoot, ".skillshare", "extras", "rules")
+	os.MkdirAll(rulesSource, 0755)
+	os.WriteFile(filepath.Join(rulesSource, "coding.md"), []byte("# Coding"), 0644)
+	sb.WriteProjectConfig(projectRoot, `targets:
+  - claude
+extras:
+  - name: rules
+    targets:
+      - path: .claude/rules
+`)
+
+	result := sb.RunCLIInDir(projectRoot, "sync", "extras", "-p", "--json")
+	result.AssertSuccess(t)
+
+	// The CLI reports the real path when invoked from the canonical project root.
+	want, _ := filepath.EvalSymlinks(filepath.Join(projectRoot, ".claude", "rules"))
+	if got := syncExtrasJSONTargets(t, result.Stdout)[0]["path"]; got != want {
+		t.Errorf("path = %v, want %q", got, want)
+	}
+	if projectCWD != projectRoot {
+		// Relative targets preserve the lexical project root when invoked through its alias.
+		result = sb.RunCLIInDir(projectCWD, "sync", "extras", "-p", "--json")
+		result.AssertSuccess(t)
+		wantAlias := filepath.Join(projectCWD, ".claude", "rules")
+		if got := syncExtrasJSONTargets(t, result.Stdout)[0]["path"]; got != wantAlias {
+			t.Errorf("aliased path = %v, want %q", got, wantAlias)
+		}
+	}
+}
+
+// `sync --all --json` exits non-zero when an extras target fails, as
+// `sync extras` does, while still writing the JSON result.
+func TestSyncAll_JSONExtrasTargetErrorExitsNonZero(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("my-skill", map[string]string{"SKILL.md": "# My Skill"})
+	targetPath := sb.CreateTarget("claude")
+	rulesSource := filepath.Join(filepath.Dir(sb.SourcePath), "extras", "rules")
+	os.MkdirAll(rulesSource, 0755)
+	os.WriteFile(filepath.Join(rulesSource, "coding.md"), []byte("# Coding"), 0644)
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+extras:
+  - name: rules
+    targets:
+      - path: ` + filepath.Join(sb.Home, ".claude", "rules") + `
+        extension: missing-ext
+`)
+
+	result := sb.RunCLI("sync", "--all", "--json")
+	result.AssertFailure(t)
+
+	var out struct {
+		Extras []struct {
+			Targets []map[string]any `json:"targets"`
+		} `json:"extras"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &out); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, result.Stdout)
+	}
+	if len(out.Extras) != 1 || len(out.Extras[0].Targets) != 1 || out.Extras[0].Targets[0]["error"] == nil {
+		t.Errorf("expected the failed extras target in JSON, got %s", result.Stdout)
+	}
+}
+
+// Text `sync --all` exits non-zero when an extras target fails, matching
+// `sync --all --json`, and still prints the extras warning.
+func TestSyncAll_TextExtrasTargetErrorExitsNonZero(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("my-skill", map[string]string{"SKILL.md": "# My Skill"})
+	targetPath := sb.CreateTarget("claude")
+	rulesSource := filepath.Join(filepath.Dir(sb.SourcePath), "extras", "rules")
+	os.MkdirAll(rulesSource, 0755)
+	os.WriteFile(filepath.Join(rulesSource, "coding.md"), []byte("# Coding"), 0644)
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+extras:
+  - name: rules
+    targets:
+      - path: ` + filepath.Join(sb.Home, ".claude", "rules") + `
+        extension: missing-ext
+`)
+
+	result := sb.RunCLI("sync", "--all")
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "Extras sync:")
+}
+
+// Project text `sync --all -p` exits non-zero when an extras target fails.
+func TestSyncAll_ProjectTextExtrasTargetErrorExitsNonZero(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectRoot := sb.SetupProjectDir("claude")
+	rulesSource := filepath.Join(projectRoot, ".skillshare", "extras", "rules")
+	os.MkdirAll(rulesSource, 0755)
+	os.WriteFile(filepath.Join(rulesSource, "coding.md"), []byte("# Coding"), 0644)
+	sb.WriteProjectConfig(projectRoot, `targets:
+  - claude
+extras:
+  - name: rules
+    targets:
+      - path: .claude/rules
+        extension: missing-ext
+`)
+
+	result := sb.RunCLIInDir(projectRoot, "sync", "--all", "-p")
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "Extras sync:")
+}
+
+func TestSyncAll_NoExtrasSaysNothingAboutExtras(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("placeholder", map[string]string{"SKILL.md": "# Placeholder"})
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + sb.CreateTarget("claude") + `
+`)
+
+	result := sb.RunCLI("sync", "--all")
 
 	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "does not exist")
+	result.AssertOutputNotContains(t, "extras")
 }

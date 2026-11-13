@@ -88,7 +88,7 @@ skillshare install anthropics/skills -s pdf --into tools -p
 Remote skills are:
 - Installed to `.skillshare/skills/<name>/` (or `.skillshare/skills/<into>/<name>/` with `--into`)
 - Recorded in `.skillshare/config.yaml` under `skills:`
-- Added to `.skillshare/.gitignore` (cloned content not committed; `logs/` is ignored by default)
+- Added to `.skillshare/.gitignore` (cloned content not committed; `logs/`, `trash/`, `backups/`, and the `.metadata.json` files are ignored by default)
 
 ### Step 4: Sync to Targets
 
@@ -107,11 +107,14 @@ git commit -m "Add project-level skills"
 
 **What gets committed:**
 - `.skillshare/config.yaml` — targets and remote skill list
-- `.skillshare/.gitignore` — ignore patterns for project logs and cloned skills
+- `.skillshare/skills.lock.json` — the commit each remote skill is pinned to, so everyone installs the same version
+- `.skillshare/.gitignore` — ignore patterns for project logs, trash, backups, install metadata, and cloned skills
 - `.skillshare/skills/<local-skills>/` — local skill content
 
 **What's ignored:**
 - `.skillshare/logs/` (operation and audit logs)
+- `.skillshare/trash/` (soft-deleted skills, auto-cleaned after 7 days)
+- `.skillshare/backups/` (agent backups from sync and backup commands)
 - Remote skill directories (re-installed from config)
 
 ### Optional: Commit Log Files
@@ -197,10 +200,12 @@ skillshare ui -p
 Or simply `skillshare ui` if `.skillshare/config.yaml` exists (auto-detected).
 
 In project mode, the dashboard:
-- Shows a **"Project" badge** in the sidebar
+- Shows `Project · <project path>` under the name in the sidebar
 - Hides **Git Sync** (use your project's own git)
-- Edits **`.skillshare/config.yaml`** in the Config page
+- Edits **`.skillshare/config.yaml`** under **Settings → Files**
 - Automatically **reconciles** `skills:` entries after installing remote skills
+
+![Dashboard in project mode: the sidebar shows the project path and hides Git Sync](/img/project-mode-dashboard.png)
 
 ---
 

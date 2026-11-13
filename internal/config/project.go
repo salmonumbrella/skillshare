@@ -1,12 +1,14 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+	"skillshare/internal/projectdir"
 	"skillshare/internal/utils"
 )
 
@@ -19,12 +21,25 @@ var projectSchemaComment = []byte("# yaml-language-server: $schema=" + ProjectSc
 // ProjectTargetEntry supports both string and object forms in YAML.
 // String: "claude"
 // Object: { name: "my-custom-ide", path: ".my-ide/skills/" }
+// New format with resource sub-keys: { name: claude, skills: {mode: merge}, agents: {path: .claude/agents} }
 type ProjectTargetEntry struct {
 	Name    string
-	Path    string
-	Mode    string // "merge", "copy", or "symlink"; default "merge"
-	Include []string
-	Exclude []string
+	Path    string   // legacy flat field; migrated to Skills on unmarshal
+	Mode    string   // legacy flat field; migrated to Skills on unmarshal
+	Include []string // legacy flat field; migrated to Skills on unmarshal
+	Exclude []string // legacy flat field; migrated to Skills on unmarshal
+
+	Skills *ResourceTargetConfig
+	Agents *ResourceTargetConfig
+
+	// Instructions is the user-set instruction file (relative to the project root).
+	Instructions *TargetInstructionsConfig
+
+	// Files are extra files the tool reads, relative to its file root.
+	Files []string
+
+	wasMigrated         bool   // true if flat fields were migrated during unmarshal; not serialized
+	defaultTargetNaming string `yaml:"-"`
 }
 
 func (t *ProjectTargetEntry) UnmarshalYAML(value *yaml.Node) error {
@@ -34,11 +49,16 @@ func (t *ProjectTargetEntry) UnmarshalYAML(value *yaml.Node) error {
 	}
 
 	var decoded struct {
-		Name    string   `yaml:"name"`
-		Path    string   `yaml:"path"`
-		Mode    string   `yaml:"mode"`
-		Include []string `yaml:"include"`
-		Exclude []string `yaml:"exclude"`
+		Name    string                `yaml:"name"`
+		Path    string                `yaml:"path"`
+		Mode    string                `yaml:"mode"`
+		Include []string              `yaml:"include"`
+		Exclude []string              `yaml:"exclude"`
+		Skills  *ResourceTargetConfig `yaml:"skills"`
+		Agents  *ResourceTargetConfig `yaml:"agents"`
+
+		Instructions *TargetInstructionsConfig `yaml:"instructions"`
+		Files        []string                  `yaml:"files"`
 	}
 	if err := value.Decode(&decoded); err != nil {
 		return err
@@ -48,41 +68,170 @@ func (t *ProjectTargetEntry) UnmarshalYAML(value *yaml.Node) error {
 	t.Mode = strings.TrimSpace(decoded.Mode)
 	t.Include = decoded.Include
 	t.Exclude = decoded.Exclude
+	t.Skills = decoded.Skills
+	t.Agents = decoded.Agents
+	t.Instructions = decoded.Instructions
+	t.Files = decoded.Files
+
+	// Migrate legacy flat fields into Skills sub-key.
+	hasFlatFields := t.Path != "" || t.Mode != "" || len(t.Include) > 0 || len(t.Exclude) > 0
+	if hasFlatFields {
+		if t.Skills == nil {
+			t.Skills = &ResourceTargetConfig{
+				Path:    t.Path,
+				Mode:    t.Mode,
+				Include: t.Include,
+				Exclude: t.Exclude,
+			}
+		} else {
+			// Mixed format: merge flat fields into existing Skills (don't overwrite)
+			if t.Skills.Path == "" && t.Path != "" {
+				t.Skills.Path = t.Path
+			}
+			if t.Skills.Mode == "" && t.Mode != "" {
+				t.Skills.Mode = t.Mode
+			}
+			if len(t.Skills.Include) == 0 && len(t.Include) > 0 {
+				t.Skills.Include = t.Include
+			}
+			if len(t.Skills.Exclude) == 0 && len(t.Exclude) > 0 {
+				t.Skills.Exclude = t.Exclude
+			}
+		}
+		t.Path = ""
+		t.Mode = ""
+		t.Include = nil
+		t.Exclude = nil
+		t.wasMigrated = true
+	}
 	return nil
 }
 
 func (t ProjectTargetEntry) MarshalYAML() (interface{}, error) {
+	hasSkills := t.Skills != nil && !t.Skills.IsEmpty()
+	hasAgents := t.Agents != nil && !t.Agents.IsEmpty()
 	hasPath := strings.TrimSpace(t.Path) != ""
 	hasMode := strings.TrimSpace(t.Mode) != ""
 	hasInclude := len(t.Include) > 0
 	hasExclude := len(t.Exclude) > 0
+	hasInstructions := t.Instructions != nil
+	hasFiles := len(t.Files) > 0
 
-	if !hasPath && !hasMode && !hasInclude && !hasExclude {
-		return t.Name, nil
+	// New format: write skills/agents sub-keys
+	if hasSkills || hasAgents || hasInstructions || hasFiles {
+		obj := map[string]any{"name": t.Name}
+		if hasSkills {
+			obj["skills"] = t.Skills
+		}
+		if hasAgents {
+			obj["agents"] = t.Agents
+		}
+		if hasInstructions {
+			obj["instructions"] = t.Instructions
+		}
+		if hasFiles {
+			obj["files"] = t.Files
+		}
+		return obj, nil
 	}
 
-	obj := map[string]any{"name": t.Name}
-	if hasPath {
-		obj["path"] = t.Path
+	// Legacy flat fields (backward compat for pre-migration data)
+	if hasPath || hasMode || hasInclude || hasExclude {
+		obj := map[string]any{"name": t.Name}
+		if hasPath {
+			obj["path"] = t.Path
+		}
+		if hasMode {
+			obj["mode"] = t.Mode
+		}
+		if hasInclude {
+			obj["include"] = t.Include
+		}
+		if hasExclude {
+			obj["exclude"] = t.Exclude
+		}
+		return obj, nil
 	}
-	if hasMode {
-		obj["mode"] = t.Mode
-	}
-	if hasInclude {
-		obj["include"] = t.Include
-	}
-	if hasExclude {
-		obj["exclude"] = t.Exclude
-	}
-	return obj, nil
+
+	// String format: no extra config
+	return t.Name, nil
 }
 
-// SkillEntry represents a remote skill entry in config (shared by global and project).
-type SkillEntry struct {
+// SkillsConfig returns the effective skills configuration.
+// If Skills sub-key is set, it is returned directly.
+// Otherwise the legacy flat fields are returned for backward compatibility.
+func (t *ProjectTargetEntry) SkillsConfig() ResourceTargetConfig {
+	if t.Skills != nil {
+		sc := *t.Skills
+		if sc.TargetNaming == "" {
+			sc.TargetNaming = t.defaultTargetNaming
+		}
+		return sc
+	}
+	return ResourceTargetConfig{
+		Path:         t.Path,
+		Mode:         t.Mode,
+		TargetNaming: t.defaultTargetNaming,
+		Include:      t.Include,
+		Exclude:      t.Exclude,
+	}
+}
+
+// AgentsConfig returns the agents configuration, or an empty value if not set.
+func (t *ProjectTargetEntry) AgentsConfig() ResourceTargetConfig {
+	if t.Agents != nil {
+		return t.Agents.withExtensionMode()
+	}
+	return ResourceTargetConfig{}
+}
+
+// EnsureSkills returns the Skills sub-key, creating it from legacy flat fields if nil.
+func (t *ProjectTargetEntry) EnsureSkills() *ResourceTargetConfig {
+	if t.Skills == nil {
+		sc := ResourceTargetConfig{
+			Path:    t.Path,
+			Mode:    t.Mode,
+			Include: t.Include,
+			Exclude: t.Exclude,
+		}
+		t.Skills = &sc
+		t.Path = ""
+		t.Mode = ""
+		t.Include = nil
+		t.Exclude = nil
+	}
+	return t.Skills
+}
+
+// EnsureAgents returns the Agents sub-key, creating it if nil.
+func (t *ProjectTargetEntry) EnsureAgents() *ResourceTargetConfig {
+	if t.Agents == nil {
+		t.Agents = &ResourceTargetConfig{}
+	}
+	return t.Agents
+}
+
+// ResourceEntry represents a remote resource entry in config (shared by global and project).
+// Used for both skills and agents.
+type ResourceEntry struct {
 	Name    string `yaml:"name"`
+	Kind    string `yaml:"kind,omitempty"`
 	Source  string `yaml:"source"`
 	Tracked bool   `yaml:"tracked,omitempty"`
 	Group   string `yaml:"group,omitempty"`
+	Branch  string `yaml:"branch,omitempty"`
+}
+
+// SkillEntry is an alias for backward compatibility.
+type SkillEntry = ResourceEntry
+
+// EffectiveKind returns the resource kind for this entry.
+// Returns "skill" if Kind is empty (backward compatibility).
+func (s ResourceEntry) EffectiveKind() string {
+	if s.Kind == "" {
+		return "skill"
+	}
+	return s.Kind
 }
 
 // FullName returns the full relative path for the skill entry.
@@ -110,24 +259,142 @@ func (s SkillEntry) EffectiveParts() (group, name string) {
 	return "", s.Name
 }
 
-// ProjectConfig holds project-level config (.skillshare/config.yaml).
+// PruneStaleSkills removes registry entries not present in the live set.
+// When skillsOnly is true, non-skill entries (e.g. agents) are preserved.
+func PruneStaleSkills(skills []SkillEntry, live map[string]bool, skillsOnly bool) ([]SkillEntry, bool) {
+	pruned := make([]SkillEntry, 0, len(skills))
+	changed := false
+	for _, s := range skills {
+		if (skillsOnly && s.EffectiveKind() != "skill") || live[s.FullName()] {
+			pruned = append(pruned, s)
+		} else {
+			changed = true
+		}
+	}
+	return pruned, changed
+}
+
+// ProjectSources overrides default source directories for project resources.
+// Relative paths resolve from the project root, not from the project directory,
+// except mcp, which resolves from the directory containing config.yaml.
+type ProjectSources struct {
+	MCP    string `yaml:"mcp,omitempty"`
+	Skills string `yaml:"skills,omitempty"`
+	Agents string `yaml:"agents,omitempty"`
+	Extras string `yaml:"extras,omitempty"`
+}
+
+// ProjectDir returns the active project directory for the given root.
+func ProjectDir(projectRoot string) string {
+	return projectdir.Resolve(projectRoot)
+}
+
+// ProjectConfig holds project-level config (<project-dir>/config.yaml).
 type ProjectConfig struct {
-	Targets []ProjectTargetEntry `yaml:"targets"`
-	Audit   AuditConfig          `yaml:"audit,omitempty"`
-	Hub     HubConfig            `yaml:"hub,omitempty"`
+	Plugins       yaml.Node            `yaml:"plugins,omitempty"`
+	Hooks         yaml.Node            `yaml:"hooks,omitempty"`
+	MCP           *MCPConfig           `yaml:"mcp,omitempty"`
+	Sources       ProjectSources       `yaml:"sources,omitempty"`
+	Targets       []ProjectTargetEntry `yaml:"targets"`
+	Skills        []SkillEntry         `yaml:"skills,omitempty"`
+	TargetNaming  string               `yaml:"target_naming,omitempty"`
+	Extras        []ExtraConfig        `yaml:"extras,omitempty"`
+	Ignore        []string             `yaml:"ignore,omitempty"`
+	Audit         AuditConfig          `yaml:"audit,omitempty"`
+	ContextBudget ContextBudgetConfig  `yaml:"context_budget,omitempty"`
+	Hub           HubConfig            `yaml:"hub,omitempty"`
+	GitLabHosts   []string             `yaml:"gitlab_hosts,omitempty"`
+	AzureHosts    []string             `yaml:"azure_hosts,omitempty"`
+	CNBHosts      []string             `yaml:"cnb_hosts,omitempty"`
+	GiteaHosts    []string             `yaml:"gitea_hosts,omitempty"`
+
+	// FollowSourceLinks is Config.FollowSourceLinks for the project's skills source.
+	FollowSourceLinks bool `yaml:"follow_source_links,omitempty"`
+}
+
+// EffectiveSkillsSource returns the resolved skills source directory.
+func (c *ProjectConfig) EffectiveSkillsSource(projectRoot string) string {
+	if c.Sources.Skills != "" {
+		return resolveProjectSourcePath(projectRoot, c.Sources.Skills)
+	}
+	return filepath.Join(projectdir.Resolve(projectRoot), "skills")
+}
+
+// EffectiveAgentsSource returns the resolved agents source directory.
+func (c *ProjectConfig) EffectiveAgentsSource(projectRoot string) string {
+	if c.Sources.Agents != "" {
+		return resolveProjectSourcePath(projectRoot, c.Sources.Agents)
+	}
+	return filepath.Join(projectdir.Resolve(projectRoot), "agents")
+}
+
+// EffectiveExtrasSource returns the resolved extras parent directory.
+func (c *ProjectConfig) EffectiveExtrasSource(projectRoot string) string {
+	if c.Sources.Extras != "" {
+		return resolveProjectSourcePath(projectRoot, c.Sources.Extras)
+	}
+	return filepath.Join(projectdir.Resolve(projectRoot), "extras")
+}
+
+// ProjectGitignoreTarget returns the directory containing the .gitignore to
+// manage and the entry prefix for skills inside sourcePath. When sourcePath is
+// under the project directory, it returns (project-dir, "skills"). When
+// sourcePath is elsewhere inside projectRoot, it returns (projectRoot,
+// relative-path). When sourcePath is outside projectRoot (e.g. absolute
+// external path), both return values are empty — callers must skip gitignore
+// management.
+func ProjectGitignoreTarget(projectRoot, sourcePath string) (gitignoreDir, entryPrefix string) {
+	skillshareDir := projectdir.Resolve(projectRoot)
+	if rel, err := filepath.Rel(skillshareDir, sourcePath); err == nil && !strings.HasPrefix(rel, "..") {
+		if rel == "." {
+			return skillshareDir, ""
+		}
+		return skillshareDir, filepath.ToSlash(rel)
+	}
+	if rel, err := filepath.Rel(projectRoot, sourcePath); err == nil && !strings.HasPrefix(rel, "..") {
+		if rel == "." {
+			return projectRoot, ""
+		}
+		return projectRoot, filepath.ToSlash(rel)
+	}
+	return "", ""
+}
+
+func resolveProjectSourcePath(projectRoot, path string) string {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	return filepath.Join(projectRoot, filepath.FromSlash(path))
+}
+
+// EffectiveGitLabHosts returns GitLabHosts merged with SKILLSHARE_GITLAB_HOSTS env var.
+func (c *ProjectConfig) EffectiveGitLabHosts() []string {
+	return mergeGitLabHostsFromEnv(c.GitLabHosts)
+}
+
+// EffectiveAzureHosts returns AzureHosts merged with SKILLSHARE_AZURE_HOSTS env var.
+func (c *ProjectConfig) EffectiveAzureHosts() []string {
+	return mergeAzureHostsFromEnv(c.AzureHosts)
+}
+
+// EffectiveCNBHosts returns CNBHosts merged with SKILLSHARE_CNB_HOSTS env var.
+func (c *ProjectConfig) EffectiveCNBHosts() []string {
+	return mergeCNBHostsFromEnv(c.CNBHosts)
+}
+
+// EffectiveGiteaHosts returns GiteaHosts merged with SKILLSHARE_GITEA_HOSTS env var.
+func (c *ProjectConfig) EffectiveGiteaHosts() []string {
+	return mergeGiteaHostsFromEnv(c.GiteaHosts)
 }
 
 // ProjectConfigPath returns the project config path for the given root.
 func ProjectConfigPath(projectRoot string) string {
-	return filepath.Join(projectRoot, ".skillshare", "config.yaml")
+	return projectdir.ConfigPath(projectRoot)
 }
 
 // LoadProject loads the project config from the given root.
 func LoadProject(projectRoot string) (*ProjectConfig, error) {
 	path := ProjectConfigPath(projectRoot)
-
-	// Migrate skills[] to registry.yaml (one-time, silent)
-	_ = migrateProjectSkillsToRegistry(path, projectRoot)
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -148,30 +415,103 @@ func LoadProject(projectRoot string) (*ProjectConfig, error) {
 	}
 	cfg.Audit.BlockThreshold = threshold
 
+	// Validate and normalize gitlab_hosts (config file only; env var merged at read time)
+	hosts, err := normalizeGitLabHosts(cfg.GitLabHosts)
+	if err != nil {
+		return nil, fmt.Errorf("project config: %w", err)
+	}
+	cfg.GitLabHosts = hosts
+
+	// Validate and normalize azure_hosts
+	azureHosts, err := normalizeAzureHosts(cfg.AzureHosts)
+	if err != nil {
+		return nil, fmt.Errorf("project config: %w", err)
+	}
+	cfg.AzureHosts = azureHosts
+
+	// Validate and normalize cnb_hosts
+	cnbHosts, err := normalizeCNBHosts(cfg.CNBHosts)
+	if err != nil {
+		return nil, fmt.Errorf("project config: %w", err)
+	}
+	cfg.CNBHosts = cnbHosts
+
+	// Validate and normalize gitea_hosts
+	giteaHosts, err := normalizeGiteaHosts(cfg.GiteaHosts)
+	if err != nil {
+		return nil, fmt.Errorf("project config: %w", err)
+	}
+	cfg.GiteaHosts = giteaHosts
+
 	for _, target := range cfg.Targets {
 		if strings.TrimSpace(target.Name) == "" {
 			return nil, fmt.Errorf("project config has target with empty name")
+		}
+	}
+	for i := range cfg.Targets {
+		cfg.Targets[i].defaultTargetNaming = cfg.TargetNaming
+	}
+
+	// Persist migrated format if any target had legacy flat fields.
+	// UnmarshalYAML sets wasMigrated on each entry it migrated.
+	migrated := false
+	for _, t := range cfg.Targets {
+		if t.wasMigrated {
+			migrated = true
+			break
+		}
+	}
+	if migrated {
+		if mdata, merr := marshalConfig(&cfg, projectSchemaComment, data); merr == nil {
+			// Write a symlinked config's target so the link survives. A link out of
+			// the project is left alone; the next save reports it.
+			if dest, err := utils.ConfigWritePath(path, true); err == nil {
+				// A fresh temp file: a predictable name could be a link the repository planted.
+				if f, err := os.CreateTemp(filepath.Dir(dest), ".config-*.tmp"); err == nil {
+					_, writeErr := f.Write(mdata)
+					if closeErr := f.Close(); writeErr == nil {
+						writeErr = closeErr
+					}
+					if writeErr == nil {
+						writeErr = os.Chmod(f.Name(), 0644)
+					}
+					if writeErr == nil {
+						writeErr = os.Rename(f.Name(), dest)
+					}
+					if writeErr != nil {
+						os.Remove(f.Name())
+					}
+				}
+			}
 		}
 	}
 
 	return &cfg, nil
 }
 
-// Save writes the project config to the given root.
+// Save writes the project config to the active project directory under root.
 func (c *ProjectConfig) Save(projectRoot string) error {
-	path := ProjectConfigPath(projectRoot)
+	return c.SaveIn(ProjectDir(projectRoot))
+}
+
+// SaveIn writes the project config into an explicit project directory. Use it
+// during init, when the directory is chosen rather than discovered.
+func (c *ProjectConfig) SaveIn(projectDir string) error {
+	path := filepath.Join(projectDir, projectdir.ConfigFileName)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create project config directory: %w", err)
 	}
 
-	data, err := yaml.Marshal(c)
+	data, err := marshalConfigFile(path, c, projectSchemaComment)
 	if err != nil {
 		return fmt.Errorf("failed to marshal project config: %w", err)
 	}
 
-	data = append(projectSchemaComment, data...)
-
+	path, err = utils.ConfigWritePath(path, true)
+	if err != nil {
+		return err
+	}
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("failed to write project config: %w", err)
 	}
@@ -179,67 +519,43 @@ func (c *ProjectConfig) Save(projectRoot string) error {
 	return nil
 }
 
-// migrateProjectSkillsToRegistry extracts skills[] from project config.yaml into registry.yaml.
-// Uses raw YAML parsing because ProjectConfig struct no longer has a Skills field.
-func migrateProjectSkillsToRegistry(configPath, projectRoot string) error {
-	registryDir := filepath.Join(projectRoot, ".skillshare")
-	registryPath := RegistryPath(registryDir)
-
-	if _, err := os.Stat(registryPath); err == nil {
-		return nil
-	}
-
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return nil
-	}
-
-	var legacy struct {
-		Skills []SkillEntry `yaml:"skills,omitempty"`
-	}
-	if err := yaml.Unmarshal(data, &legacy); err != nil {
-		return nil
-	}
-
-	if len(legacy.Skills) == 0 {
-		return nil
-	}
-
-	reg := &Registry{Skills: legacy.Skills}
-	if err := reg.Save(registryDir); err != nil {
-		return fmt.Errorf("failed to create registry.yaml during project migration: %w", err)
-	}
-
-	// Strip skills from project config.yaml
-	var raw map[string]any
-	if err := yaml.Unmarshal(data, &raw); err != nil {
-		return nil
-	}
-	delete(raw, "skills")
-	cleaned, err := yaml.Marshal(raw)
-	if err != nil {
-		return nil
-	}
-	cleaned = append(projectSchemaComment, cleaned...)
-	return os.WriteFile(configPath, cleaned, 0644)
-}
+// needsTargetMigration detects if a project config still uses legacy flat
+// target format by re-parsing targets and checking for flat fields.
 
 // ResolveProjectTargets converts project config targets into absolute target paths.
+// It fails on the first target that cannot resolve.
 func ResolveProjectTargets(projectRoot string, cfg *ProjectConfig) (map[string]TargetConfig, error) {
-	resolved := make(map[string]TargetConfig)
+	resolved, unresolved := ResolveValidProjectTargets(projectRoot, cfg)
+	for _, entry := range cfg.Targets {
+		if name := strings.TrimSpace(entry.Name); unresolved[name] != nil {
+			return nil, fmt.Errorf("unknown target '%s' (missing path)", name)
+		}
+	}
+	return resolved, nil
+}
+
+// ResolveValidProjectTargets is ResolveProjectTargets for callers that keep
+// working when a target cannot resolve: a custom target without a path is left
+// out of resolved and returned in unresolved with the reason.
+func ResolveValidProjectTargets(projectRoot string, cfg *ProjectConfig) (resolved map[string]TargetConfig, unresolved map[string]error) {
+	resolved = make(map[string]TargetConfig)
+	unresolved = make(map[string]error)
 	for _, entry := range cfg.Targets {
 		name := strings.TrimSpace(entry.Name)
 		if name == "" {
 			continue
 		}
 
+		sc := entry.SkillsConfig()
+
 		var targetPath string
-		if strings.TrimSpace(entry.Path) != "" {
-			targetPath = entry.Path
+		if strings.TrimSpace(sc.Path) != "" {
+			targetPath = sc.Path
 		} else if known, ok := LookupProjectTarget(name); ok {
 			targetPath = known.Path
 		} else {
-			return nil, fmt.Errorf("unknown target '%s' (missing path)", name)
+			unresolved[name] = errors.New("missing path (custom targets require skills.path)")
+			continue
 		}
 
 		absPath := targetPath
@@ -250,13 +566,50 @@ func ResolveProjectTargets(projectRoot string, cfg *ProjectConfig) (map[string]T
 			absPath = filepath.Join(projectRoot, filepath.FromSlash(targetPath))
 		}
 
-		resolved[name] = TargetConfig{
-			Path:    absPath,
-			Mode:    entry.Mode,
-			Include: append([]string(nil), entry.Include...),
-			Exclude: append([]string(nil), entry.Exclude...),
+		tc := TargetConfig{
+			defaultTargetNaming: cfg.TargetNaming,
+			Skills: &ResourceTargetConfig{
+				Path:         absPath,
+				Mode:         sc.Mode,
+				TargetNaming: sc.TargetNaming,
+				Include:      append([]string(nil), sc.Include...),
+				Exclude:      append([]string(nil), sc.Exclude...),
+				Enabled:      sc.Enabled,
+			},
 		}
+		if entry.Instructions != nil {
+			ic := *entry.Instructions
+			tc.Instructions = &ic
+		}
+		tc.Files = append([]string(nil), entry.Files...)
+
+		// Resolve Agents sub-key: from entry config or builtin defaults.
+		ac := entry.AgentsConfig()
+		agentPath := strings.TrimSpace(ac.Path)
+		if agentPath == "" {
+			if builtin, ok := LookupProjectAgentTarget(name); ok {
+				agentPath = builtin.Path
+			}
+		}
+		if agentPath != "" {
+			absAgentPath := agentPath
+			if utils.HasTildePrefix(absAgentPath) {
+				absAgentPath = expandPath(absAgentPath)
+			}
+			if !filepath.IsAbs(agentPath) {
+				absAgentPath = filepath.Join(projectRoot, filepath.FromSlash(agentPath))
+			}
+			tc.Agents = &ResourceTargetConfig{
+				Path:      absAgentPath,
+				Mode:      ac.Mode,
+				Include:   append([]string(nil), ac.Include...),
+				Exclude:   append([]string(nil), ac.Exclude...),
+				Extension: ac.Extension,
+			}
+		}
+
+		resolved[name] = tc
 	}
 
-	return resolved, nil
+	return WithSharedSkillsTargets(resolved, "merge"), unresolved
 }

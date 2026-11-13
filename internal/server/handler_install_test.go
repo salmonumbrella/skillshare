@@ -1,0 +1,455 @@
+package server
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"skillshare/internal/install"
+)
+
+func entryNames(entries []os.DirEntry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
+}
+
+func TestHandleInstallBatch_AgentInstallWritesMetadataToAgentsSource(t *testing.T) {
+	s, skillsDir := newTestServer(t)
+
+	agentsDir := filepath.Join(t.TempDir(), "agents")
+	if err := os.MkdirAll(agentsDir, 0755); err != nil {
+		t.Fatalf("failed to create agents dir: %v", err)
+	}
+	s.cfg.AgentsSource = agentsDir
+	s.agentsStore = install.NewMetadataStore()
+
+	repoDir := t.TempDir()
+	initGitRepo(t, repoDir)
+
+	agentPath := filepath.Join(repoDir, "reviewer.md")
+	if err := os.WriteFile(agentPath, []byte("# Reviewer agent"), 0644); err != nil {
+		t.Fatalf("failed to write agent file: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", "reviewer.md"},
+		{"commit", "-m", "add reviewer agent"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %s %v", args, out, err)
+		}
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"source": "file://" + repoDir,
+		"skills": []map[string]string{
+			{"name": "reviewer", "path": "reviewer.md"},
+		},
+		"kind": "agent",
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal payload: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/install/batch", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+	s.mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	if _, err := os.Stat(filepath.Join(agentsDir, "reviewer.md")); err != nil {
+		t.Fatalf("expected installed agent in agents source: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(agentsDir, install.MetadataFileName)); err != nil {
+		t.Fatalf("expected metadata written to agents source: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(skillsDir, install.MetadataFileName)); !os.IsNotExist(err) {
+		t.Fatalf("expected no agent metadata written to skills source, got err=%v", err)
+	}
+}
+
+func TestHandleDiscover_LocalSourceReturnsAgents(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	sourceDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sourceDir, "reviewer.md"), []byte("# Reviewer agent"), 0o644); err != nil {
+		t.Fatalf("failed to write local agent: %v", err)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"source": sourceDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal payload: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/discover", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+	s.mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		NeedsSelection bool `json:"needsSelection"`
+		Skills         []struct {
+			Name string `json:"name"`
+		} `json:"skills"`
+		Agents []struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+			Kind string `json:"kind"`
+		} `json:"agents"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if !resp.NeedsSelection {
+		t.Fatal("expected local agent discovery to require selection UI")
+	}
+	if len(resp.Skills) != 0 {
+		t.Fatalf("expected no skills, got %d", len(resp.Skills))
+	}
+	if len(resp.Agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(resp.Agents))
+	}
+	if resp.Agents[0].Name != "reviewer" || resp.Agents[0].Path != "reviewer.md" || resp.Agents[0].Kind != "agent" {
+		t.Fatalf("unexpected agent payload: %+v", resp.Agents[0])
+	}
+}
+
+func TestHandleInstallBatch_LocalAgentInstallPreservesNestedPath(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	agentsDir := filepath.Join(t.TempDir(), "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("failed to create agents dir: %v", err)
+	}
+	s.cfg.AgentsSource = agentsDir
+	s.agentsStore = install.NewMetadataStore()
+
+	sourceDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(sourceDir, "demo"), 0o755); err != nil {
+		t.Fatalf("failed to create nested agent dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "demo", "reviewer.md"), []byte("# Reviewer agent"), 0o644); err != nil {
+		t.Fatalf("failed to write nested agent: %v", err)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"source": sourceDir,
+		"skills": []map[string]string{
+			{"name": "reviewer", "path": "demo/reviewer.md"},
+		},
+		"kind": "agent",
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal payload: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/install/batch", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+	s.mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	if _, err := os.Stat(filepath.Join(agentsDir, "demo", "reviewer.md")); err != nil {
+		t.Fatalf("expected installed nested agent in agents source: %v", err)
+	}
+	if got := s.agentsStore.GetByPath("demo/reviewer"); got == nil {
+		t.Fatal("expected nested agent metadata loaded into agentsStore")
+	}
+}
+
+func TestHandleInstall_GlobalRelativeLocalPathRecordsAbsoluteSource(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	parent := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(parent, "rel-skill"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "rel-skill", "SKILL.md"), []byte("---\nname: rel-skill\n---\n# Rel"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(parent)
+
+	payload, _ := json.Marshal(map[string]any{"source": "./rel-skill", "skipAudit": true})
+	req := httptest.NewRequest(http.MethodPost, "/api/install", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+	s.mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	entry := s.skillsStore.GetByPath("rel-skill")
+	if entry == nil {
+		t.Fatal("expected metadata for rel-skill")
+	}
+	if want := filepath.Join(parent, "rel-skill"); entry.Source != want {
+		t.Errorf("Source = %q, want %q", entry.Source, want)
+	}
+}
+
+func TestHandleInstall_ProjectRootRejected(t *testing.T) {
+	s, projectRoot := newProjectTargetServer(t, nil)
+
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+		payload  map[string]any
+	}{
+		{
+			name:     "single",
+			endpoint: "/api/install",
+			payload:  map[string]any{"source": projectRoot, "name": "project-root"},
+		},
+		{
+			name:     "batch",
+			endpoint: "/api/install/batch",
+			payload: map[string]any{
+				"source": projectRoot,
+				"skills": []map[string]string{{"name": "project-root", "path": "."}},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(tc.payload)
+			if err != nil {
+				t.Fatalf("failed to marshal payload: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, tc.endpoint, bytes.NewReader(payload))
+			rr := httptest.NewRecorder()
+			s.mux.ServeHTTP(rr, req)
+
+			if rr.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d body=%s", rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), "cannot install the project root into itself") {
+				t.Fatalf("expected rejection message, got %s", rr.Body.String())
+			}
+			if _, err := os.Stat(filepath.Join(projectRoot, ".skillshare", "skills", "project-root")); !os.IsNotExist(err) {
+				t.Fatalf("project root install should not create a skill, got err=%v", err)
+			}
+		})
+	}
+}
+
+// Issue #858: the dashboard's project config must follow a skill installed
+// again from another source.
+func TestHandleInstall_ProjectNewSourceReplacesConfigSource(t *testing.T) {
+	s, _ := newProjectTargetServer(t, nil)
+
+	var sources []string
+	for _, dir := range []string{"old", "new"} {
+		src := filepath.Join(t.TempDir(), dir, "demo")
+		if err := os.MkdirAll(src, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(src, "SKILL.md"), []byte("---\nname: demo\ndescription: "+dir+"\n---\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sources = append(sources, src)
+
+		payload, _ := json.Marshal(map[string]any{"source": src, "name": "demo", "force": true})
+		rr := httptest.NewRecorder()
+		s.mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/install", bytes.NewReader(payload)))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("install from %s: %d body=%s", dir, rr.Code, rr.Body.String())
+		}
+	}
+
+	if len(s.projectCfg.Skills) != 1 || s.projectCfg.Skills[0].Source != sources[1] {
+		t.Errorf("config skills = %+v, want one entry from %s", s.projectCfg.Skills, sources[1])
+	}
+}
+
+func TestHandleInstall_TrackPureAgentRepoInstallsIntoAgentsSource(t *testing.T) {
+	s, skillsDir := newTestServer(t)
+
+	agentsDir := filepath.Join(t.TempDir(), "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("failed to create agents dir: %v", err)
+	}
+	s.cfg.AgentsSource = agentsDir
+	s.agentsStore = install.NewMetadataStore()
+
+	repoDir := t.TempDir()
+	initGitRepo(t, repoDir)
+
+	agentPath := filepath.Join(repoDir, "reviewer.md")
+	if err := os.WriteFile(agentPath, []byte("# Reviewer v1"), 0o644); err != nil {
+		t.Fatalf("failed to write agent file: %v", err)
+	}
+	for _, args := range [][]string{
+		{"add", "reviewer.md"},
+		{"commit", "-m", "add reviewer agent"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %s %v", args, out, err)
+		}
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"source": "file://" + repoDir,
+		"track":  true,
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal payload: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/install", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+	s.mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d, body=%s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		RepoName string `json:"repoName"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	trackedRepoName := resp.RepoName
+	if _, err := os.Stat(filepath.Join(agentsDir, trackedRepoName, ".git")); err != nil {
+		agentEntries, _ := os.ReadDir(agentsDir)
+		skillEntries, _ := os.ReadDir(skillsDir)
+		t.Fatalf("expected tracked agent repo in agents source: %v (agents=%v skills=%v body=%s)", err, entryNames(agentEntries), entryNames(skillEntries), rr.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(agentsDir, trackedRepoName, "reviewer.md")); err != nil {
+		t.Fatalf("expected tracked agent file in agents source: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(skillsDir, trackedRepoName)); !os.IsNotExist(err) {
+		t.Fatalf("expected no tracked agent repo in skills source, got err=%v", err)
+	}
+}
+
+// TestReloadSkillsStore_PicksUpNewEntry guards the "installed skill shows as
+// Local with empty source" regression: install writes metadata to disk via its
+// own store instance, so the server's cached skillsStore must be reloaded or a
+// freshly installed skill renders with an empty source/type in the UI.
+func TestReloadSkillsStore_PicksUpNewEntry(t *testing.T) {
+	s, sourceDir := newTestServer(t)
+
+	if got := s.skillsStore.GetByPath("frontend/react-best-practices"); got != nil {
+		t.Fatalf("expected empty store at startup, got %+v", got)
+	}
+
+	// Simulate an install persisting metadata through a separate store instance.
+	disk := install.NewMetadataStore()
+	disk.Set("frontend/react-best-practices", &install.MetadataEntry{
+		Source: "https://github.com/vercel-labs/agent-skills/tree/main/skills/react-best-practices",
+		Type:   "github-subdir",
+		Group:  "frontend",
+	})
+	if err := disk.Save(sourceDir); err != nil {
+		t.Fatalf("failed to save metadata: %v", err)
+	}
+
+	s.reloadSkillsStore()
+
+	got := s.skillsStore.GetByPath("frontend/react-best-practices")
+	if got == nil {
+		t.Fatal("reloadSkillsStore did not pick up the on-disk entry (skill would show as Local)")
+	}
+	if got.Type != "github-subdir" {
+		t.Errorf("Type = %q, want github-subdir", got.Type)
+	}
+}
+
+func TestHandleInstall_TrackAcceptsLocalGitPath(t *testing.T) {
+	s, skillsDir := newTestServer(t)
+
+	repoDir := t.TempDir()
+	initGitRepo(t, repoDir)
+	if err := os.WriteFile(filepath.Join(repoDir, "SKILL.md"), []byte("---\nname: local-tracked\n---\n# s"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "SKILL.md"}, {"commit", "-m", "add skill"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %s %v", args, out, err)
+		}
+	}
+
+	payload, _ := json.Marshal(map[string]any{"source": repoDir, "track": true, "skipAudit": true})
+	req := httptest.NewRequest(http.MethodPost, "/api/install", bytes.NewReader(payload))
+	rr := httptest.NewRecorder()
+	s.mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status: got %d, body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		RepoName string `json:"repoName"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(skillsDir, resp.RepoName, "SKILL.md")); err != nil {
+		t.Fatalf("expected tracked repo %q in skills source: %v", resp.RepoName, err)
+	}
+}
+
+// An into folder inside a skill, inside a tracked checkout or malformed is
+// refused with move's codes before anything is created, on both endpoints.
+func TestHandleInstall_RefusesUnsafeInto(t *testing.T) {
+	s, src := newTestServer(t)
+	addSkill(t, src, "holder")
+	addTrackedRepo(t, src, "_team")
+
+	for _, endpoint := range []string{"/api/install", "/api/install/batch"} {
+		for _, tc := range []struct {
+			into   string
+			status int
+			code   string
+		}{
+			{"holder/sub", http.StatusConflict, "dest_is_skill"},
+			{"_team/sub", http.StatusConflict, "dest_inside_tracked_repo"},
+			{"../out", http.StatusBadRequest, "invalid_dest"},
+		} {
+			t.Run(endpoint+" "+tc.into, func(t *testing.T) {
+				payload, _ := json.Marshal(map[string]any{
+					"source": "./not-read", "into": tc.into,
+					"skills": []map[string]string{{"name": "x", "path": "x"}},
+				})
+				rr := httptest.NewRecorder()
+				s.mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(payload)))
+
+				var got struct {
+					ErrorCode string `json:"error_code"`
+				}
+				_ = json.Unmarshal(rr.Body.Bytes(), &got)
+				if rr.Code != tc.status || got.ErrorCode != tc.code {
+					t.Fatalf("status = %d, code = %q; want %d %s (%s)", rr.Code, got.ErrorCode, tc.status, tc.code, rr.Body.String())
+				}
+			})
+		}
+	}
+	for _, rel := range []string{"holder/sub", "_team/sub"} {
+		if _, err := os.Stat(filepath.Join(src, filepath.FromSlash(rel))); !os.IsNotExist(err) {
+			t.Errorf("%s was created by a refused install", rel)
+		}
+	}
+}

@@ -1,15 +1,19 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"skillshare/internal/audit"
 	"skillshare/internal/config"
 	"skillshare/internal/install"
 	"skillshare/internal/oplog"
+	"skillshare/internal/skillmove"
+	"skillshare/internal/sourcefs"
 	"skillshare/internal/ui"
 	"skillshare/internal/validate"
 )
@@ -23,13 +27,15 @@ type installArgs struct {
 
 // installJSONOutput is the JSON representation for install --json output.
 type installJSONOutput struct {
-	Source   string   `json:"source"`
-	Tracked  bool     `json:"tracked"`
-	DryRun   bool     `json:"dry_run"`
-	Into     string   `json:"into,omitempty"`
-	Skills   []string `json:"skills"`
-	Failed   []string `json:"failed"`
-	Duration string   `json:"duration"`
+	Source   string                 `json:"source"`
+	Tracked  bool                   `json:"tracked"`
+	DryRun   bool                   `json:"dry_run"`
+	Into     string                 `json:"into,omitempty"`
+	Skills   []string               `json:"skills"`
+	Failed   []string               `json:"failed"`
+	Duration string                 `json:"duration"`
+	Error    string                 `json:"error,omitempty"`
+	Planned  *[]installPlannedSkill `json:"planned,omitempty"`
 }
 
 type installLogSummary struct {
@@ -38,6 +44,7 @@ type installLogSummary struct {
 	SkillCount      int
 	InstalledSkills []string
 	FailedSkills    []string
+	PlannedSkills   []installPlannedSkill
 	DryRun          bool
 	Tracked         bool
 	Into            string
@@ -48,7 +55,34 @@ type installLogSummary struct {
 
 type installBatchSummary struct {
 	InstalledSkills []string
+	SkippedSkills   int
 	FailedSkills    []string
+	Failures        []install.SkillFailure // why each FailedSkills entry failed
+	Err             error                  // the batch could not start, e.g. a refused --into folder
+}
+
+// allSkillsFailedError reports an install in which every skill failed, so the
+// exit code and --json show it. succeeded counts installed and skipped skills;
+// any success makes the install partial, which still succeeds.
+func allSkillsFailedError(succeeded int, failures []install.SkillFailure) error {
+	if succeeded > 0 || len(failures) == 0 {
+		return nil
+	}
+	reasons := make([]string, len(failures))
+	blocked := false
+	for i, f := range failures {
+		reason := firstWarningLine(f.Err.Error())
+		if errors.Is(f.Err, audit.ErrBlocked) {
+			reason = "blocked by security audit"
+			blocked = true
+		}
+		reasons[i] = f.Name + ": " + reason
+	}
+	err := fmt.Errorf("%s failed to install: %s", plural(len(failures), "skill"), strings.Join(reasons, "; "))
+	if blocked {
+		err = fmt.Errorf("%w (use --force to override)", err)
+	}
+	return err
 }
 
 // parseInstallArgs parses install command arguments
@@ -67,6 +101,7 @@ func parseInstallArgs(args []string) (*installArgs, bool, error) {
 			result.opts.Name = args[i]
 		case arg == "--force" || arg == "-f":
 			result.opts.Force = true
+			result.opts.AuditOverride = true
 		case arg == "--update" || arg == "-u":
 			result.opts.Update = true
 		case arg == "--dry-run" || arg == "-n":
@@ -85,8 +120,35 @@ func parseInstallArgs(args []string) (*installArgs, bool, error) {
 				return nil, false, err
 			}
 			result.opts.AuditThreshold = threshold
+		case arg == "--branch" || arg == "-b":
+			if i+1 >= len(args) {
+				return nil, false, fmt.Errorf("--branch requires a value")
+			}
+			i++
+			branch := strings.TrimSpace(args[i])
+			if branch == "" {
+				return nil, false, fmt.Errorf("--branch requires a non-empty value")
+			}
+			result.opts.Branch = branch
 		case arg == "--track" || arg == "-t":
 			result.opts.Track = true
+		case arg == "--kind":
+			if i+1 >= len(args) {
+				return nil, false, fmt.Errorf("--kind requires a value (skill or agent)")
+			}
+			i++
+			kind := strings.ToLower(args[i])
+			if kind != "skill" && kind != "agent" {
+				return nil, false, fmt.Errorf("--kind must be 'skill' or 'agent', got %q", args[i])
+			}
+			result.opts.Kind = kind
+		case arg == "--agent" || arg == "-a":
+			if i+1 >= len(args) {
+				return nil, false, fmt.Errorf("-a requires agent name(s)")
+			}
+			i++
+			result.opts.AgentNames = strings.Split(args[i], ",")
+			result.opts.Kind = "agent"
 		case arg == "--skill" || arg == "-s":
 			if i+1 >= len(args) {
 				return nil, false, fmt.Errorf("--skill requires a value")
@@ -105,6 +167,8 @@ func parseInstallArgs(args []string) (*installArgs, bool, error) {
 			}
 			i++
 			result.opts.Into = args[i]
+		case strings.HasPrefix(arg, "--into="):
+			result.opts.Into = strings.TrimPrefix(arg, "--into=")
 		case arg == "--all":
 			result.opts.All = true
 		case arg == "--yes" || arg == "-y":
@@ -161,8 +225,20 @@ func parseInstallArgs(args []string) (*installArgs, bool, error) {
 	if result.opts.HasSkillFilter() && result.opts.Track {
 		return nil, false, fmt.Errorf("--skill cannot be used with --track")
 	}
+	if result.opts.HasAgentFilter() && result.opts.Track {
+		return nil, false, fmt.Errorf("--agent cannot be used with --track")
+	}
 	if result.opts.ShouldInstallAll() && result.opts.Track {
 		return nil, false, fmt.Errorf("--all/--yes cannot be used with --track")
+	}
+
+	if result.opts.Branch != "" && result.sourceArg != "" {
+		source, parseErr := install.ParseSource(result.sourceArg)
+		trackableLocal := result.opts.Track && source != nil &&
+			source.Type == install.SourceTypeLocalPath && install.IsLocalGitRepo(source.Path)
+		if parseErr == nil && !source.IsGit() && !trackableLocal {
+			return nil, false, fmt.Errorf("--branch can only be used with git repository sources")
+		}
 	}
 
 	if result.opts.Into != "" {
@@ -174,6 +250,17 @@ func parseInstallArgs(args []string) (*installArgs, bool, error) {
 	return result, false, nil
 }
 
+func applyInstallJSONDefaults(parsed *installArgs) {
+	if !parsed.jsonOutput {
+		return
+	}
+	// Force only: --json must not silently override the audit gate.
+	parsed.opts.Force = true
+	if !parsed.opts.HasSkillFilter() && !parsed.opts.HasAgentFilter() {
+		parsed.opts.All = true
+	}
+}
+
 // destWithInto returns the destination path, prepending opts.Into if set.
 func destWithInto(sourceDir string, opts install.InstallOptions, skillName string) string {
 	if opts.Into != "" {
@@ -182,27 +269,73 @@ func destWithInto(sourceDir string, opts install.InstallOptions, skillName strin
 	return filepath.Join(sourceDir, skillName)
 }
 
-// ensureIntoDirExists creates the Into subdirectory if opts.Into is set.
+// agentsDirWithInto returns agentsDir joined with opts.Into (if set).
+func agentsDirWithInto(agentsDir string, opts install.InstallOptions) string {
+	if opts.Into != "" {
+		return filepath.Join(agentsDir, opts.Into)
+	}
+	return agentsDir
+}
+
+// ensureIntoDirExists creates the Into subdirectory if opts.Into is set. It
+// first refuses a folder an install must not land in: inside a skill or inside
+// a tracked checkout. Links are sourcefs's to follow or refuse.
 func ensureIntoDirExists(sourceDir string, opts install.InstallOptions) error {
 	if opts.Into == "" {
 		return nil
 	}
-	return os.MkdirAll(filepath.Join(sourceDir, opts.Into), 0755)
+	if err := checkIntoFolder(sourceDir, opts); err != nil {
+		return err
+	}
+	return sourcefs.MkdirAllIn(sourceDir, opts.Into, opts.SourceFollow)
+}
+
+// checkIntoFolder reports why opts.Into is no place for an install, with the
+// code move uses for it; nil when it is fine or unset.
+func checkIntoFolder(sourceDir string, opts install.InstallOptions) error {
+	if opts.Into == "" {
+		return nil
+	}
+	_, refusal := skillmove.CheckDest(opts.Into, skillmove.Options{SourceDir: sourceDir, Follow: opts.SourceFollow, Install: true})
+	if refusal == nil {
+		return nil
+	}
+	return fmt.Errorf("%s (%s)", refusal.Error(), refusal.Code)
+}
+
+// parseOptsFromConfig builds install.ParseOptions from the global config.
+func parseOptsFromConfig(cfg *config.Config) install.ParseOptions {
+	return install.ParseOptions{
+		GitLabHosts: cfg.EffectiveGitLabHosts(),
+		AzureHosts:  cfg.EffectiveAzureHosts(),
+		CNBHosts:    cfg.EffectiveCNBHosts(),
+		GiteaHosts:  cfg.EffectiveGiteaHosts(),
+	}
+}
+
+// parseOptsFromProjectConfig builds install.ParseOptions from a project config.
+func parseOptsFromProjectConfig(cfg *config.ProjectConfig) install.ParseOptions {
+	return install.ParseOptions{
+		GitLabHosts: cfg.EffectiveGitLabHosts(),
+		AzureHosts:  cfg.EffectiveAzureHosts(),
+		CNBHosts:    cfg.EffectiveCNBHosts(),
+		GiteaHosts:  cfg.EffectiveGiteaHosts(),
+	}
 }
 
 // resolveSkillFromName resolves a skill name to source using metadata
 func resolveSkillFromName(skillName string, cfg *config.Config) (*install.Source, error) {
-	skillPath := filepath.Join(cfg.Source, skillName)
-
-	meta, err := install.ReadMeta(skillPath)
+	store, err := install.LoadMetadataWithMigration(cfg.EffectiveSkillsSource(), "")
 	if err != nil {
 		return nil, fmt.Errorf("skill '%s' not found or has no metadata", skillName)
 	}
-	if meta == nil {
+
+	entry := store.GetByPath(skillName)
+	if entry == nil || entry.Source == "" {
 		return nil, fmt.Errorf("skill '%s' has no metadata, cannot update", skillName)
 	}
 
-	source, err := install.ParseSource(meta.Source)
+	source, err := install.RecordedSource(entry, parseOptsFromConfig(cfg))
 	if err != nil {
 		return nil, fmt.Errorf("invalid source in metadata: %w", err)
 	}
@@ -213,7 +346,7 @@ func resolveSkillFromName(skillName string, cfg *config.Config) (*install.Source
 
 // resolveInstallSource parses and resolves the install source
 func resolveInstallSource(sourceArg string, opts install.InstallOptions, cfg *config.Config) (*install.Source, bool, error) {
-	source, err := install.ParseSource(sourceArg)
+	source, err := install.ParseSourceWithOptions(sourceArg, parseOptsFromConfig(cfg))
 	if err == nil {
 		return source, false, nil
 	}
@@ -224,7 +357,7 @@ func resolveInstallSource(sourceArg string, opts install.InstallOptions, cfg *co
 		if resolveErr != nil {
 			return nil, false, fmt.Errorf("invalid source: %w", err)
 		}
-		ui.Info("Resolved '%s' from installed skill metadata", sourceArg)
+		ui.Note(fmt.Sprintf("Resolved '%s' from installed skill metadata", sourceArg))
 		return resolvedSource, true, nil // resolvedFromMeta = true
 	}
 
@@ -241,13 +374,21 @@ func dispatchInstall(source *install.Source, cfg *config.Config, opts install.In
 		return handleGitInstall(source, cfg, opts)
 	}
 
+	if source.Type == install.SourceTypeLocalPath {
+		skill := install.SkillInfo{Name: install.DefaultSkillName(source.Path, source.Name), Path: "."}
+		name, err := install.ExistingSkillInstallName(cfg.EffectiveSkillsSource(), source, skill, opts)
+		if err != nil {
+			return installLogSummary{}, err
+		}
+		source.Name = name
+	}
 	return handleDirectInstall(source, cfg, opts)
 }
 
 func cmdInstall(args []string) error {
 	start := time.Now()
 
-	mode, rest, err := parseModeArgs(args)
+	mode, rest, err := parseModeArgs(args, "--name", "--audit-threshold", "--threshold", "-T", "--branch", "-b", "--kind", "--agent", "-a", "--skill", "-s", "--exclude", "--into")
 	if err != nil {
 		return err
 	}
@@ -257,22 +398,37 @@ func cmdInstall(args []string) error {
 		return fmt.Errorf("cannot determine working directory: %w", err)
 	}
 
-	if mode == modeAuto {
-		if projectConfigExists(cwd) {
-			mode = modeProject
-		} else {
-			mode = modeGlobal
-		}
-	}
+	mode = resolveAutoMode(mode, cwd)
 
 	applyModeLabel(mode)
 
 	if mode == modeProject {
-		summary, err := cmdInstallProject(rest, cwd)
+		parsed, showHelp, parseErr := parseInstallArgs(rest)
+		if showHelp {
+			printInstallHelp()
+			return parseErr
+		}
+		if parseErr != nil {
+			return parseErr
+		}
+		applyInstallJSONDefaults(parsed)
+
+		jsonUI := newJSONUISuppressor(parsed.jsonOutput)
+		defer jsonUI.Flush()
+
+		jsonWriteResult := func(summary installLogSummary, cmdErr error) error {
+			jsonUI.Flush()
+			return installOutputJSON(summary, start, cmdErr)
+		}
+
+		summary, err := cmdInstallProjectParsed(parsed, cwd)
 		if summary.Mode == "" {
 			summary.Mode = "project"
 		}
-		logInstallOp(config.ProjectConfigPath(cwd), rest, start, err, summary)
+		logInstallOp(config.ProjectConfigPath(cwd), parsed.sourceArg, start, err, summary)
+		if parsed.jsonOutput {
+			return jsonWriteResult(summary, err)
+		}
 		return err
 	}
 
@@ -284,45 +440,30 @@ func cmdInstall(args []string) error {
 	if parseErr != nil {
 		return parseErr
 	}
-
-	// --json implies --force and --all (skip prompts for non-interactive use)
-	if parsed.jsonOutput {
-		parsed.opts.Force = true
-		if !parsed.opts.HasSkillFilter() {
-			parsed.opts.All = true
-		}
-	}
+	applyInstallJSONDefaults(parsed)
 
 	// When no source is given, only bare "install" is valid — reject incompatible flags
 	if parsed.sourceArg == "" {
 		hasSourceFlags := parsed.opts.Name != "" || parsed.opts.Into != "" ||
-			parsed.opts.Track || len(parsed.opts.Skills) > 0 ||
-			len(parsed.opts.Exclude) > 0 || parsed.opts.All || parsed.opts.Yes || parsed.opts.Update
-		if hasSourceFlags && !parsed.jsonOutput {
-			return fmt.Errorf("flags --name, --into, --track, --skill, --exclude, --all, --yes, and --update require a source argument")
+			parsed.opts.Track || parsed.opts.HasSkillFilter() || parsed.opts.HasAgentFilter() ||
+			len(parsed.opts.Exclude) > 0 || parsed.opts.Update || parsed.opts.Branch != "" ||
+			parsed.opts.Kind != ""
+		if hasSourceFlags || ((parsed.opts.All || parsed.opts.Yes) && !parsed.jsonOutput) {
+			return fmt.Errorf("flags --name, --into, --track, --skill, --agent, --kind, --exclude, --all, --yes, --branch, and --update require a source argument")
 		}
 	}
 
 	// In JSON mode, redirect all UI output to stderr early so the
 	// logo, spinner, step, and handler output don't corrupt stdout.
-	var restoreJSONUI func()
-	restoreJSONUIIfNeeded := func() {
-		if restoreJSONUI != nil {
-			restoreJSONUI()
-			restoreJSONUI = nil
-		}
-	}
-	if parsed.jsonOutput {
-		restoreJSONUI = suppressUIToDevnull()
-	}
-	defer restoreJSONUIIfNeeded()
+	jsonUI := newJSONUISuppressor(parsed.jsonOutput)
+	defer jsonUI.Flush()
 
 	jsonWriteError := func(err error) error {
-		restoreJSONUIIfNeeded()
+		jsonUI.Flush()
 		return writeJSONError(err)
 	}
 	jsonWriteResult := func(summary installLogSummary, cmdErr error) error {
-		restoreJSONUIIfNeeded()
+		jsonUI.Flush()
 		return installOutputJSON(summary, start, cmdErr)
 	}
 
@@ -337,19 +478,32 @@ func cmdInstall(args []string) error {
 		parsed.opts.AuditThreshold = cfg.Audit.BlockThreshold
 	}
 
+	parsed.opts.SourceFollow = cfg.SkillsWalk().Follow
+
 	// No source argument: install from global config
 	if parsed.sourceArg == "" {
 		summary, err := installFromGlobalConfig(cfg, parsed.opts)
-		logInstallOp(config.ConfigPath(), rest, start, err, summary)
+		logInstallOp(config.ConfigPath(), parsed.sourceArg, start, err, summary)
 		if parsed.jsonOutput {
 			return jsonWriteResult(summary, err)
 		}
 		return err
 	}
 
+	parsed.opts.SourceDir = cfg.EffectiveSkillsSource()
 	source, resolvedFromMeta, err := resolveInstallSource(parsed.sourceArg, parsed.opts, cfg)
+	if err == nil && parsed.opts.Branch != "" {
+		source.Branch = parsed.opts.Branch
+	}
+	// Global metadata has no fixed base for a relative path, so `update` and
+	// `check` would resolve it against whatever directory they run in.
+	// Project mode keeps relative sources: they are relative to the project
+	// root and the project config is shared across machines.
+	if err == nil && source.Type == install.SourceTypeLocalPath {
+		source.Raw = source.Path
+	}
 	if err != nil {
-		logInstallOp(config.ConfigPath(), rest, start, err, installLogSummary{
+		logInstallOp(config.ConfigPath(), parsed.sourceArg, start, err, installLogSummary{
 			Source: parsed.sourceArg,
 			Mode:   "global",
 		})
@@ -379,15 +533,15 @@ func cmdInstall(args []string) error {
 		if summary.Source == "" {
 			summary.Source = parsed.sourceArg
 		}
-		if err == nil && !parsed.opts.DryRun && len(summary.InstalledSkills) > 0 {
-			reg, regErr := config.LoadRegistry(filepath.Dir(config.ConfigPath()))
-			if regErr != nil {
-				ui.Warning("Failed to load registry: %v", regErr)
-			} else if rErr := config.ReconcileGlobalSkills(cfg, reg); rErr != nil {
+		if err == nil && !parsed.opts.DryRun {
+			store, storeErr := install.LoadMetadataWithMigration(cfg.EffectiveSkillsSource(), "")
+			if storeErr != nil {
+				ui.Warning("Failed to load metadata: %v", storeErr)
+			} else if rErr := config.ReconcileGlobalSkills(cfg, store); rErr != nil {
 				ui.Warning("Failed to reconcile global skills config: %v", rErr)
 			}
 		}
-		logInstallOp(config.ConfigPath(), rest, start, err, summary)
+		logInstallOp(config.ConfigPath(), parsed.sourceArg, start, err, summary)
 		if parsed.jsonOutput {
 			return jsonWriteResult(summary, err)
 		}
@@ -401,15 +555,15 @@ func cmdInstall(args []string) error {
 	if summary.Source == "" {
 		summary.Source = parsed.sourceArg
 	}
-	if err == nil && !parsed.opts.DryRun && len(summary.InstalledSkills) > 0 {
-		reg, regErr := config.LoadRegistry(filepath.Dir(config.ConfigPath()))
-		if regErr != nil {
-			ui.Warning("Failed to load registry: %v", regErr)
-		} else if rErr := config.ReconcileGlobalSkills(cfg, reg); rErr != nil {
+	if err == nil && !parsed.opts.DryRun {
+		store, storeErr := install.LoadMetadataWithMigration(cfg.EffectiveSkillsSource(), "")
+		if storeErr != nil {
+			ui.Warning("Failed to load metadata: %v", storeErr)
+		} else if rErr := config.ReconcileGlobalSkills(cfg, store); rErr != nil {
 			ui.Warning("Failed to reconcile global skills config: %v", rErr)
 		}
 	}
-	logInstallOp(config.ConfigPath(), rest, start, err, summary)
+	logInstallOp(config.ConfigPath(), parsed.sourceArg, start, err, summary)
 	if parsed.jsonOutput {
 		return jsonWriteResult(summary, err)
 	}
@@ -427,10 +581,18 @@ func installOutputJSON(summary installLogSummary, start time.Time, installErr er
 		Failed:   summary.FailedSkills,
 		Duration: formatDuration(start),
 	}
+	if summary.PlannedSkills != nil {
+		output.Planned = &summary.PlannedSkills
+	}
+	if installErr != nil {
+		output.Error = installErr.Error()
+	}
 	return writeJSONResult(&output, installErr)
 }
 
-func logInstallOp(cfgPath string, args []string, start time.Time, cmdErr error, summary installLogSummary) {
+// logInstallOp logs sourceArg, the source as typed, or summary.Source when
+// none was given.
+func logInstallOp(cfgPath, sourceArg string, start time.Time, cmdErr error, summary installLogSummary) {
 	status := statusFromErr(cmdErr)
 	if len(summary.InstalledSkills) > 0 && len(summary.FailedSkills) > 0 {
 		status = "partial"
@@ -438,8 +600,8 @@ func logInstallOp(cfgPath string, args []string, start time.Time, cmdErr error, 
 	e := oplog.NewEntry("install", status, time.Since(start))
 	fields := map[string]any{}
 	source := summary.Source
-	if len(args) > 0 {
-		source = args[0]
+	if sourceArg != "" {
+		source = sourceArg
 	}
 	if source != "" {
 		fields["source"] = source
@@ -487,78 +649,88 @@ func logInstallOp(cfgPath string, args []string, start time.Time, cmdErr error, 
 }
 
 func printInstallHelp() {
-	fmt.Println(`Usage: skillshare install [source|skill-name] [options]
-
-Install skills from a local path, git repository, or global config.
-When run with no arguments, installs all skills listed in config.yaml.
-When using --update or --force with a skill name, skillshare uses stored metadata to resolve the source.
-
-Sources:
-  user/repo                  GitHub shorthand (expands to github.com/user/repo)
-  user/repo/path/to/skill    GitHub shorthand with subdirectory
-  github.com/user/repo       Full GitHub URL (discovers skills)
-  github.com/user/repo/path  Subdirectory in GitHub repo (direct install)
-  https://github.com/...     HTTPS git URL
-  git@github.com:...         SSH git URL
-  ~/path/to/skill            Local directory
-
-Options:
-  --name <name>       Override installed name when exactly one skill is installed
-  --into <dir>        Install into subdirectory (e.g. "frontend" or "frontend/react")
-  --force, -f         Overwrite existing skill; also continue if audit would block
-  --update, -u        Update existing (git pull if possible, else reinstall)
-  --track, -t         Install as tracked repo (preserves .git for updates)
-  --skill, -s <names> Select specific skills from multi-skill repo (comma-separated;
-                      supports glob patterns like "core-*", "test-?")
-  --exclude <names>   Skip specific skills during install (comma-separated;
-                      supports glob patterns like "test-*")
-  --all               Install all discovered skills without prompting
-  --yes, -y           Auto-accept all prompts (equivalent to --all for multi-skill repos)
-  --dry-run, -n       Preview the installation without making changes
-  --skip-audit        Skip security audit entirely for this install
-  --audit-verbose     Show full audit finding lines (default: compact summary)
-  --audit-threshold, --threshold, -T <t>
-                      Block install by severity at/above: critical|high|medium|low|info
-                      (also supports c|h|m|l|i)
-  --json              Output results as JSON (implies --force --all)
-  --project, -p       Use project-level config in current directory
-  --global, -g        Use global config (~/.config/skillshare)
-  --help, -h          Show this help
-
-Examples:
-  skillshare install anthropics/skills
-  skillshare install anthropics/skills/skills/pdf
-  skillshare install ComposioHQ/awesome-claude-skills
-  skillshare install ~/my-skill
-  skillshare install github.com/user/repo --force
-  skillshare install ~/my-skill --skip-audit     # Bypass scan (no findings generated)
-  skillshare install user/repo --all --audit-verbose
-  skillshare install ~/my-skill -T high          # Override block threshold for this run
-
-Selective install (non-interactive):
-  skillshare install anthropics/skills -s pdf,commit     # Specific skills
-  skillshare install anthropics/skills -s "core-*"       # Glob pattern
-  skillshare install anthropics/skills --all             # All skills
-  skillshare install anthropics/skills -y                # Auto-accept
-  skillshare install anthropics/skills -s pdf --dry-run  # Preview selection
-  skillshare install repo --all --exclude cli-sentry     # All except specific
-  skillshare install repo --all --exclude "test-*"       # Exclude by pattern
-
-Organize into subdirectories:
-  skillshare install anthropics/skills -s pdf --into frontend
-  skillshare install user/repo --track --into devops
-  skillshare install ~/my-skill --into frontend/react
-
-Tracked repositories (Team Edition):
-  skillshare install team/shared-skills --track   # Clone as _shared-skills
-  skillshare install _shared-skills --update      # Update tracked repo
-
-Install from config (no arguments):
-  skillshare install                         # Install all skills from config.yaml
-  skillshare install --dry-run               # Preview config-based install
-
-Update existing skills:
-  skillshare install my-skill --update       # Update using stored source
-  skillshare install my-skill --force        # Reinstall using stored source
-  skillshare install my-skill --update -n    # Preview update`)
+	printHelp("skillshare install [source|skill-name] [options]", "Install skills from a local path, git repository, or global config.\nWhen run with no arguments, installs all skills listed in config.yaml.\nWhen using --update or --force with a skill name, skillshare uses stored metadata to resolve the source.",
+		helpGroup{title: "Sources", rows: []helpRow{
+			{"user/repo", "GitHub shorthand (expands to github.com/user/repo)"},
+			{"user/repo/path/to/skill", "GitHub shorthand with subdirectory"},
+			{"github.com/user/repo", "Full GitHub URL (discovers skills)"},
+			{"github.com/user/repo/path", "Subdirectory in GitHub repo (direct install)"},
+			{"https://github.com/...", "HTTPS git URL"},
+			{"git@github.com:...", "SSH git URL"},
+			{"~/path/to/skill", "Local directory"},
+		}},
+		helpGroup{title: "Options", rows: []helpRow{
+			{"--name <name>", "Override installed name when exactly one skill is installed"},
+			{"--kind <kind>", "Restrict discovery/install to skill or agent"},
+			{"--into <dir>", "Install into subdirectory (e.g. \"frontend\" or \"frontend/react\")"},
+			{"-f, --force", "Overwrite existing skill; also continue if audit findings would block"},
+			{"-u, --update", "Update existing (git pull if possible, else reinstall)"},
+			{"-b, --branch <ref>", "Git branch, tag, or commit SHA to install from (default: remote default)"},
+			{"-t, --track", "Keep a Git checkout for updates; no selection prompt.\nCannot combine with --all, --yes, --skill, or --agent"},
+			{"-a, --agent <names>", "Select specific agents from a multi-agent repo (comma-separated)"},
+			{"-s, --skill <names>", "Select specific skills from multi-skill repo (comma-separated;\nsupports glob patterns like \"core-*\", \"test-?\")"},
+			{"--exclude <names>", "Skip specific skills during install (comma-separated;\nsupports glob patterns like \"test-*\")"},
+			{"--all", "Install all discovered skills without prompting"},
+			{"-y, --yes", "Auto-accept all prompts (equivalent to --all for multi-skill repos)"},
+			{"-n, --dry-run", "Preview the installation without making changes"},
+			{"--skip-audit", "Skip security audit entirely for this install"},
+			{"--audit-verbose", "Show full audit finding lines (default: compact summary)"},
+			{"-T, --audit-threshold, --threshold <t>", ""},
+			{"", "Block install by severity at/above: critical|high|medium|low|info\n(also supports c|h|m|l|i)"},
+			{"--json", "Noninteractive JSON; permits overwrite and selects all unless\n--skill/--agent is given. Audit blocking still applies"},
+			{"-p, --project", "Use project-level config in current directory"},
+			{"-g, --global", "Use global config (~/.config/skillshare)"},
+		}},
+		helpExamples(
+			helpRow{"skillshare install anthropics/skills", ""},
+			helpRow{"skillshare install anthropics/skills/skills/pdf", ""},
+			helpRow{"skillshare install ComposioHQ/awesome-claude-skills", ""},
+			helpRow{"skillshare install ~/my-skill", ""},
+			helpRow{"skillshare install github.com/user/repo --force", ""},
+			helpRow{"skillshare install ~/my-skill --skip-audit", "Bypass scan (no findings generated)"},
+			helpRow{"skillshare install user/repo --all --audit-verbose", ""},
+			helpRow{"skillshare install ~/my-skill -T high", "Override block threshold for this run"},
+		),
+		helpGroup{title: "Selective install (non-interactive)", examples: true, rows: []helpRow{
+			{"skillshare install org/agents --kind agent", "Agents only"},
+			{"skillshare install org/agents -a reviewer,tutor", "Specific agents"},
+			{"skillshare install anthropics/skills -s pdf,commit", "Specific skills"},
+			{"skillshare install anthropics/skills -s \"core-*\"", "Glob pattern"},
+			{"skillshare install anthropics/skills --all", "All skills"},
+			{"skillshare install anthropics/skills -y", "Auto-accept"},
+			{"skillshare install anthropics/skills -s pdf --dry-run", "Preview selection"},
+			{"skillshare install repo --all --exclude cli-sentry", "All except specific"},
+			{"skillshare install repo --all --exclude \"test-*\"", "Exclude by pattern"},
+		}},
+		helpGroup{title: "Organize into subdirectories", examples: true, rows: []helpRow{
+			{"skillshare install anthropics/skills -s pdf --into frontend", ""},
+			{"skillshare install user/repo --track --into devops", ""},
+			{"skillshare install ~/my-skill --into frontend/react", ""},
+		}},
+		helpGroup{title: "Track an upstream collection", examples: true, rows: []helpRow{
+			{"skillshare install owner/repo --track --name team -g --dry-run", "Preview checkout"},
+			{"skillshare install owner/repo --track --name team -g", "Track as _team (no --all/--yes needed)"},
+			{"skillshare list -g --json", "Inspect installed names before setting target filters"},
+			{"skillshare sync -g --dry-run", "Preview target exposure; then run sync -g"},
+			{"skillshare check _team -g --json", "Check upstream changes"},
+			{"skillshare update _team -g", "Update source; then run sync -g again"},
+		}},
+		helpNotes("Workflow notes",
+			"Use -g for user-wide resources or -p for a project; keep the scope on each command.",
+			"--skill rejects --all/--yes. --track keeps the collection as one unit.",
+			"With a plain owner/repo source (no URL ref), omit --branch to start on its default branch.",
+			"Tracked repositories follow branches; omit --track to pin a tag or commit.",
+			"Target include/exclude filters control exposure; sync never fetches upstream updates.",
+			"Complete native plugins use plugin discover/add/check/update, not install --track.",
+		),
+		helpGroup{title: "Install from config (no arguments)", examples: true, rows: []helpRow{
+			{"skillshare install", "Install all skills from config.yaml"},
+			{"skillshare install --dry-run", "Preview config-based install"},
+		}},
+		helpGroup{title: "Update existing skills", examples: true, rows: []helpRow{
+			{"skillshare install my-skill --update", "Update using stored source"},
+			{"skillshare install my-skill --force", "Reinstall using stored source"},
+			{"skillshare install my-skill --update -n", "Preview update"},
+		}},
+	)
 }

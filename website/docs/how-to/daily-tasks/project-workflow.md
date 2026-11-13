@@ -58,6 +58,24 @@ git add .skillshare/
 git commit -m "Add my-skill"
 ```
 
+### Add a New Agent
+
+Agents are single `.md` files; create them directly under `.skillshare/agents/`:
+
+```bash
+# Create an agent file
+$EDITOR .skillshare/agents/my-agent.md
+
+# Sync to agent-capable targets (claude, cursor, augment, opencode)
+skillshare sync agents
+
+# Commit
+git add .skillshare/agents/
+git commit -m "Add my-agent"
+```
+
+`skillshare sync` (without `agents`) syncs both skills and agents in one shot. Use `skillshare disable my-agent --kind agent -p` to add an entry to `.skillshare/agents/.agentignore` without deleting the file.
+
 ### Install a Remote Skill
 
 ```bash
@@ -151,9 +169,13 @@ skillshare target list -p
 ```
 
 ```
-Project Targets
-  claude    .claude/skills (merge)
-  cursor         .cursor/skills (merge)
+claude
+  Skills    .claude/skills  merge · flat · merged · 3 shared
+
+cursor
+  Skills    .cursor/skills  merge · flat · merged · 3 shared
+
+2 targets
 ```
 
 ---
@@ -165,18 +187,15 @@ skillshare status
 ```
 
 ```
-Project Skills (.skillshare/)
-
 Source
-  ✓ .skillshare/skills (3 skills)
+  skills    .skillshare/skills  3 skills
+  agents    .skillshare/agents  4 agents
+  .skillignore: 3 patterns, 0 skills ignored
 
-Targets
-  ✓ claude       [merge] .claude/skills (3 synced)
-  ✓ cursor       [merge] .cursor/skills (3 synced)
-
-Remote Skills
-  ✓ pdf          anthropic/skills/pdf
-  ✓ review       github.com/team/tools
+Targets                   skills      agents
+  claude  .claude/skills  ✓ 3 linked  ✓ 4
+  cursor  .cursor/skills  ✓ 3 linked  ✓ 4
+  all use merge
 ```
 
 ---
@@ -188,13 +207,13 @@ skillshare list
 ```
 
 ```
-Installed skills (project)
-─────────────────────────────────────────
-  → my-skill            local
-  → pdf                 anthropic/skills/pdf
-  → review              github.com/team/tools
+Skills · project
+  my-skill  local
+  pdf       anthropic/skills/pdf
+  review    github.com/team/tools
 
-→ 3 skill(s): 2 remote, 1 local
+3 skills · 2 remote, 1 local
+  Add -v for sources and install dates
 ```
 
 ---

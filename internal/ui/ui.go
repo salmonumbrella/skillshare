@@ -5,10 +5,17 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"skillshare/internal/theme"
+
+	"github.com/pterm/pterm"
 )
 
-// Base colors for terminal output
-const (
+// Deprecated: Use theme.ANSI() instead. These raw escape sequences are
+// retained for existing callers. They are variables rather than constants so
+// DisableColors can blank them when NO_COLOR is set. New code should use
+// theme.ANSI().
+var (
 	Reset      = "\033[0m"
 	Red        = "\033[31m"
 	Green      = "\033[32m"
@@ -27,7 +34,7 @@ const (
 )
 
 // Semantic color aliases for consistent theming
-const (
+var (
 	// Primary brand color (yellow - matches logo)
 	Primary = Yellow
 	// Accent color for interactive elements
@@ -42,10 +49,26 @@ const (
 )
 
 // Bold variants
-const (
+var (
 	Bold      = "\033[1m"
 	BoldReset = "\033[22m"
 )
+
+// DisableColors blanks every raw escape variable above (and pterm's colors)
+// so output built from them is plain text. main calls it once at startup when
+// the resolved theme has NoColor or Plain set, before any output is produced.
+func DisableColors() {
+	pterm.DisableColor()
+	for _, v := range []*string{
+		&Reset, &Red, &Green, &Yellow, &Blue, &Magenta, &Cyan, &Orange,
+		&Purple, &BrightRed, &OrangeAlt, &BrightBlue, &Gray, &Dim, &White,
+		&Primary, &Accent, &Muted,
+		&StatusSuccess, &StatusError, &StatusWarning, &StatusInfo,
+		&Bold, &BoldReset,
+	} {
+		*v = ""
+	}
+}
 
 // Severity color IDs (256-color palette) — single source of truth for both
 // ANSI escape codes (SeverityColor) and lipgloss styles (SeverityColorID).
@@ -97,7 +120,7 @@ func SeverityColorID(severity string) string {
 // Colorize wraps text with a color code and reset. Returns plain text if
 // color is empty or stdout is not a TTY.
 func Colorize(color, text string) string {
-	if color == "" || !IsTTY() {
+	if color == "" || !IsTTY() || theme.Get().NoColor {
 		return text
 	}
 	return color + text + Reset
@@ -105,60 +128,50 @@ func Colorize(color, text string) string {
 
 // Success prints a success message
 func Success(format string, args ...interface{}) {
-	fmt.Printf(Green+"✓ "+Reset+format+"\n", args...)
+	a := theme.ANSI()
+	fmt.Printf(a.Success+"✓ "+a.Reset+format+"\n", args...)
 }
 
 // Error prints an error message
 func Error(format string, args ...interface{}) {
-	fmt.Printf(Red+"✗ "+Reset+format+"\n", args...)
+	a := theme.ANSI()
+	fmt.Printf(a.Danger+"✗ "+a.Reset+format+"\n", args...)
 }
 
 // Warning prints a warning message
 func Warning(format string, args ...interface{}) {
-	fmt.Printf(Yellow+"! "+Reset+format+"\n", args...)
+	a := theme.ANSI()
+	fmt.Printf(a.Warning+"! "+a.Reset+format+"\n", args...)
 }
 
 // Info prints an info message
 func Info(format string, args ...interface{}) {
-	fmt.Printf(Cyan+"→ "+Reset+format+"\n", args...)
-}
-
-// Status prints a status line
-func Status(name, status, detail string) {
-	statusColor := Gray
-	switch status {
-	case "linked":
-		statusColor = Green
-	case "not exist":
-		statusColor = Yellow
-	case "has files":
-		statusColor = Blue
-	case "conflict", "broken":
-		statusColor = Red
-	}
-
-	fmt.Printf("  %-12s %s%-12s%s %s\n", name, statusColor, status, Reset, Dim+detail+Reset)
+	a := theme.ANSI()
+	fmt.Printf(a.Info+"→ "+a.Reset+format+"\n", args...)
 }
 
 // Header prints a section header
 func Header(text string) {
-	fmt.Printf("\n%s%s%s\n", Cyan, text, Reset)
-	fmt.Println(Dim + "─────────────────────────────────────────" + Reset)
+	a := theme.ANSI()
+	fmt.Printf("\n%s%s%s\n", a.Info, text, a.Reset)
+	fmt.Println(a.Dim + "─────────────────────────────────────────" + a.Reset)
 }
 
 // Checkbox returns a formatted checkbox string
 func Checkbox(checked bool) string {
+	a := theme.ANSI()
 	if checked {
-		return Green + "[x]" + Reset
+		return a.Success + "[x]" + a.Reset
 	}
 	return "[ ]"
 }
 
 // CheckboxItem prints a checkbox item with name and description
 func CheckboxItem(checked bool, name, description string) {
+	a := theme.ANSI()
 	checkbox := Checkbox(checked)
 	if description != "" {
-		fmt.Printf("  %s %-12s %s%s%s\n", checkbox, name, Dim, description, Reset)
+		fmt.Printf("  %s %-12s %s%s%s\n", checkbox, name, a.Dim, description, a.Reset)
 	} else {
 		fmt.Printf("  %s %s\n", checkbox, name)
 	}
@@ -169,31 +182,32 @@ func CheckboxItem(checked bool, name, description string) {
 //	kind: "new"/"restore" (+ green), "modified" (~ cyan), "override" (! yellow),
 //	      "orphan" (- red), "local" (← gray), "warn" (⚠ yellow)
 func ActionLine(kind, text string) {
+	a := theme.ANSI()
 	var icon, color string
 	switch kind {
 	case "new", "restore":
-		icon, color = "+", Green
+		icon, color = "+", a.Success
 	case "modified":
-		icon, color = "~", Cyan
+		icon, color = "~", a.Info
 	case "override":
-		icon, color = "!", Yellow
+		icon, color = "!", a.Warning
 	case "orphan":
-		icon, color = "-", Red
+		icon, color = "-", a.Danger
 	case "local":
-		icon, color = "←", Dim
+		icon, color = "←", a.Dim
 	// Legacy kinds for backward compatibility
 	case "sync":
-		icon, color = "→", Cyan
+		icon, color = "→", a.Info
 	case "force":
-		icon, color = "⚠", Yellow
+		icon, color = "⚠", a.Warning
 	case "collect":
-		icon, color = "←", Dim
+		icon, color = "←", a.Dim
 	case "warn":
-		icon, color = "⚠", Yellow
+		icon, color = "⚠", a.Warning
 	default:
-		icon, color = " ", Reset
+		icon, color = " ", a.Reset
 	}
-	fmt.Printf("  %s%s%s %s\n", color, icon, Reset, text)
+	fmt.Printf("  %s%s%s %s\n", color, icon, a.Reset, text)
 }
 
 // isTTY checks if stdout is a terminal (for animation support)
@@ -224,22 +238,23 @@ func Logo(version string) {
 
 // LogoAnimated prints the ASCII art logo with optional animation
 func LogoAnimated(version string, animate bool) {
+	a := theme.ANSI()
 	lines := []string{
-		Primary + `     _    _ _ _     _` + Reset,
-		Primary + ` ___| | _(_) | |___| |__   __ _ _ __ ___` + Reset,
-		Primary + `/ __| |/ / | | / __| '_ \ / _` + "`" + ` | '__/ _ \` + Reset,
-		Primary + `\__ \   <| | | \__ \ | | | (_| | | |  __/` + Reset + `  ` + Muted + `https://github.com/runkids/skillshare` + Reset,
+		a.Warning + `     _    _ _ _     _` + a.Reset,
+		a.Warning + ` ___| | _(_) | |___| |__   __ _ _ __ ___` + a.Reset,
+		a.Warning + `/ __| |/ / | | / __| '_ \ / _` + "`" + ` | '__/ _ \` + a.Reset,
+		a.Warning + `\__ \   <| | | \__ \ | | | (_| | | |  __/` + a.Reset + `  ` + a.Dim + `https://github.com/runkids/skillshare` + a.Reset,
 	}
 
 	// Last line varies based on version
 	suffix := ""
 	if ModeLabel != "" {
-		suffix = `  ` + Accent + `(` + ModeLabel + `)` + Reset
+		suffix = `  ` + a.Info + `(` + ModeLabel + `)` + a.Reset
 	}
 	if version != "" {
-		lines = append(lines, Primary+`|___/_|\_\_|_|_|___/_| |_|\__,_|_|  \___|`+Reset+`  `+Muted+`v`+version+Reset+suffix)
+		lines = append(lines, a.Warning+`|___/_|\_\_|_|_|___/_| |_|\__,_|_|  \___|`+a.Reset+`  `+a.Dim+`v`+version+a.Reset+suffix)
 	} else {
-		lines = append(lines, Primary+`|___/_|\_\_|_|_|___/_| |_|\__,_|_|  \___|`+Reset+`  `+Muted+`Sync skills across all AI CLI tools`+Reset+suffix)
+		lines = append(lines, a.Warning+`|___/_|\_\_|_|_|___/_| |_|\__,_|_|  \___|`+a.Reset+`  `+a.Dim+`Your AI coding setup, everywhere.`+a.Reset+suffix)
 	}
 
 	if animate {

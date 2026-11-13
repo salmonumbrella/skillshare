@@ -1,0 +1,194 @@
+---
+sidebar_position: 8
+---
+
+# Declarative Skill Manifest
+
+把你的 skill 收藏定義為程式碼 — 從單一 manifest 檔案安裝、分享並重現整個設定。
+
+:::tip 這什麼時候重要？
+當你想要跨機器可重現的 skill 設定、以單一指令完成團隊導入，或是開源專案的啟動流程時，就該使用 declarative manifest。
+:::
+
+## 什麼是 Skill Manifest？
+
+Skill manifest 是你 skill 收藏的一份**可攜式宣告**。你不需要逐一手動安裝 skills，而是把它們列在一個 manifest 檔案中，然後執行 `skillshare install` 把所有內容一次建立起來。
+
+Manifest 的位置取決於模式：
+
+| 模式 | Manifest 位置 | 可 commit？ |
+|------|------------------|-------------|
+| **Project** | `.skillshare/config.yaml`（`skills:` 區段） | 可以 — commit 以分享給團隊 |
+| **Global** | `~/.config/skillshare/skills/.metadata.json` | 不可 — 屬於個人機器狀態 |
+
+### Project Mode Manifest
+
+在 project mode 中，`skills:` 位於 `config.yaml` 中，與 `targets:` 並列：
+
+```yaml
+# .skillshare/config.yaml
+targets:
+  - claude
+  - cursor
+
+skills:
+  - name: react-best-practices
+    source: anthropics/skills/skills/react-best-practices
+    group: frontend
+  - name: _team-skills
+    source: my-org/shared-skills
+    tracked: true
+  - name: commit
+    source: anthropics/skills/skills/commit
+```
+
+這個檔案會被 commit 進 git — 隊友 clone repo 後執行 `skillshare install -p`，就能安裝所有列出的 skills。
+
+Manifest 記錄的是*要安裝什麼*。每個 skill 實際解析到的確切 commit 則記錄在旁邊的 `.skillshare/skills.lock.json`，這個檔案是自動寫入的，也應該一併 commit。有了這兩個檔案，即使 upstream 之後已經往前推進，`skillshare install -p` 仍會讓每位隊友得到相同的 commit。詳見 [Lockfile](./project-skills.md#lockfile)。
+
+### Global Mode Manifest
+
+在 global mode 中，skill 記錄儲存在 `.metadata.json`（集中化的 metadata 儲存區）。這個檔案也包含執行期追蹤資料（雜湊值、時間戳記），並且是自動管理的。
+
+## 運作方式
+
+### 從 Manifest 安裝
+
+在**不帶任何參數**的情況下執行 `skillshare install`，會讀取 manifest 並安裝所有列出的 skills：
+
+```bash
+# Global mode — installs all skills from ~/.config/skillshare/skills/.metadata.json
+skillshare install
+
+# Project mode — installs all skills from .skillshare/config.yaml skills: section
+skillshare install -p
+
+# Preview without installing
+skillshare install --dry-run
+```
+
+已存在的 skills 會自動被略過。在 project mode 中，若某個 skill 已安裝的 commit 與 lockfile 不同，則會改為把它移動到釘選的 commit。
+
+### 自動同步協調
+
+Manifest 會與你實際的 skill 收藏保持同步：
+
+- **`skillshare install <source>`** — 自動把安裝好的 skill 加入 manifest
+- **`skillshare uninstall <name>...`** — 自動從 manifest 中移除該項目
+
+在 project mode 中，更新的是 `config.yaml` 與 `skills.lock.json`。在 global mode 中，更新的是 `.metadata.json`。你永遠不需要手動編輯 manifest（雖然你也可以這麼做）。
+
+Global 的追蹤宣告及其稽核接受紀錄會在 checkout 不存在時保留，手動刪除 checkout 也不會移除它們。若要還原，請在來源可存取且目的路徑空閒時執行 `skillshare install`；先移走佔用路徑的資料夾。如果透過 `unlink` 騰出路徑，也會移除對應的 global 追蹤紀錄。
+
+若要直接移除宣告，請執行 `skillshare uninstall _team-skills -g`（或記錄的完整路徑，如 `devops/_team-skills`）。不需要 checkout，也不需要來源可存取。只要它仍是沒有 checkout 的追蹤宣告，就只移除紀錄及其稽核接受紀錄：該路徑的一般資料夾或指向非 checkout 的連結及其目標不受影響，`.gitignore` 不變，也不會移到垃圾桶，因此無法透過 `trash restore` 復原。路徑被佔用時，請使用含 `_` 的標準名稱；簡寫可能選中既有的 skill 或資料夾。
+
+後續 `install` 或 reconcile 若走訪該路徑的一般資料夾或有跟隨的非 checkout 連結，會將項目正規化為一般紀錄（`Tracked=false`）。此後適用一般解除安裝行為，會把佔用該路徑的內容移到垃圾桶。不存在的路徑、未跟隨或無法使用的連結不會被這樣走訪。
+
+在 project mode 中，沒有本機安裝紀錄的 config 宣告會保留，以便在新 clone 的儲存庫中執行 `skillshare install -p` 安裝。
+
+## Skill 項目欄位
+
+`skills:` 清單中每個項目都有以下欄位：
+
+| 欄位 | 必要 | 說明 |
+|-------|----------|-------------|
+| `name` | 是 | Skill 名稱（source 中的目錄名稱） |
+| `source` | 是 | 安裝來源（GitHub 簡寫、HTTPS URL、SSH URL） |
+| `tracked` | 否 | `true` 表示 tracked repository（保留 `.git`） |
+| `group` | 否 | 子目錄路徑（例如 `frontend` 或 `frontend/vue`）。對應到安裝時的 `--into`。 |
+
+## 使用情境
+
+### 個人設定
+
+跨機器維護你的個人 skill 收藏：
+
+```bash
+# On machine A — skills are already installed and tracked in registry
+skillshare push   # backup config + registry to git
+
+# On machine B — fresh machine
+skillshare pull   # restore config + registry from git
+skillshare install  # install all skills from manifest
+skillshare sync   # distribute to all targets
+```
+
+### 團隊導入
+
+新團隊成員只需一個指令就能取得相同的 AI context：
+
+```bash
+# .skillshare/config.yaml skills: section is committed to the repo
+git clone <project-repo>
+cd <project-repo>
+skillshare install -p   # installs all declared skills
+skillshare sync -p      # links to project targets
+```
+
+### 開源專案啟動流程
+
+專案維護者在 `config.yaml` 中宣告建議的 skills：
+
+```yaml
+# .skillshare/config.yaml
+targets:
+  - claude
+  - cursor
+
+skills:
+  - name: react-best-practices
+    source: anthropics/skills/skills/react-best-practices
+    group: frontend
+  - name: commit
+    source: anthropics/skills/skills/commit
+```
+
+:::info Group 欄位與 `--into`
+當你使用 `--into` 安裝時，group 會自動被記錄下來：
+
+```bash
+skillshare install anthropics/skills/skills/pdf --into frontend -p
+# config.yaml will contain: name: pdf, group: frontend
+```
+
+執行 `skillshare install -p`（不帶參數）會從 manifest 重新建立相同的目錄結構。
+:::
+
+貢獻者 clone 後執行 `skillshare install -p`，就能立刻取得專案專屬的 AI context。
+
+## 工作流程總覽
+
+```
+Project mode:
+1. Install skills normally      →  config.yaml skills: auto-updates
+2. Commit config.yaml and skills.lock.json via git  →  same skills, same commits for the team
+3. Run `skillshare install -p`  →  reproduce on clone
+4. Run `skillshare sync`        →  distribute to all targets
+
+Global mode:
+1. Install skills normally      →  .metadata.json auto-updates
+2. Push/pull config via git     →  portable across machines
+3. Run `skillshare install`     →  reproduce on new machine
+4. Run `skillshare sync`        →  distribute to all targets
+```
+
+## Extras 設定
+
+除了 skills 之外，`config.yaml` 也能宣告 **extras** — 非 skill 資源（rules、commands、prompts），會同步到獨立的目錄。Extras 設定在 `config.yaml` 的 `extras:` 區段中（global 與 project 皆適用）：
+
+```yaml
+extras:
+  - name: rules
+    targets:
+      - path: ~/.claude/rules
+      - path: ~/.cursor/rules
+        mode: copy
+```
+
+詳見 [sync extras](/docs/reference/commands/sync#sync-extras)。
+
+## 相關文件
+
+- [Install command](/docs/reference/commands/install) — 有無參數的 `skillshare install`
+- [Push/Pull](/docs/reference/commands/push) — 透過 git 備份與還原 config
+- [Project Skills](./project-skills.md) — Project 層級的 manifest

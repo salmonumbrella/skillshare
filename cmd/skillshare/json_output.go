@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"reflect"
 	"slices"
@@ -48,16 +50,42 @@ func writeJSONError(err error) error {
 		fmt.Fprintf(os.Stderr, "json marshal error: %v\n", merr)
 		fmt.Printf("{\"error\": %q}\n", err.Error())
 	} else {
-		os.Stdout.Write(out)    //nolint:errcheck
+		os.Stdout.Write(out)          //nolint:errcheck
 		os.Stdout.Write([]byte("\n")) //nolint:errcheck
 	}
 	return &jsonSilentError{cause: err}
 }
 
+// jsonUISuppressor encapsulates the common "suppress stdout/UI once,
+// restore-once-and-only-once before writing the JSON payload" pattern that
+// every --json-capable command needs. Call Flush before emitting JSON so
+// the payload goes to real stdout; deferring Flush guarantees restoration
+// even if the command returns early.
+type jsonUISuppressor struct{ restore func() }
+
+// newJSONUISuppressor suppresses UI only when jsonMode is true.
+// Returns a zero-value suppressor otherwise, so callers can unconditionally
+// defer Flush without extra branching.
+func newJSONUISuppressor(jsonMode bool) *jsonUISuppressor {
+	if !jsonMode {
+		return &jsonUISuppressor{}
+	}
+	return &jsonUISuppressor{restore: suppressUIToDevnull()}
+}
+
+// Flush restores stdout/UI. Safe to call multiple times.
+func (s *jsonUISuppressor) Flush() {
+	if s.restore != nil {
+		s.restore()
+		s.restore = nil
+	}
+}
+
 // suppressUIToDevnull temporarily redirects os.Stdout and the progress
-// writer to /dev/null so that handler functions using fmt.Printf / ui.*
-// produce zero visible output.  This keeps --json output clean even when
-// stdout and stderr share the same terminal (e.g. docker exec).
+// writer to /dev/null and silences slog so that handler functions using
+// fmt.Printf / ui.* / slog.* produce zero visible output.  This keeps --json
+// output clean even when stdout and stderr share the same terminal (e.g.
+// docker exec).
 // Returns a restore function that MUST be called before writing JSON.
 func suppressUIToDevnull() func() {
 	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
@@ -72,10 +100,14 @@ func suppressUIToDevnull() func() {
 	ui.SetProgressWriter(devnull)
 	ui.SuppressProgress()
 
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+
 	return func() {
 		os.Stdout = origStdout
 		ui.SetProgressWriter(prevProgress)
 		ui.RestoreProgress()
+		slog.SetDefault(prevLogger)
 		if devnull != os.Stderr {
 			devnull.Close()
 		}
@@ -90,6 +122,30 @@ func formatDuration(start time.Time) string {
 // hasFlag checks if a flag is present in args.
 func hasFlag(args []string, flag string) bool {
 	return slices.Contains(args, flag)
+}
+
+// isStructuredOutput returns true if the args request any machine-readable
+// output mode.  This covers --json, -j, and --format json/sarif/markdown.
+// Used by main() to suppress human-oriented output (update notices, trailing
+// newlines) that would violate the structured-output contract.
+func isStructuredOutput(args []string) bool {
+	if hasFlag(args, "--json") || hasFlag(args, "-j") {
+		return true
+	}
+	for i, arg := range args {
+		if arg == "--format" && i+1 < len(args) {
+			switch args[i+1] {
+			case "json", "sarif", "markdown":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// wantsHelp returns true if args contain --help or -h.
+func wantsHelp(args []string) bool {
+	return hasFlag(args, "--help") || hasFlag(args, "-h")
 }
 
 // ensureEmptySlices recursively walks exported struct fields and replaces nil

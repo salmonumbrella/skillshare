@@ -1,19 +1,23 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"skillshare/internal/backup"
 	"skillshare/internal/config"
+	"skillshare/internal/gitenv"
 	"skillshare/internal/install"
+	"skillshare/internal/resource"
+	"skillshare/internal/skillignore"
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/sync"
+	"skillshare/internal/theme"
 	"skillshare/internal/trash"
 	"skillshare/internal/ui"
 	"skillshare/internal/utils"
@@ -22,9 +26,17 @@ import (
 
 // doctorResult tracks issues and warnings
 type doctorResult struct {
-	errors   int
-	warnings int
+	errors         int
+	warnings       int
+	checks         []doctorCheck
+	start          time.Time
+	next           []string // command and reason pairs for the closing Next
+	updateCommands []string // Suggestions belonging to automatic version notices.
+	stream         func(doctorCheck)
 }
+
+// doctorWidth aligns the labels of doctor's fixed rows.
+var doctorWidth = ui.RowWidth("Skillignore")
 
 func (r *doctorResult) addError() {
 	r.errors++
@@ -34,24 +46,69 @@ func (r *doctorResult) addWarning() {
 	r.warnings++
 }
 
+func (r *doctorResult) addCheck(name, status, message string, details []string) {
+	r.addCheckWithSuggestions(name, status, message, details, nil)
+}
+
+func (r *doctorResult) addCheckWithSuggestions(name, status, message string, details []string, suggestions []string) {
+	check := doctorCheck{Name: name, Status: status, Message: message, Details: details, Suggestions: suggestions}
+	r.checks = append(r.checks, check)
+	if r.stream != nil {
+		r.stream(check)
+	}
+}
+
+func (r *doctorResult) addInfo(name, message string) {
+	r.addCheck(name, checkInfo, message, nil)
+}
+
+func (r *doctorResult) suggestUpdate(cmd, why string) {
+	r.suggest(cmd, why)
+	r.updateCommands = append(r.updateCommands, cmd)
+}
+
+// suggest adds a command to the closing Next, once each and at most three.
+func (r *doctorResult) suggest(cmd, why string) {
+	if len(r.next) >= 6 {
+		return
+	}
+	for i := 0; i < len(r.next); i += 2 {
+		if r.next[i] == cmd {
+			return
+		}
+	}
+	r.next = append(r.next, cmd, why)
+}
+
 func cmdDoctor(args []string) error {
+	if wantsHelp(args) {
+		printDoctorHelp()
+		return nil
+	}
+
 	mode, rest, err := parseModeArgs(args)
 	if err != nil {
 		return err
 	}
+
+	// Extract --json before checking for unexpected arguments
+	var jsonMode bool
+	var filtered []string
+	for _, arg := range rest {
+		if arg == "--json" {
+			jsonMode = true
+		} else {
+			filtered = append(filtered, arg)
+		}
+	}
+	rest = filtered
 
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("cannot determine working directory: %w", err)
 	}
 
-	if mode == modeAuto {
-		if projectConfigExists(cwd) {
-			mode = modeProject
-		} else {
-			mode = modeGlobal
-		}
-	}
+	mode = resolveAutoMode(mode, cwd)
 
 	applyModeLabel(mode)
 
@@ -59,149 +116,351 @@ func cmdDoctor(args []string) error {
 		return fmt.Errorf("unexpected arguments: %v", rest)
 	}
 
-	ui.Logo(version)
-
 	if mode == modeProject {
-		return cmdDoctorProject(cwd)
+		return cmdDoctorProject(cwd, jsonMode)
 	}
-	return cmdDoctorGlobal()
+	return cmdDoctorGlobal(jsonMode)
 }
 
-func cmdDoctorGlobal() error {
+func cmdDoctorGlobal(jsonMode bool) error {
 	// Start network check early so it overlaps with local I/O
 	updateCh := make(chan *versioncheck.CheckResult, 1)
 	go func() { updateCh <- fetchDoctorUpdateResult() }()
+	skillCh := make(chan string, 1)
+	go func() { skillCh <- fetchDoctorSkillVersion() }()
 
-	ui.Header("Checking environment")
-	result := &doctorResult{}
+	result := &doctorResult{start: time.Now()}
+	var restoreUI func()
+	if jsonMode {
+		result.stream = doctorCheckStream(os.Stdout)
+		restoreUI = suppressUIToDevnull()
+	}
+
+	fmt.Println(theme.Primary().Bold(true).Render(ui.WithModeLabel("Environment")))
 
 	// Check config exists
 	if _, err := os.Stat(config.ConfigPath()); os.IsNotExist(err) {
+		if jsonMode {
+			restoreUI()
+			return writeJSONError(fmt.Errorf("config not found: run 'skillshare init' first"))
+		}
 		ui.Error("Config not found: run 'skillshare init' first")
 		return nil
 	}
-	ui.Success("Config: %s", config.ConfigPath())
-	ui.Info("Config directory: %s", config.BaseDir())
-	ui.Info("Data directory:   %s", config.DataDir())
-	ui.Info("State directory:  %s", config.StateDir())
+	ui.Row(ui.MarkOK, "Config", shortenPath(config.ConfigPath()), doctorWidth)
+	ui.Row(ui.MarkNone, "Config dir", shortenPath(config.BaseDir()), doctorWidth)
+	ui.Row(ui.MarkNone, "Data", shortenPath(config.DataDir()), doctorWidth)
+	ui.Row(ui.MarkNone, "State", shortenPath(config.StateDir()), doctorWidth)
 
 	cfg, err := config.Load()
 	if err != nil {
+		if jsonMode {
+			restoreUI()
+			return writeJSONError(fmt.Errorf("config error: %w", err))
+		}
 		ui.Error("Config error: %v", err)
 		return nil
 	}
 
 	runDoctorChecks(cfg, result, false)
-	checkBackupStatus(false, backup.BackupDir())
-	checkTrashStatus(trash.TrashDir())
-	checkVersionDoctor(cfg)
-	printUpdateAvailable(<-updateCh)
+	checkExtras(cfg.Extras, result, false, cfg.EffectiveSkillsSource(), cfg.EffectiveExtrasSource(), "", "", func() error { return cfg.ValidateExtras() })
+	checkNativeResources(cfg, "", result)
+	ui.Section("Storage")
+	checkBackupStatus(result, false, backup.BackupDir())
+	checkTrashStatus(result, trash.TrashDir())
+	checkVersionDoctor(cfg, result, false, skillCh)
+
+	if jsonMode {
+		return finalizeDoctorJSON(restoreUI, result, updateCh)
+	}
+
+	printUpdateAvailable(<-updateCh, result)
 	printDoctorSummary(result)
 
 	return nil
 }
 
-func cmdDoctorProject(root string) error {
+func cmdDoctorProject(root string, jsonMode bool) error {
 	updateCh := make(chan *versioncheck.CheckResult, 1)
 	go func() { updateCh <- fetchDoctorUpdateResult() }()
+	skillCh := make(chan string, 1)
+	go func() { skillCh <- fetchDoctorSkillVersion() }()
 
-	ui.Header("Checking environment")
-	result := &doctorResult{}
+	result := &doctorResult{start: time.Now()}
+	var restoreUI func()
+	if jsonMode {
+		result.stream = doctorCheckStream(os.Stdout)
+		restoreUI = suppressUIToDevnull()
+	}
+
+	fmt.Println(theme.Primary().Bold(true).Render(ui.WithModeLabel("Environment")))
 
 	cfgPath := config.ProjectConfigPath(root)
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		if jsonMode {
+			restoreUI()
+			return writeJSONError(fmt.Errorf("project config not found: run 'skillshare init -p' first"))
+		}
 		ui.Error("Project config not found: run 'skillshare init -p' first")
 		return nil
 	}
-	ui.Success("Config: %s", cfgPath)
+	ui.Row(ui.MarkOK, "Config", shortenPath(cfgPath), doctorWidth)
 
 	rt, err := loadProjectRuntime(root)
 	if err != nil {
+		if jsonMode {
+			restoreUI()
+			return writeJSONError(fmt.Errorf("config error: %w", err))
+		}
 		ui.Error("Config error: %v", err)
 		return nil
 	}
 
 	cfg := &config.Config{
-		Source:  rt.sourcePath,
-		Targets: rt.targets,
-		Mode:    "merge",
-		Audit:   rt.config.Audit,
+		Source:            rt.sourcePath,
+		AgentsSource:      rt.agentsSourcePath,
+		FollowSourceLinks: rt.config.FollowSourceLinks,
+		Targets:           rt.targets,
+		Mode:              "merge",
+		Audit:             rt.config.Audit,
 	}
 
-	runDoctorChecks(cfg, result, true)
-	checkBackupStatus(true, "")
-	checkTrashStatus(trash.ProjectTrashDir(root))
-	checkVersionDoctor(cfg)
-	printUpdateAvailable(<-updateCh)
+	runDoctorChecks(cfg, result, true, root)
+	checkExtras(rt.config.Extras, result, true, "", "", root, rt.config.EffectiveExtrasSource(root), func() error { return rt.config.ValidateExtras(root) })
+	checkNativeResources(nil, root, result)
+	ui.Section("Storage")
+	checkBackupStatus(result, true, "")
+	checkTrashStatus(result, trash.ProjectTrashDir(root))
+	checkVersionDoctor(cfg, result, true, skillCh)
+
+	if jsonMode {
+		return finalizeDoctorJSON(restoreUI, result, updateCh)
+	}
+
+	printUpdateAvailable(<-updateCh, result)
 	printDoctorSummary(result)
 
 	return nil
 }
 
-func runDoctorChecks(cfg *config.Config, result *doctorResult, isProject bool) {
-	// Single discovery pass for all checks
+func runDoctorChecks(cfg *config.Config, result *doctorResult, isProject bool, projectRoots ...string) {
+	// Single discovery pass for all checks (with .skillignore stats)
 	sp := ui.StartSpinner("Discovering skills...")
-	discovered, discoverErr := sync.DiscoverSourceSkills(cfg.Source)
+	walk := cfg.SkillsWalk()
+	discovered, stats, discoverErr := sync.DiscoverSourceSkillsWithStats(cfg.EffectiveSkillsSource(), walk)
 	if discoverErr != nil {
 		discovered = nil
 	}
 	sp.Stop()
 
-	checkSource(cfg, result, discovered, discoverErr)
+	checkSource(cfg, walk, result, discovered, discoverErr)
+	checkAgentsSource(cfg, result)
+	checkSkillignore(result, stats)
+	checkUndeclaredSourceLinks(cfg.EffectiveSkillsSource(), walk, result)
 	checkSymlinkSupport(result)
+	checkTheme(result)
 
 	if !isProject {
-		checkGitStatus(cfg.Source, result)
+		checkGitStatus(cfg.EffectiveSkillsSource(), result)
 	}
+	checkMissingTrackedRepos(cfg.EffectiveSkillsSource(), result, isProject, walk)
 
-	checkSkillsValidity(cfg.Source, result, discovered)
-	checkSkillIntegrity(result, discovered)
+	checkSkillsValidity(cfg.EffectiveSkillsSource(), walk, result, discovered)
+	checkSkillIntegrity(result, discovered, walk.Follow)
+	projectRoot := ""
+	if len(projectRoots) > 0 {
+		projectRoot = projectRoots[0]
+	}
+	checkSkillReferences(result, discovered, projectRoot, walk.Follow)
 	checkSkillTargetsField(result, discovered, targetNamesFromConfig(cfg.Targets))
-	targetCache := checkTargets(cfg, result)
+	targetCache := checkTargets(cfg, result, isProject)
 	printSymlinkCompatHint(cfg.Targets, cfg.Mode, isProject)
+	checkSharedTargetPaths(cfg, result, isProject)
+	checkCrossTargetDiscovery(cfg, result, isProject, discovered)
 	checkSyncDrift(cfg, result, discovered, targetCache)
-	checkBrokenSymlinks(cfg, result)
+	checkBrokenSymlinks(cfg, walk.Follow, result)
 	checkDuplicateSkills(cfg, result, discovered)
 }
 
 func printDoctorSummary(result *doctorResult) {
-	ui.Header("Summary")
-	if result.errors == 0 && result.warnings == 0 {
-		ui.Success("All checks passed!")
-	} else if result.errors == 0 {
-		ui.Warning("%d warning(s)", result.warnings)
-	} else {
-		ui.Error("%d error(s), %d warning(s)", result.errors, result.warnings)
+	if !config.AutoUpdateCheckEnabled() {
+		quiet := *result
+		quiet.next = nil
+		for i := 0; i+1 < len(result.next); i += 2 {
+			if !slices.Contains(result.updateCommands, result.next[i]) {
+				quiet.next = append(quiet.next, result.next[i:i+2]...)
+			}
+		}
+		for _, check := range result.checks {
+			if check.UpdateAvailable && check.Status == checkWarning {
+				quiet.warnings--
+			}
+		}
+		result = &quiet
 	}
-
+	fmt.Println()
+	took := time.Since(result.start)
+	switch {
+	case result.errors == 0 && result.warnings == 0:
+		ui.Done(ui.MarkOK, "All checks passed", took)
+	case result.errors == 0:
+		ui.Done(ui.MarkWarn, plural(result.warnings, "warning"), took)
+	case result.warnings == 0:
+		ui.Done(ui.MarkFail, plural(result.errors, "error"), took)
+	default:
+		ui.Done(ui.MarkFail, plural(result.errors, "error")+", "+plural(result.warnings, "warning"), took)
+	}
+	ui.Next(result.next...)
 }
 
-func checkSource(cfg *config.Config, result *doctorResult, discovered []sync.DiscoveredSkill, discoverErr error) {
-	info, err := os.Stat(cfg.Source)
+// checkSkillignore reports .skillignore status as an info or pass check.
+func checkSkillignore(result *doctorResult, stats *skillignore.IgnoreStats) {
+	if stats == nil || !stats.Active() {
+		ui.Row(ui.MarkNone, "Skillignore", "not configured", doctorWidth)
+		result.addInfo("skillignore", "No .skillignore found — you can create one to hide skills from discovery")
+		return
+	}
+
+	msg := fmt.Sprintf("%d patterns, %d skills ignored", stats.PatternCount(), stats.IgnoredCount())
+	if stats.HasLocal() {
+		msg += " (.local active)"
+	}
+	shown := plural(stats.PatternCount(), "pattern") + ", " + plural(stats.IgnoredCount(), "skill") + " ignored"
+	if stats.HasLocal() {
+		shown += " (.local active)"
+	}
+	ui.Row(ui.MarkOK, "Skillignore", shown, doctorWidth)
+	var details []string
+	details = append(details, stats.Patterns...)
+	if len(stats.IgnoredSkills) > 0 {
+		details = append(details, "---")
+		details = append(details, stats.IgnoredSkills...)
+	}
+	result.addCheck("skillignore", checkPass, ".skillignore: "+msg, details)
+}
+
+// checkUndeclaredSourceLinks reports first-level links by their raw identity:
+// not followed while follow_source_links is off; followed, or skipped with the
+// reason, while walk follows them.
+func checkUndeclaredSourceLinks(source string, walk sourcewalk.Options, result *doctorResult) {
+	root := utils.ResolveSymlink(source)
+	entries, err := sourcewalk.ReadDir(root, sourcewalk.Options{})
 	if err != nil {
-		ui.Error("Source not found: %s", cfg.Source)
+		return
+	}
+	followed := map[string]bool{}
+	skipped := map[string]sourcewalk.Skipped{}
+	if walk.Follow != nil {
+		view, _ := sourcewalk.ReadDir(root, walk)
+		for _, e := range view {
+			followed[e.Name()] = e.IsDir()
+		}
+		for _, s := range walk.Follow.Skipped() {
+			skipped[s.Name] = s
+		}
+	}
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		info, err := entry.Info()
+		if err != nil || !utils.IsLinkMode(path, info.Mode()) {
+			continue
+		}
+		if s, ok := skipped[entry.Name()]; ok {
+			message := entry.Name() + ": not followed: " + s.Reason
+			ui.Row(ui.MarkWarn, "Source link", message, doctorWidth)
+			result.addWarning()
+			result.addCheck("undeclared_source_links", checkWarning, message, nil)
+			continue
+		}
+		message := entry.Name() + ": followed as a directory (follow_source_links)"
+		if !followed[entry.Name()] {
+			if walk.Follow != nil {
+				continue // a link to a file is an ordinary entry
+			}
+			target, err := os.Stat(path)
+			message = unfollowedLinkHint(entry.Name(), err != nil || target.IsDir())
+		}
+		ui.Row(ui.MarkNone, "Source link", message, doctorWidth)
+		result.addInfo("undeclared_source_links", message)
+	}
+}
+
+// unfollowedLinkHint is doctor's line for a first-level source link while
+// follow_source_links is off; dir adds how to follow it.
+func unfollowedLinkHint(name string, dir bool) string {
+	message := name + ": not followed by discovery; its contents are invisible to skillshare"
+	if dir {
+		message += ". Set follow_source_links: true to follow it"
+	}
+	return message
+}
+
+func checkSource(cfg *config.Config, walk sourcewalk.Options, result *doctorResult, discovered []sync.DiscoveredSkill, discoverErr error) {
+	info, err := os.Stat(cfg.EffectiveSkillsSource())
+	if err != nil {
+		ui.Row(ui.MarkFail, "Source", "not found: "+shortenPath(cfg.EffectiveSkillsSource()), doctorWidth)
+		result.suggest("skillshare init", "create the source")
 		result.addError()
+		result.addCheck("source", checkError, fmt.Sprintf("Source not found: %s", cfg.EffectiveSkillsSource()), nil)
 		return
 	}
 
 	if !info.IsDir() {
-		ui.Error("Source is not a directory: %s", cfg.Source)
+		ui.Row(ui.MarkFail, "Source", "not a directory: "+shortenPath(cfg.EffectiveSkillsSource()), doctorWidth)
 		result.addError()
+		result.addCheck("source", checkError, fmt.Sprintf("Source is not a directory: %s", cfg.EffectiveSkillsSource()), nil)
 		return
 	}
 
 	skillCount := 0
+	var variants int
 	if discoverErr == nil {
-		skillCount = len(discovered)
+		counts := sync.CountSkills(discovered)
+		skillCount, variants = counts.Skills, counts.Variants
 	} else {
-		entries, _ := os.ReadDir(cfg.Source)
+		entries, _ := sourcewalk.ReadDir(cfg.EffectiveSkillsSource(), walk)
 		for _, e := range entries {
 			if e.IsDir() && !utils.IsHidden(e.Name()) {
 				skillCount++
 			}
 		}
 	}
-	ui.Success("Source: %s (%d skills)", cfg.Source, skillCount)
+	count := sourceSkillCountText(skillCount, variants)
+	ui.Row(ui.MarkOK, "Source", shortenPath(cfg.EffectiveSkillsSource())+ui.DimText(" · "+count), doctorWidth)
+	result.addCheck("source", checkPass, fmt.Sprintf("Source: %s (%s)", cfg.EffectiveSkillsSource(), count), nil)
+}
+
+func checkAgentsSource(cfg *config.Config, result *doctorResult) {
+	agentsSource := cfg.EffectiveAgentsSource()
+	info, err := os.Stat(agentsSource)
+	if err != nil {
+		if os.IsNotExist(err) {
+			ui.Row(ui.MarkNone, "Agents", shortenPath(agentsSource)+ui.DimText(" · not created yet"), doctorWidth)
+			result.addCheck("agents_source", checkPass, fmt.Sprintf("Agents source: %s (not created yet)", agentsSource), nil)
+			return
+		}
+		ui.Row(ui.MarkFail, "Agents", err.Error(), doctorWidth)
+		result.addError()
+		result.addCheck("agents_source", checkError, fmt.Sprintf("Agents source error: %v", err), nil)
+		return
+	}
+
+	if !info.IsDir() {
+		ui.Row(ui.MarkFail, "Agents", "not a directory: "+shortenPath(agentsSource), doctorWidth)
+		result.addError()
+		result.addCheck("agents_source", checkError, fmt.Sprintf("Agents source is not a directory: %s", agentsSource), nil)
+		return
+	}
+
+	agentCount := 0
+	entries, _ := os.ReadDir(agentsSource)
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".md") {
+			agentCount++
+		}
+	}
+	ui.Row(ui.MarkOK, "Agents", shortenPath(agentsSource)+ui.DimText(" · "+plural(agentCount, "agent")), doctorWidth)
+	result.addCheck("agents_source", checkPass, fmt.Sprintf("Agents source: %s (%d agents)", agentsSource, agentCount), nil)
 }
 
 func checkSymlinkSupport(result *doctorResult) {
@@ -214,13 +473,84 @@ func checkSymlinkSupport(result *doctorResult) {
 	defer os.RemoveAll(testTarget)
 
 	// Use sync.CreateSymlink which handles Windows junctions
-	if err := sync.CreateSymlink(testLink, testTarget); err != nil {
-		ui.Error("Link not supported: %v", err)
+	if err := sync.CreateSymlink(testLink, testTarget, ""); err != nil {
+		ui.Row(ui.MarkFail, "Links", fmt.Sprintf("not supported: %v", err), doctorWidth)
 		result.addError()
+		result.addCheck("symlink_support", checkError, fmt.Sprintf("Link not supported: %v", err), nil)
 		return
 	}
 
-	ui.Success("Link support: OK")
+	ui.Row(ui.MarkOK, "Links", "supported", doctorWidth)
+	result.addCheck("symlink_support", checkPass, "Link support: OK", nil)
+}
+
+// checkTheme reports the resolved theme mode and source. Emits a warning
+// status when the theme fell back to dark due to probe failure or non-TTY
+// environments — users can resolve by setting SKILLSHARE_THEME explicitly.
+func checkTheme(result *doctorResult) {
+	tm := theme.Get()
+
+	var status string
+	switch tm.Source {
+	case "env", "detected", "no-color":
+		status = checkPass
+	case "fallback-dark-no-tty", "fallback-dark-probe-failed":
+		status = checkWarning
+	default:
+		status = checkInfo
+	}
+
+	// Build user-friendly message based on how the theme was resolved.
+	var msg string
+	switch {
+	case tm.NoColor:
+		msg = "Theme: colors disabled (NO_COLOR is set)"
+	case tm.Source == "env":
+		msg = fmt.Sprintf("Theme: %s (set via SKILLSHARE_THEME)", tm.Mode)
+	case tm.Source == "detected":
+		msg = fmt.Sprintf("Theme: %s (auto-detected from terminal)", tm.Mode)
+	case tm.Source == "fallback-dark-no-tty":
+		msg = fmt.Sprintf("Theme: %s (non-interactive terminal, defaulted to dark)", tm.Mode)
+	case tm.Source == "fallback-dark-probe-failed":
+		msg = fmt.Sprintf("Theme: %s (terminal detection failed, defaulted to dark)", tm.Mode)
+	default:
+		msg = fmt.Sprintf("Theme: %s", tm.Mode)
+	}
+
+	// Details: actionable guidance only, not raw internals.
+	var details []string
+	envVal := envOrDefault("SKILLSHARE_THEME", "")
+	if envVal != "" {
+		details = append(details, fmt.Sprintf("SKILLSHARE_THEME is set to \"%s\"", envVal))
+	}
+	if status == checkWarning {
+		details = append(details, "Tip: set SKILLSHARE_THEME=light or SKILLSHARE_THEME=dark to choose your theme")
+	}
+	if tm.NoColor {
+		details = append(details, "Unset NO_COLOR to re-enable colors")
+	}
+
+	mark := ui.MarkNone
+	switch status {
+	case checkPass:
+		mark = ui.MarkOK
+	case checkWarning:
+		mark = ui.MarkWarn
+	}
+	ui.Row(mark, "Theme", strings.TrimPrefix(msg, "Theme: "), doctorWidth)
+
+	if status == checkWarning {
+		result.addWarning()
+	}
+	result.addCheck("theme", status, msg, details)
+}
+
+// envOrDefault returns the value of env var name or the given default.
+func envOrDefault(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
 }
 
 // cachedTargetStatus stores CheckStatusMerge/Copy results so checkSyncDrift
@@ -229,51 +559,119 @@ type cachedTargetStatus struct {
 	syncedCount int
 	mode        string
 	status      sync.TargetStatus
+	needsSync   bool
 }
 
-func checkTargets(cfg *config.Config, result *doctorResult) map[string]cachedTargetStatus {
-	ui.Header("Checking targets")
+func checkTargets(cfg *config.Config, result *doctorResult, isProject bool) map[string]cachedTargetStatus {
+	ui.Section("Targets")
 	cache := make(map[string]cachedTargetStatus)
 
-	for name, target := range cfg.Targets {
-		mode := target.Mode
+	// Prepare agent context for per-target agent checks
+	agentsSource := cfg.EffectiveAgentsSource()
+	agentsExist := dirExists(agentsSource)
+	var discoveredAgents []resource.DiscoveredResource
+	if agentsExist {
+		all, _ := resource.AgentKind{}.Discover(agentsSource)
+		discoveredAgents = resource.ActiveAgents(all)
+	}
+	builtinAgents := config.DefaultAgentTargets()
+	if isProject {
+		builtinAgents = config.ProjectAgentTargets()
+	}
+
+	var details []string
+	hasError := false
+
+	names := targetNamesFromConfig(cfg.Targets)
+	sort.Strings(names)
+	width := ui.RowWidth(names...)
+	for _, name := range names {
+		target := cfg.Targets[name]
+		sc := target.SkillsConfig()
+		mode := sc.Mode
 		if mode == "" {
 			mode = cfg.Mode
 		}
 		if mode == "" {
 			mode = "merge"
 		}
-		if _, err := sync.FilterSkills(nil, target.Include, target.Exclude); err != nil {
-			ui.Error("%s [%s]: invalid include/exclude config: %v", name, mode, err)
-			result.addError()
+		// The name labels the target's first row only.
+		label := name
+		row := func(mark, kind, text string) {
+			ui.Row(mark, label, fmt.Sprintf("%-6s  %s", kind, text), width)
+			label = ""
+		}
+		// Skills off: the folder is not managed, so it has nothing to check.
+		if !sc.IsEnabled() {
+			row(ui.MarkNone, "skills", ui.DimText(skillsOffSummary))
+			if agentsExist {
+				checkAgentTargetInline(name, target, builtinAgents, discoveredAgents, result, row)
+			}
 			continue
 		}
-		if mode == "symlink" && (len(target.Include) > 0 || len(target.Exclude) > 0) {
-			ui.Warning("%s [%s]: include/exclude ignored in symlink mode", name, mode)
+		if _, err := sync.FilterSkills(nil, sc.Include, sc.Exclude); err != nil {
+			row(ui.MarkFail, "skills", fmt.Sprintf("invalid include/exclude config: %v", err))
+			result.addError()
+			details = append(details, fmt.Sprintf("%s: invalid include/exclude config: %v", name, err))
+			hasError = true
+			continue
+		}
+		if err := target.NamingModeConfigError(mode); err != nil {
+			row(ui.MarkFail, "skills", err.Error()+ui.DimText(" · "+mode))
+			result.addError()
+			details = append(details, fmt.Sprintf("%s: %v", name, err))
+			hasError = true
+			if agentsExist {
+				checkAgentTargetInline(name, target, builtinAgents, discoveredAgents, result, row)
+			}
+			continue
+		}
+		if mode == "symlink" && (len(sc.Include) > 0 || len(sc.Exclude) > 0) {
+			row(ui.MarkWarn, "skills", "include/exclude ignored in symlink mode")
 			result.addWarning()
 		}
 
-		targetIssues := checkTargetIssues(target, cfg.Source)
+		targetIssues := checkTargetIssues(target, cfg.EffectiveSkillsSource(), mode)
 
 		if len(targetIssues) > 0 {
-			ui.Error("%s [%s]: %s", name, mode, strings.Join(targetIssues, ", "))
+			row(ui.MarkFail, "skills", strings.Join(targetIssues, ", ")+ui.DimText(" · "+mode))
 			result.addError()
+			details = append(details, fmt.Sprintf("%s: %s", name, strings.Join(targetIssues, ", ")))
+			hasError = true
 		} else {
-			cached := displayTargetStatus(name, target, cfg.Source, mode)
+			cached := displayTargetStatus(target, cfg.EffectiveSkillsSource(), mode, row)
 			cache[name] = cached
+			if cached.needsSync {
+				result.suggest("skillshare sync", "bring the targets up to date")
+			}
+		}
+
+		// Agent sub-check for this target
+		if agentsExist {
+			checkAgentTargetInline(name, target, builtinAgents, discoveredAgents, result, row)
 		}
 	}
+
+	if hasError {
+		result.addCheck("targets", checkError, "Some targets have issues", details)
+	} else if len(cfg.Targets) > 0 {
+		result.addCheck("targets", checkPass, fmt.Sprintf("All %d target(s) OK", len(cfg.Targets)), nil)
+	} else {
+		result.addCheck("targets", checkWarning, "No targets configured", nil)
+	}
+
 	return cache
 }
 
-func checkTargetIssues(target config.TargetConfig, source string) []string {
+func checkTargetIssues(target config.TargetConfig, source, mode string) []string {
+	sc := target.SkillsConfig()
 	var targetIssues []string
 
-	info, err := os.Lstat(target.Path)
+	info, err := os.Lstat(sc.Path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Check parent is writable
-			parent := filepath.Dir(target.Path)
+			parent := filepath.Dir(sc.Path)
 			if _, err := os.Stat(parent); err != nil {
 				targetIssues = append(targetIssues, "parent directory not found")
 			}
@@ -283,19 +681,20 @@ func checkTargetIssues(target config.TargetConfig, source string) []string {
 		return targetIssues
 	}
 
-	// Check if it's a symlink
-	if info.Mode()&os.ModeSymlink != 0 {
-		link, _ := os.Readlink(target.Path)
-		absLink, _ := filepath.Abs(link)
+	// Check if it's a symlink. Relative links must resolve against the link's
+	// parent directory, not the current working directory.
+	if mode == "symlink" && utils.IsLinkMode(sc.Path, info.Mode()) {
+		link, _ := os.Readlink(sc.Path)
+		absLink, err := utils.ResolveLinkTarget(sc.Path)
 		absSource, _ := filepath.Abs(source)
-		if !utils.PathsEqual(absLink, absSource) {
+		if err != nil || !utils.PathsEqual(absLink, absSource) {
 			targetIssues = append(targetIssues, fmt.Sprintf("symlink points to wrong location: %s", link))
 		}
 	}
 
 	// Check write permission
 	if info.IsDir() {
-		testFile := filepath.Join(target.Path, ".skillshare_write_test")
+		testFile := filepath.Join(sc.Path, ".skillshare_write_test")
 		if f, err := os.Create(testFile); err != nil {
 			targetIssues = append(targetIssues, "not writable")
 		} else {
@@ -307,63 +706,81 @@ func checkTargetIssues(target config.TargetConfig, source string) []string {
 	return targetIssues
 }
 
-func displayTargetStatus(name string, target config.TargetConfig, source, mode string) cachedTargetStatus {
-	var statusStr string
+func displayTargetStatus(target config.TargetConfig, source, mode string, row func(mark, kind, text string)) cachedTargetStatus {
+	sc := target.SkillsConfig()
+	var statusWord, detail string
 	var cached cachedTargetStatus
 	cached.mode = mode
 	needsSync := false
 
 	switch mode {
 	case "merge":
-		status, linkedCount, localCount := sync.CheckStatusMerge(target.Path, source)
+		status, linkedCount, localCount := sync.CheckStatusMerge(sc.Path, source)
 		cached.status = status
 		cached.syncedCount = linkedCount
 		switch status {
 		case sync.StatusMerged:
-			statusStr = fmt.Sprintf("merged (%d shared, %d local)", linkedCount, localCount)
+			statusWord = "merged"
+			detail = joinAgentCounts(linkedCount, "shared", localCount)
 		case sync.StatusLinked:
-			statusStr = "linked (needs sync to apply merge mode)"
+			statusWord = "linked"
+			detail = "needs sync"
 			needsSync = true
 		default:
-			statusStr = status.String()
+			statusWord = status.String()
 		}
 	case "copy":
-		status, managedCount, localCount := sync.CheckStatusCopy(target.Path)
+		status, managedCount, localCount := sync.CheckStatusCopy(sc.Path)
 		cached.status = status
 		cached.syncedCount = managedCount
 		switch status {
 		case sync.StatusCopied:
-			statusStr = fmt.Sprintf("copied (%d managed, %d local)", managedCount, localCount)
+			statusWord = "copied"
+			detail = joinAgentCounts(managedCount, "managed", localCount)
 		case sync.StatusLinked:
-			statusStr = "linked (needs sync to apply copy mode)"
+			statusWord = "linked"
+			detail = "needs sync"
 			needsSync = true
 		default:
-			statusStr = status.String()
+			statusWord = status.String()
 		}
 	default:
-		status := sync.CheckStatus(target.Path, source)
+		status := sync.CheckStatus(sc.Path, source)
 		cached.status = status
-		statusStr = status.String()
+		statusWord = status.String()
 		if status == sync.StatusMerged {
-			statusStr = "merged (needs sync to apply symlink mode)"
+			statusWord = "merged"
+			detail = "needs sync"
 			needsSync = true
 		}
 	}
 
+	mark := ui.MarkOK
 	if needsSync {
-		ui.Warning("%s [%s]: %s", name, mode, statusStr)
-	} else {
-		ui.Success("%s [%s]: %s", name, mode, statusStr)
+		mark = ui.MarkWarn
 	}
+	cached.needsSync = needsSync
+	info := mode
+	if detail != "" {
+		info += " · " + detail
+	}
+	row(mark, "skills", statusWord+ui.DimText(" · "+info))
 	return cached
 }
 
 func checkSyncDrift(cfg *config.Config, result *doctorResult, discovered []sync.DiscoveredSkill, targetCache map[string]cachedTargetStatus) {
+	checkVariantRouting(cfg, result, discovered)
 	if discovered == nil {
+		result.addCheck("sync_drift", checkPass, "No skills discovered, skipping drift check", nil)
 		return
 	}
 
-	for name, target := range cfg.Targets {
+	var driftDetails []string
+	names := targetNamesFromConfig(cfg.Targets)
+	sort.Strings(names)
+	width := ui.RowWidth(names...)
+	for _, name := range names {
+		target := cfg.Targets[name]
 		cached, ok := targetCache[name]
 		if !ok {
 			continue // target had issues, skip drift check
@@ -371,14 +788,13 @@ func checkSyncDrift(cfg *config.Config, result *doctorResult, discovered []sync.
 		if cached.mode != "merge" && cached.mode != "copy" {
 			continue
 		}
-		filtered, err := sync.FilterSkills(discovered, target.Include, target.Exclude)
+		sc := target.SkillsConfig()
+		expectedCount, err := sync.ExpectedSkillCount(name, sc, discovered)
 		if err != nil {
-			ui.Error("%s: invalid include/exclude config: %v", name, err)
+			ui.Row(ui.MarkFail, name, fmt.Sprintf("invalid include/exclude config: %v", err), width)
 			result.addError()
 			continue
 		}
-		filtered = sync.FilterSkillsByTarget(filtered, name)
-		expectedCount := len(filtered)
 		if expectedCount == 0 {
 			continue
 		}
@@ -389,8 +805,11 @@ func checkSyncDrift(cfg *config.Config, result *doctorResult, discovered []sync.
 			}
 			if cached.syncedCount < expectedCount {
 				drift := expectedCount - cached.syncedCount
-				ui.Warning("%s: %d skill(s) not synced (%d/%d copied)", name, drift, cached.syncedCount, expectedCount)
+				msg := fmt.Sprintf("%s: %d skill(s) not synced (%d/%d copied)", name, drift, cached.syncedCount, expectedCount)
+				ui.Row(ui.MarkWarn, name, plural(drift, "skill")+" not synced"+ui.DimText(fmt.Sprintf(" · %d/%d copied", cached.syncedCount, expectedCount)), width)
+				result.suggest("skillshare sync", "bring the targets up to date")
 				result.addWarning()
+				driftDetails = append(driftDetails, msg)
 			}
 		} else {
 			if cached.status != sync.StatusMerged {
@@ -398,53 +817,98 @@ func checkSyncDrift(cfg *config.Config, result *doctorResult, discovered []sync.
 			}
 			if cached.syncedCount < expectedCount {
 				drift := expectedCount - cached.syncedCount
-				ui.Warning("%s: %d skill(s) not synced (%d/%d linked)", name, drift, cached.syncedCount, expectedCount)
+				msg := fmt.Sprintf("%s: %d skill(s) not synced (%d/%d linked)", name, drift, cached.syncedCount, expectedCount)
+				ui.Row(ui.MarkWarn, name, plural(drift, "skill")+" not synced"+ui.DimText(fmt.Sprintf(" · %d/%d linked", cached.syncedCount, expectedCount)), width)
+				result.suggest("skillshare sync", "bring the targets up to date")
 				result.addWarning()
+				driftDetails = append(driftDetails, msg)
 			}
 		}
+	}
+
+	if len(driftDetails) > 0 {
+		result.addCheck("sync_drift", checkWarning, "Sync drift detected", driftDetails)
+	} else {
+		result.addCheck("sync_drift", checkPass, "No sync drift detected", nil)
 	}
 }
 
 // checkGitStatus checks if source is a git repo and its status
 func checkGitStatus(source string, result *doctorResult) {
-	gitDir := filepath.Join(source, ".git")
-	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
-		ui.Warning("Git: not initialized (recommended for backup)")
+	cmd := gitenv.Command("rev-parse", "--is-inside-work-tree")
+	cmd.Dir = source
+	if err := cmd.Run(); err != nil {
+		ui.Row(ui.MarkWarn, "Git", "not initialized (recommended for backup)", doctorWidth)
 		result.addWarning()
+		result.addCheck("git_status", checkWarning, "Git: not initialized (recommended for backup)", nil)
 		return
 	}
 
 	// Check for uncommitted changes
-	cmd := exec.Command("git", "status", "--porcelain")
+	cmd = gitenv.Command("status", "--porcelain")
 	cmd.Dir = source
 	output, err := cmd.Output()
 	if err != nil {
-		ui.Warning("Git: unable to check status")
+		ui.Row(ui.MarkWarn, "Git", "unable to check status", doctorWidth)
 		result.addWarning()
+		result.addCheck("git_status", checkWarning, "Git: unable to check status", nil)
 		return
 	}
 
 	if len(output) > 0 {
 		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-		ui.Warning("Git: %d uncommitted change(s)", len(lines))
+		ui.Row(ui.MarkWarn, "Git", plural(len(lines), "uncommitted change"), doctorWidth)
 		result.addWarning()
+		result.addCheck("git_status", checkWarning, fmt.Sprintf("Git: %d uncommitted change(s)", len(lines)), nil)
 		return
 	}
 
 	// Check for remote
-	cmd = exec.Command("git", "remote")
+	cmd = gitenv.Command("remote")
 	cmd.Dir = source
 	output, err = cmd.Output()
 	if err == nil && len(strings.TrimSpace(string(output))) == 0 {
-		ui.Success("Git: initialized (no remote configured)")
+		ui.Row(ui.MarkOK, "Git", "initialized, no remote configured", doctorWidth)
+		result.addCheck("git_status", checkPass, "Git: initialized (no remote configured)", nil)
 	} else {
-		ui.Success("Git: initialized with remote")
+		ui.Row(ui.MarkOK, "Git", "initialized with remote", doctorWidth)
+		result.addCheck("git_status", checkPass, "Git: initialized with remote", nil)
 	}
 }
 
 // checkSkillsValidity checks if all skills have valid SKILL.md files
-func checkSkillsValidity(source string, result *doctorResult, discovered []sync.DiscoveredSkill) {
-	entries, err := os.ReadDir(source)
+func checkMissingTrackedRepos(source string, result *doctorResult, isProject bool, walks ...sourcewalk.Options) {
+	missingRepos, err := install.GetMissingTrackedRepos(source, walks...)
+	if err != nil || len(missingRepos) == 0 {
+		return
+	}
+
+	details := make([]string, 0, len(missingRepos))
+	for _, repo := range missingRepos {
+		detail := repo.Name
+		if repo.Source != "" {
+			detail += " ← " + repo.Source
+		}
+		details = append(details, detail)
+	}
+
+	suggestion := "Run 'skillshare install' to rehydrate tracked repositories from metadata."
+	if isProject {
+		suggestion = "Run 'skillshare install -p' to rehydrate tracked repositories from project metadata."
+	}
+
+	result.addWarning()
+	result.addCheckWithSuggestions(
+		"tracked_repos",
+		checkWarning,
+		fmt.Sprintf("%d tracked repository clone(s) are missing", len(missingRepos)),
+		details,
+		[]string{suggestion},
+	)
+}
+
+func checkSkillsValidity(source string, walk sourcewalk.Options, result *doctorResult, discovered []sync.DiscoveredSkill) {
+	entries, err := sourcewalk.ReadDir(source, walk)
 	if err != nil {
 		return
 	}
@@ -481,47 +945,60 @@ func checkSkillsValidity(source string, result *doctorResult, discovered []sync.
 	}
 
 	if len(invalid) > 0 {
-		ui.Warning("Skills without SKILL.md: %s", strings.Join(invalid, ", "))
+		ui.Row(ui.MarkWarn, "Skills", fmt.Sprintf("%d without SKILL.md: %s", len(invalid), strings.Join(invalid, ", ")), doctorWidth)
 		result.addWarning()
+		result.addCheck("skills_validity", checkWarning, fmt.Sprintf("Skills without SKILL.md: %s", strings.Join(invalid, ", ")), invalid)
+	} else {
+		result.addCheck("skills_validity", checkPass, "All skills have valid SKILL.md", nil)
 	}
 }
 
 // checkSkillIntegrity verifies installed skills haven't been tampered with by
 // comparing current file hashes against the stored .skillshare-meta.json hashes.
-func checkSkillIntegrity(result *doctorResult, discovered []sync.DiscoveredSkill) {
+func checkSkillIntegrity(result *doctorResult, discovered []sync.DiscoveredSkill, follow ...*sourcewalk.Follow) {
 	if discovered == nil {
 		return
 	}
 
-	// Phase 1: filter to skills that have meta with file hashes (cheap ReadMeta only)
+	// Phase 1: filter to skills that have meta with file hashes
 	type verifiable struct {
 		name   string
 		path   string
 		stored map[string]string
 	}
 	var toVerify []verifiable
-	var skippedCount int
+	var skippedNames []string
+
+	store := install.NewMetadataStore()
+	if len(discovered) > 0 {
+		sourceDir := strings.TrimSuffix(discovered[0].SourcePath, discovered[0].RelPath)
+		sourceDir = strings.TrimRight(sourceDir, `/\`)
+		store = install.LoadMetadataOrNew(sourceDir)
+	}
 
 	for _, skill := range discovered {
-		meta, err := install.ReadMeta(skill.SourcePath)
-		if err != nil {
-			continue
+		entry := store.GetByPath(skill.RelPath)
+		if entry == nil {
+			continue // Local skill without meta — expected, skip silently
 		}
-		if meta == nil || meta.FileHashes == nil {
-			skippedCount++
+		if entry.FileHashes == nil {
+			skippedNames = append(skippedNames, skill.RelPath)
 			continue
 		}
 		toVerify = append(toVerify, verifiable{
 			name:   skill.RelPath,
 			path:   skill.SourcePath,
-			stored: meta.FileHashes,
+			stored: entry.FileHashes,
 		})
 	}
 
 	if len(toVerify) == 0 {
-		if skippedCount > 0 {
-			ui.Warning("Skill integrity: %d skill(s) unverifiable (no metadata)", skippedCount)
+		if len(skippedNames) > 0 {
+			ui.Row(ui.MarkWarn, "Integrity", plural(len(skippedNames), "skill")+" missing file hashes: "+strings.Join(skippedNames, ", "), doctorWidth)
 			result.addWarning()
+			result.addCheck("skill_integrity", checkWarning, fmt.Sprintf("%d skill(s) missing file hashes", len(skippedNames)), skippedNames)
+		} else {
+			result.addCheck("skill_integrity", checkPass, "No tracked skills to verify", nil)
 		}
 		return
 	}
@@ -533,7 +1010,7 @@ func checkSkillIntegrity(result *doctorResult, discovered []sync.DiscoveredSkill
 	verified := 0
 
 	for _, v := range toVerify {
-		current, err := install.ComputeFileHashes(v.path)
+		current, err := install.ComputeFileHashes(v.path, follow...)
 		if err != nil {
 			tampered = append(tampered, fmt.Sprintf("%s: hash error: %v", v.name, err))
 			continue
@@ -573,19 +1050,30 @@ func checkSkillIntegrity(result *doctorResult, discovered []sync.DiscoveredSkill
 
 	sp.Stop()
 
+	mark := ui.MarkOK
+	if len(tampered)+len(skippedNames) > 0 {
+		mark = ui.MarkWarn
+	}
+	ui.Row(mark, "Integrity", fmt.Sprintf("%d/%d skills verified", verified, len(toVerify)), doctorWidth)
+	for _, t := range tampered {
+		ui.Row(ui.MarkWarn, "", t, doctorWidth)
+	}
+
 	if len(tampered) > 0 {
-		for _, t := range tampered {
-			ui.Warning(t)
-		}
 		result.addWarning()
+		result.addCheck("skill_integrity", checkWarning,
+			fmt.Sprintf("%d skill(s) with integrity issues", len(tampered)), tampered)
 	}
 
 	if verified > 0 {
-		ui.Success("Skill integrity: %d/%d verified", verified, len(toVerify))
+		if len(tampered) == 0 {
+			result.addCheck("skill_integrity", checkPass,
+				fmt.Sprintf("Skill integrity: %d/%d verified", verified, len(toVerify)), nil)
+		}
 	}
 
-	if skippedCount > 0 {
-		ui.Warning("Skill integrity: %d skill(s) unverifiable (no metadata)", skippedCount)
+	if len(skippedNames) > 0 {
+		ui.Row(ui.MarkWarn, "", plural(len(skippedNames), "skill")+" missing file hashes: "+strings.Join(skippedNames, ", "), doctorWidth)
 		result.addWarning()
 	}
 }
@@ -598,22 +1086,89 @@ func checkSkillTargetsField(result *doctorResult, discovered []sync.DiscoveredSk
 
 	warnings := findUnknownSkillTargets(discovered, extraTargetNames)
 	if len(warnings) > 0 {
+		label := "Skills"
 		for _, w := range warnings {
-			ui.Warning("Skill targets: %s", w)
+			ui.Row(ui.MarkWarn, label, w, doctorWidth)
+			label = ""
 		}
 		result.addWarning()
+		result.addCheck("skill_targets_field", checkWarning, "Skills reference unknown targets", warnings)
+	} else {
+		result.addCheck("skill_targets_field", checkPass, "All skill target references are valid", nil)
 	}
 }
 
-// checkBrokenSymlinks finds broken symlinks in targets
-func checkBrokenSymlinks(cfg *config.Config, result *doctorResult) {
-	for name, target := range cfg.Targets {
-		broken := findBrokenSymlinks(target.Path)
+// checkBrokenSymlinks finds broken symlinks in targets. Links to skills behind
+// a source link whose target is away (an unmounted drive) are expected to be
+// broken and are kept by sync, so they are reported as waiting, not as errors.
+func checkBrokenSymlinks(cfg *config.Config, follow *sourcewalk.Follow, result *doctorResult) {
+	var allBroken, allWaiting []string
+	unavailable := follow.Unavailable()
+	names := targetNamesFromConfig(cfg.Targets)
+	sort.Strings(names)
+	width := ui.RowWidth(names...)
+	for _, name := range names {
+		target := cfg.Targets[name]
+		if !target.SkillsConfig().IsEnabled() {
+			continue
+		}
+		var broken, waiting []string
+		for _, b := range findBrokenSymlinks(target.SkillsConfig().Path) {
+			if behindUnavailableLink(filepath.Join(target.SkillsConfig().Path, b), cfg.EffectiveSkillsSource(), unavailable) {
+				waiting = append(waiting, b)
+			} else {
+				broken = append(broken, b)
+			}
+		}
 		if len(broken) > 0 {
-			ui.Error("%s: %d broken symlink(s): %s", name, len(broken), strings.Join(broken, ", "))
+			ui.Row(ui.MarkFail, name, plural(len(broken), "broken symlink")+": "+strings.Join(broken, ", "), width)
+			result.suggest("skillshare sync", "prune the broken links")
 			result.addError()
+			for _, b := range broken {
+				allBroken = append(allBroken, fmt.Sprintf("%s/%s", name, b))
+			}
+		}
+		if len(waiting) > 0 {
+			ui.Row(ui.MarkWarn, name, plural(len(waiting), "link")+" behind an unavailable source link, kept until it is back: "+strings.Join(waiting, ", "), width)
+			result.addWarning()
+			for _, b := range waiting {
+				allWaiting = append(allWaiting, fmt.Sprintf("%s/%s", name, b))
+			}
 		}
 	}
+	switch {
+	case len(allBroken) > 0:
+		result.addCheck("broken_symlinks", checkError,
+			fmt.Sprintf("%d broken symlink(s) found", len(allBroken)), allBroken)
+	case len(allWaiting) > 0:
+		result.addCheck("broken_symlinks", checkWarning,
+			fmt.Sprintf("%d link(s) behind an unavailable source link", len(allWaiting)), allWaiting)
+	default:
+		result.addCheck("broken_symlinks", checkPass, "No broken symlinks", nil)
+	}
+}
+
+// behindUnavailableLink classifies broken links by their stored destination,
+// so frontmatter-based target names work as well as flattened names.
+func behindUnavailableLink(path, source string, unavailable []string) bool {
+	if destination, err := utils.ResolveLinkTarget(path); err == nil {
+		destination = sourcewalk.Canonical(destination)
+		for _, name := range unavailable {
+			root := sourcewalk.Canonical(filepath.Join(source, name))
+			if utils.PathsEqual(destination, root) || utils.PathHasPrefix(destination, root+string(filepath.Separator)) {
+				return true
+			}
+		}
+		return false
+	}
+	// Some link types cannot expose their target; retain the flattened-name fallback.
+	entry := filepath.Base(path)
+	for _, name := range unavailable {
+		if entry == name || strings.HasPrefix(entry, name+"__") {
+			return true
+		}
+	}
+	return false
 }
 
 func findBrokenSymlinks(dir string) []string {
@@ -631,7 +1186,7 @@ func findBrokenSymlinks(dir string) []string {
 			continue
 		}
 
-		if info.Mode()&os.ModeSymlink != 0 {
+		if utils.IsLinkMode(path, info.Mode()) {
 			// It's a symlink, check if target exists
 			if _, err := os.Stat(path); os.IsNotExist(err) {
 				broken = append(broken, entry.Name())
@@ -647,24 +1202,16 @@ func findBrokenSymlinks(dir string) []string {
 func checkDuplicateSkills(cfg *config.Config, result *doctorResult, discovered []sync.DiscoveredSkill) {
 	skillLocations := make(map[string][]string)
 
-	// Collect from source
-	if discovered != nil {
-		for _, skill := range discovered {
-			skillLocations[skill.FlatName] = append(skillLocations[skill.FlatName], "source")
-		}
-	} else {
-		entries, _ := os.ReadDir(cfg.Source)
-		for _, entry := range entries {
-			if entry.IsDir() && !utils.IsHidden(entry.Name()) {
-				skillLocations[entry.Name()] = append(skillLocations[entry.Name()], "source")
-			}
-		}
+	if discovered == nil {
+		result.addCheck("duplicate_skills", checkInfo, "Duplicate skill check skipped (source discovery unavailable)", nil)
+		return
 	}
 
 	// Collect from non-merge targets.
 	for name, target := range cfg.Targets {
+		sc := target.SkillsConfig()
 		// Determine effective mode
-		mode := target.Mode
+		mode := sc.Mode
 		if mode == "" {
 			mode = cfg.Mode
 		}
@@ -672,19 +1219,31 @@ func checkDuplicateSkills(cfg *config.Config, result *doctorResult, discovered [
 			mode = "merge"
 		}
 
-		// Skip merge mode - local skills are intentional
-		if mode == "merge" {
+		// Skip merge mode - local skills are intentional; skip targets with skills off.
+		if mode == "merge" || !sc.IsEnabled() {
 			continue
 		}
 
+		// The target dir is itself a link (symlink mode after sync), so its
+		// entries are the source itself, not target-local copies.
+		if mode == "symlink" && utils.IsSymlinkOrJunction(sc.Path) {
+			continue
+		}
+
+		resolution, err := sync.ResolveTargetSkillsForTarget(name, target.SkillsConfig(), discovered)
+		if err != nil {
+			continue
+		}
+		sourceNames := resolution.ValidTargetNames()
+
 		manifestManaged := map[string]string{}
 		if mode == "copy" {
-			if manifest, err := sync.ReadManifest(target.Path); err == nil && manifest != nil {
+			if manifest, err := sync.ReadManifest(sc.Path); err == nil && manifest != nil {
 				manifestManaged = manifest.Managed
 			}
 		}
 
-		entries, err := os.ReadDir(target.Path)
+		entries, err := os.ReadDir(sc.Path)
 		if err != nil {
 			continue
 		}
@@ -702,15 +1261,20 @@ func checkDuplicateSkills(cfg *config.Config, result *doctorResult, discovered [
 			}
 
 			// Check if it's a local skill (not a symlink to source)
-			path := filepath.Join(target.Path, entry.Name())
+			path := filepath.Join(sc.Path, entry.Name())
 			info, err := os.Lstat(path)
 			if err != nil {
 				continue
 			}
 
-			if info.Mode()&os.ModeSymlink == 0 {
+			if !utils.IsLinkMode(path, info.Mode()) {
 				// It's a real directory, not a symlink
-				skillLocations[entry.Name()] = append(skillLocations[entry.Name()], name)
+				if sourceNames[entry.Name()] {
+					if !slices.Contains(skillLocations[entry.Name()], "source") {
+						skillLocations[entry.Name()] = append(skillLocations[entry.Name()], "source")
+					}
+					skillLocations[entry.Name()] = append(skillLocations[entry.Name()], name)
+				}
 			}
 		}
 	}
@@ -726,21 +1290,132 @@ func checkDuplicateSkills(cfg *config.Config, result *doctorResult, discovered [
 	if len(duplicates) > 0 {
 		sort.Strings(duplicates)
 		ui.Warning("Duplicate skills: %s", strings.Join(duplicates, "; "))
-		ui.Info("  These exist in both source and target as separate copies.")
-		ui.Info("  Fix: manually delete target copies, then run 'skillshare sync'")
+		ui.Note("These exist in both source and target as separate copies.")
+		ui.Note("Fix: delete the target copies, then run skillshare sync")
 		result.addWarning()
+		result.addCheck("duplicate_skills", checkWarning, "Duplicate skills found", duplicates)
+	} else {
+		result.addCheck("duplicate_skills", checkPass, "No duplicate skills", nil)
+	}
+}
+
+// checkExtras verifies extras source directories exist and targets are reachable.
+func checkExtras(extras []config.ExtraConfig, result *doctorResult, isProject bool, source, extrasSource, projectRoot, projectExtrasParent string, validate func() error) {
+	if len(extras) == 0 {
+		return
+	}
+
+	ui.Section("Extras")
+	names := make([]string, len(extras))
+	for i, extra := range extras {
+		names[i] = extra.Name
+	}
+	width := ui.RowWidth(names...)
+
+	var details []string
+	hasIssue, hasError := false, false
+
+	for _, extra := range extras {
+		if err := config.ValidateExtraConfig(extra); err != nil {
+			result.addError()
+			ui.Row(ui.MarkFail, extra.Name, err.Error(), width)
+			details = append(details, fmt.Sprintf("%s: %v", extra.Name, err))
+			hasIssue, hasError = true, true
+			continue
+		}
+
+		var sourceDir string
+		if isProject {
+			sourceDir = config.ResolveExtrasSourceDirProject(extra, projectExtrasParent, projectRoot)
+		} else {
+			sourceDir = config.ResolveExtrasSourceDir(extra, extrasSource, source)
+		}
+
+		files, err := sync.DiscoverExtraSource(sourceDir, extra.File)
+		if err != nil {
+			result.addError()
+			ui.Row(ui.MarkFail, extra.Name, "source missing · "+shortenPath(sourceDir), width)
+			details = append(details, fmt.Sprintf("%s: source directory missing", extra.Name))
+			hasIssue = true
+			continue
+		}
+
+		reachable := 0
+		var unreachableTargets []string
+		var targetErrors, targetWarnings []string
+		for _, t := range extra.Targets {
+			targetPath := resolveDoctorExtraTarget(t.Path, isProject, projectRoot)
+			if _, err := os.Stat(filepath.Dir(targetPath)); err == nil {
+				reachable++
+				errs, warns := extraTargetFindings(extra, t, sourceDir, targetPath)
+				targetErrors = append(targetErrors, errs...)
+				targetWarnings = append(targetWarnings, warns...)
+			} else {
+				unreachableTargets = append(unreachableTargets, t.Path)
+			}
+		}
+		// Findings name the extra unless a row above already did.
+		findingsLabel := ""
+		if reachable == len(extra.Targets) && len(targetErrors)+len(targetWarnings) == 0 {
+			ui.Row(ui.MarkOK, extra.Name, fmt.Sprintf("%s · %d/%d targets OK", plural(len(files), "file"), reachable, len(extra.Targets)), width)
+		} else if reachable < len(extra.Targets) {
+			result.addWarning()
+			ui.Row(ui.MarkWarn, extra.Name, fmt.Sprintf("%s · %d/%d targets unreachable", plural(len(files), "file"), len(extra.Targets)-reachable, len(extra.Targets)), width)
+			for _, t := range unreachableTargets {
+				ui.Note(t + " (parent dir missing)")
+			}
+			details = append(details, fmt.Sprintf("%s: %d/%d targets unreachable", extra.Name, len(extra.Targets)-reachable, len(extra.Targets)))
+			hasIssue = true
+		}
+		shownErrors, shownWarnings := targetErrors, targetWarnings
+		if reachable == len(extra.Targets) {
+			// The row label names the extra, so the lines start at the arrow.
+			findingsLabel = extra.Name
+			shownErrors = trimFindingsPrefix(targetErrors, extra.Name+" ")
+			shownWarnings = trimFindingsPrefix(targetWarnings, extra.Name+" ")
+		}
+		printResourceFindings(findingsLabel, width, shownErrors, shownWarnings)
+		for range targetErrors {
+			result.addError()
+		}
+		for range targetWarnings {
+			result.addWarning()
+		}
+		details = append(append(details, targetErrors...), targetWarnings...)
+		hasIssue = hasIssue || len(targetErrors)+len(targetWarnings) > 0
+		hasError = hasError || len(targetErrors) > 0
+	}
+
+	if !hasError {
+		if err := validate(); err != nil {
+			result.addError()
+			ui.Error("%v", err)
+			details = append(details, err.Error())
+			hasIssue, hasError = true, true
+		}
+	}
+
+	switch {
+	case hasError:
+		result.addCheck("extras", checkError, "Some extras have errors", details)
+	case hasIssue:
+		result.addCheck("extras", checkWarning, "Some extras have issues", details)
+	default:
+		result.addCheck("extras", checkPass, fmt.Sprintf("All %d extra(s) OK", len(extras)), nil)
 	}
 }
 
 // checkBackupStatus shows last backup time
-func checkBackupStatus(isProject bool, backupDir string) {
+func checkBackupStatus(result *doctorResult, isProject bool, backupDir string) {
 	if isProject {
-		ui.Info("Backups: not used in project mode")
+		ui.Row(ui.MarkNone, "Backups", "not used in project mode", doctorWidth)
+		result.addCheck("backup", checkPass, "Backups: not used in project mode", nil)
 		return
 	}
 	entries, err := os.ReadDir(backupDir)
 	if err != nil || len(entries) == 0 {
-		ui.Info("Backups: none found")
+		ui.Row(ui.MarkNone, "Backups", "none found", doctorWidth)
+		result.addCheck("backup", checkPass, "Backups: none found", nil)
 		return
 	}
 
@@ -772,19 +1447,25 @@ func checkBackupStatus(isProject bool, backupDir string) {
 		default:
 			ageStr = fmt.Sprintf("%d days ago", int(age.Hours()/24))
 		}
-		ui.Info("Backups: last backup %s (%s)", latest, ageStr)
+		ui.Row(ui.MarkNone, "Backups", "last "+latest+ui.DimText(" · "+timeAgo(latestTime)), doctorWidth)
+		result.addCheck("backup", checkPass, fmt.Sprintf("Backups: last backup %s (%s)", latest, ageStr), nil)
+	} else {
+		ui.Row(ui.MarkNone, "Backups", "none found", doctorWidth)
+		result.addCheck("backup", checkPass, "Backups: none found", nil)
 	}
 }
 
 // checkTrashStatus shows trash directory status
-func checkTrashStatus(trashBase string) {
+func checkTrashStatus(result *doctorResult, trashBase string) {
 	if trashBase == "" {
+		result.addCheck("trash", checkPass, "Trash: not configured", nil)
 		return
 	}
 
 	items := trash.List(trashBase)
 	if len(items) == 0 {
-		ui.Info("Trash: empty")
+		ui.Row(ui.MarkNone, "Trash", "empty", doctorWidth)
+		result.addCheck("trash", checkPass, "Trash: empty", nil)
 		return
 	}
 
@@ -796,11 +1477,18 @@ func checkTrashStatus(trashBase string) {
 	age := time.Since(oldest.Date)
 	days := int(age.Hours() / 24)
 
+	var msg string
 	if days > 0 {
-		ui.Info("Trash: %d item(s) (%s), oldest %d day(s)", len(items), sizeStr, days)
+		msg = fmt.Sprintf("Trash: %d item(s) (%s), oldest %d day(s)", len(items), sizeStr, days)
 	} else {
-		ui.Info("Trash: %d item(s) (%s), oldest <1 day", len(items), sizeStr)
+		msg = fmt.Sprintf("Trash: %d item(s) (%s), oldest <1 day", len(items), sizeStr)
 	}
+	oldestStr := "under a day"
+	if days > 0 {
+		oldestStr = plural(days, "day")
+	}
+	ui.Row(ui.MarkNone, "Trash", fmt.Sprintf("%s, %s", plural(len(items), "item"), sizeStr)+ui.DimText(" · oldest "+oldestStr), doctorWidth)
+	result.addCheck("trash", checkPass, msg, nil)
 }
 
 // formatBytes formats bytes into a human-readable string.
@@ -820,61 +1508,118 @@ func formatBytes(b int64) string {
 }
 
 // checkVersionDoctor checks CLI and skill versions
-func checkVersionDoctor(cfg *config.Config) {
-	ui.Header("Version")
+// remoteSkill delivers the latest published skill version, or "" offline;
+// it is read only once a local version is known.
+func checkVersionDoctor(cfg *config.Config, result *doctorResult, isProject bool, remoteSkill <-chan string) {
+	ui.Section("Version")
 
 	// CLI version
-	ui.Success("CLI: %s", version)
+	ui.Row(ui.MarkOK, "CLI", version, doctorWidth)
+	result.addCheck("cli_version", checkPass, fmt.Sprintf("CLI: %s", version), nil)
 
-	// Skill version
-	skillFile := filepath.Join(cfg.Source, "skillshare", "SKILL.md")
-
-	file, err := os.Open(skillFile)
-	if err != nil {
-		ui.Warning("Skill: not found")
-		ui.Info("  Run: skillshare upgrade --skill")
-		return
-	}
-	defer file.Close()
-
-	var localVersion string
-	scanner := bufio.NewScanner(file)
-	inFrontmatter := false
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "---" {
-			if !inFrontmatter {
-				inFrontmatter = true
-				continue
-			}
-			break
-		}
-		if inFrontmatter && strings.HasPrefix(line, "version:") {
-			localVersion = strings.TrimSpace(strings.TrimPrefix(line, "version:"))
-			break
+	// Skill version: try SKILL.md frontmatter first, then metadata store
+	localVersion := versioncheck.ReadLocalSkillVersion(cfg.EffectiveSkillsSource())
+	if localVersion == "" {
+		// Try metadata store (tracks installed version even without metadata.version in SKILL.md)
+		store := install.LoadMetadataOrNew(cfg.EffectiveSkillsSource())
+		if entry := store.Get("skillshare"); entry != nil && entry.Version != "" {
+			localVersion = strings.TrimPrefix(entry.Version, "v")
 		}
 	}
 
 	if localVersion == "" {
-		ui.Warning("Skill: missing version")
+		skillFile := filepath.Join(cfg.EffectiveSkillsSource(), "skillshare", "SKILL.md")
+		if _, err := os.Stat(skillFile); os.IsNotExist(err) {
+			if isProject {
+				ui.Row(ui.MarkNone, "Skill", "not installed", doctorWidth)
+				result.addCheck("skill_version", checkInfo, "Skill: not installed in project", nil)
+			} else {
+				ui.Row(ui.MarkWarn, "Skill", "not found", doctorWidth)
+				result.suggest("skillshare upgrade --skill", "install the built-in skill")
+				result.addCheck("skill_version", checkWarning, "Skill: not found", nil)
+				result.addWarning()
+			}
+		} else {
+			ui.Row(ui.MarkWarn, "Skill", "missing version", doctorWidth)
+			result.addCheck("skill_version", checkWarning, "Skill: missing version", nil)
+			result.addWarning()
+		}
 		return
 	}
 
-	ui.Success("Skill: %s", localVersion)
+	if remote := <-remoteSkill; config.AutoUpdateCheckEnabled() && versioncheck.SkillOutdated(localVersion, remote) {
+		ui.Row(ui.MarkWarn, "Skill", localVersion+" → "+remote+" available", doctorWidth)
+		result.suggestUpdate("skillshare upgrade --skill", "update the built-in skill")
+		result.addCheck("skill_version", checkWarning, fmt.Sprintf("Skill: %s (%s available)", localVersion, remote), nil)
+		result.checks[len(result.checks)-1].UpdateAvailable = true
+		result.addWarning()
+		return
+	}
+	ui.Row(ui.MarkOK, "Skill", localVersion, doctorWidth)
+	result.addCheck("skill_version", checkPass, fmt.Sprintf("Skill: %s", localVersion), nil)
 }
 
 // fetchDoctorUpdateResult checks if a newer version is available.
 // Uses the shared versioncheck.Check which handles caching, auth, and
 // proper semver comparison. Safe to call from a goroutine.
+func fetchDoctorSkillVersion() string {
+	if !config.AutoUpdateCheckEnabled() {
+		return ""
+	}
+	return versioncheck.CachedRemoteSkillVersion()
+}
+
 func fetchDoctorUpdateResult() *versioncheck.CheckResult {
-	method := detectInstallMethod()
+	if !config.AutoUpdateCheckEnabled() {
+		return nil
+	}
+	method := versioncheck.DetectCurrentInstallMethod()
+	if version == "" || version == "dev" {
+		return &versioncheck.CheckResult{
+			CurrentVersion:  "dev",
+			LatestVersion:   "dev-ui-flow",
+			UpdateAvailable: true,
+			InstallMethod:   method,
+		}
+	}
 	return versioncheck.Check(version, method)
 }
 
-func printUpdateAvailable(result *versioncheck.CheckResult) {
-	if result == nil || !result.UpdateAvailable {
+func printUpdateAvailable(update *versioncheck.CheckResult, result *doctorResult) {
+	if update == nil || !update.UpdateAvailable || !config.AutoUpdateCheckEnabled() {
 		return
 	}
-	ui.Info("Update available: %s -> %s", result.CurrentVersion, result.LatestVersion)
-	ui.Info("  Run: %s", result.InstallMethod.UpgradeCommand())
+	available := ui.VersionLabel(update.CurrentVersion) + " → " + ui.VersionLabel(update.LatestVersion) + " available"
+	cmd := update.InstallMethod.UpgradeCommand()
+	if cmd == "" {
+		available += ui.DimText(" · " + versioncheck.NixConfigUpgradeHint)
+	}
+	ui.Row(ui.MarkNone, "Update", available, doctorWidth)
+	if cmd != "" {
+		result.suggestUpdate(cmd, "update to "+ui.VersionLabel(update.LatestVersion))
+	}
+}
+
+func printDoctorHelp() {
+	printHelp("skillshare doctor [options]", "Check environment and diagnose issues.",
+		helpGroup{title: "Options", rows: []helpRow{
+			{"--json", "Output results as JSON"},
+			{"-p, --project", "Use project-level config"},
+			{"-g, --global", "Use global config"},
+		}},
+		helpExamples(
+			helpRow{"skillshare doctor", "Run diagnostics"},
+			helpRow{"skillshare doctor --json", "Output as JSON"},
+			helpRow{"skillshare doctor -p", "Check project config"},
+		),
+	)
+}
+
+// trimFindingsPrefix drops prefix from each finding for display.
+func trimFindingsPrefix(findings []string, prefix string) []string {
+	out := make([]string, len(findings))
+	for i, f := range findings {
+		out[i] = strings.TrimPrefix(f, prefix)
+	}
+	return out
 }

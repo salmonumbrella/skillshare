@@ -29,14 +29,7 @@ skillshare log -p                 # Project operations + audit logs
 
 ## Interactive TUI
 
-On a TTY, `skillshare log` launches an interactive terminal UI with:
-
-- **Fuzzy filtering** — type to filter by timestamp, command, status, source, or detail content
-- **Keyboard navigation** — arrow keys to browse, `q` to quit
-- **Detail panel** — shows full timestamp, command, status, duration, source, and structured args for the selected entry
-- **Stats footer** — always-visible compact summary: ops count, success rate, last operation
-- **Stats panel** — press `s` to toggle a full breakdown by command with success/failure counts
-- **Merged view** — operations and audit entries are merged and sorted by time when viewing both
+On a TTY, `skillshare log` opens an interactive list of operations with the details of the selected entry beside it, a filter, and a stats view broken down by command. Operations and audit entries are merged and sorted by time. The keys are listed at the bottom of the screen.
 
 Use `--no-tui` to skip the TUI and print plain text instead:
 
@@ -51,10 +44,12 @@ Every mutating CLI and Web UI operation is recorded as a JSONL entry with timest
 
 | Command | Log File |
 |---------|----------|
-| `install`, `uninstall`, `sync`, `push`, `pull`, `collect`, `backup`, `restore`, `update`, `target`, `trash`, `config`, `check`, `diff`, `init`, `upgrade` | `operations.log` |
+| `install`, `uninstall`, `sync`, `push`, `pull`, `collect`, `backup`, `restore`, `update`, `target`, `project`, `trash`, `config`, `check`, `diff`, `init`, `upgrade` | `operations.log` |
 | `audit` | `audit.log` |
 
 Web UI actions that call these APIs are logged the same way as CLI operations.
+
+`project` entries record the `action` (`add`, `update`, `remove`, `localize`, `share`, or the dashboard's `convert`) and the project `root`, so you can tell which project changed; `remove` also records `shared`, which is true when `config.yaml`'s copy was removed too. `skillshare project sync` is logged as a `sync` entry with the same two fields.
 
 ## Log Types
 
@@ -98,40 +93,30 @@ skillshare log --json --cmd sync          # Filtered JSONL
 
 ## Example Output (Plain Text)
 
-When using `--no-tui` or in a non-TTY environment:
+With `--no-tui` in a terminal (when piped, each entry's details are joined on one line):
 
 ```
-┌─ skillshare log ────────────────────────────────────┐
-│ Operations (last 2)                                 │
-│ mode: global                                        │
-│ file: ~/.local/state/skillshare/logs/operations.log │
-└─────────────────────────────────────────────────────┘
-  TIME             | CMD       | STATUS  | DUR
-  -----------------+-----------+---------+--------
-  2026-02-10 14:31 | SYNC      | error   | 0.8s
-  targets: 3
-  failed: 1
-  scope: global
+Operations · last 2
+✓ sync      2026-02-10 14:35 · 0.3s
+            targets: 3
+            scope: global
 
-  2026-02-10 14:35 | SYNC      | ok      | 0.3s
-  targets: 3
-  scope: global
+✗ sync      2026-02-10 14:31 · 0.8s · error
+            targets: 3
+            failed: 1
+            scope: global
+  ~/.local/state/skillshare/logs/operations.log
 
-┌─ skillshare log ────────────────────────────────────┐
-│ Audit (last 1)                                      │
-│ mode: global                                        │
-│ file: ~/.local/state/skillshare/logs/audit.log      │
-└─────────────────────────────────────────────────────┘
-  TIME             | CMD       | STATUS  | DUR
-  -----------------+-----------+---------+--------
-  2026-02-10 14:36 | AUDIT     | blocked | 1.1s
-  scope: all-skills
-  scanned: 12
-  passed: 11
-  failed: 1
-  failed skills:
-    - prompt-injection-skill
-    - data-exfil-skill
+Audit · last 1
+✗ audit     2026-02-10 14:36 · 1.1s · blocked
+            scope: all-skills
+            scanned: 12
+            passed: 11
+            failed: 1
+            failed skills:
+              - prompt-injection-skill
+              - data-exfil-skill
+  ~/.local/state/skillshare/logs/audit.log
 ```
 
 ## Log Format
@@ -216,21 +201,6 @@ skillshare log --stats                # Summary of all operations
 skillshare log --stats --cmd sync     # Stats for sync only
 skillshare log --stats --since 7d     # Stats for last 7 days
 ```
-
-### TUI
-
-Press `s` in the TUI to toggle the stats panel, showing:
-
-- Total operations and per-command breakdown with horizontal bar chart
-- Success/failure counts per command (color-coded)
-- Overall success rate with visual progress bar
-- Last operation timestamp
-
-The footer bar always shows a compact summary: `20 ops | ✓ 92.3% | last: sync 2h ago`
-
-### Detail Panel Scrolling
-
-When a log entry has long detail content (e.g. audit results with many skills), use `j`/`k` to scroll the detail panel up and down.
 
 ## Log Retention
 

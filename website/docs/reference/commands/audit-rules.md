@@ -48,7 +48,7 @@ rules:
 
 Pattern-level entries use `pattern` without `id`. Merge order: pattern-level rules apply first, then id-level rules can override individual entries within a disabled group.
 
-## Custom Rules
+## Custom Rules {#custom-rules}
 
 You can add, override, or disable audit rules using YAML files. Rules are merged in order: **built-in → global user → project user**.
 
@@ -110,7 +110,9 @@ rules:
 | `pattern` | Yes* | Rule category name (e.g., `prompt-injection`) |
 | `message` | Yes* | Human-readable description shown in findings |
 | `regex` | Yes* | Regular expression to match against each line |
+| `confidence` | No | Confidence between 0 and 1; defaults to 0.95 |
 | `exclude` | No | If a line matches both `regex` and `exclude`, the finding is suppressed |
+| `files` | No | File glob patterns that limit where the rule applies; see [File Applicability](#file-applicability). |
 | `enabled` | No | Set to `false` to disable a rule. Only `id` is required when disabling. |
 
 *Required unless `enabled: false`.
@@ -120,10 +122,10 @@ rules:
 Each layer (global, then project) is applied on top of the previous:
 
 - **Same `id`** + `enabled: false` → disables the rule
-- **Same `id`** + other fields → replaces the entire rule
+- **Same `id`** + `regex` → replaces the entire rule; `severity` or `confidence` alone overrides that field
 - **New `id`** → appends as a custom rule
 - **`pattern` only** (no `id`) + `enabled: false` → disables all rules matching that pattern
-- **`pattern` only** + `severity` → overrides severity for all matching rules
+- **`pattern` only** + `severity` or `confidence` → overrides that field for all matching rules
 - **Pattern then id** → id-level entries can re-enable individual rules within a disabled pattern group
 
 ### Practical Templates
@@ -167,7 +169,7 @@ The generated file looks like this:
 #            → project (.skillshare/audit-rules.yaml)
 #
 # Each rule needs: id, severity, pattern, message, regex.
-# Optional: exclude (suppress match), enabled (false to disable).
+# Optional: exclude (suppress match), files (scope), enabled (false to disable).
 
 rules:
   # Example: flag TODO comments as informational
@@ -203,9 +205,17 @@ A common reason to customize rules is when a legitimate skill triggers a built-i
 
 ```bash
 $ skillshare audit ci-helper
-[1/1] ! ci-helper    0.2s
-      └─ HIGH: Destructive command pattern (SKILL.md:42)
-         "sudo apt-get install -y jq"
+Audit  ~/.config/skillshare/skills
+  global · blocks at CRITICAL · policy DEFAULT / dedupe:GLOBAL / analyzers:ALL
+
+HIGH      Sudo escalation  SKILL.md:42
+  destructive-commands-2 / static
+  "sudo apt-get install -y jq"
+
+  Risk       HIGH 15/100
+  Auditable  100%
+
+! ci-helper has findings below CRITICAL · 0.2s
 ```
 
 **2. Identify the rule ID from the [built-in rules table](#built-in-rule-ids):**
@@ -243,7 +253,10 @@ rules:
 
 ```bash
 $ skillshare audit ci-helper
-[1/1] ✓ ci-helper    0.1s   # Now passes (or shows MEDIUM instead of HIGH)
+Audit  ~/.config/skillshare/skills
+  global · blocks at CRITICAL · policy DEFAULT / dedupe:GLOBAL / analyzers:ALL
+
+✓ No issues found in ci-helper · 0.1s   # Now passes (or shows MEDIUM instead of HIGH)
 ```
 
 ### Validate Changes
@@ -256,54 +269,67 @@ skillshare audit <name>              # Check a specific skill
 skillshare audit --json | jq '.skills[].findings'  # Inspect findings programmatically
 ```
 
+If a rules file cannot be read, parsed, or compiled (for example, an invalid regex), every scan that uses it reports a scan error naming the file, and `audit` exits `2`. Installs are blocked until you fix the file.
+
 Summary interpretation:
 
 - `Failed` counts skills with findings at or above the active threshold.
 - `Warning` counts skills with findings below threshold but above clean (for example `HIGH/MEDIUM/LOW/INFO` when threshold is `CRITICAL`).
 
-## Built-in Rule IDs
+## Built-in Rule IDs {#built-in-rule-ids}
 
 Use `id` values to override or disable specific built-in rules:
 
 Source of truth for regex-based rules:
 [`internal/audit/rules.yaml`](https://github.com/runkids/skillshare/blob/main/internal/audit/rules.yaml)
 
+The file-level `whitespace-padding` detector is also registered in `rules.yaml`. Its thresholds and exemptions are implemented in Go; configure its enabled state, severity or confidence without `regex` or `exclude`. See [Whitespace Padding](/docs/understand/audit-engine#whitespace-padding). Rules for this ID that set `regex` or `exclude` are rejected.
+
 :::note Structural, tier, and cross-skill checks
 
-`dangling-link`, `content-tampered`, `content-oversize`, `content-missing`, and `content-unexpected` are **structural checks** (filesystem lookups and hash comparisons, not regex). `low-analyzability` is an **analyzability finding** generated from the [Analyzability Score](/docs/understand/audit-engine#analyzability-score). `tier-stealth`, `tier-destructive-network`, `tier-network-heavy`, `tier-interpreter`, and `tier-interpreter-network` are **tier combination findings** generated from [Command Safety Tiering](/docs/understand/audit-engine#command-safety-tiering) profiles. `cross-skill-*` findings are generated from [Cross-Skill Interaction Detection](/docs/understand/audit-engine#cross-skill-interaction-detection). All of these appear in the table below but are not defined in `rules.yaml`.
+`dangling-link`, `reference-escapes-root`, `reference-check-incomplete`, `content-tampered`, `content-oversize`, `content-missing`, and `content-unexpected` are **structural checks** (filesystem lookups and hash comparisons, not regex). `low-analyzability` is an **analyzability finding** generated from the [Analyzability Score](/docs/understand/audit-engine#analyzability-score). `tier-stealth`, `tier-destructive-network`, `tier-network-heavy`, `tier-interpreter`, and `tier-interpreter-network` are **tier combination findings** generated from [Command Safety Tiering](/docs/understand/audit-engine#command-safety-tiering) profiles. `cross-skill-*` findings are generated from [Cross-Skill Interaction Detection](/docs/understand/audit-engine#cross-skill-interaction-detection). Header checks also generate `disguised-executable`, `python-bytecode`, `executable-artifact`, `archive-artifact`, and `uncertain-header` findings described in [Executable and archive headers](/docs/understand/audit-engine#executable-headers). All of these appear in the table below but are not defined in `rules.yaml`.
+
+`bundled-*` rules are structured JSON checks under `structure`, registered for listing, disabling, and severity overrides. Their metadata regex never matches text; see [bundled hooks and settings](/docs/understand/audit-engine#bundled-hooks-and-settings).
 
 :::
 
 | ID | Pattern | Severity |
 |----|---------|----------|
+| `bundled-hook-command` | bundled-hook-command | MEDIUM |
+| `bundled-network-command` | bundled-network-command | HIGH |
+| `bundled-remote-post` | bundled-remote-post | HIGH |
+| `bundled-permission` | bundled-permission | HIGH |
+| `bundled-helper-command` | bundled-helper-command | HIGH |
+| `bundled-config-unparsed` | bundled-config-unparsed | INFO |
 | `prompt-injection-0` | prompt-injection | CRITICAL |
 | `prompt-injection-1` | prompt-injection | CRITICAL |
 | `prompt-injection-2` | prompt-injection | HIGH |
 | `prompt-injection-3` | prompt-injection | CRITICAL |
 | `prompt-injection-4` | prompt-injection | CRITICAL |
+| `prompt-injection-5` | prompt-injection | HIGH |
 | `hidden-unicode-1` | invisible-payload | CRITICAL |
 | `data-exfiltration-0` | data-exfiltration | CRITICAL |
 | `data-exfiltration-1` | data-exfiltration | CRITICAL |
 | `data-exfiltration-2` | data-exfiltration | MEDIUM |
 | `data-exfiltration-3` | data-exfiltration | HIGH |
-| `credential-access-ssh-private-key` | credential-access | CRITICAL |
-| `credential-access-env-file` | credential-access | CRITICAL |
-| `credential-access-aws-credentials` | credential-access | CRITICAL |
-| `credential-access-etc-shadow` | credential-access | CRITICAL |
-| `credential-access-git-credentials` | credential-access | CRITICAL |
-| `credential-access-netrc` | credential-access | CRITICAL |
-| `credential-access-gnupg` | credential-access | CRITICAL |
-| `credential-access-kube-config` | credential-access | CRITICAL |
-| `credential-access-vault-token` | credential-access | CRITICAL |
-| `credential-access-terraform-creds` | credential-access | CRITICAL |
-| `credential-access-gnome-keyring` | credential-access | CRITICAL |
-| `credential-access-npmrc` | credential-access | CRITICAL |
-| `credential-access-pypirc` | credential-access | CRITICAL |
-| `credential-access-gem-credentials` | credential-access | CRITICAL |
-| `credential-access-ssl-private` | credential-access | CRITICAL |
-| `credential-access-ssh-host-key` | credential-access | CRITICAL |
-| `credential-access-pgpass` | credential-access | CRITICAL |
-| `credential-access-mysql-cnf` | credential-access | CRITICAL |
+| `credential-access-ssh-private-key` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-env-file` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-aws-credentials` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-etc-shadow` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-git-credentials` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-netrc` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-gnupg` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-kube-config` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-vault-token` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-terraform-creds` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-gnome-keyring` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-npmrc` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-pypirc` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-gem-credentials` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-ssl-private` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-ssh-host-key` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-pgpass` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-mysql-cnf` | credential-access | CRITICAL / HIGH ([context](/docs/understand/audit-engine#credential-access)) |
 | `credential-access-etc-passwd` | credential-access | MEDIUM |
 | `credential-access-azure-creds` | credential-access | HIGH |
 | `credential-access-gcloud-creds` | credential-access | HIGH |
@@ -328,6 +354,11 @@ Source of truth for regex-based rules:
 | `hidden-unicode-0` | hidden-unicode | HIGH |
 | `hidden-unicode-2` | hidden-unicode | HIGH |
 | `config-manipulation-0` | config-manipulation | HIGH |
+| `anti-refusal-0` | anti-refusal | HIGH |
+| `prompt-leakage-0` | prompt-leakage | HIGH |
+| `memory-poisoning-0` | memory-poisoning | HIGH |
+| `agent-snooping-0` | agent-snooping | HIGH |
+| `persistence-0` | persistence | HIGH |
 | `hidden-comment-injection-1` | hidden-comment-injection | HIGH |
 | `self-propagation-0` | self-propagation | HIGH |
 | `destructive-commands-0` | destructive-commands | HIGH |
@@ -355,6 +386,7 @@ Source of truth for regex-based rules:
 | `hardcoded-secret-9` | hardcoded-secret | HIGH |
 | `data-uri-0` | data-uri | MEDIUM |
 | `escape-obfuscation-0` | escape-obfuscation | MEDIUM |
+| `whitespace-padding` | whitespace-padding | MEDIUM (HIGH: ≥40 blank lines before nonblank text) |
 | `suspicious-fetch-0` | suspicious-fetch | MEDIUM |
 | `ip-address-url-0` | ip-address-url | MEDIUM |
 | `hidden-unicode-3` | hidden-unicode | MEDIUM |
@@ -363,6 +395,8 @@ Source of truth for regex-based rules:
 | `insecure-http-0` | insecure-http | LOW |
 | `external-link-0` | external-link | LOW |
 | `dangling-link` | dangling-link | LOW |
+| `reference-escapes-root` | reference-escapes-root | HIGH |
+| `reference-check-incomplete` | reference-check-incomplete | LOW |
 | `content-tampered` | content-tampered | MEDIUM |
 | `content-oversize` | content-oversize | MEDIUM |
 | `content-missing` | content-missing | LOW |
@@ -378,6 +412,22 @@ Source of truth for regex-based rules:
 | `cross-skill-privilege-network` | cross-skill-privilege-network | MEDIUM |
 | `cross-skill-stealth` | cross-skill-stealth | HIGH |
 | `cross-skill-cred-interpreter` | cross-skill-cred-interpreter | MEDIUM |
+| `disguised-executable` | disguised-executable | HIGH |
+| `python-bytecode` | python-bytecode | HIGH |
+| `executable-artifact` | executable-artifact | MEDIUM |
+| `archive-artifact` | archive-artifact | INFO |
+| `uncertain-header` | uncertain-header | INFO |
+| `ssrf-metadata-0` | ssrf-metadata | CRITICAL / HIGH ([context](/docs/understand/audit-engine#sensitive-destinations)) |
+| `ssrf-internal-0` | ssrf-internal | MEDIUM |
+| `ssrf-dynamic-0` | ssrf-dynamic | MEDIUM |
+| `unsafe-deserialization-python` | unsafe-deserialization | HIGH |
+| `unsafe-deserialization-yaml` | unsafe-deserialization | HIGH |
+| `unsafe-deserialization-torch` | unsafe-deserialization | HIGH |
+| `unsafe-deserialization-php` | unsafe-deserialization | HIGH |
+| `unsafe-deserialization-ruby` | unsafe-deserialization | HIGH |
+| `unsafe-deserialization-js` | unsafe-deserialization | HIGH |
+
+In `audit rules --format json`, rules marked *context* above carry `"severityContext": "python-inert"` while they keep their built-in CRITICAL severity and regex. Setting a severity or replacing the regex removes it, because the downgrade no longer applies.
 
 ## Subcommands
 
@@ -399,3 +449,15 @@ Source of truth for regex-based rules:
 - [Audit Engine](/docs/understand/audit-engine) — How the engine works (threat model, risk scoring, tiering)
 - [Securing Your Skills](/docs/how-to/advanced/security) — Security guide for teams
 - [CI/CD Skill Validation](/docs/how-to/recipes/ci-cd-skill-validation) — Pipeline automation recipe
+
+## File Applicability {#file-applicability}
+
+The optional `files` list limits a rule to matching paths. It uses Go `path.Match` syntax (`*`, `?`, character classes). A glob without `/`, such as `*.py`, matches a basename at any depth. A glob with `/`, such as `scripts/*.php`, matches the whole path relative to the scanned skill root; `*` does not cross `/`. Single-file scans use the basename; raw-content scans use the supplied filename. Matching is case-insensitive. This field filters files already admitted by the scanner; it does not collect additional file types.
+
+Absolute paths, empty globs, empty/dot/parent path segments, backslashes, colons, malformed character classes, and recursive `**` are rejected, including in disabled rules and unmatched overrides. Omitted `files` preserves inherited applicability; an explicit `files: []` clears it. ID and pattern overrides support this field; ID overrides take precedence. A full regex replacement replaces the whole rule, including applicability and built-in call inspection. `audit rules --format json` includes the effective `files` list when nonempty.
+
+```yaml
+rules:
+  - id: unsafe-deserialization-python
+    files: ['*.py', 'scripts/*.txt']
+```

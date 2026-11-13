@@ -6,24 +6,16 @@ import (
 	"strings"
 	"time"
 
+	"skillshare/internal/oplog"
+	"skillshare/internal/theme"
+	"skillshare/internal/ui"
+
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-
-	"skillshare/internal/oplog"
-	"skillshare/internal/ui"
 )
-
-// lc holds log-specific styles that don't belong in the shared tc palette.
-var lc = struct {
-	Bold  lipgloss.Style // counts, totals — bold without color
-	Label lipgloss.Style // row labels — wider (22) than tc.Label (14)
-}{
-	Bold:  lipgloss.NewStyle().Bold(true),
-	Label: lipgloss.NewStyle().Faint(true).Width(22),
-}
 
 // logLoadFn is a function that loads log items (runs in a goroutine inside the TUI).
 type logLoadFn func() ([]logItem, error)
@@ -44,6 +36,7 @@ type logDeletedMsg struct {
 // logTUIModel is the bubbletea model for the interactive log viewer.
 type logTUIModel struct {
 	list      list.Model
+	logLabel  string // "Operations" or "Audit"
 	modeLabel string // "global" or "project"
 	quitting  bool
 
@@ -63,7 +56,8 @@ type logTUIModel struct {
 
 	// Stats
 	stats     logStats
-	showStats bool
+	showStats bool // the Stats tab is open
+	showKeys  bool // ? swaps the detail panel for the full key list
 
 	// Detail panel scrolling
 	detailScroll int
@@ -73,10 +67,11 @@ type logTUIModel struct {
 	// Delete selection
 	selected       map[int]bool // key = allItems index; true = marked
 	selCount       int
-	configPath     string // needed for oplog.DeleteEntries
-	confirmDelete  bool   // true = showing delete confirmation prompt
-	deleting       bool   // true = delete in progress (spinner)
-	lastDeletedMsg string // e.g. "Deleted 3 entries"
+	configPath     string    // needed for oplog.DeleteEntries
+	confirmDelete  bool      // true = asking on the key line
+	deleteItems    []logItem // what the pending delete removes
+	deleting       bool      // true = delete in progress (spinner)
+	lastDeletedMsg string    // e.g. "✓ Deleted 3 entries"
 }
 
 // newLogTUIModel creates a new TUI model.
@@ -93,13 +88,9 @@ func newLogTUIModel(loadFn logLoadFn, items []logItem, logLabel, modeLabel, conf
 		allItems = items
 	}
 
-	delegate := list.NewDefaultDelegate()
-	configureDelegate(&delegate, false)
-
-	l := list.New(listItems, delegate, 0, 0)
-	l.Title = fmt.Sprintf("Log: %s (%s)", logLabel, modeLabel)
-	l.Styles.Title = tc.ListTitle
-	l.SetShowStatusBar(false)    // custom status line
+	l := list.New(listItems, logDelegate{}, 0, 0)
+	l.SetShowTitle(false)
+	l.SetShowStatusBar(false)    // counts are on the title line
 	l.SetFilteringEnabled(false) // application-level filter
 	l.SetShowHelp(false)
 	l.SetShowPagination(false) // page info in custom status line
@@ -107,16 +98,14 @@ func newLogTUIModel(loadFn logLoadFn, items []logItem, logLabel, modeLabel, conf
 	// Loading spinner
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
-	sp.Style = tc.SpinnerStyle
+	sp.Style = theme.Accent()
 
 	// Filter text input
-	fi := textinput.New()
-	fi.Prompt = "/ "
-	fi.PromptStyle = tc.Filter
-	fi.Cursor.Style = tc.Filter
+	fi := newTUIFilterInput("type to match a command, status or detail")
 
 	return logTUIModel{
 		list:        l,
+		logLabel:    logLabel,
 		modeLabel:   modeLabel,
 		loading:     loadFn != nil,
 		loadFn:      loadFn,
@@ -145,17 +134,12 @@ func (m logTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.termWidth = msg.Width
 		m.termHeight = msg.Height
-		// Horizontal layout: list takes left panel width; height = full minus overhead
-		// Overhead: filter bar(1) + stats footer(1) + help bar(1) + newlines(2) = 5
-		panelHeight := msg.Height - 5
-		if panelHeight < 6 {
-			panelHeight = 6
-		}
-		if m.termWidth >= 70 {
-			m.list.SetSize(logListWidth(m.termWidth), panelHeight)
+		bodyHeight := max(msg.Height-frameChrome, 6)
+		if m.termWidth >= tuiNarrowSplitWidth {
+			m.list.SetSize(logListWidth(m.termWidth), bodyHeight)
 		} else {
-			// Narrow fallback: vertical layout, list takes full width
-			m.list.SetSize(msg.Width, panelHeight)
+			// Narrow: the list sits above the details
+			m.list.SetSize(msg.Width, max(bodyHeight/2, 4))
 		}
 		return m, nil
 
@@ -173,7 +157,7 @@ func (m logTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.quitting = true
 			return m, tea.Quit
 		}
-		m.lastDeletedMsg = fmt.Sprintf("Deleted %d entries", msg.deleted)
+		m.lastDeletedMsg = "  " + theme.Success().Render("✓") + " Deleted " + countNoun(msg.deleted, "entry")
 		m.allItems = msg.items
 		m.selected = make(map[int]bool)
 		m.selCount = 0
@@ -213,7 +197,7 @@ func (m logTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
-		if !m.loading && !m.showStats && m.termWidth >= 70 {
+		if !m.loading && !m.showStats && m.termWidth >= tuiNarrowSplitWidth {
 			leftWidth := logListWidth(m.termWidth)
 			if msg.X > leftWidth {
 				// Right panel: scroll detail with mouse wheel
@@ -243,12 +227,13 @@ func (m logTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// --- Confirm delete mode ---
 		if m.confirmDelete {
 			switch msg.String() {
-			case "y":
+			case "y", "Y", "enter":
 				m.confirmDelete = false
 				m.deleting = true
 				return m, tea.Batch(m.loadSpinner.Tick, m.executeDelete())
-			case "n", "esc":
+			case "n", "N", "esc", "q":
 				m.confirmDelete = false
+				m.deleteItems = nil
 				return m, nil
 			}
 			return m, nil
@@ -256,24 +241,7 @@ func (m logTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// --- Filter mode: route keys to filterInput ---
 		if m.filtering {
-			switch msg.String() {
-			case "esc":
-				m.filtering = false
-				m.filterText = ""
-				m.filterInput.SetValue("")
-				m.applyLogFilter()
-				return m, nil
-			case "enter":
-				m.filtering = false
-				return m, nil
-			}
-			var cmd tea.Cmd
-			m.filterInput, cmd = m.filterInput.Update(msg)
-			newVal := m.filterInput.Value()
-			if newVal != m.filterText {
-				m.filterText = newVal
-				m.applyLogFilter()
-			}
+			cmd := handleTUIFilterKey(msg, &m.filtering, &m.filterText, &m.filterInput, m.applyLogFilter)
 			return m, cmd
 		}
 
@@ -282,13 +250,36 @@ func (m logTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
+		case "esc":
+			switch {
+			case m.showKeys:
+				m.showKeys = false
+			case m.showStats:
+				m.showStats = false
+			case m.filterText != "":
+				m.filterText = ""
+				m.filterInput.SetValue("")
+				m.applyLogFilter()
+			default:
+				m.quitting = true
+				return m, tea.Quit
+			}
+			return m, nil
+		case "?":
+			m.showKeys = !m.showKeys
+			return m, nil
+		case "tab", "shift+tab":
+			m.showStats = !m.showStats
+			return m, nil
+		}
+		if m.showStats {
+			return m, nil // the Stats tab has no list to act on
+		}
+		switch msg.String() {
 		case "/":
 			m.filtering = true
 			m.filterInput.Focus()
 			return m, textinput.Blink
-		case "s":
-			m.showStats = !m.showStats
-			return m, nil
 		case "ctrl+d":
 			m.detailScroll += 5
 			return m, nil
@@ -340,11 +331,13 @@ func (m logTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.rebuildListItems()
 			return m, nil
 
-		case "d": // initiate delete of selected items
-			if m.selCount == 0 {
+		case "d": // delete the selection, or the entry under the cursor
+			m.deleteItems = m.deleteTargets()
+			if len(m.deleteItems) == 0 {
 				break
 			}
 			m.confirmDelete = true
+			m.lastDeletedMsg = ""
 			return m, nil
 		}
 	}
@@ -452,15 +445,28 @@ func (m *logTUIModel) rebuildListItems() {
 	}
 }
 
+// deleteTargets is what d removes: the selection, or the entry under the
+// cursor when nothing is selected.
+func (m *logTUIModel) deleteTargets() []logItem {
+	var items []logItem
+	for i, item := range m.allItems {
+		if m.selected[i] {
+			items = append(items, item)
+		}
+	}
+	if len(items) == 0 {
+		if item, ok := m.list.SelectedItem().(logItem); ok {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
 // executeDelete performs the actual deletion in a background goroutine, then reloads.
 func (m *logTUIModel) executeDelete() tea.Cmd {
 	// Collect entries to delete, grouped by source file
 	var opsMatches, auditMatches []oplog.Entry
-	for idx, marked := range m.selected {
-		if !marked || idx >= len(m.allItems) {
-			continue
-		}
-		item := m.allItems[idx]
+	for _, item := range m.deleteItems {
 		switch item.source {
 		case "audit":
 			auditMatches = append(auditMatches, item.entry)
@@ -519,125 +525,116 @@ func (m logTUIModel) View() string {
 	if m.quitting {
 		return ""
 	}
-
-	// Loading / deleting state — spinner + message
+	title := m.renderTitleLine()
 	if m.loading {
-		return fmt.Sprintf("\n  %s Loading log entries...\n", m.loadSpinner.View())
+		return title + "\n\n" + renderBusyLine(m.termWidth, m.loadSpinner.View(), "Loading log entries…")
 	}
-	if m.deleting {
-		return fmt.Sprintf("\n  %s Deleting entries...\n", m.loadSpinner.View())
-	}
-
-	var b strings.Builder
-
-	// Stats overlay — full screen, unchanged
+	bodyHeight := max(m.termHeight-frameChrome, 6)
 	if m.showStats {
-		b.WriteString("\n")
-		b.WriteString(m.renderStatsPanel())
-		b.WriteString("\n")
-
-		help := "s back to list  q quit"
-		b.WriteString(tc.Help.Render(help))
-		b.WriteString("\n")
-		return b.String()
+		right := m.renderStatsPanel()
+		if m.showKeys {
+			right = renderKeysPanel(logKeyGroups)
+		}
+		body := lipgloss.NewStyle().Height(bodyHeight).MaxHeight(bodyHeight).PaddingLeft(1).Render(right)
+		return title + "\n\n" + body + "\n" + m.renderBottom()
 	}
-
-	// Narrow terminal (<70 cols): vertical fallback
-	if m.termWidth < 70 {
-		return m.viewVertical()
+	if m.termWidth < tuiNarrowSplitWidth {
+		listHeight := max(bodyHeight/2, 4)
+		detailHeight := max(bodyHeight-listHeight-1, 4)
+		detail := lipgloss.NewStyle().Height(detailHeight).MaxHeight(detailHeight).PaddingLeft(1).
+			Render(m.renderRight(m.termWidth-2, detailHeight))
+		return title + "\n\n" + m.list.View() + "\n\n" + detail + "\n" + m.renderBottom()
 	}
-
-	// ── Horizontal split layout ──
-	// Footer: gap(1) + filter(1) + stats(1) + gap(1) + help(1) + trailing(1) = 6 + 2 gaps = 8
-	panelHeight := m.termHeight - 8
-	if panelHeight < 6 {
-		panelHeight = 6
-	}
-
 	leftWidth := logListWidth(m.termWidth)
 	rightWidth := logDetailPanelWidth(m.termWidth)
-
-	// Right panel: detail for selected item
-	var detailStr, scrollInfo string
-	if item, ok := m.list.SelectedItem().(logItem); ok {
-		detailStr, scrollInfo = wrapAndScroll(renderLogDetailPanel(item), rightWidth-1, m.detailScroll, panelHeight)
-	}
-
-	body := renderHorizontalSplit(m.list.View(), detailStr, leftWidth, rightWidth, panelHeight)
-	b.WriteString(body)
-	b.WriteString("\n\n")
-
-	// Filter bar (below panels, matching list TUI layout)
-	b.WriteString(m.renderLogFilterBar())
-
-	// Stats footer
-	b.WriteString(m.renderStatsFooter())
-	b.WriteString("\n")
-
-	b.WriteString(tc.Help.Render(appendScrollInfo(m.logHelpBar(), scrollInfo)))
-	b.WriteString("\n")
-
-	return b.String()
+	return title + "\n\n" +
+		renderFrameSplit(m.list.View(), m.renderRight(rightWidth-2, bodyHeight), leftWidth, rightWidth, bodyHeight) + "\n" +
+		m.renderBottom()
 }
 
-// viewVertical renders the original vertical layout for narrow terminals.
-func (m logTUIModel) viewVertical() string {
-	var b strings.Builder
-
-	b.WriteString(m.list.View())
-	b.WriteString("\n\n")
-
-	b.WriteString(m.renderLogFilterBar())
-
-	var scrollInfo string
-	if item, ok := m.list.SelectedItem().(logItem); ok {
-		detailHeight := m.termHeight - m.termHeight*2/5 - 7
-		var detailStr string
-		detailStr, scrollInfo = wrapAndScroll(renderLogDetailPanel(item), m.termWidth, m.detailScroll, detailHeight)
-		b.WriteString(detailStr)
+// renderTitleLine renders the scope, the entry count, the success rate and
+// the Entries / Stats tabs.
+func (m logTUIModel) renderTitleLine() string {
+	facts := []string{m.modeLabel}
+	if m.logLabel == "Audit" {
+		facts = append(facts, "audit log")
 	}
-
-	b.WriteString(m.renderStatsFooter())
-
-	b.WriteString(tc.Help.Render(appendScrollInfo(m.logHelpBar(), scrollInfo)))
-	b.WriteString("\n")
-
-	return b.String()
+	if !m.loading {
+		count := countNoun(len(m.allItems), "entry")
+		if m.filterText != "" {
+			count = formatNumber(m.matchCount) + " of " + count
+		}
+		facts = append(facts, count)
+	}
+	if m.stats.Total > 0 && !m.loading {
+		// Last, because a colored fact ends the dim run of facts.
+		facts = append(facts, statsSuccessRateColor(m.stats.SuccessRate).Render(fmt.Sprintf("%.0f%% ok", m.stats.SuccessRate*100)))
+	}
+	return renderFrameTitle(m.termWidth, "log", facts, []frameTab{{"Entries", !m.showStats}, {"Stats", m.showStats}})
 }
 
-// logHelpBar returns the context-sensitive help text for the bottom bar.
-func (m logTUIModel) logHelpBar() string {
-	if m.confirmDelete {
-		return fmt.Sprintf("Delete %d entries? y confirm  n cancel", m.selCount)
+// renderRight renders the detail panel, or the key list while ? is on.
+func (m logTUIModel) renderRight(width, height int) string {
+	if m.showKeys {
+		return renderKeysPanel(logKeyGroups)
 	}
-
-	var parts []string
-	parts = append(parts, "↑↓ navigate  ←→ page  / filter")
-
-	if m.selCount > 0 {
-		parts = append(parts, fmt.Sprintf("d delete(%d)  space toggle  a all", m.selCount))
-	} else {
-		parts = append(parts, "space select  a all")
+	item, ok := m.list.SelectedItem().(logItem)
+	if !ok {
+		return ""
 	}
-
-	parts = append(parts, "s stats  q quit")
-
-	help := strings.Join(parts, "  ")
-
-	if m.lastDeletedMsg != "" {
-		help = tc.Green.Render(m.lastDeletedMsg) + "  " + help
-	}
-
-	return help
+	detail, _ := wrapAndScroll(renderLogDetailPanel(item), width, m.detailScroll, height)
+	return detail
 }
 
-// renderLogFilterBar renders the status line for the log TUI.
-func (m logTUIModel) renderLogFilterBar() string {
-	return renderTUIFilterBar(
-		m.filterInput.View(), m.filtering, m.filterText,
-		m.matchCount, len(m.allItems), 0,
-		"entries", renderPageInfoFromPaginator(m.list.Paginator),
-	)
+// renderBottom renders the note line and the key line. The delete
+// confirmation, the filter input and a running delete take over the key line.
+func (m logTUIModel) renderBottom() string {
+	note := m.lastDeletedMsg
+	var line string
+	switch {
+	case m.deleting:
+		line = renderBusyLine(m.termWidth, m.loadSpinner.View(), "Deleting "+countNoun(len(m.deleteItems), "entry")+"…")
+	case m.confirmDelete:
+		line = renderConfirmLine(m.termWidth, "Delete "+countNoun(len(m.deleteItems), "entry")+"?", true, "")
+	case m.filtering:
+		line = renderFilterLine(m.termWidth, m.filterInput.View(), m.matchCount)
+	case m.showKeys:
+		line = renderKeyLine(m.termWidth, []keyHint{{"?/esc", "close"}}, "")
+	case m.showStats:
+		line = renderKeyLine(m.termWidth, []keyHint{{"tab", "entries"}, {"esc", "back"}, {"?", "keys"}}, "")
+	default:
+		filter := keyHint{"/", "filter"}
+		if m.filterText != "" {
+			filter = keyHint{"esc", "clear filter"}
+		}
+		hints := []keyHint{{"↑↓", "move"}, {"space", "select"}, filter, {"d", "delete"}, {"tab", "stats"}, {"?", "keys"}}
+		right := framePosition(m.list.Index()+1, m.matchCount)
+		if m.selCount > 0 {
+			right = formatNumber(m.selCount) + " selected"
+		}
+		line = renderKeyLine(m.termWidth, hints, right)
+	}
+	return note + "\n" + line
+}
+
+// logKeyGroups lists every key for the ? panel.
+var logKeyGroups = []keyGroup{
+	{"Move", []keyHint{
+		{"↑↓", "move"},
+		{"←→", "page"},
+		{"/", "filter"},
+		{"ctrl+d/u", "scroll the details"},
+		{"tab", "switch between Entries and Stats"},
+		{"esc", "clear the filter, then quit"},
+		{"q", "quit"},
+	}},
+	{"Select", []keyHint{
+		{"space", "select"},
+		{"a", "select all, or none"},
+	}},
+	{"Actions", []keyHint{
+		{"d", "delete the selection, or the entry under the cursor"},
+	}},
 }
 
 // logListWidth returns the left panel width for horizontal layout.
@@ -654,68 +651,51 @@ func logListWidth(termWidth int) int {
 }
 
 // logDetailPanelWidth returns the right detail panel width.
-// termWidth minus list width minus border/gap (3 chars).
 func logDetailPanelWidth(termWidth int) int {
-	w := termWidth - logListWidth(termWidth) - 3
-	if w < 30 {
-		w = 30
-	}
-	return w
+	return max(termWidth-logListWidth(termWidth), 30)
 }
 
 // renderLogDetailPanel renders structured details for the selected log entry.
 func renderLogDetailPanel(item logItem) string {
 	var b strings.Builder
+	e := item.entry
+	pairs := formatLogDetailPairs(e)
 
+	labelWidth := 9
+	for _, p := range pairs {
+		labelWidth = max(labelWidth, min(lipgloss.Width(p.key), 20))
+	}
 	row := func(label, value string) {
-		b.WriteString(lc.Label.Render(label))
-		b.WriteString(tc.Value.Render(value))
+		b.WriteString(theme.Dim().Width(labelWidth + 1).Render(label))
+		b.WriteString(value)
 		b.WriteString("\n")
 	}
 
-	e := item.entry
+	b.WriteString(theme.Primary().Bold(true).Render(e.Command))
+	b.WriteString("\n\n")
 
-	// Full timestamp
-	row("Timestamp:", e.Timestamp)
-
-	// Command — cyan to match CLI palette
-	row("Command:", tc.Cyan.Render(strings.ToUpper(e.Command)))
-
-	// Status with color
-	statusDisplay := e.Status
-	switch e.Status {
-	case "ok":
-		statusDisplay = tc.Green.Render(e.Status)
-	case "error", "blocked":
-		statusDisplay = tc.Red.Render(e.Status)
-	case "partial":
-		statusDisplay = tc.Yellow.Render(e.Status)
+	row("Status", ui.StyledMark(logStatusMark(e.Status))+" "+e.Status)
+	when := e.Timestamp
+	if ts, err := time.Parse(time.RFC3339, e.Timestamp); err == nil {
+		when = ts.Local().Format("2006-01-02 15:04:05") + theme.Dim().Render(" · "+timeAgo(ts))
 	}
-	row("Status:", statusDisplay)
-
-	// Duration
+	row("When", when)
 	if dur := formatLogDuration(e.Duration); dur != "" {
-		row("Duration:", dur)
+		row("Took", dur)
 	}
-
-	// Source log file
-	if item.source != "" {
-		row("Source:", item.source)
+	if item.source == "audit" {
+		row("Log", "audit")
 	}
-
-	// Message
 	if e.Message != "" {
-		row("Message:", e.Message)
+		row("Message", e.Message)
 	}
 
-	// Structured args via formatLogDetailPairs — colorize semantic values
-	pairs := formatLogDetailPairs(e)
 	const maxBulletItems = 100 // right panel has dedicated space + scroll
 
 	for _, p := range pairs {
 		// List fields: render as multi-line bullet list for readability
 		if p.isList && len(p.listValues) > 0 {
-			b.WriteString(lc.Label.Render(p.key + ":"))
+			b.WriteString(theme.Dim().Render(p.key))
 			b.WriteString("\n")
 			show := p.listValues
 			remaining := 0
@@ -724,11 +704,11 @@ func renderLogDetailPanel(item logItem) string {
 				show = show[:maxBulletItems]
 			}
 			for _, v := range show {
-				b.WriteString("    - " + tc.Value.Render(v) + "\n")
+				b.WriteString("  - " + v + "\n")
 			}
 			if remaining > 0 {
-				summary := fmt.Sprintf("    ... and %d more", remaining)
-				b.WriteString(tc.Dim.Render(summary) + "\n")
+				summary := fmt.Sprintf("  ... and %d more", remaining)
+				b.WriteString(theme.Dim().Render(summary) + "\n")
 			}
 			continue
 		}
@@ -741,9 +721,9 @@ func renderLogDetailPanel(item logItem) string {
 		// Colorize only severity/status fields to avoid visual noise
 		switch {
 		case strings.Contains(p.key, "failed") || strings.Contains(p.key, "scan-errors"):
-			value = tc.Red.Render(value)
+			value = theme.Danger().Render(value)
 		case strings.Contains(p.key, "warning"):
-			value = tc.Yellow.Render(value)
+			value = theme.Warning().Render(value)
 		case p.key == "risk":
 			value = colorizeRiskValue(value)
 		case p.key == "threshold":
@@ -752,7 +732,7 @@ func renderLogDetailPanel(item logItem) string {
 			value = colorizeSeverityBreakdown(value)
 		}
 
-		row(p.key+":", value)
+		row(p.key, value)
 	}
 
 	return b.String()
@@ -760,7 +740,7 @@ func renderLogDetailPanel(item logItem) string {
 
 // severityStyles maps the 5 severity levels (c/h/m/l/i) to lipgloss styles.
 var severityStyles = []lipgloss.Style{
-	tc.Critical, tc.High, tc.Medium, tc.Low, tc.Info,
+	theme.Severity("critical"), theme.Severity("high"), theme.Severity("medium"), theme.Severity("low"), theme.Severity("info"),
 }
 
 // colorizeSeverityBreakdown colors each number in "0/0/1/0/0" to match audit summary.
@@ -772,16 +752,16 @@ func colorizeSeverityBreakdown(value string) string {
 	for i, p := range parts {
 		parts[i] = severityStyles[i].Render(p)
 	}
-	sep := tc.Dim.Render("/")
+	sep := theme.Dim().Render("/")
 	return strings.Join(parts, sep)
 }
 
 // colorizeThreshold applies color based on audit threshold level.
 func colorizeThreshold(value string) string {
 	if ui.SeverityColorID(value) == "" {
-		return tc.Green.Render(value)
+		return theme.Success().Render(value)
 	}
-	return tcSevStyle(value).Render(value)
+	return theme.SeverityStyle(value).Render(value)
 }
 
 // colorizeRiskValue applies color based on the risk label embedded in the value string.
@@ -790,9 +770,9 @@ func colorizeRiskValue(value string) string {
 	sev := strings.SplitN(strings.ToUpper(value), " ", 2)[0]
 	sev = strings.TrimRight(sev, "(")
 	if ui.SeverityColorID(sev) == "" {
-		return tc.Green.Render(value)
+		return theme.Success().Render(value)
 	}
-	return tcSevStyle(sev).Render(value)
+	return theme.SeverityStyle(sev).Render(value)
 }
 
 // computeLogStatsFromItems converts logItems to oplog entries and computes stats.
@@ -804,44 +784,12 @@ func computeLogStatsFromItems(items []logItem) logStats {
 	return computeLogStats(entries)
 }
 
-// renderStatsFooter renders a compact stats line above the help bar.
-func (m logTUIModel) renderStatsFooter() string {
-	if m.stats.Total == 0 {
-		return ""
-	}
-
-	rateStyle := statsSuccessRateColor(m.stats.SuccessRate)
-
-	parts := []string{
-		tc.Dim.Render(fmt.Sprintf("%d ops", m.stats.Total)),
-		rateStyle.Render(fmt.Sprintf("✓ %.1f%%", m.stats.SuccessRate*100)),
-	}
-
-	if m.stats.LastOperation != nil {
-		ts, err := time.Parse(time.RFC3339, m.stats.LastOperation.Timestamp)
-		if err == nil {
-			lastPart := tc.Dim.Render("last: ") +
-				tc.Cyan.Render(m.stats.LastOperation.Command) +
-				tc.Dim.Render(fmt.Sprintf(" %s ago", formatRelativeTime(time.Since(ts))))
-			parts = append(parts, lastPart)
-		}
-	}
-
-	sep := tc.Dim.Render(" | ")
-	return "  " + strings.Join(parts, sep) + "\n"
-}
-
 // renderStatsPanel renders the full stats overlay panel.
 func (m logTUIModel) renderStatsPanel() string {
 	var b strings.Builder
 
-	b.WriteString(tc.Title.Render("  Operation Log Summary"))
-	b.WriteString("\n")
-	b.WriteString(tc.Dim.Render("  " + strings.Repeat("─", 50)))
-	b.WriteString("\n\n")
-
 	if m.stats.Total == 0 {
-		b.WriteString(tc.Dim.Render("  No entries"))
+		b.WriteString(theme.Dim().Render("  No entries"))
 		b.WriteString("\n")
 		return b.String()
 	}
@@ -853,20 +801,24 @@ func (m logTUIModel) renderStatsPanel() string {
 	}
 	rateColor := statsSuccessRateColor(m.stats.SuccessRate)
 	b.WriteString(fmt.Sprintf("  %s  %s\n\n",
-		tc.Dim.Render("Total:"),
-		lc.Bold.Render(fmt.Sprintf("%d", m.stats.Total)),
+		theme.Dim().Render("Total:"),
+		lipgloss.NewStyle().Bold(true).Render(fmt.Sprintf("%d", m.stats.Total)),
 	))
 	b.WriteString(fmt.Sprintf("  %s  %s %s\n\n",
-		tc.Dim.Render("OK:"),
+		theme.Dim().Render("OK:"),
 		rateColor.Render(fmt.Sprintf("%d/%d", okTotal, m.stats.Total)),
-		tc.Dim.Render(fmt.Sprintf("(%.1f%%)", m.stats.SuccessRate*100)),
+		theme.Dim().Render(fmt.Sprintf("(%.1f%%)", m.stats.SuccessRate*100)),
 	))
 
 	// ── Command breakdown with horizontal bars ──
-	header := fmt.Sprintf("  %-12s  %-20s  %s", "Command", "", "OK")
-	b.WriteString(tc.Dim.Render(header))
+	nameWidth := 12
+	for name := range m.stats.ByCommand {
+		nameWidth = max(nameWidth, lipgloss.Width(name))
+	}
+	header := fmt.Sprintf("  %-*s  %-20s  %s", nameWidth, "Command", "", "OK")
+	b.WriteString(theme.Dim().Render(header))
 	b.WriteString("\n")
-	b.WriteString(tc.Dim.Render("  " + strings.Repeat("─", 42)))
+	b.WriteString(theme.Dim().Render("  " + strings.Repeat("─", nameWidth+30)))
 	b.WriteString("\n")
 
 	type cmdEntry struct {
@@ -902,21 +854,21 @@ func (m logTUIModel) renderStatsPanel() string {
 		}
 		errBarLen := barLen - okBarLen
 
-		cmdBar := tc.Green.Render(strings.Repeat("▓", okBarLen))
+		cmdBar := theme.Success().Render(strings.Repeat("▓", okBarLen))
 		if errBarLen > 0 {
-			cmdBar += tc.Red.Render(strings.Repeat("▓", errBarLen))
+			cmdBar += theme.Danger().Render(strings.Repeat("▓", errBarLen))
 		}
 		padding := strings.Repeat(" ", cmdBarWidth-barLen)
 
 		// "✓6/9" format — ok out of total, self-explanatory
 		okRatio := fmt.Sprintf("✓%d/%d", cmd.cs.OK, cmd.cs.Total)
-		ratioColor := tc.Green
+		ratioColor := theme.Success()
 		if cmd.cs.OK < cmd.cs.Total {
-			ratioColor = tc.Red
+			ratioColor = theme.Danger()
 		}
 
 		b.WriteString(fmt.Sprintf("  %s  %s%s  %s\n",
-			tc.Dim.Render(fmt.Sprintf("%-12s", cmd.name)),
+			theme.Dim().Render(fmt.Sprintf("%-*s", nameWidth, cmd.name)),
 			cmdBar, padding, ratioColor.Render(okRatio)))
 	}
 
@@ -931,19 +883,19 @@ func (m logTUIModel) renderStatsPanel() string {
 		blockedTotal += cs.Blocked
 	}
 
-	b.WriteString(tc.Dim.Render("  " + strings.Repeat("─", 50)))
+	b.WriteString(theme.Dim().Render("  " + strings.Repeat("─", 50)))
 	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("  %s %s",
-		tc.Dim.Render("Status:"),
-		tc.Green.Render(fmt.Sprintf("✓ %d ok", okTotal))))
+		theme.Dim().Render("Status:"),
+		theme.Success().Render(fmt.Sprintf("✓ %d ok", okTotal))))
 	if errTotal > 0 {
-		b.WriteString(fmt.Sprintf("  %s", tc.Red.Render(fmt.Sprintf("✗ %d error", errTotal))))
+		b.WriteString(fmt.Sprintf("  %s", theme.Danger().Render(fmt.Sprintf("✗ %d error", errTotal))))
 	}
 	if partialTotal > 0 {
-		b.WriteString(fmt.Sprintf("  %s", tc.Yellow.Render(fmt.Sprintf("◐ %d partial", partialTotal))))
+		b.WriteString(fmt.Sprintf("  %s", theme.Warning().Render(fmt.Sprintf("◐ %d partial", partialTotal))))
 	}
 	if blockedTotal > 0 {
-		b.WriteString(fmt.Sprintf("  %s", tc.Red.Render(fmt.Sprintf("⊘ %d blocked", blockedTotal))))
+		b.WriteString(fmt.Sprintf("  %s", theme.Danger().Render(fmt.Sprintf("⊘ %d blocked", blockedTotal))))
 	}
 	b.WriteString("\n")
 
@@ -951,11 +903,11 @@ func (m logTUIModel) renderStatsPanel() string {
 	if m.stats.LastOperation != nil {
 		ts, err := time.Parse(time.RFC3339, m.stats.LastOperation.Timestamp)
 		if err == nil {
-			ago := formatRelativeTime(time.Since(ts))
+			ago := timeAgo(ts)
 			b.WriteString(fmt.Sprintf("  %s %s %s\n",
-				tc.Dim.Render("Last op:"),
-				tc.Cyan.Render(m.stats.LastOperation.Command),
-				tc.Dim.Render(fmt.Sprintf("(%s ago)", ago))))
+				theme.Dim().Render("Last op:"),
+				theme.Accent().Render(m.stats.LastOperation.Command),
+				theme.Dim().Render("("+ago+")")))
 		}
 	}
 
@@ -966,11 +918,11 @@ func (m logTUIModel) renderStatsPanel() string {
 func statsSuccessRateColor(rate float64) lipgloss.Style {
 	switch {
 	case rate >= 0.9:
-		return tc.Green.Bold(true)
+		return theme.Success().Bold(true)
 	case rate >= 0.7:
-		return tc.Yellow.Bold(true)
+		return theme.Warning().Bold(true)
 	default:
-		return tc.Red.Bold(true)
+		return theme.Danger().Bold(true)
 	}
 }
 

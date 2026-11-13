@@ -1,235 +1,655 @@
 targets:
-  - global_name: adal
-    project_name: adal
-    global_path: "~/.adal/skills"
-    project_path: ".adal/skills"
-  - global_name: universal
-    project_name: universal
-    global_path: "~/.agents/skills"
-    project_path: ".agents/skills"
+  - name: adal
+    skills:
+      global: "~/.adal/skills"
+      project: ".adal/skills"
+  - name: universal
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+    instructions:
+      global: "~/.agents/AGENTS.md"
+      project: "AGENTS.md"
     aliases: [agents]
-  - global_name: amp
-    project_name: amp
-    global_path: "~/.config/agents/skills"
-    project_path: ".agents/skills"
-  - global_name: antigravity
-    project_name: antigravity
-    global_path: "~/.gemini/antigravity/skills"
-    project_path: ".agent/skills"
-  - global_name: astrbot
-    project_name: astrbot
-    global_path: "~/.astrbot/data/skills"
-    project_path: "data/skills"
-  - global_name: augment
-    project_name: augment
-    global_path: "~/.augment/skills"
-    project_path: ".augment/skills"
-  - global_name: bob
-    project_name: bob
-    global_path: "~/.bob/skills"
-    project_path: ".bob/skills"
-  - global_name: claude
-    project_name: claude
-    global_path: "~/.claude/skills"
-    project_path: ".claude/skills"
+  - name: amp
+    skills:
+      global: "~/.config/agents/skills"
+      project: ".agents/skills"
+    also_scans:
+      - {global: "~/.agents/skills"}
+      - {global: "~/.config/amp/skills"}
+      - {global: "~/.claude/skills", project: ".claude/skills"}
+    instructions:
+      global: "~/.config/amp/AGENTS.md"
+      project: "AGENTS.md"
+  - name: antigravity
+    skills:
+      global: "~/.gemini/config/skills"
+      project: ".agents/skills"
+    # Same global file as gemini, so it always shares gemini's instructions.
+    instructions:
+      global: "~/.gemini/GEMINI.md"
+      project: "AGENTS.md"
+      same_as: gemini
+  - name: antigravity-cli
+    skills:
+      global: "~/.gemini/antigravity-cli/skills"
+      project: ".agents/skills"
+    # Same global file as gemini, so it always shares gemini's instructions.
+    instructions:
+      global: "~/.gemini/GEMINI.md"
+      project: "AGENTS.md"
+      same_as: gemini
+  - name: aiderdesk
+    skills:
+      global: "~/.aider-desk/skills"
+      project: ".aider-desk/skills"
+    aliases: [aider-desk]
+  - name: astrbot
+    skills:
+      global: "~/.astrbot/data/skills"
+      project: "data/skills"
+  - name: augment
+    skills:
+      global: "~/.augment/skills"
+      project: ".augment/skills"
+    agents:
+      global: "~/.augment/agents"
+      project: ".augment/agents"
+  - name: autohand-code
+    skills:
+      global: "~/.autohand/skills"
+      project: ".autohand/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+      - {global: "~/.codex/skills"}
+      - {global: "~/.claude/skills", project: ".claude/skills"}
+      - {global: "~/.agent/skills", project: ".agent/skills"}
+      - {project: "skills"}
+    instructions:
+      project: "AGENTS.md"
+  - name: bob
+    skills:
+      global: "~/.bob/skills"
+      project: ".bob/skills"
+  - name: claude
+    config_dir: "~/.claude"
+    skills:
+      global: "~/.claude/skills"
+      project: ".claude/skills"
+    agents:
+      global: "~/.claude/agents"
+      project: ".claude/agents"
+    # Claude reads ./AGENTS.md only when the project has no CLAUDE.md, and has
+    # no user-level AGENTS.md. Rules are the extra .md files it loads too.
+    instructions:
+      global: "~/.claude/CLAUDE.md"
+      project: "CLAUDE.md"
+      import: true
+      project_fallback: "AGENTS.md"
+      rules:
+        global: "~/.claude/rules"
+        project: ".claude/rules"
     aliases: [claude-code]
-  - global_name: cline
-    project_name: cline
-    global_path: "~/.agents/skills"
-    project_path: ".agents/skills"
-  - global_name: codebuddy
-    project_name: codebuddy
-    global_path: "~/.codebuddy/skills"
-    project_path: ".codebuddy/skills"
-  - global_name: comate
-    project_name: comate
-    global_path: "~/.comate/skills"
-    project_path: ".comate/skills"
-  - global_name: codex
-    project_name: codex
-    global_path: "~/.codex/skills"
-    project_path: ".agents/skills"
-  - global_name: commandcode
-    project_name: commandcode
-    global_path: "~/.commandcode/skills"
-    project_path: ".commandcode/skills"
+  - name: codearts
+    skills:
+      global: "~/.codeartsdoer/skills"
+      project: ".codeartsdoer/skills"
+    aliases: [codearts-agent]
+  - name: cline
+    skills:
+      global: "~/.cline/skills"
+      project: ".cline/skills"
+    also_scans:
+      - {project: ".clinerules/skills"}
+      - {project: ".claude/skills"}
+    instructions:
+      global: "~/.agents/AGENTS.md"
+      project: "AGENTS.md"
+      same_as: universal
+      rules:
+        global: "~/Documents/Cline/Rules"
+        project: ".clinerules"
+  - name: codebuddy
+    skills:
+      global: "~/.codebuddy/skills"
+      project: ".codebuddy/skills"
+    instructions:
+      global: "~/.codebuddy/CODEBUDDY.md"
+      project: "CODEBUDDY.md"
+      import: true
+      project_fallback: "AGENTS.md"
+      rules:
+        global: "~/.codebuddy/rules"
+        project: ".codebuddy/rules"
+  - name: codestudio
+    skills:
+      global: "~/.codestudio/skills"
+      project: ".codestudio/skills"
+    aliases: [code-studio]
+  - name: comate
+    skills:
+      global: "~/.comate/skills"
+      project: ".comate/skills"
+  - name: codex
+    detect: "~/.codex"
+    config_dir: "~/.codex"
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+    also_scans:
+      - {global: "~/.codex/skills", project: ".codex/skills"}
+    instructions:
+      global: "~/.codex/AGENTS.md"
+      project: "AGENTS.md"
+  - name: commandcode
+    skills:
+      global: "~/.commandcode/skills"
+      project: ".commandcode/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+    instructions:
+      global: "~/.commandcode/AGENTS.md"
+      project: "AGENTS.md"
+      import: true
     aliases: [command-code]
-  - global_name: continue
-    project_name: continue
-    global_path: "~/.continue/skills"
-    project_path: ".continue/skills"
-  - global_name: cortex
-    project_name: cortex
-    global_path: "~/.snowflake/cortex/skills"
-    project_path: ".cortex/skills"
-  - global_name: copilot
-    project_name: copilot
-    global_path: "~/.copilot/skills"
-    project_path: ".github/skills"
+  - name: continue
+    skills:
+      global: "~/.continue/skills"
+      project: ".continue/skills"
+  - name: cortex
+    skills:
+      global: "~/.snowflake/cortex/skills"
+      project: ".cortex/skills"
+  - name: copilot
+    skills:
+      global: "~/.copilot/skills"
+      project: ".github/skills"
+    agents:
+      global: "~/.copilot/agents"
+      project: ".github/agents"
+    also_scans:
+      - {project: ".claude/skills"}
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+    instructions:
+      global: "~/.copilot/copilot-instructions.md"
+      project: ".github/copilot-instructions.md"
     aliases: [github-copilot]
-  - global_name: crush
-    project_name: crush
-    global_path: "~/.config/crush/skills"
-    project_path: ".crush/skills"
-  - global_name: cursor
-    project_name: cursor
-    global_path: "~/.cursor/skills"
-    project_path: ".cursor/skills"
-  - global_name: deepagents
-    project_name: deepagents
-    global_path: "~/.deepagents/agent/skills"
-    project_path: ".deepagents/skills"
+  - name: crush
+    skills:
+      global: "~/.config/crush/skills"
+      project: ".crush/skills"
+    also_scans:
+      - {global: "~/.config/agents/skills"}
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+      - {global: "~/.claude/skills", project: ".claude/skills"}
+      - {project: ".cursor/skills"}
+  - name: cursor
+    skills:
+      global: "~/.cursor/skills"
+      project: ".agents/skills"
+    agents:
+      global: "~/.cursor/agents"
+      project: ".cursor/agents"
+    also_scans:
+      - {project: ".cursor/skills"}
+      - {global: "~/.agents/skills"}
+      - {global: "~/.claude/skills", project: ".claude/skills"}
+      - {global: "~/.codex/skills", project: ".codex/skills"}
+    # Cursor keeps User Rules in app settings, so there is no global file.
+    instructions:
+      project: "AGENTS.md"
+  - name: deepagents
+    skills:
+      global: "~/.deepagents/agent/skills"
+      project: ".deepagents/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+    instructions:
+      global: "~/.deepagents/agent/AGENTS.md"
+      project: ".deepagents/AGENTS.md"
     aliases: [deep-agents]
-  - global_name: droid
-    project_name: droid
-    global_path: "~/.factory/skills"
-    project_path: ".factory/skills"
-  - global_name: firebender
-    project_name: firebender
-    global_path: "~/.firebender/skills"
-    project_path: ".firebender/skills"
-  - global_name: gemini
-    project_name: gemini
-    global_path: "~/.gemini/skills"
-    project_path: ".gemini/skills"
+  - name: deepseek-harness
+    skills:
+      global: "~/.dsh/skills"
+      project: ".dsh/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+  - name: devin
+    skills:
+      global: "~/.config/devin/skills"
+      project: ".devin/skills"
+    instructions:
+      global: "~/.config/devin/AGENTS.md"
+      project: "AGENTS.md"
+    aliases: [devin-terminal]
+  - name: dexto
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+  - name: droid
+    skills:
+      global: "~/.factory/skills"
+      project: ".factory/skills"
+    agents:
+      global: "~/.factory/droids"
+      project: ".factory/droids"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+      - {global: "~/.agent/skills", project: ".agent/skills"}
+    instructions:
+      global: "~/.factory/AGENTS.md"
+      project: "AGENTS.md"
+    aliases: [factory]
+  - name: firebender
+    skills:
+      global: "~/.firebender/skills"
+      project: ".firebender/skills"
+    also_scans:
+      - {global: "~/.agents/skills"}
+      - {global: "~/.claude/skills"}
+      - {global: "~/.codex/skills"}
+      - {global: "~/.cursor/skills"}
+      - {global: "~/.goose/skills"}
+    instructions:
+      global: "~/.firebender/AGENTS.md"
+      project: "AGENTS.md"
+  - name: forgecode
+    skills:
+      global: "~/forge/skills"
+      project: ".forge/skills"
+    also_scans:
+      - {global: "~/.agents/skills"}
+    instructions:
+      global: "~/forge/AGENTS.md"
+      project: "AGENTS.md"
+    aliases: [forge-code]
+  - name: fx
+    skills:
+      global: "~/.fx/skills"
+      project: ".fx/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+      - {global: "~/.claude/skills", project: ".claude/skills"}
+      - {global: "~/.codex/skills", project: ".codex/skills"}
+      - {global: "~/.config/opencode/skills"}
+      - {project: ".opencode/skills"}
+      - {global: "~/.claw/skills", project: ".claw/skills"}
+      - {project: "skills"}
+    instructions:
+      global: "~/.fx/AGENTS.md"
+      project: "AGENTS.md"
+  - name: gemini
+    skills:
+      global: "~/.gemini/skills"
+      project: ".gemini/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+    # Gemini CLI's @import only reads allowed directories; unverified for skillshare paths, so symlink for now.
+    instructions:
+      global: "~/.gemini/GEMINI.md"
+      project: "GEMINI.md"
     aliases: [gemini-cli]
-  - global_name: goose
-    project_name: goose
-    global_path: "~/.config/goose/skills"
-    project_path: ".goose/skills"
-  - global_name: iflow
-    project_name: iflow
-    global_path: "~/.iflow/skills"
-    project_path: ".iflow/skills"
+  - name: gitlab-duo
+    skills:
+      global: "~/.gitlab/duo/skills"
+      project: "skills"
+    also_scans:
+      - {global: "~/.agents/skills"}
+  - name: goose
+    detect: "~/.config/goose"
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+    also_scans:
+      - {project: ".goose/skills"}
+      - {global: "~/.config/goose/skills"}
+      - {global: "~/.claude/skills", project: ".claude/skills"}
+      - {global: "~/.config/agents/skills"}
+    instructions:
+      global: "~/.config/goose/.goosehints"
+      project: "AGENTS.md"
+  - name: grok
+    skills:
+      global: "~/.grok/skills"
+      project: ".grok/skills"
+    also_scans:
+      - {global: "~/.agents/skills"}
+    instructions:
+      global: "~/.grok/AGENTS.md"
+      project: "AGENTS.md"
+      rules:
+        global: "~/.grok/rules"
+        project: ".grok/rules"
+    aliases: [xai, grok-cli]
+  - name: hermes
+    skills:
+      global: "~/.hermes/skills"
+      project: ".hermes/skills"
+    aliases: [hermes-agent]
+  - name: iflow
+    skills:
+      global: "~/.iflow/skills"
+      project: ".iflow/skills"
+    instructions:
+      global: "~/.iflow/IFLOW.md"
+      project: "IFLOW.md"
+      import: true
     aliases: [iflow-cli]
-  - global_name: junie
-    project_name: junie
-    global_path: "~/.junie/skills"
-    project_path: ".junie/skills"
-  - global_name: kilocode
-    project_name: kilocode
-    global_path: "~/.kilocode/skills"
-    project_path: ".kilocode/skills"
+  - name: jazz
+    skills:
+      global: "~/.jazz/skills"
+      project: "skills"
+    also_scans:
+      - {global: "~/.agents/skills"}
+    instructions:
+      global: "~/.agents/AGENTS.md"
+      project: "AGENTS.md"
+      same_as: universal
+  - name: junie
+    skills:
+      global: "~/.junie/skills"
+      project: ".junie/skills"
+    instructions:
+      global: "~/.junie/AGENTS.md"
+      project: "AGENTS.md"
+  - name: kilocode
+    skills:
+      global: "~/.kilo/skills"
+      project: ".kilo/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+    instructions:
+      global: "~/.config/kilo/AGENTS.md"
+      project: "AGENTS.md"
     aliases: [kilo]
-  - global_name: kimi
-    project_name: kimi
-    global_path: "~/.config/agents/skills"
-    project_path: ".agents/skills"
+  - name: kimchi
+    skills:
+      global: "~/.config/kimchi/harness/skills"
+      project: ".kimchi/skills"
+    also_scans:
+      - {project: ".agents/skills"}
+      - {project: ".claude/skills"}
+      - {project: ".pi/agent/skills"}
+    instructions:
+      global: "~/.config/kimchi/harness/AGENTS.md"
+      project: "AGENTS.md"
+      project_fallback: "CLAUDE.md"
+  - name: kimi
+    skills:
+      global: "~/.config/agents/skills"
+      project: ".agents/skills"
+    also_scans:
+      - {global: "~/.kimi/skills", project: ".kimi/skills"}
+      - {global: "~/.claude/skills", project: ".claude/skills"}
+      - {global: "~/.codex/skills", project: ".codex/skills"}
+    instructions:
+      project: "AGENTS.md"
     aliases: [kimi-cli]
-  - global_name: kiro
-    project_name: kiro
-    global_path: "~/.kiro/skills"
-    project_path: ".kiro/skills"
+  - name: kimi-code
+    skills:
+      global: "~/.kimi-code/skills"
+      project: ".kimi-code/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+    instructions:
+      global: "~/.kimi-code/AGENTS.md"
+      project: "AGENTS.md"
+  - name: kiro
+    skills:
+      global: "~/.kiro/skills"
+      project: ".kiro/skills"
+    instructions:
+      global: "~/.kiro/steering/AGENTS.md"
+      project: "AGENTS.md"
     aliases: [kiro-cli]
-  - global_name: kode
-    project_name: kode
-    global_path: "~/.kode/skills"
-    project_path: ".kode/skills"
-  - global_name: letta
-    project_name: letta
-    global_path: "~/.letta/skills"
-    project_path: ".skills"
-  - global_name: lingma
-    project_name: lingma
-    global_path: "~/.lingma/skills"
-    project_path: ".lingma/skills"
-  - global_name: mcpjam
-    project_name: mcpjam
-    global_path: "~/.mcpjam/skills"
-    project_path: ".mcpjam/skills"
-  - global_name: mux
-    project_name: mux
-    global_path: "~/.mux/skills"
-    project_path: ".mux/skills"
-  - global_name: neovate
-    project_name: neovate
-    global_path: "~/.neovate/skills"
-    project_path: ".neovate/skills"
-  - global_name: omp
-    project_name: omp
-    global_path: "~/.omp/agent/skills"
-    project_path: ".omp/skills"
+  - name: kode
+    skills:
+      global: "~/.kode/skills"
+      project: ".kode/skills"
+    also_scans:
+      - {project: ".claude/skills"}
+  - name: letta
+    skills:
+      global: "~/.letta/skills"
+      project: ".skills"
+  - name: lingma
+    skills:
+      global: "~/.lingma/skills"
+      project: ".lingma/skills"
+  - name: mcpjam
+    skills:
+      global: "~/.mcpjam/skills"
+      project: ".mcpjam/skills"
+  - name: mux
+    skills:
+      global: "~/.mux/skills"
+      project: ".mux/skills"
+  - name: neovate
+    skills:
+      global: "~/.neovate/skills"
+      project: ".neovate/skills"
+  - name: omp
+    detect: "~/.omp"
+    config_dir: "~/.omp/agent"
+    skills:
+      global: "~/.omp/agent/skills"
+      project: ".omp/skills"
+    instructions:
+      global: "~/.omp/agent/AGENTS.md"
+      project: "AGENTS.md"
+      import: true
+    files: [APPEND_SYSTEM.md]
     aliases: [oh-my-pi]
-  - global_name: openclaw
-    project_name: openclaw
-    global_path: "~/.openclaw/skills"
-    project_path: "skills"
-  - global_name: opencode
-    project_name: opencode
-    global_path: "~/.config/opencode/skills"
-    project_path: ".opencode/skills"
-  - global_name: openhands
-    project_name: openhands
-    global_path: "~/.openhands/skills"
-    project_path: ".openhands/skills"
-  - global_name: pi
-    project_name: pi
-    global_path: "~/.pi/agent/skills"
-    project_path: ".pi/skills"
-  - global_name: pochi
-    project_name: pochi
-    global_path: "~/.pochi/skills"
-    project_path: ".pochi/skills"
-  - global_name: purecode
-    project_name: purecode
-    global_path: "~/.purecode/skills"
-    project_path: ".agents/skills"
+  - name: ona
+    skills:
+      project: ".ona/skills"
+    also_scans:
+      - {project: ".claude/skills"}
+      - {project: ".agents/skills"}
+    instructions:
+      project: "AGENTS.md"
+  - name: openclaw
+    skills:
+      global: "~/.openclaw/skills"
+      project: "skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+  - name: opencode
+    config_dir: "~/.config/opencode"
+    skills:
+      global: "~/.config/opencode/skills"
+      project: ".opencode/skills"
+    agents:
+      global: "~/.config/opencode/agents"
+      project: ".opencode/agents"
+    also_scans:
+      # off_when_env: packages/opencode/src/effect/runtime-flags.ts
+      - global: "~/.claude/skills"
+        project: ".claude/skills"
+        off_when_env: [OPENCODE_DISABLE_CLAUDE_CODE_SKILLS, OPENCODE_DISABLE_CLAUDE_CODE, OPENCODE_DISABLE_EXTERNAL_SKILLS]
+      - global: "~/.agents/skills"
+        project: ".agents/skills"
+        off_when_env: [OPENCODE_DISABLE_EXTERNAL_SKILLS]
+    # Same-named skills across its own and also_scans folders load once.
+    one_skill_per_name: true
+    instructions:
+      global: "~/.config/opencode/AGENTS.md"
+      project: "AGENTS.md"
+  - name: openhands
+    detect: "~/.openhands"
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+    also_scans:
+      - {global: "~/.openhands/skills", project: ".openhands/skills"}
+  - name: pi
+    config_dir: "~/.pi/agent"
+    skills:
+      global: "~/.pi/agent/skills"
+      project: ".pi/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+    instructions:
+      global: "~/.pi/agent/AGENTS.md"
+      project: "AGENTS.md"
+    files: [APPEND_SYSTEM.md]
+  - name: pochi
+    skills:
+      global: "~/.pochi/skills"
+      project: ".pochi/skills"
+    instructions:
+      global: "~/.pochi/README.pochi.md"
+      project: "AGENTS.md"
+  - name: posit-assistant
+    skills:
+      global: "~/.posit/assistant/skills"
+      project: ".posit/assistant/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+    instructions:
+      global: "~/.posit/assistant/AGENTS.md"
+      project: "AGENTS.md"
+  - name: purecode
+    skills:
+      global: "~/.purecode/skills"
+      project: ".agents/skills"
     aliases: [purecode-ai]
-  - global_name: qoder
-    project_name: qoder
-    global_path: "~/.qoder/skills"
-    project_path: ".qoder/skills"
-  - global_name: qwen
-    project_name: qwen
-    global_path: "~/.qwen/skills"
-    project_path: ".qwen/skills"
+  - name: qoder
+    skills:
+      global: "~/.qoder/skills"
+      project: ".qoder/skills"
+    instructions:
+      global: "~/.qoder/AGENTS.md"
+      project: "AGENTS.md"
+      import: true
+      rules:
+        global: "~/.qoder/rules"
+        project: ".qoder/rules"
+  - name: qoder-cn
+    skills:
+      global: "~/.qoder-cn/skills"
+      project: ".qoder/skills"
+    instructions:
+      global: "~/.qoder-cn/AGENTS.md"
+      project: "AGENTS.md"
+  - name: qwen
+    skills:
+      global: "~/.qwen/skills"
+      project: ".qwen/skills"
+    instructions:
+      global: "~/.qwen/QWEN.md"
+      project: "QWEN.md"
+      import: true
     aliases: [qwen-code]
-  - global_name: roo
-    project_name: roo
-    global_path: "~/.roo/skills"
-    project_path: ".roo/skills"
-  - global_name: trae
-    project_name: trae
-    global_path: "~/.trae/skills"
-    project_path: ".trae/skills"
-  - global_name: trae-cn
-    project_name: trae-cn
-    global_path: "~/.trae-cn/skills"
-    project_path: ".trae/skills"
-  - global_name: vibe
-    project_name: vibe
-    global_path: "~/.vibe/skills"
-    project_path: ".vibe/skills"
+  - name: reasonix
+    skills:
+      global: "~/.reasonix/skills"
+      project: ".reasonix/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+      - {project: ".agent/skills"}
+      - {project: ".claude/skills"}
+    instructions:
+      project: "AGENTS.md"
+  - name: roo
+    skills:
+      global: "~/.roo/skills"
+      project: ".roo/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+    instructions:
+      global: "~/.roo/rules/AGENTS.md"
+      project: "AGENTS.md"
+  - name: rovodev
+    skills:
+      global: "~/.rovodev/skills"
+      project: ".rovodev/skills"
+    instructions:
+      global: "~/.rovodev/AGENTS.md"
+      project: "AGENTS.md"
+    aliases: [rovo-dev]
+  - name: tabnine
+    skills:
+      global: "~/.tabnine/agent/skills"
+      project: ".tabnine/agent/skills"
+    aliases: [tabnine-cli]
+  - name: trae
+    skills:
+      global: "~/.trae/skills"
+      project: ".trae/skills"
+  - name: trae-cn
+    skills:
+      global: "~/.trae-cn/skills"
+      project: ".trae/skills"
+  - name: vibe
+    skills:
+      global: "~/.vibe/skills"
+      project: ".vibe/skills"
+    instructions:
+      global: "~/.vibe/AGENTS.md"
+      project: "AGENTS.md"
     aliases: [mistral-vibe]
-  - global_name: verdent
-    project_name: verdent
-    global_path: "~/.verdent/skills"
-    project_path: ".verdent/skills"
-  - global_name: warp
-    project_name: warp
-    global_path: "~/.agents/skills"
-    project_path: ".agents/skills"
-  - global_name: windsurf
-    project_name: windsurf
-    global_path: "~/.codeium/windsurf/skills"
-    project_path: ".windsurf/skills"
-  - global_name: witsy
-    project_name: witsy
-    global_path: "~/.agents/skills"
-    project_path: ".agents/skills"
-  - global_name: xcode-claude
-    project_name: xcode-claude
-    global_path: "~/Library/Developer/Xcode/CodingAssistant/ClaudeAgentConfig/skills"
-    project_path: ".claude/skills"
-  - global_name: xcode-codex
-    project_name: xcode-codex
-    global_path: "~/Library/Developer/Xcode/CodingAssistant/codex/skills"
-    project_path: ".codex/skills"
-  - global_name: zencoder
-    project_name: zencoder
-    global_path: "~/.zencoder/skills"
-    project_path: ".zencoder/skills"
-  - global_name: replit
-    project_name: replit
-    global_path: "~/.config/agents/skills"
-    project_path: ".agents/skills"
+  - name: verdent
+    skills:
+      global: "~/.verdent/skills"
+      project: ".verdent/skills"
+    instructions:
+      global: "~/.verdent/VERDENT.md"
+      project: "AGENTS.md"
+  - name: warp
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+    instructions:
+      global: "~/.agents/AGENTS.md"
+      project: "AGENTS.md"
+      same_as: universal
+  - name: windsurf
+    skills:
+      global: "~/.codeium/windsurf/skills"
+      project: ".windsurf/skills"
+    # Windsurf caps global rules at 6,000 characters.
+    instructions:
+      global: "~/.codeium/windsurf/memories/global_rules.md"
+      project: "AGENTS.md"
+      max_chars: 6000
+  - name: witsy
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+  - name: xcode-claude
+    skills:
+      global: "~/Library/Developer/Xcode/CodingAssistant/ClaudeAgentConfig/skills"
+      project: ".claude/skills"
+  - name: xcode-codex
+    skills:
+      global: "~/Library/Developer/Xcode/CodingAssistant/codex/skills"
+      project: ".codex/skills"
+  - name: zcode
+    skills:
+      global: "~/.zcode/skills"
+      project: ".zcode/skills"
+    also_scans:
+      - {global: "~/.agents/skills", project: ".agents/skills"}
+    instructions:
+      global: "~/.zcode/AGENTS.md"
+      project: "AGENTS.md"
+  - name: zed
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+    instructions:
+      global: "~/.config/zed/AGENTS.md"
+      project: "AGENTS.md"
+  - name: zencoder
+    detect: "~/.zencoder"
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+    also_scans:
+      - {global: "~/.zencoder/skills", project: ".zencoder/skills"}
+    aliases: [zenflow]
+  - name: replit
+    skills:
+      project: ".agents/skills"

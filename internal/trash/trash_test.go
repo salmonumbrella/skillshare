@@ -3,6 +3,7 @@ package trash
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -114,6 +115,19 @@ func TestCleanup(t *testing.T) {
 	}
 }
 
+func TestDelete_RemovesSavedMetadata(t *testing.T) {
+	entry := filepath.Join(t.TempDir(), "foo_2026-01-01_00-00-00")
+	os.MkdirAll(entry, 0755)
+	os.WriteFile(MetadataFile(entry), []byte("{}"), 0644)
+
+	if err := Delete(entry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(MetadataFile(entry)); !os.IsNotExist(err) {
+		t.Errorf("saved metadata should be gone, got %v", err)
+	}
+}
+
 func TestTotalSize(t *testing.T) {
 	tmpDir := t.TempDir()
 	trashBase := filepath.Join(tmpDir, "trash")
@@ -202,6 +216,216 @@ func TestRestore_AlreadyExists(t *testing.T) {
 	err := Restore(entry, destDir)
 	if err == nil {
 		t.Error("expected error when dest already exists")
+	}
+}
+
+func TestMoveToTrash_NestedName(t *testing.T) {
+	tmpDir := t.TempDir()
+	trashBase := filepath.Join(tmpDir, "trash")
+	srcDir := filepath.Join(tmpDir, "source", "org", "_team-skills")
+
+	os.MkdirAll(srcDir, 0755)
+	os.WriteFile(filepath.Join(srcDir, "README.md"), []byte("# Team"), 0644)
+
+	trashPath, err := MoveToTrash(srcDir, "org/_team-skills", trashBase)
+	if err != nil {
+		t.Fatalf("MoveToTrash failed: %v", err)
+	}
+
+	if _, err := os.Stat(srcDir); !os.IsNotExist(err) {
+		t.Error("source should be removed after MoveToTrash")
+	}
+
+	if _, err := os.Stat(filepath.Join(trashPath, "README.md")); err != nil {
+		t.Error("trashed repo should contain README.md")
+	}
+
+	// Trash path should be nested under trashBase/org/
+	rel, err := filepath.Rel(trashBase, trashPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		t.Errorf("trash path should be under trashBase, rel=%q err=%v", rel, err)
+	}
+	if dir := filepath.Dir(rel); dir != "org" {
+		t.Errorf("expected parent dir 'org', got %q", dir)
+	}
+}
+
+func TestList_NestedEntries(t *testing.T) {
+	tmpDir := t.TempDir()
+	trashBase := filepath.Join(tmpDir, "trash")
+
+	// Flat entry
+	os.MkdirAll(filepath.Join(trashBase, "skill-a_2026-01-01_10-00-00"), 0755)
+	// Nested entry
+	os.MkdirAll(filepath.Join(trashBase, "org", "_team-skills_2026-01-02_10-00-00"), 0755)
+
+	items := List(trashBase)
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+
+	// Newest first
+	if items[0].Name != "org/_team-skills" {
+		t.Errorf("expected 'org/_team-skills', got %q", items[0].Name)
+	}
+	if items[1].Name != "skill-a" {
+		t.Errorf("expected 'skill-a', got %q", items[1].Name)
+	}
+}
+
+func TestList_SkipsReservedAgentTrashSubtree(t *testing.T) {
+	tmpDir := t.TempDir()
+	trashBase := filepath.Join(tmpDir, "trash")
+
+	os.MkdirAll(filepath.Join(trashBase, "skill-a_2026-01-01_10-00-00"), 0755)
+	os.MkdirAll(filepath.Join(trashBase, "agents", "demo", "code-archaeologist_2026-01-02_10-00-00"), 0755)
+
+	items := List(trashBase)
+	if len(items) != 1 {
+		t.Fatalf("expected only skill trash items, got %d", len(items))
+	}
+	if items[0].Name != "skill-a" {
+		t.Fatalf("expected only skill-a, got %q", items[0].Name)
+	}
+}
+
+func TestFindByName_NestedName(t *testing.T) {
+	tmpDir := t.TempDir()
+	trashBase := filepath.Join(tmpDir, "trash")
+
+	os.MkdirAll(filepath.Join(trashBase, "org", "_team-skills_2026-01-01_10-00-00"), 0755)
+
+	entry := FindByName(trashBase, "org/_team-skills")
+	if entry == nil {
+		t.Fatal("expected to find org/_team-skills")
+	}
+	if entry.Name != "org/_team-skills" {
+		t.Errorf("expected Name 'org/_team-skills', got %q", entry.Name)
+	}
+}
+
+func TestFindByName_SkipsReservedAgentTrashSubtree(t *testing.T) {
+	tmpDir := t.TempDir()
+	trashBase := filepath.Join(tmpDir, "trash")
+
+	os.MkdirAll(filepath.Join(trashBase, "agents", "demo", "code-archaeologist_2026-01-01_10-00-00"), 0755)
+
+	if entry := FindByName(trashBase, "agents/demo/code-archaeologist"); entry != nil {
+		t.Fatalf("expected reserved agent subtree to be ignored, got %q", entry.Name)
+	}
+}
+
+func TestRestore_NestedName(t *testing.T) {
+	tmpDir := t.TempDir()
+	trashBase := filepath.Join(tmpDir, "trash")
+	destDir := filepath.Join(tmpDir, "skills")
+	// Note: destDir/org/ does NOT exist yet — Restore should create it
+
+	srcDir := filepath.Join(tmpDir, "src", "org", "_team-skills")
+	os.MkdirAll(srcDir, 0755)
+	os.WriteFile(filepath.Join(srcDir, "README.md"), []byte("# Team"), 0644)
+	MoveToTrash(srcDir, "org/_team-skills", trashBase)
+
+	entry := FindByName(trashBase, "org/_team-skills")
+	if entry == nil {
+		t.Fatal("expected to find org/_team-skills in trash")
+	}
+
+	if err := Restore(entry, destDir); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	restored := filepath.Join(destDir, "org", "_team-skills", "README.md")
+	if _, err := os.Stat(restored); err != nil {
+		t.Error("restored repo should contain README.md at nested path")
+	}
+
+	if FindByName(trashBase, "org/_team-skills") != nil {
+		t.Error("trash entry should be removed after restore")
+	}
+}
+
+func TestCleanup_NestedEntry(t *testing.T) {
+	tmpDir := t.TempDir()
+	trashBase := filepath.Join(tmpDir, "trash")
+
+	// Create an expired nested entry (8 days ago)
+	old := time.Now().Add(-8 * 24 * time.Hour).Format("2006-01-02_15-04-05")
+	os.MkdirAll(filepath.Join(trashBase, "org", "_team-skills_"+old), 0755)
+
+	removed, err := Cleanup(trashBase, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Cleanup failed: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("expected 1 removed, got %d", removed)
+	}
+
+	// Empty parent dir should also be cleaned
+	if _, err := os.Stat(filepath.Join(trashBase, "org")); !os.IsNotExist(err) {
+		t.Error("expected empty parent dir 'org' to be cleaned up")
+	}
+}
+
+func TestCleanEmptyParents_MultiLevel(t *testing.T) {
+	tmpDir := t.TempDir()
+	trashBase := filepath.Join(tmpDir, "trash")
+
+	// Create a 3-level nested empty structure: trash/a/b/c/
+	deepDir := filepath.Join(trashBase, "a", "b", "c")
+	os.MkdirAll(deepDir, 0755)
+
+	// cleanEmptyParents starts from Dir(path), so pass a child of deepDir
+	os.Remove(deepDir) // remove c/ first (simulating the item being deleted)
+	cleanEmptyParents(deepDir, trashBase)
+
+	// All empty dirs should be removed
+	if _, err := os.Stat(filepath.Join(trashBase, "a")); !os.IsNotExist(err) {
+		t.Error("expected all empty parent dirs to be removed")
+	}
+	// trashBase itself should survive
+	if _, err := os.Stat(trashBase); os.IsNotExist(err) {
+		t.Error("trashBase should not be removed")
+	}
+}
+
+func TestCleanEmptyParents_StopsAtNonEmpty(t *testing.T) {
+	tmpDir := t.TempDir()
+	trashBase := filepath.Join(tmpDir, "trash")
+
+	// Create: trash/org/keep.txt and trash/org/sub/ (empty)
+	orgDir := filepath.Join(trashBase, "org")
+	subDir := filepath.Join(orgDir, "sub")
+	os.MkdirAll(subDir, 0755)
+	os.WriteFile(filepath.Join(orgDir, "keep.txt"), []byte("keep"), 0644)
+
+	// Remove sub/ then clean parents — org/ has keep.txt so should survive
+	os.Remove(subDir)
+	cleanEmptyParents(subDir, trashBase)
+
+	if _, err := os.Stat(subDir); !os.IsNotExist(err) {
+		t.Error("expected empty sub/ to stay removed")
+	}
+	if _, err := os.Stat(orgDir); os.IsNotExist(err) {
+		t.Error("expected org/ to survive (has keep.txt)")
+	}
+}
+
+func TestCleanEmptyParents_StopsAtBoundary(t *testing.T) {
+	tmpDir := t.TempDir()
+	trashBase := filepath.Join(tmpDir, "trash")
+
+	// Create: trash/level1/ (empty)
+	level1 := filepath.Join(trashBase, "level1")
+	os.MkdirAll(level1, 0755)
+
+	// Remove level1 then call cleanEmptyParents
+	os.Remove(level1)
+	cleanEmptyParents(level1, trashBase)
+
+	// trashBase should survive
+	if _, err := os.Stat(trashBase); os.IsNotExist(err) {
+		t.Error("trashBase should not be removed")
 	}
 }
 

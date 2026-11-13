@@ -23,11 +23,12 @@ Technical reference appendix for skillshare.
 | Path | Purpose |
 |------|---------|
 | `~/.config/skillshare/config.yaml` | Configuration file |
-| `~/.config/skillshare/registry.yaml` | Installed skill registry (auto-managed) |
 | `~/.config/skillshare/skills/` | Source directory (your skills) |
+| `~/.config/skillshare/skills/.metadata.json` | Installed skill metadata (auto-managed) |
 | `~/.local/share/skillshare/backups/` | Backup directory |
 | `~/.local/share/skillshare/trash/` | Soft-deleted skills |
 | `~/.local/state/skillshare/logs/` | Operation and audit logs |
+| `~/.local/state/skillshare/projects/` | Machine-local project registrations and locks |
 | `~/.cache/skillshare/ui/` | Downloaded web dashboard |
 
 ### Environment Variables

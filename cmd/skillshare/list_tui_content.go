@@ -7,13 +7,13 @@ import (
 	"sort"
 	"strings"
 
+	"skillshare/internal/theme"
 	"skillshare/internal/utils"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/glamour/ansi"
 	"github.com/charmbracelet/glamour/styles"
-	"github.com/charmbracelet/lipgloss"
 	xansi "github.com/charmbracelet/x/ansi"
 )
 
@@ -139,12 +139,37 @@ func buildVisibleNodes(all []treeNode) []treeNode {
 
 // loadContentForSkill populates the content viewer fields for the given skill.
 func loadContentForSkill(m *listTUIModel, e skillEntry) {
-	skillDir := filepath.Join(m.sourcePath, e.RelPath)
 	m.contentSkillKey = e.RelPath
+	m.contentKind = e.Kind
 	m.contentScroll = 0
 	m.treeCursor = 0
 	m.treeScroll = 0
 
+	if e.Kind == "agent" {
+		// Agents are single .md files — render directly, minimal tree
+		agentFile := filepath.Join(m.agentsSourcePath, e.RelPath)
+		if _, err := os.Stat(agentFile); err != nil {
+			m.contentText = fmt.Sprintf("(error reading agent: %v)", err)
+			m.treeAllNodes = nil
+			m.treeNodes = nil
+			return
+		}
+		// Front matter is in the details; rendering it turns "---" into rules.
+		raw := printableText(utils.ReadSkillBody(agentFile))
+		if raw == "" {
+			m.contentText = "(empty)"
+		} else {
+			w := m.contentPanelWidth()
+			m.contentText = hardWrapContent(renderMarkdown(raw, w), w)
+		}
+		// Single-file tree: just the agent .md file
+		m.treeAllNodes = []treeNode{{name: filepath.Base(e.RelPath), relPath: e.RelPath}}
+		m.treeNodes = m.treeAllNodes
+		return
+	}
+
+	// Existing skill directory logic
+	skillDir := filepath.Join(m.sourcePath, e.RelPath)
 	m.treeAllNodes = buildTreeNodes(skillDir)
 	m.treeNodes = buildVisibleNodes(m.treeAllNodes)
 
@@ -172,8 +197,13 @@ func loadContentFile(m *listTUIModel) {
 		return
 	}
 
-	skillDir := filepath.Join(m.sourcePath, m.contentSkillKey)
-	filePath := filepath.Join(skillDir, node.relPath)
+	var filePath string
+	if m.contentKind == "agent" {
+		filePath = filepath.Join(m.agentsSourcePath, node.relPath)
+	} else {
+		skillDir := filepath.Join(m.sourcePath, m.contentSkillKey)
+		filePath = filepath.Join(skillDir, node.relPath)
+	}
 
 	var rawText string
 	if node.name == "SKILL.md" {
@@ -186,6 +216,7 @@ func loadContentFile(m *listTUIModel) {
 		}
 		rawText = strings.TrimSpace(string(data))
 	}
+	rawText = printableText(rawText)
 
 	if rawText == "" {
 		m.contentText = "(empty)"
@@ -212,18 +243,8 @@ func autoPreviewFile(m *listTUIModel) {
 	}
 }
 
-// contentPanelWidth returns the available text width for the right content panel.
-// This accounts for PaddingLeft(1) used in rendering, so content renders at
-// the exact width the panel can display without line-wrapping.
 func (m *listTUIModel) contentPanelWidth() int {
-	sw := sidebarWidth(m.termWidth)
-	// lipgloss Width includes padding, so subtract 1 for PaddingLeft(1)
-	// Layout: leftMargin(1) + sidebar(sw) + PaddingLeft(1) + border(1) + PaddingLeft(1) + content + rightMargin(1)
-	w := m.termWidth - sw - 5 - 1
-	if w < 40 {
-		w = 40
-	}
-	return w
+	return fileViewerTextWidth(m.termWidth, m.contentKind == "agent")
 }
 
 // hardWrapContent hard-wraps content so every logical line fits within width.
@@ -238,10 +259,18 @@ func hardWrapContent(text string, width int) string {
 
 // ─── Glamour Markdown Rendering ──────────────────────────────────────
 
-// contentGlamourStyle returns a modified dark style with no backgrounds or margins
-// that would bleed or overflow in the constrained dual-pane layout.
+// contentGlamourStyle returns a glamour style tuned for the dual-pane list
+// detail view. The base config tracks the resolved terminal theme so body
+// text stays legible on light backgrounds (glamour's dark base uses light
+// gray prose which disappears on white). Backgrounds and margins are
+// stripped to avoid bleeding in the constrained layout.
 func contentGlamourStyle() ansi.StyleConfig {
-	s := styles.DarkStyleConfig
+	var s ansi.StyleConfig
+	if theme.Get().Mode == theme.ModeLight {
+		s = styles.LightStyleConfig
+	} else {
+		s = styles.DarkStyleConfig
+	}
 	zero := uint(0)
 
 	s.Document.Margin = &zero
@@ -282,8 +311,8 @@ func renderMarkdown(text string, width int) string {
 
 // ─── Keyboard Handling ───────────────────────────────────────────────
 
-// handleContentKey handles keyboard input in the dual-pane content viewer.
-// Keyboard always controls the left tree; Ctrl+d/u/g/G scroll the right panel.
+// handleContentKey handles keyboard input in the content viewer.
+// Agents (single file) only support scroll; skills support tree navigation + scroll.
 func (m listTUIModel) handleContentKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "q", "ctrl+c":
@@ -293,35 +322,36 @@ func (m listTUIModel) handleContentKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showContent = false
 		return m, nil
 
-	// Left tree: navigate
+	// Left tree: navigate (skills only — agents have no sidebar)
 	case "j", "down":
-		if m.treeCursor < len(m.treeNodes)-1 {
+		if m.contentKind != "agent" && m.treeCursor < len(m.treeNodes)-1 {
 			m.treeCursor++
 			m.ensureTreeCursorVisible()
 			autoPreviewFile(&m)
 		}
 		return m, nil
 	case "k", "up":
-		if m.treeCursor > 0 {
+		if m.contentKind != "agent" && m.treeCursor > 0 {
 			m.treeCursor--
 			m.ensureTreeCursorVisible()
 			autoPreviewFile(&m)
 		}
 		return m, nil
 	case "l", "right", "enter":
-		if len(m.treeNodes) > 0 && m.treeCursor < len(m.treeNodes) {
+		if m.contentKind != "agent" && len(m.treeNodes) > 0 && m.treeCursor < len(m.treeNodes) {
 			node := m.treeNodes[m.treeCursor]
 			if node.isDir {
 				toggleTreeDir(&m)
 			}
-			// Files are already auto-previewed by j/k
 		}
 		return m, nil
 	case "h", "left":
-		collapseOrParent(&m)
+		if m.contentKind != "agent" {
+			collapseOrParent(&m)
+		}
 		return m, nil
 
-	// Right content: scroll
+	// Content scroll
 	case "ctrl+d":
 		half := m.contentViewHeight() / 2
 		max := m.contentMaxScroll()
@@ -362,166 +392,15 @@ func sidebarWidth(termWidth int) int {
 	return w
 }
 
-// renderContentOverlay renders the full-screen dual-pane content viewer.
+// renderContentOverlay renders the file viewer. An agent is a single .md
+// file, so it has no file tree.
 func renderContentOverlay(m listTUIModel) string {
-	var b strings.Builder
-
-	titleStyle := tc.Title
-	dimStyle := tc.Dim
-
-	skillName := filepath.Base(m.contentSkillKey)
-	fileName := ""
-	if len(m.treeNodes) > 0 && m.treeCursor < len(m.treeNodes) {
-		fileName = m.treeNodes[m.treeCursor].relPath
-	}
-
-	b.WriteString("\n")
-	b.WriteString(titleStyle.Render(fmt.Sprintf("  %s", skillName)))
-	if fileName != "" {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  ─  %s", fileName)))
-	}
-	b.WriteString("\n\n")
-
-	sw := sidebarWidth(m.termWidth)
-	// panelW is the lipgloss Width (includes PaddingLeft); textW is usable text width
-	panelW := m.termWidth - sw - 5
-	if panelW < 20 {
-		panelW = 20
-	}
-	textW := panelW - 1 // subtract PaddingLeft(1)
-	if textW < 20 {
-		textW = 20
-	}
-	contentHeight := m.contentViewHeight()
-
-	sidebarStr := renderSidebarStr(m, sw, contentHeight)
-	contentStr, scrollInfo := renderContentStr(m, textW, contentHeight)
-
-	leftPanel := lipgloss.NewStyle().
-		Width(sw).MaxWidth(sw).
-		Height(contentHeight).MaxHeight(contentHeight).
-		PaddingLeft(1).
-		Render(sidebarStr)
-
-	borderStyle := tc.Border.
-		Height(contentHeight).MaxHeight(contentHeight)
-	borderCol := strings.Repeat("│\n", contentHeight)
-	borderPanel := borderStyle.Render(strings.TrimRight(borderCol, "\n"))
-
-	rightPanel := lipgloss.NewStyle().
-		Width(panelW).MaxWidth(panelW).
-		Height(contentHeight).MaxHeight(contentHeight).
-		PaddingLeft(1).
-		Render(contentStr)
-
-	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, borderPanel, rightPanel)
-	b.WriteString(body)
-	b.WriteString("\n\n")
-
-	help := "j/k browse  l/Enter expand  h collapse  Ctrl+d/u scroll  g/G top/bottom  Esc back  q quit"
-	if scrollInfo != "" {
-		help += "  " + scrollInfo
-	}
-	b.WriteString(tc.Help.Render(help))
-	b.WriteString("\n")
-
-	return b.String()
-}
-
-// renderSidebarStr renders the file tree as a single string for the left panel.
-func renderSidebarStr(m listTUIModel, width, height int) string {
-	if len(m.treeNodes) == 0 {
-		return "(no files)"
-	}
-
-	selectedStyle := lipgloss.NewStyle().Bold(true).Foreground(tc.BrandYellow)
-	dirStyle := tc.Cyan
-	fileStyle := lipgloss.NewStyle()
-	dimStyle := tc.Dim
-
-	total := len(m.treeNodes)
-	start := m.treeScroll
-	if start > total-height {
-		start = total - height
-	}
-	if start < 0 {
-		start = 0
-	}
-	end := start + height
-	if end > total {
-		end = total
-	}
-
-	var lines []string
-	for i := start; i < end; i++ {
-		n := m.treeNodes[i]
-		indent := strings.Repeat("  ", n.depth)
-
-		var prefix string
-		if n.isDir {
-			if n.expanded {
-				prefix = "▾ "
-			} else {
-				prefix = "▸ "
-			}
-		} else {
-			prefix = "  "
-		}
-
-		name := n.name
-		if n.isDir {
-			name += "/"
-		}
-
-		label := indent + prefix + name
-
-		maxLabel := width - 2
-		if maxLabel < 5 {
-			maxLabel = 5
-		}
-		if len(label) > maxLabel {
-			label = label[:maxLabel-3] + "..."
-		}
-
-		if i == m.treeCursor {
-			lines = append(lines, selectedStyle.Render(label))
-		} else if n.isDir {
-			lines = append(lines, dirStyle.Render(label))
-		} else {
-			lines = append(lines, fileStyle.Render(label))
-		}
-	}
-
-	if total > height {
-		lines = append(lines, dimStyle.Render(fmt.Sprintf(" (%d/%d)", m.treeCursor+1, total)))
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-// renderContentStr renders the right content panel as a single string.
-func renderContentStr(m listTUIModel, width, height int) (string, string) {
-	lines := strings.Split(m.contentText, "\n")
-	totalLines := len(lines)
-
-	if totalLines <= height {
-		return strings.Join(lines, "\n"), ""
-	}
-
-	maxScroll := totalLines - height
-	offset := m.contentScroll
-	if offset > maxScroll {
-		offset = maxScroll
-	}
-
-	visible := lines[offset : offset+height]
-	result := make([]string, height)
-	copy(result, visible)
-
-	scrollInfo := fmt.Sprintf("(%d/%d)", offset+1, maxScroll+1)
-	_ = width
-
-	return strings.Join(result, "\n"), scrollInfo
+	return renderFileViewer(m.termWidth, m.termHeight, fileViewer{
+		command: "list", name: filepath.Base(m.contentSkillKey),
+		nodes: m.treeNodes, cursor: m.treeCursor, scroll: m.treeScroll,
+		content: m.contentText, contentScroll: m.contentScroll,
+		noTree: m.contentKind == "agent",
+	})
 }
 
 // ─── Mouse Handling ──────────────────────────────────────────────────
@@ -529,8 +408,7 @@ func renderContentStr(m listTUIModel, width, height int) (string, string) {
 // handleContentMouse handles mouse events in the dual-pane content viewer.
 // Left side = tree navigation, right side = content scrolling.
 func (m listTUIModel) handleContentMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	sw := sidebarWidth(m.termWidth)
-	inSidebar := msg.X < sw+3
+	inSidebar := m.contentKind != "agent" && msg.X < sidebarWidth(m.termWidth) // an agent has no tree
 
 	switch {
 	case msg.Button == tea.MouseButtonWheelUp:
@@ -579,13 +457,8 @@ func (m listTUIModel) handleContentMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) 
 // ─── Tree Navigation Helpers ─────────────────────────────────────────
 
 // contentViewHeight returns the usable height for the content area.
-// Overhead: leading(1) + title(1) + gap(1) + body-newline(1) + blank(1) + help(1) + trailing(1) = 7
 func (m *listTUIModel) contentViewHeight() int {
-	h := m.termHeight - 7
-	if h < 5 {
-		h = 5
-	}
-	return h
+	return fileViewerHeight(m.termHeight)
 }
 
 // contentMaxScroll returns the maximum scroll offset for the current content.

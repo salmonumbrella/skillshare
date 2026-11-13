@@ -220,3 +220,38 @@ func TestTargetStatus_String(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckStatusMerge_CountsHiddenManagedEntry(t *testing.T) {
+	tmp := t.TempDir()
+	src := filepath.Join(tmp, "source")
+	tgt := filepath.Join(tmp, "target")
+	hiddenSrc := filepath.Join(src, ".system", "example")
+
+	if err := os.MkdirAll(hiddenSrc, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(tgt, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(hiddenSrc, filepath.Join(tgt, ".system__example")); err != nil {
+		t.Fatal(err)
+	}
+	// Unmanaged hidden entries stay ignored
+	if err := os.MkdirAll(filepath.Join(tgt, ".cache"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteManifest(tgt, &Manifest{Managed: map[string]string{".system__example": "symlink"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	status, linked, local := CheckStatusMerge(tgt, src)
+	if status != StatusMerged {
+		t.Errorf("expected StatusMerged, got %s", status)
+	}
+	if linked != 1 {
+		t.Errorf("expected 1 linked, got %d", linked)
+	}
+	if local != 0 {
+		t.Errorf("expected 0 local, got %d", local)
+	}
+}

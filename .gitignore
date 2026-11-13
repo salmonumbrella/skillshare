@@ -15,37 +15,33 @@ Thumbs.db
 *.swp
 *.swo
 
-# Test
-coverage.out
-.claude/
-AGENTS.md
-CLAUDE.md
-docs/plans/
-.agents/
-.skillshare/*
-!.skillshare/skills/
-!.skillshare/config.yaml
-!.skillshare/.gitignore
-/specs/
-.pnpm-store/
-.feature-radar/
-.cache/
-.playwright-mcp
-
-# Worktrees
-.worktrees/
-
-video/node_modules/
-
 # Secrets
 .env
 .devcontainer/.env
 
-# Web UI
+# Build and test output
+coverage.out
+/result
+tmp/
+__pycache__/
+.cache/
+.pnpm-store/
 ui/node_modules/
 ui/dist/
-internal/server/dist/
+video/node_modules/
 
-# Air hot-reload
-tmp/
-MEMORY.md
+# Host verification environment (scripts/verify.sh)
+.verify-home/
+
+# Worktrees
+.worktrees/
+
+# Agent skills: sync rewrites these manifests on every run; the links beside them are tracked
+.claude/skills/.skillshare-manifest.json
+.agents/skills/.skillshare-manifest.json
+
+# Local planning and tool state
+/specs/
+.archify/
+.playwright-mcp
+.feature-radar/

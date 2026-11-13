@@ -1,0 +1,314 @@
+---
+sidebar_position: 1
+---
+
+# ui
+
+启动 web dashboard 以可视化管理 skills。
+
+远程搜索（`GET /api/search`）和安装预览（`GET /api/preview`）使用与修改操作相同的来源检查，在获取前拒绝跨站浏览器请求。仍支持不带浏览器 origin/fetch 请求头的直接客户端。GitHub API 凭据仅用于 HTTPS `api.github.com` 和 `raw.githubusercontent.com` 的默认端口或 443；跨来源重定向会移除认证信息。
+
+```bash
+skillshare ui                  # 在前台运行
+skillshare ui start            # 启动（或复用）一个后台 server
+skillshare ui stop             # 停止后台 server
+```
+
+在默认浏览器中打开 `http://127.0.0.1:19420`。
+
+## 模式
+
+| 模式 | 行为 |
+|------|------|
+| `skillshare ui`（默认） | 在前台运行 UI server；`Ctrl+C` 停止它 |
+| `skillshare ui start` | 把 UI server 作为后台进程启动，并把控制权交回 shell。再次运行 `start` 会复用现有进程（如果它仍然健康） |
+| `skillshare ui stop` | 停止由 `skillshare ui start` 启动的后台 UI server |
+
+## 何时使用
+
+- 通过可视化 web 界面管理 skills、targets 和 sync
+- 无需记忆 CLI flag 即可浏览和安装 skills
+- 用可视化的 findings 报告运行安全审计
+- 与不熟悉 CLI 的团队成员分享 dashboard 视图
+
+## Flags
+
+| Flag | 默认值 | 说明 |
+|------|---------|-------------|
+| `-p`, `--project` | | 以 project mode 运行（使用 `.skillshare/`） |
+| `-g`, `--global` | | 以 global mode 运行（使用 `~/.config/skillshare/`） |
+| `--port <port>` | `19420` | HTTP server 端口 |
+| `--host <host>` | `127.0.0.1` | 绑定地址（Docker 请使用 `0.0.0.0`） |
+| `-b`, `--base-path <path>` | | 反向代理用的子路径（例如 `/skillshare`） |
+| `--trusted-origin <url>` | | dashboard 响应的另一个地址，例如 [反向代理](#reverse-proxy) 后面的 `https://tools.example.com`。可重复指定多个 |
+| `--no-open` | `false` | 不自动打开浏览器 |
+| `--app` | `false` | 在可用时以桌面风格的 Chromium app 窗口打开 dashboard（仅 `start` 模式） |
+| `--clear-cache` | | 前台形式下：清除缓存的 UI 资源并退出。与 `start` 结合：先清除缓存，再在后台启动 |
+
+:::tip 自动检测
+如果当前目录存在 `.skillshare/config.yaml`，dashboard 会自动以 project mode 启动。使用 `-g` 强制 global mode。
+:::
+
+## 示例
+
+```bash
+# 默认：在 localhost:19420 打开浏览器（前台）
+skillshare ui
+
+# Project mode（管理 .skillshare/ 中的 skills）
+skillshare ui -p
+
+# 自定义端口
+skillshare ui --port 8080
+
+# Docker / 远程访问
+skillshare ui --host 0.0.0.0 --no-open
+
+# 在后台启动并返回 shell
+skillshare ui start
+
+# 以无边框的桌面风格 app 窗口启动
+skillshare ui start --app
+
+# 停止后台 server（使用记住的 host/port）
+skillshare ui stop
+
+# 清除缓存的 UI 资源，然后在后台重新启动
+skillshare ui start --clear-cache
+```
+
+## Dashboard 页面
+
+侧边栏按任务分组页面：同步、你管理的内容、内容去向何处，以及日常维护。名称下方的一行显示模式和其目录，例如 `Global · ~/.config/skillshare`。
+
+部分页面在需要关注时会在侧边栏显示计数。这些计数在 dashboard 标签页打开时每 15 秒刷新一次：
+
+- **Sync**：一次 sync 会应用的变更
+- **Git Sync**：未提交的文件；如果工作树干净，则显示尚未推送的提交数
+- **Audit**：最近一次扫描中被阻止的 skills 和 agents（运行一次扫描后才会显示）
+
+| 页面 | 说明 |
+|------|------|
+| **Dashboard** | skills、agents、extras、MCP servers、hooks、plugins 和 targets 的计数，以及需要关注的项目。卸载有未提交更改、或读不到 git 状态的 tracked repo 时，会说明原因并再次确认，然后把 repo 原样移入回收站，等同 `uninstall --force` |
+| **Sync** | 在写入之前，按 Target 预览每一处变更。选择要包含的部分（Skills、Agents、Extras、MCP）。在 Target 内部编辑过的文件会被保留，除非开启了 **Force**。只存在于某个 Target 中的项目可以从这里收集回 Source。每次 sync 会先备份 Target 目录。某个 Target 失败时，其他 Target 仍会 sync：页面会在其他警告上方列出每个失败的 Target 及其部分（Skills、Agents、Extras 或 Config）和错误，常见原因（symlink 指向别处、权限不足、只读文件系统、文件或文件夹不存在、Target 设置无效）还会附上一句易懂的说明；若 Skills 的 symlink 指向别处，会提供 **开启 Force**；变更列表中也会标出该 Target。即使所有 Target 都失败，也会以同样方式列出。**上次同步** 卡片会列出最近一次 sync 中失败的 Target。收到相同变更的 Target 会合并成一张卡片，按文件夹列出 skills。**Discard all** 会在确认后，把还没有任何 Target 收到的 skills 移到回收站。当某个 Target 的 `include` 过滤条件没有匹配任何 skill 时，会显示提示说明该 Target 收不到任何 skill，**Edit filter** 会打开设置该过滤条件的地方；Git Sync 在 pull 之后也会显示同样的提示 |
+| **Git Sync** | 提交并推送 source 仓库，推送尚未上 remote 的提交，并拉取。打开页面时会先从 remote fetch，所以 **Pull** 会显示 remote 有多少个新提交。Pull 会同步该仓库 scope 所涵盖的内容（`skills`、`agents`、`extras` 或 `root`），与 [`pull`](/docs/reference/commands/pull) 相同。**Sync both ways** 会提交本地更改、拉取并合并、同步 targets，然后推送，与 [`push --pull`](/docs/reference/commands/push#push-and-pull-together) 相同；遇到冲突时会在推送前停止。当 remote 因为有更新的提交而拒绝 push 时，错误提示会提供 **Pull**。当首次 pull 无法与 remote 合并时，它会提供一个强制 pull 选项，用 remote 分支替换本地文件 |
+| **Hubs** | 从 Skill 页面进入。列出内置 hub、已保存的 hubs 与你自己的 Hub（**我的**）；选择一个即可过滤并安装其中的 skills。**添加或创建 Hub** 可添加已有的 hub、创建新的 Hub，或导入 `skillshare-hub.json`。自己的 Hub 通过 **编辑** 修改；**分享** 会下载索引并生成 `hub add` 命令。已保存与内置的 hub 可点 **刷新**，不必等两分钟缓存过期就重新读取列表。参见 [`hub`](/docs/reference/commands/hub) |
+| **Skills** / **Agents** | 已安装的项目、**Updates** 标签页，以及 **Trash** 标签页。Skills 还有一个 **Analyze** 标签页，估算每个 skill 为某个 target 的上下文增加了多少 token。**Install** 可从 GitHub 搜索，或从 URL 或路径安装。菜单里还有打开创建向导的 **New skill** 和 **Link folder**。config 中有尚未安装的条目时，**Updates** 标签页和安装对话框会提供 **Install all**，效果同不带参数的 [`install`](/docs/reference/commands/install)。执行检查后，已从来源 repo 删除的 skills 会列出并提供 **Prune** 和 **Prune all**，把它们移到回收站。**Link folder** 与 [`link`](/docs/reference/commands/link) 一样把文件夹链接到 skills Source：填写路径、可选的链接名，`follow_source_links` 关闭时还有一个开启它的复选框；被拒绝的文件夹会显示与命令相同的原因。链接的文件夹会以独立分组列出，带有链接图标和它指向的文件夹；该行的图标按钮（悬停时链接图标变为取消链接图标）会先确认，再像 [`unlink`](/docs/reference/commands/unlink) 一样取消链接：文件夹本身不受影响，链接可以从 **Trash** 标签页恢复。链接文件夹里的 skill 仍可单独卸载，它会从该文件夹移到 trash；链接的文件夹没有 **Update repo** 和 **Uninstall repo**。列表和卡片视图可以按 **Folder**（tracked repo、`frontend/react` 这类文件夹，或 **Root**）过滤，也可以按 **Folder** 分组，Root 排在最前，其余文件夹按名称 A→Z 排序。列表视图中，位于另一个 skill 文件夹里的 skill 会列在那个 skill 下方：点 package 名称后面的数量按钮，会在下方展开它的 skill，并用淡淡的树状线连到 package（package 默认折叠），更深的 package 再往内缩进。搜索时会展开含有匹配项的 package，显示 `1 / 3` 这样的数量，并标出名称里匹配的文字；搜索中收起的 package 在搜索改变后会重新展开，搜索前展开的 package 保持不变。分页只计算顶层的行。每一行以一行显示 frontmatter 里的 `description`，该行获得键盘焦点时显示全文；可在 **分组与排序** → **显示** → **描述** 隐藏。**全部展开** / **全部折叠**也会展开和折叠 package，选择栏会显示已选但未显示的项目数。只有点名称才会打开详情页。卸载 package 时，它文件夹里的 skill 也会一起移到 trash，确认对话框会显示数量。**tree** 视图左侧显示 source 文件夹，右侧显示详情：点击文件夹或 skill 进行选择，Cmd/Ctrl 点击加入选择，Shift 点击选择范围，双击 skill 打开它。右侧可以用一个开关启用或停用所有选中的项目（被 `.skillignore.local` 的 `!` 规则保持启用的项目会报告为失败并附上原因）、设置它们的 targets（包括 tracked repo 及其子文件夹），并列出每个 skill 各自的开关；tracked repo 还提供 **Update repo** 和 **Uninstall repo**。带有 `disable-model-invocation: true` 的 skill 会在列表、卡片和详情页上带有 **manual only** 标签，这与 [`list`](/docs/reference/commands/list) 用 `m` 切换的状态相同。从远程默认分支以外的分支安装的 skill（`install --branch`）会在列表、卡片和 **Updates** 标签页上以标签显示该分支。从远程来源安装的 skill（tracked repo 除外，它在 **Git Sync** 切换分支）在详情页的 **Branch** 中列出来源的分支，适用于任何主机上的 Git 远程（HTTPS 或 SSH）。选择分支后会先确认，再经过与 update 相同的安全审计和本地修改检查，从该分支重新安装。如果该分支没有这个 skill，会保留当前的安装。在项目中，切换成功后也会把分支记录到 `.skillshare/config.yaml`，让团队成员从该分支安装。在 skill 编辑器中，**Add field** 会描述每个 frontmatter 字段的作用。**Sync skills** / **Sync agents** 会先预览，然后只将该类型 sync 到每个 target；在更新、卸载或 collect 之后，点击 **Sync Now** 也会打开同一个对话框。文件浏览器会通过被跟随的 source 链接列出 `SKILL.md` 和附件，包括链接本身就是 skill 根目录的情况。 |
+| **Extras** | **文件夹**：与 skills 一起同步的 rules、commands 和其他目录。**Edit target** 可修改 Target 的文件夹、文件名、模式、flatten 设置和[文件过滤](./extras.md#choosing-files)，并实时预览；**Edit extra** 可重命名 extra，或改为指向另一个来源文件夹。**AGENTS.md**：在 global mode 下是共享 `AGENTS.md` 以及哪些 target 在使用它们；在项目中是项目的 `./AGENTS.md` 以及每个 target 是否会读取它。参见[让多个工具共用一份 AGENTS.md](../../how-to/daily-tasks/sharing-instructions.md)  **Memory**: [记忆共享教程](../../how-to/daily-tasks/sharing-memory.md)（英文截图）。搜索、预览、编辑、删除笔记、INDEX 链接、冲突时保留草稿、Backup Files 历史与恢复，以及 **Connect to agents** → **Review changes** → **Apply changes**；配置状态不代表已读取 |
+| **MCP** | 每个 server 一行，并以 chip 显示它同步到的 Agents；行上的计数按钮会打开它们的开关。**添加服务器** 接受 URL、命令、粘贴的片段或文件；**从目标导入** 会读取某个已安装 Agent 现有的配置。每个 server 的菜单都有 **查看各 Agent 会写入的配置**，会列出来源和每个 Agent 的文件，并显示你选中的那一个，包括尚未保存的编辑。冲突会提供 **从该 Agent 导入** 或 **使用来源覆盖**。server 对话框的 **工具** 区块用于设置[工具策略](./mcp.md#tool-policy)：**加载工具**，它会用对话框当前的设置（无论是否已保存）启动 server 一次并列出工具供勾选；用于 `*` 通配符的 **排除规则** 行；该区块会列出每个未应用部分策略的所选 Agent，设置了策略时该行会显示一个标签。对于 Pi server，对话框还提供 [Pi 内置 MCP](./mcp.md#pi) 的设置：工具暴露方式和其他 Pi 设置，后者以 JSON 形式填写 [`piOptions`](./mcp.md#pi-options)，说明位于信息提示中。**默认值** 用于编辑 `mcp.targets`。Sync 框中的 **Sync MCP** 会列出待写入的更改，并只写入 MCP 配置文件，同时为每个文件保留一份备份；其下方的 [**检查**](./mcp.md#check-servers-before-an-agent-starts-them) 用于检查 server，**备份与还原** 用于预览并恢复这些备份。 |
+| **Plugins** | 每个 plugin 一行，以及它的 Agents 开关。展开一行还会列出该来源支持的其他 Agents；勾选一个会预览安装效果。行菜单可以同步、更新、移除，或打开 **View files**，即 Skillshare 审阅过的本地副本的只读浏览器。参见 [Manage plugins across tools](/docs/how-to/daily-tasks/sharing-plugins) |
+| **Targets** | 带状态的 Target 列表。**添加目标** 还提供 **另一个账号**：你已在使用的某个 Agent 的第二个配置文件夹，并会预览它的写入位置。每个 Target 的页面可编辑 include/exclude filter，并把本地专属的 skills 收集回 Source。filter 预览上方的搜索框可按名称筛选行，并标出匹配的文字；它只改变显示的行，不改变 filter。项目页面和 Extras 的 **Edit target** 对话框也使用同一个预览和搜索。**同步内容** 列以链接列出每个 target 拿到的内容：**Skills**、**Agents**、**MCP**、**Hooks** 及数量、Pi 的 **Extensions**，以及连接了共享 `AGENTS.md` 的 target 指令文件；点击即打开 target 页面的对应标签页。有 MCP 配置文件的 Target 会多一个 **MCP** 标签页，每个 server 一行；点一下就会保存，**Sync all targets** 会写入所有 Target 的 MCP 配置文件。每个 Target 还有一个以其指示文件命名的标签页（**CLAUDE.md**、**GEMINI.md**、**AGENTS.md** 等），显示读取顺序、编辑该文件，并可将其转换为 `AGENTS.md` |
+| **Projects** | 仅限 global mode。global 配置会 sync 进的项目文件夹，来自 `config.yaml` 中的 [`projects`](/docs/reference/targets/configuration#projects)、只保存在本机的项目（标记为 **此机器**）和 [`mcp.projects`](./mcp.md#projects-in-the-dashboard)。同样的项目也可以在终端中通过 [`skillshare project`](./project.md) 管理。**添加项目** 需要填写文件夹、它的 Target 和要 sync 的内容，除非在对话框底部的 **保存到** 选择 **只存在这台机器**，否则会保存到 `config.yaml`（当 [`projects_storage`](/docs/reference/targets/configuration#projects-storage) 为 `machine-local` 时默认选择只存在这台机器）。编辑会保存在项目所在的位置。要移动已保存的项目，请使用 `skillshare project localize` 或 `share`。移除一个被本机覆盖的项目时，会询问是只移除本机的副本，还是连 `config.yaml` 中的一并移除。每个项目都有带 filter 的 **Skills** 和 **Agents** 标签页，可以预览并查看会写入的文件夹，还有一个 **MCP** 标签页，用于在该文件夹中关闭 global server 或为它添加自己的 server，并提供 **检查** 来检查这些 server。**Sync project** 会先预览，然后只 sync 该项目的 skills、agents 和 MCP。已经指向某个项目文件夹的 Target 可以被转换 |
+| **Audit** | 对 skills 和 agents 的安全扫描，按严重程度列出 findings。[跟随的 source 链接](/docs/reference/targets/configuration#follow_source_links)无法读取时，Skills / Agents 标签页旁会标出 **扫描不完整**，以免把部分扫描误认为完整扫描；此时扫描完成后会显示警告而不是全部正常，dashboard 的 **Needs attention** 中也会列出。**Rules** 标签页按类别浏览每一条规则：可以关闭某一条、更改其严重程度、把某个严重程度应用到整个类别、选择扫描 profile（`default`、`strict`、`permissive`），或打开自定义 `audit-rules.yaml` 的编辑器 |
+| **Settings** | 带标签页：**General**（source 路径、sync 模式、外观）、**Backup**（target 文件夹快照、`AGENTS.md` 等文件的早期版本，以及 MCP 配置备份；参见 [`backup`](./backup.md#dashboard)）、**Log**（操作历史）、**Health**（与 [`doctor`](/docs/reference/commands/doctor) 相同的检查）、**Extensions**（同步时的文件转换）、**Files**（`config.yaml`、`.skillignore` 和 `.agentignore` 的直接编辑器；存在 `.skillignore.local` 或 `.agentignore.local` 时，因为它在该文件之后套用、可以覆盖它，编辑器会在上方显示它的规则） |
+
+更改列表旁的 **放弃更改** 会在确认后，将所选 Git 范围内所有已跟踪的文件和暂存区恢复至最后一次提交，并删除未跟踪的文件和文件夹。被 Git 忽略的文件、嵌套 Git 仓库，以及 `root` 范围的 `config.yaml` 都会保留。此操作不会更改提交记录，也不会推送到远程仓库，且无法撤销。**试运行** 只会预览，不会更改文件。仓库必须已有第一次提交，才能放弃更改。
+
+Git 冲突比较使用完整文件版本。可以逐个文件选择本机或远端，也能用 **全部保留本机**／**全部保留远端** 一次选择，再在应用前调整个别文件。选择已删除的一方会在合并中删除该文件。双方的提交历史都会保留；取消不会修改文件。
+
+在 **Updates** 标签页中，进度条会显示更新进度，正在更新的行也会标记出来。被阻止或失败的更新会显示在单独的区域。更新成功后，标签页会检查该类型是否有待同步变更。只有有变更可应用时才会显示 **Sync Now**；没有差异时会提示无需同步。现有 symlink 已能读取更新后的 source 内容。同步检查失败时会显示错误与 **Retry**，不会误报全部为最新状态。 链接指向的 Git checkout 会以信息行显示链接名称和目标路径。与 `skillshare update --all` 一样，此标签页不会检查、更新或强制重试这些 checkout；请自行管理，或在 CLI 中按名称明确更新。
+
+旧链接如 `/collect`、`/install`、`/search`、`/trash`、`/analyze`、`/backup`、`/log` 和 `/doctor` 会重定向到新位置。
+
+**Files** 标签页在编辑器旁边放了一个面板。对于 `config.yaml`，它会显示光标所在字段的作用、文件结构以及尚未保存的变更；对于 ignore 文件，它会列出当前这些 pattern 隐藏了什么。`Cmd+S` / `Ctrl+S` 保存。**Audit -> Rules -> Edit YAML** 下的规则编辑器有同样的面板，外加一个 **Test** 标签页，可以用你粘贴的行来测试某条规则的正则表达式。
+
+### 主题系统
+
+Dashboard 支持两种视觉风格和三种颜色模式，可通过侧边栏的 **Theme** 按钮切换：
+
+| 设置 | 选项 | 默认值 |
+|---------|---------|---------|
+| **Style** | `Clean`（专业风格）、`Playful`（粗描边、硬阴影、手写标题） | Playful |
+| **Mode** | `Light`、`Dark`、`System`（跟随操作系统偏好） | Light |
+
+主题偏好会持久化在 localStorage 中，跨会话保留。
+
+### Project Mode 差异
+
+在 project mode（`-p`）下运行时，dashboard 会有以下调整：
+
+- **Sidebar** 在名称下方显示 `Project · <project path>`
+- **Git Sync 页面** 被隐藏（project skills 使用项目自己的 git）
+- **Sync** 只备份 agent target 目录，与 `skillshare sync -p` 相同
+- **Backup 标签页** 在 Settings 中被隐藏（改用版本控制）
+- **Tracked Repos 区块** 从 Dashboard 中隐藏（不适用）
+- **Settings -> Files** 显示的是 `.skillshare/config.yaml` 和项目级的 `.skillignore`，而非全局版本
+- **Available targets** 列出的是 project 级 target（例如相对于项目根目录的 `.claude/skills/`）
+- **Targets** 统计并切换 project 的 MCP server，写入 project 自己的文件（例如 `.mcp.json`）。Claude Code、OpenCode、Kilo Code 和 Pi 的 **MCP** 标签页还会列出在这个 project 关闭全局 server 的开关
+- **Install** 会自动协调 project config 中的 `skills:` 条目
+- **Extras -> AGENTS.md** 编辑的是项目的 `./AGENTS.md` 而不是共享文件，并为只读取自己文件的 target 提供一个小修正
+
+## UI 预览
+
+<div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1rem'}}>
+  <img src="/img/web-install-demo.png" alt="安装流程" />
+  <img src="/img/web-dashboard-demo.png" alt="仪表板概览" />
+  <img src="/img/web-skills-demo.png" alt="技能浏览页面" />
+  <img src="/img/web-skill-detail-demo.png" alt="技能详细信息页面" />
+  <img src="/img/web-sync-demo.png" alt="同步控件" />
+  <img src="/img/web-search-skills-demo.png" alt="GitHub 搜索界面" />
+  <img src="/img/web-projects-demo.png" alt="列出项目文件夹的 Projects 页面" />
+</div>
+
+## REST API
+
+web dashboard 在 `/api/` 下暴露一个 REST API。所有端点都返回 JSON。
+
+| Method | Path | 说明 |
+|--------|------|-------------|
+| GET | `/api/overview` | skill/target 计数、模式、版本、config 目录（`configDir`） |
+| GET | `/api/skills` | 列出所有 skills 及其元数据 |
+| GET | `/api/skills/{name}` | skill 详情 + SKILL.md 内容 |
+| GET | `/api/skills/templates` | 获取用于创建 skill 的可用 pattern 和分类 |
+| POST | `/api/skills` | 创建一个新 skill（name、pattern、category、scaffoldDirs） |
+| DELETE | `/api/skills/{name}` | 卸载一个 skill |
+| GET | `/api/targets` | 列出 targets 及其状态、include/exclude filter，以及每个 target 的预期计数 |
+| POST | `/api/targets` | 添加一个 target |
+| DELETE | `/api/targets/{name}` | 移除一个 target |
+| POST | `/api/sync` | 运行 sync（支持 `dryRun`、`force`、`kind`，以及 `project`：一个已声明的项目根目录，用于将 sync 限定在该项目的 targets）。除非设置了 `dryRun`，否则会先备份 targets |
+| POST | `/api/git/commit` | 从 source 仓库创建一个本地 git commit，但不推送 |
+| POST | `/api/git/discard` | 放弃配置的 Git 范围内尚未提交的更改（仅限全局模式，仓库必须已有第一次提交）。支持 `dryRun`；保留被 Git 忽略的文件、嵌套 Git 仓库，以及 `root` 范围的 `config.yaml` |
+| GET | `/api/git/status` | source 仓库状态，包括尚未推送的提交（`ahead`），以及截至上次 fetch 尚未拉取的 upstream 提交（`behind`）。不会执行 fetch |
+| POST | `/api/push` | 提交任何变更，然后推送。首次推送时会设置 upstream。当 remote 有本仓库没有的提交时，会以 `409` 和错误码 `push_rejected` 失败；先 pull，再重新 push |
+| POST | `/api/pull` | 拉取，然后同步该仓库 scope 所涵盖的内容。分歧的历史会被合并；`.metadata.json` 的冲突会自动解决，其他冲突会失败并撤销合并。当首次 pull 无法合并时，会以错误码 `merge_failed` 失败；用 `force: true` 重试可用 remote 分支替换本地文件。`alwaysSync: true` 时即使没有拉取到新内容也会同步 targets。remote 没有任何分支时返回 `400 remote_empty` |
+| GET | `/api/diff` | source 与 targets 之间的差异 |
+| GET | `/api/search?q=` | 在 GitHub 上搜索 skills |
+| POST | `/api/install` | 从来源安装一个 skill |
+| GET | `/api/audit` | 扫描所有 skills 的安全威胁；跟随的 source 链接无法读取时，会像 `audit --format json` 一样加上 `warnings` 和 `incomplete: true`。之前已用 `--force` 接受的 findings 带有 `acknowledged: true`，计入 `summary.accepted` 而非原本的严重程度 |
+| GET | `/api/audit/rules` | 获取自定义 audit rules YAML |
+| PUT | `/api/audit/rules` | 保存自定义 audit rules（会校验正则表达式） |
+| POST | `/api/audit/rules` | 创建初始的 audit-rules.yaml |
+| GET | `/api/audit/rules/compiled` | 合并内置规则和自定义规则后的每一条规则，以及当前激活的 profile |
+| POST | `/api/audit/rules/toggle` | 启用、禁用或重新评级某条规则或整个 pattern |
+| POST | `/api/audit/rules/reset` | 删除自定义规则并恢复内置默认值 |
+| PATCH | `/api/audit/policy` | 设置 `blockThreshold`、`profile`，或两者一起 |
+| GET | `/api/log` | 列出日志条目，支持可选的过滤条件 |
+| GET | `/api/config` | 以 YAML 形式获取 config |
+| PUT | `/api/config` | 更新 config YAML |
+| GET | `/api/skillignore` | 获取 `.skillignore` 内容、存在时的 `.skillignore.local` 内容，以及忽略统计 |
+| PUT | `/api/skillignore` | 更新 `.skillignore` 内容 |
+| GET | `/api/doctor` | 运行所有健康检查（JSON） |
+| GET | `/api/doctor/stream` | 以 Server-Sent Events 运行所有健康检查：每完成一项发送一个 `check` 事件，最后以 `done` 发送与 `/api/doctor` 相同的 JSON |
+| GET | `/api/health` | 存活探针；server 就绪后返回 `200` |
+| GET | `/api/version` | 当前/最新版本、是否有可用升级，以及 Nix 安装时更新 CLI 的命令（`nixUpgradeCommand`） |
+| POST | `/api/upgrade` | 就地运行 `skillshare upgrade`（当二进制文件为开发构建时返回 `devMode: true`；通过 Nix 安装且有更新的 CLI 待安装时返回 `409`，错误码为 `upgrade.nix`） |
+| POST | `/api/restart` | 重启本地 UI server；可选的 `{ "clearCache": true }` body 会先清除缓存的 UI 资源 |
+
+## 就地升级
+
+当 dashboard 检测到有新的 CLI 发布版本可用时，**Update** 对话框和 **Doctor** 页面的 *Version* 卡片都会出现 **Update now** 按钮：
+
+1. UI 调用 `POST /api/upgrade`，在宿主机上运行 `skillshare upgrade`。
+2. 新二进制文件就位后，UI 调用 `POST /api/restart` 重启本地 server。
+3. 浏览器轮询 `GET /api/health`，并在新 server 就绪后自动重新加载。
+
+如果 skillshare 通过 Nix 安装，该端点仍会更新内置的 skillshare skill，但 CLI 交给 Nix 更新。有更新的 CLI 时，它会返回 `409`（`upgrade.nix`），对话框随后说明如何通过 Nix 更新。点击之前，对话框就会说明如何通过 Nix 更新 CLI：`nix profile` 安装为 `nix profile upgrade skillshare`，否则为重新构建 Nix 配置。参见 [upgrade](./upgrade.md#nix-users)。
+
+如果运行中的二进制文件是开发构建（`version == "dev"`），upgrade 端点会返回
+`devMode: true`，UI 会模拟一次重启而不修改磁盘上的任何内容。
+
+如果自动重新加载没有完成，对话框会提示你运行 `skillshare ui start` 来重新拉起后台 server。
+
+## 反向代理 {#reverse-proxy}
+
+如果你在共享服务器（例如家庭实验室、内部工具平台）上运行 dashboard，并处于反向代理之后，可以用 `--trusted-origin` 传入你在浏览器中打开的地址，并用 `--base-path` 把它挂载在子路径下，与其他服务共存：
+
+```bash
+skillshare ui --base-path /skillshare --host 0.0.0.0 --trusted-origin https://tools.example.com --no-open
+```
+
+或者通过环境变量：
+
+```bash
+SKILLSHARE_UI_BASE_PATH=/skillshare SKILLSHARE_UI_TRUSTED_ORIGINS=https://tools.example.com skillshare ui --host 0.0.0.0 --no-open
+```
+
+dashboard 只在 `localhost`、形如 `http://192.168.1.20:19420` 的 IP 地址、`--host` 指定的名称以及每个 trusted origin 上响应。其他域名会得到 403，因为 DNS rebinding 攻击会把它控制的域名指向你的机器。每个 origin 写成协议加主机，端口不是默认值时再加端口，例如 `https://tools.example.com` 或 `http://nas.local:8080`。可重复使用 `--trusted-origin`，或在 `SKILLSHARE_UI_TRUSTED_ORIGINS` 中用逗号分隔。能访问某个 trusted 地址的人可以使用整个 dashboard，包括会写入 Agent 所执行命令的 MCP、Hooks 与 Plugins 页面，因此只列出你自己控制的地址，并在代理处限制谁能访问它们。
+
+### Nginx
+
+```nginx
+location /skillshare/ {
+    proxy_pass http://127.0.0.1:19420;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
+
+### Caddy
+
+```
+handle_path /skillshare/* {
+    reverse_proxy 127.0.0.1:19420
+}
+```
+
+如两个示例所示，请保留浏览器的 `Host` 头，包括端口。dashboard 会把 `Host` 与 trusted origin 比对，并且请求的 `Origin` 与 `Host` 不一致时，dashboard 会拒绝变更，这样其他网站就无法通过你的浏览器进行变更。Caddy 默认保留 `Host`，不要用 `header_up Host` 改写它。
+
+:::tip
+不使用 `--base-path` 时，dashboard 的行为与以前完全一致——直接访问 `localhost:19420` 不需要任何配置。
+:::
+
+## Docker 使用方式
+
+要在 Docker 内使用 web UI（首次下载 UI 需要网络访问）：
+
+```bash
+make playground
+
+# 在容器内：
+skillshare ui --host 0.0.0.0 --no-open
+```
+
+然后在宿主机上打开 `http://localhost:19420`（19420 端口已自动映射）。
+
+## Project Mode
+
+web dashboard 完整支持 project 级 skills：
+
+```bash
+cd my-project
+skillshare ui -p
+```
+
+或者，如果 `.skillshare/config.yaml` 存在（自动检测），直接运行 `skillshare ui` 即可。
+
+dashboard 会读写 `.skillshare/config.yaml`，同步到 project 本地的 targets，并在安装后协调 remote skill 条目——就像 CLI 一样。
+
+## 运行时 UI 下载
+
+`skillshare ui` 会在首次启动时自动从匹配的 GitHub Release 下载预构建的 UI 资源。这些资源会缓存在 `~/.cache/skillshare/ui/<version>/`（遵循 `XDG_CACHE_HOME`），因此后续启动是即时且离线的。
+
+- **首次运行** 需要网络连接来下载 UI 资源（约 2 MB）
+- **后续运行** 使用缓存的资源——无需网络
+- **升级时**，`skillshare upgrade` 会预先下载新 UI，并保留新版与升级前版本的缓存；其他缓存版本会被清理
+- **手动清除缓存**，运行 `skillshare ui --clear-cache`
+
+## Homebrew 说明
+
+所有安装方式（Homebrew、Nix、安装脚本、手动二进制文件）都使用运行时 UI 下载。当你运行 `skillshare ui` 时，它会在首次启动时自动从 GitHub 下载 UI 资源。之后会使用缓存的资源离线运行。
+
+清除已下载的 UI 缓存：
+
+```bash
+skillshare ui --clear-cache
+```
+
+## 架构
+
+web UI 是一个单页 React 应用，在运行时从匹配的 GitHub Release 下载，并从磁盘缓存中提供服务（`~/.cache/skillshare/ui/<version>/`）。
+
+```
+skillshare ui
+  ├── Go HTTP server (net/http)
+  │   ├── /api/*    → REST API handlers
+  │   └── /*        → Cached React SPA (runtime download)
+  └── Browser opens http://127.0.0.1:19420
+```
+
+## 另请参阅
+
+- [status](/docs/reference/commands/status) —— CLI 状态检查
+- [sync](/docs/reference/commands/sync) —— CLI 同步命令
+- [Project Setup](/docs/how-to/sharing/project-setup) —— Project mode 设置指南
+- [Docker Sandbox](/docs/how-to/advanced/docker-sandbox) —— 在 Docker 中运行 UI

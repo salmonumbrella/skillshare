@@ -4,14 +4,16 @@ import (
 	"sync"
 
 	"skillshare/internal/git"
+	"skillshare/internal/install"
 )
 
 const maxWorkers = 8
 
 // RepoCheckInput describes a tracked repo to check.
 type RepoCheckInput struct {
-	Name     string
-	RepoPath string
+	Name         string
+	RepoPath     string
+	ParseOptions install.ParseOptions
 }
 
 // RepoCheckOutput holds the result of checking a single repo.
@@ -19,18 +21,22 @@ type RepoCheckOutput struct {
 	Name    string
 	Status  string // "up_to_date", "behind", "dirty", "error"
 	Behind  int
+	Branch  string
 	Message string
 }
 
 // URLCheckInput describes a remote URL to probe.
 type URLCheckInput struct {
-	RepoURL string
+	RepoURL      string
+	Branch       string
+	ParseOptions install.ParseOptions
 }
 
 // URLCheckOutput holds the result of probing a remote URL.
 type URLCheckOutput struct {
 	RepoURL    string
 	RemoteHash string
+	Branch     string
 	Err        error
 }
 
@@ -66,6 +72,9 @@ func ParallelCheckRepos(repos []RepoCheckInput, onDone func()) []RepoCheckOutput
 
 func checkOneRepo(r RepoCheckInput) RepoCheckOutput {
 	out := RepoCheckOutput{Name: r.Name}
+	if branch, err := git.GetCurrentBranch(r.RepoPath); err == nil {
+		out.Branch = branch
+	}
 
 	isDirty, err := git.IsDirty(r.RepoPath)
 	if err != nil {
@@ -79,7 +88,7 @@ func checkOneRepo(r RepoCheckInput) RepoCheckOutput {
 		return out
 	}
 
-	behind, err := git.GetBehindCountWithAuth(r.RepoPath)
+	behind, err := git.GetBehindCountWithAuth(r.RepoPath, r.ParseOptions)
 	if err != nil {
 		out.Status = "error"
 		out.Message = err.Error()
@@ -114,10 +123,11 @@ func ParallelCheckURLs(urls []URLCheckInput, onDone func()) []URLCheckOutput {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			hash, err := git.GetRemoteHeadHashWithAuth(input.RepoURL)
+			hash, err := (GitRemote{ParseOptions: input.ParseOptions}).Hash(input.RepoURL, input.Branch)
 			outputs[idx] = URLCheckOutput{
 				RepoURL:    input.RepoURL,
 				RemoteHash: hash,
+				Branch:     input.Branch,
 				Err:        err,
 			}
 			if onDone != nil {

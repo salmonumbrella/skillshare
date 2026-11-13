@@ -1,25 +1,31 @@
 package server
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"skillshare/internal/audit"
-	"skillshare/internal/git"
+	"skillshare/internal/config"
 	"skillshare/internal/install"
+	"skillshare/internal/sourcewalk"
+	"skillshare/internal/update"
 	"skillshare/internal/utils"
 )
 
 type updateRequest struct {
 	Name      string `json:"name"`
+	Kind      string `json:"kind,omitempty"`
 	Force     bool   `json:"force"`
 	All       bool   `json:"all"`
 	SkipAudit bool   `json:"skipAudit"`
+	// Branch reinstalls one skill from this branch of its recorded source.
+	Branch string `json:"branch,omitempty"`
 }
 
 type updateResultItem struct {
@@ -29,6 +35,7 @@ type updateResultItem struct {
 	IsRepo         bool   `json:"isRepo"`
 	AuditRiskScore int    `json:"auditRiskScore,omitempty"`
 	AuditRiskLabel string `json:"auditRiskLabel,omitempty"`
+	Kind           string `json:"kind,omitempty"`
 }
 
 func (s *Server) updateAuditThreshold() string {
@@ -50,10 +57,19 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer s.trackProjectLock()()
+	defer s.followRepairedSources()()
 
 	var body updateRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if err := decodeJSON(w, r, &body, defaultJSONBodyLimit); err != nil {
+		if !errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+		}
+		return
+	}
+
+	if body.Branch != "" && (body.All || body.Kind == "agent") {
+		writeError(w, http.StatusBadRequest, "branch applies to a single skill only")
 		return
 	}
 
@@ -100,8 +116,21 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name is required (or use all: true)")
 		return
 	}
+	if body.Kind != "" && body.Kind != "skill" && body.Kind != "agent" {
+		writeError(w, http.StatusBadRequest, "invalid kind: "+body.Kind)
+		return
+	}
+	if body.Kind != "agent" && !validSourceName(body.Name) {
+		writeError(w, http.StatusBadRequest, "invalid skill name: "+body.Name)
+		return
+	}
 
-	result := s.updateSingle(body.Name, body.Force, body.SkipAudit)
+	var result updateResultItem
+	if body.Branch != "" {
+		result = s.switchSkillBranch(body.Name, body.Branch, body.Force, body.SkipAudit)
+	} else {
+		result = s.updateSingleByKind(body.Name, body.Kind, body.Force, body.SkipAudit)
+	}
 	status := "ok"
 	msg := ""
 	if result.Action == "error" {
@@ -114,37 +143,51 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		status = "partial"
 		msg = result.Message
 	}
-	s.writeOpsLog("update", status, start, map[string]any{
+	logArgs := map[string]any{
 		"name":       body.Name,
 		"force":      body.Force,
 		"skip_audit": body.SkipAudit,
 		"scope":      "ui",
-	}, msg)
+	}
+	if body.Branch != "" {
+		logArgs["branch"] = body.Branch
+	}
+	s.writeOpsLog("update", status, start, logArgs, msg)
 	writeJSON(w, map[string]any{"results": []updateResultItem{result}})
 }
 
 func (s *Server) updateSingle(name string, force, skipAudit bool) updateResultItem {
-	// Try tracked repo first (with _ prefix)
-	repoName := name
-	if !strings.HasPrefix(repoName, "_") {
-		repoName = "_" + name
-	}
-	repoPath := filepath.Join(s.cfg.Source, repoName)
+	return s.updateSingleByKind(name, "", force, skipAudit)
+}
 
-	if install.IsGitRepo(repoPath) {
-		return s.updateTrackedRepo(repoName, repoPath, force, skipAudit)
+func (s *Server) updateSingleByKind(name, kind string, force, skipAudit bool) updateResultItem {
+	name = path.Clean(filepath.ToSlash(name)) // "org/team/" names the same item as "org/team"
+	if kind == "agent" {
+		return s.updateAgent(name, force, skipAudit)
+	}
+	walk := s.skillsWalk()
+	// Try exact skill path first (prevents basename collision with nested repos)
+	skillPath := filepath.Join(s.cfg.EffectiveSkillsSource(), name)
+	if refusal := s.refuseFollowedCheckout(name, skillPath, []*sourcewalk.Follow{walk.Follow}); refusal != nil {
+		return *refusal
+	}
+	// A tracked repo's own entry has a Source too; a reinstall would drop its
+	// tracked state, so checkouts go to the tracked-repo update. A tracked repo
+	// whose checkout is gone is not reinstalled, nor matched by basename.
+	if entry := s.skillsStore.GetByPath(name); entry != nil && entry.Source != "" && !install.IsTrackedCheckout(skillPath) {
+		if entry.Tracked && utils.IsTrackedRepoDir(filepath.Base(name)) {
+			return updateResultItem{Name: name, Action: "error", Message: fmt.Sprintf("tracked repo '%s' is declared in metadata but missing on disk", name)}
+		}
+		return s.updateRegularSkill(name, skillPath, force, skipAudit, walk.Follow)
 	}
 
-	// Try as regular skill
-	skillPath := filepath.Join(s.cfg.Source, name)
-	if meta, _ := install.ReadMeta(skillPath); meta != nil && meta.Source != "" {
-		return s.updateRegularSkill(name, skillPath, skipAudit)
+	// Try tracked repo (flat, nested, or basename fallback)
+	repoName, repoPath, err := s.resolveTrackedRepo(name, walk)
+	if err != nil {
+		return updateResultItem{Name: name, Action: "error", Message: err.Error()}
 	}
-
-	// Try original name as git repo path
-	origPath := filepath.Join(s.cfg.Source, name)
-	if install.IsGitRepo(origPath) {
-		return s.updateTrackedRepo(name, origPath, force, skipAudit)
+	if repoPath != "" {
+		return s.updateTrackedRepo(repoName, repoPath, s.cfg.EffectiveSkillsSource(), force, skipAudit, walk.Follow)
 	}
 
 	return updateResultItem{
@@ -154,120 +197,252 @@ func (s *Server) updateSingle(name string, force, skipAudit bool) updateResultIt
 	}
 }
 
-func (s *Server) updateTrackedRepo(name, repoPath string, force, skipAudit bool) updateResultItem {
-	// Check for uncommitted changes
-	if isDirty, _ := git.IsDirty(repoPath); isDirty {
-		if !force {
-			return updateResultItem{
-				Name:    name,
-				Action:  "skipped",
-				Message: "has uncommitted changes (use force to discard)",
-				IsRepo:  true,
-			}
-		}
-		if err := git.Restore(repoPath); err != nil {
-			return updateResultItem{
-				Name:    name,
-				Action:  "error",
-				Message: "failed to discard changes: " + err.Error(),
-				IsRepo:  true,
-			}
+func (s *Server) updateAgent(name string, force, skipAudit bool) updateResultItem {
+	agentsSource := s.agentsSource()
+	if agentsSource == "" {
+		return updateResultItem{Name: name, Kind: "agent", Action: "error", Message: "agents source is not configured"}
+	}
+
+	// The dashboard names an agent repo by its folder.
+	if validSourceName(name) {
+		if repoPath := filepath.Join(agentsSource, filepath.FromSlash(name)); install.IsTrackedCheckout(repoPath) {
+			item := s.updateTrackedRepo(name, repoPath, agentsSource, force, skipAudit)
+			item.Kind = "agent"
+			return item
 		}
 	}
 
-	var info *git.UpdateInfo
-	var err error
-	if force {
-		info, err = git.ForcePullWithAuth(repoPath)
+	localAgent, err := resolveAgentResource(agentsSource, name)
+	if err != nil {
+		return updateResultItem{Name: name, Kind: "agent", Action: "error", Message: err.Error()}
+	}
+
+	if localAgent.RepoRelPath != "" {
+		repoPath := filepath.Join(agentsSource, filepath.FromSlash(localAgent.RepoRelPath))
+		item := s.updateTrackedRepo(agentMetaKey(localAgent.RelPath), repoPath, agentsSource, force, skipAudit)
+		item.Kind = "agent"
+		return item
+	}
+
+	metaKey := agentMetaKey(localAgent.RelPath)
+	entry := s.agentsStore.GetByPath(metaKey)
+	if entry == nil || entry.Source == "" {
+		return updateResultItem{
+			Name:    metaKey,
+			Kind:    "agent",
+			Action:  "skipped",
+			Message: "agent is local and has no update source",
+		}
+	}
+
+	source, err := install.AgentRepoSource(entry, s.parseOpts())
+	if err != nil {
+		return updateResultItem{Name: metaKey, Kind: "agent", Action: "error", Message: "invalid source: " + err.Error()}
+	}
+
+	var discovery *install.DiscoveryResult
+	if source.HasSubdir() {
+		discovery, err = install.DiscoverFromGitSubdir(source)
 	} else {
-		info, err = git.PullWithAuth(repoPath)
+		discovery, err = install.DiscoverFromGit(source)
 	}
 	if err != nil {
+		return updateResultItem{Name: metaKey, Kind: "agent", Action: "error", Message: err.Error()}
+	}
+	defer install.CleanupDiscovery(discovery)
+
+	if discovery.CommitHash != "" && discovery.CommitHash == entry.Version {
+		return updateResultItem{Name: metaKey, Kind: "agent", Action: "up-to-date"}
+	}
+
+	var target *install.AgentInfo
+	for i := range discovery.Agents {
+		candidate := discovery.Agents[i]
+		if candidate.Path == entry.Subdir ||
+			candidate.FileName == filepath.Base(localAgent.RelPath) ||
+			candidate.Name == filepath.Base(metaKey) {
+			target = &discovery.Agents[i]
+			break
+		}
+	}
+	if target == nil {
 		return updateResultItem{
-			Name:    name,
+			Name:    metaKey,
+			Kind:    "agent",
 			Action:  "error",
-			Message: err.Error(),
-			IsRepo:  true,
+			Message: fmt.Sprintf("agent path %q not found in repository", entry.Subdir),
 		}
 	}
 
-	if info.UpToDate {
-		return updateResultItem{Name: name, Action: "up-to-date", IsRepo: true}
+	destDir := agentsSource
+	opts := install.InstallOptions{
+		Kind:           "agent",
+		Force:          force,
+		Update:         true,
+		SkipAudit:      skipAudit,
+		AuditThreshold: s.updateAuditThreshold(),
+		SourceDir:      agentsSource,
+	}
+	if s.IsProjectMode() {
+		opts.AuditProjectRoot = s.projectRoot
+	}
+	res, err := install.UpdateAgentFromDiscovery(discovery, *target, destDir, opts)
+	if err != nil {
+		return updateResultItem{Name: metaKey, Kind: "agent", Action: "error", Message: err.Error()}
 	}
 
-	// Post-pull audit gate
-	item := updateResultItem{
-		Name:    name,
+	if st, loadErr := install.LoadMetadataWithMigration(agentsSource, install.MetadataKindAgent); loadErr == nil && st != nil {
+		s.agentsStore = st
+	}
+
+	message := res.Action
+	if message == "" {
+		message = "updated"
+	}
+	return updateResultItem{
+		Name:    metaKey,
+		Kind:    "agent",
 		Action:  "updated",
-		Message: fmt.Sprintf("%d commits, %d files changed", len(info.Commits), info.Stats.FilesChanged),
-		IsRepo:  true,
+		Message: message,
 	}
-	if !skipAudit {
-		blocked, auditResult := s.auditGateTrackedRepo(name, repoPath, info.BeforeHash, s.updateAuditThreshold())
-		if blocked != nil {
-			return *blocked
+}
+
+// updateTrackedRepo runs the shared tracked-repo update and reports it as a
+// result item. sourceDir is the skills or agents source root that holds the
+// repo's metadata and accepted findings, as the CLI passes it.
+func (s *Server) updateTrackedRepo(name, repoPath, sourceDir string, force, skipAudit bool, follow ...*sourcewalk.Follow) updateResultItem {
+	if refusal := s.refuseFollowedCheckout(name, repoPath, follow); refusal != nil {
+		return *refusal
+	}
+	opts := update.TrackedRepoOptions{
+		ParseOptions: s.parseOpts(),
+		SourceDir:    sourceDir,
+		Force:        force,
+		SkipAudit:    skipAudit,
+		Threshold:    s.updateAuditThreshold(),
+	}
+	if len(follow) > 0 {
+		opts.Follow = follow[0]
+	}
+	if s.IsProjectMode() {
+		opts.ProjectRoot = s.projectRoot
+	}
+	res, err := update.TrackedRepo(repoPath, opts)
+
+	item := updateResultItem{Name: name, IsRepo: true}
+	var blocked *install.AuditGateError
+	var opErr *update.Error
+	switch {
+	case errors.As(err, &blocked):
+		item.Action = "blocked"
+		item.Message = trackedBlockMessage(blocked)
+		return item
+	case errors.As(err, &opErr) && opErr.Stage == update.StagePull:
+		item.Action = "error"
+		item.Message = opErr.Err.Error()
+		if !force {
+			item.Message += " (try force update)"
 		}
-		if auditResult != nil {
-			item.AuditRiskScore = auditResult.RiskScore
-			item.AuditRiskLabel = auditResult.RiskLabel
-		}
+		return item
+	case err != nil:
+		item.Action = "error"
+		item.Message = err.Error()
+		return item
 	}
 
+	if res.MetadataErr != nil {
+		log.Printf("warning: failed to refresh metadata for %s: %v", name, res.MetadataErr)
+	}
+	if res.MetadataChanged {
+		if sourceDir == s.agentsSource() {
+			if st, loadErr := install.LoadMetadataWithMigration(sourceDir, install.MetadataKindAgent); loadErr == nil {
+				s.agentsStore = st
+			}
+		} else {
+			s.reloadSkillsStore()
+		}
+	}
+	switch res.Status {
+	case update.StatusDirty:
+		item.Action = "skipped"
+		item.Message = "has uncommitted changes (use force to discard)"
+	case update.StatusUpToDate:
+		item.Action = "up-to-date"
+	default:
+		item.Action = "updated"
+		item.Message = fmt.Sprintf("%d commits, %d files changed", len(res.Info.Commits), res.Info.Stats.FilesChanged)
+		for _, w := range res.Warnings {
+			item.Message += "; " + w
+		}
+		if res.RecordErr != nil {
+			item.Message += "; failed to record accepted findings: " + res.RecordErr.Error()
+		}
+		if res.Audit != nil {
+			item.AuditRiskScore = res.Audit.RiskScore
+			item.AuditRiskLabel = res.Audit.RiskLabel
+		}
+	}
 	return item
 }
 
-// auditGateTrackedRepo scans a tracked repo after pull and rolls back if findings are detected
-// at or above the active threshold.
-// Returns (blocked item, audit result). blocked is non-nil when the update should be rejected.
-func (s *Server) auditGateTrackedRepo(name, repoPath, beforeHash, threshold string) (*updateResultItem, *audit.Result) {
-	var result *audit.Result
-	var err error
-	if s.IsProjectMode() {
-		result, err = audit.ScanSkillForProject(repoPath, s.projectRoot)
-	} else {
-		result, err = audit.ScanSkill(repoPath)
+// trackedBlockMessage words a blocked update for the dashboard, which offers
+// Force Retry only for messages containing "blocked by security audit".
+func trackedBlockMessage(e *install.AuditGateError) string {
+	switch {
+	case e.Rollback == install.RollbackUnavailable:
+		return "security audit failed (" + e.RollbackNote() + ")"
+	case e.ScanErr != nil:
+		return "security audit failed: " + e.ScanErr.Error() + " (" + e.RollbackNote() + ")"
+	case e.Rollback == install.RolledBack:
+		return fmt.Sprintf("blocked by security audit — findings at/above %s detected, rolled back", e.Threshold)
 	}
-
-	if err != nil {
-		msg := "security audit failed: " + err.Error()
-		if beforeHash == "" {
-			msg += " (rollback commit unavailable, repository state is unknown)"
-		} else if resetErr := git.ResetHard(repoPath, beforeHash); resetErr != nil {
-			msg += " (WARNING: rollback also failed: " + resetErr.Error() + " — malicious content may remain)"
-		} else {
-			msg += " (rolled back)"
-		}
-		return &updateResultItem{
-			Name:    name,
-			Action:  "blocked",
-			Message: msg,
-			IsRepo:  true,
-		}, nil
-	}
-
-	if result.HasSeverityAtOrAbove(threshold) {
-		msg := fmt.Sprintf("blocked by security audit — findings at/above %s detected", threshold)
-		if beforeHash == "" {
-			msg += " (rollback commit unavailable, repository state is unknown)"
-		} else if resetErr := git.ResetHard(repoPath, beforeHash); resetErr != nil {
-			msg += " (WARNING: rollback failed: " + resetErr.Error() + " — malicious content may remain)"
-		} else {
-			msg += ", rolled back"
-		}
-		return &updateResultItem{
-			Name:    name,
-			Action:  "blocked",
-			Message: msg,
-			IsRepo:  true,
-		}, result
-	}
-
-	return nil, result
+	return fmt.Sprintf("blocked by security audit — findings at/above %s detected (%s)", e.Threshold, e.RollbackNote())
 }
 
-func (s *Server) updateRegularSkill(name, skillPath string, skipAudit bool) updateResultItem {
-	meta, _ := install.ReadMeta(skillPath)
-	source, err := install.ParseSource(meta.Source)
+// switchSkillBranch reinstalls a skill from another branch of its recorded
+// source. Tracked repos change branch with git checkout instead.
+func (s *Server) switchSkillBranch(name, branch string, force, skipAudit bool) updateResultItem {
+	name = path.Clean(filepath.ToSlash(name))
+	skillPath := filepath.Join(s.cfg.EffectiveSkillsSource(), name)
+	if entry := s.skillsStore.GetByPath(name); entry == nil || entry.Source == "" || entry.Tracked || install.IsTrackedCheckout(skillPath) {
+		return updateResultItem{Name: name, Action: "error", Message: "only a skill installed from a remote source can switch branch"}
+	}
+	walk := s.skillsWalk()
+	result := s.reinstallRegularSkill(name, skillPath, branch, force, skipAudit, walk.Follow)
+	if result.Action == "updated" && s.IsProjectMode() {
+		// config.yaml declares the branch teammates install from, so it follows
+		// the switch; other declarations stay as the shared file has them.
+		for i := range s.projectCfg.Skills {
+			if skill := &s.projectCfg.Skills[i]; skill.FullName() == name {
+				skill.Branch = branch
+				if err := s.projectCfg.Save(s.projectRoot); err != nil {
+					result.Message += "; failed to record the branch in config.yaml: " + err.Error()
+				}
+				break
+			}
+		}
+	}
+	return result
+}
+
+func (s *Server) updateRegularSkill(name, skillPath string, force, skipAudit bool, follow ...*sourcewalk.Follow) updateResultItem {
+	return s.reinstallRegularSkill(name, skillPath, "", force, skipAudit, follow...)
+}
+
+// reinstallRegularSkill reinstalls a skill from its recorded source, from
+// branch when set and from the recorded branch otherwise.
+func (s *Server) reinstallRegularSkill(name, skillPath, branch string, force, skipAudit bool, follow ...*sourcewalk.Follow) updateResultItem {
+	if refusal := s.refuseFollowedCheckout(name, skillPath, follow); refusal != nil {
+		return *refusal
+	}
+	entry := s.skillsStore.GetByPath(name)
+	if entry == nil {
+		return updateResultItem{Name: name, Action: "error", Message: "no metadata found"}
+	}
+	if !force && entry.LocallyModified(skillPath, follow...) {
+		return updateResultItem{Name: name, Action: "skipped", Message: "has local changes since install (try force update)"}
+	}
+	source, err := install.RecordedSource(entry, s.parseOpts())
 	if err != nil {
 		return updateResultItem{
 			Name:    name,
@@ -275,12 +450,23 @@ func (s *Server) updateRegularSkill(name, skillPath string, skipAudit bool) upda
 			Message: "invalid source: " + err.Error(),
 		}
 	}
+	if branch == "" {
+		branch = entry.Branch
+	}
+	source.ApplyRecordedBranch(branch)
 
+	sourceDir := s.cfg.EffectiveSkillsSource()
 	opts := install.InstallOptions{
 		Force:          true,
+		AuditOverride:  force,
+		Reinstall:      force,
 		Update:         true,
 		SkipAudit:      skipAudit,
 		AuditThreshold: s.updateAuditThreshold(),
+		SourceDir:      sourceDir,
+	}
+	if len(follow) > 0 {
+		opts.SourceFollow = follow[0]
 	}
 	if s.IsProjectMode() {
 		opts.AuditProjectRoot = s.projectRoot
@@ -292,6 +478,10 @@ func (s *Server) updateRegularSkill(name, skillPath string, skipAudit bool) upda
 			Action:  "error",
 			Message: err.Error(),
 		}
+	}
+
+	if st, loadErr := install.LoadMetadataWithMigration(sourceDir, ""); loadErr == nil && st != nil {
+		s.skillsStore = st
 	}
 
 	item := updateResultItem{
@@ -310,20 +500,21 @@ func (s *Server) updateAll(force, skipAudit bool) []updateResultItem {
 	var results []updateResultItem
 
 	// Update tracked repos
-	repos, err := install.GetTrackedRepos(s.cfg.Source)
+	walk := s.skillsWalk()
+	repos, err := install.GetTrackedRepos(s.cfg.EffectiveSkillsSource(), walk)
 	if err == nil {
 		for _, repo := range repos {
-			repoPath := filepath.Join(s.cfg.Source, repo)
-			results = append(results, s.updateTrackedRepo(repo, repoPath, force, skipAudit))
+			repoPath := filepath.Join(s.cfg.EffectiveSkillsSource(), repo)
+			results = append(results, s.updateTrackedRepo(repo, repoPath, s.cfg.EffectiveSkillsSource(), force, skipAudit, walk.Follow))
 		}
 	}
 
 	// Update regular skills with source metadata
-	skills, err := getServerUpdatableSkills(s.cfg.Source)
+	skills, err := getServerUpdatableSkills(s.cfg.EffectiveSkillsSource(), s.skillsStore, walk)
 	if err == nil {
 		for _, skill := range skills {
-			skillPath := filepath.Join(s.cfg.Source, skill)
-			results = append(results, s.updateRegularSkill(skill, skillPath, skipAudit))
+			skillPath := filepath.Join(s.cfg.EffectiveSkillsSource(), skill)
+			results = append(results, s.updateRegularSkill(skill, skillPath, force, skipAudit, walk.Follow))
 		}
 	}
 
@@ -332,10 +523,10 @@ func (s *Server) updateAll(force, skipAudit bool) []updateResultItem {
 
 // getServerUpdatableSkills returns relative paths of skills that have metadata with a remote source.
 // It walks the source directory recursively to find nested skills (e.g. utils/ascii-box-check).
-func getServerUpdatableSkills(sourceDir string) ([]string, error) {
+func getServerUpdatableSkills(sourceDir string, store *install.MetadataStore, walk sourcewalk.Options) ([]string, error) {
 	var skills []string
 	walkRoot := utils.ResolveSymlink(sourceDir)
-	err := filepath.WalkDir(walkRoot, func(path string, d os.DirEntry, err error) error {
+	err := sourcewalk.WalkDir(walkRoot, walk, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -355,8 +546,12 @@ func getServerUpdatableSkills(sourceDir string) ([]string, error) {
 			return filepath.SkipDir
 		}
 		// Check if this directory has updatable metadata
-		meta, metaErr := install.ReadMeta(path)
-		if metaErr != nil || meta == nil || meta.Source == "" {
+		relName := filepath.Base(path)
+		if relP, relErr2 := filepath.Rel(walkRoot, path); relErr2 == nil {
+			relName = filepath.ToSlash(relP)
+		}
+		entry := store.GetByPath(relName)
+		if entry == nil || entry.Source == "" {
 			return nil // continue walking into subdirectories
 		}
 		relPath, relErr := filepath.Rel(walkRoot, path)
@@ -369,4 +564,35 @@ func getServerUpdatableSkills(sourceDir string) ([]string, error) {
 		return nil, err
 	}
 	return skills, nil
+}
+
+// followRepairedSources returns a function for defer: the project config
+// follows the records the request rewrote because their source did not parse
+// (config.FollowRepairedSources). Defer it after trackProjectLock, which pins
+// by the config's source.
+func (s *Server) followRepairedSources() func() {
+	if !s.IsProjectMode() {
+		return func() {}
+	}
+	sourceDir := s.cfg.EffectiveSkillsSource()
+	before := install.LoadMetadataOrNew(sourceDir)
+	return func() {
+		if err := config.FollowRepairedSources(s.projectRoot, s.projectCfg, before, install.LoadMetadataOrNew(sourceDir), s.parseOpts()); err != nil {
+			log.Printf("warning: failed to update project config: %v", err)
+		}
+	}
+}
+
+// trackProjectLock returns a function for defer: it moves the lockfile pins of
+// the skills the request changed. Global mode has no lockfile.
+func (s *Server) trackProjectLock() func() {
+	if !s.IsProjectMode() {
+		return func() {}
+	}
+	done := config.TrackProjectLock(s.projectRoot, s.projectCfg, s.cfg.EffectiveSkillsSource())
+	return func() {
+		if err := done(); err != nil {
+			log.Printf("warning: failed to update %s: %v", install.LockFileName, err)
+		}
+	}
 }

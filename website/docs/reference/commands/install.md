@@ -6,6 +6,10 @@ sidebar_position: 3
 
 Add skills from GitHub repos, git URLs, or local paths.
 
+Tracked repositories report `Found N skills, M variants` when agent-specific copies
+represent fewer logical skills. All physical variants remain installed in the source;
+merge and copy sync select the matching agent's instructions.
+
 ## Overview
 
 ```mermaid
@@ -75,6 +79,10 @@ skillshare install https://gitlab.com/user/repo.git
 skillshare install git@gitlab.com:user/repo.git
 ```
 
+:::tip Self-managed GitLab on custom domains
+Hosts containing `gitlab` or `jihulab` in the name are automatically detected with nested subgroup support. For other self-managed GitLab instances on custom domains (e.g., `git.company.com`), add the hostname to [`gitlab_hosts`](/docs/reference/targets/configuration#gitlab_hosts) in your config so skillshare treats the full URL path as the repository. Without config, you can append `.git` as a workaround: `git.company.com/team/frontend/ui.git`.
+:::
+
 ### Azure DevOps
 
 Use the `ado:` shorthand or full Azure DevOps URLs:
@@ -102,11 +110,28 @@ When you don't specify a path, skillshare clones the repo, scans for skills, and
 skillshare install anthropics/skills
 ```
 
-<p>
-  <img src="/img/install-demo.png" alt="install demo" width="720" />
-</p>
+```text
+$ skillshare install anthropics/skills
+✓ Source    github.com/anthropics/skills
+  Found     20 skills
 
-Discovery scans all directories for `SKILL.md` files, skipping only `.git`. This means skills inside hidden directories like `.curated/` or `.system/` are discovered automatically. When multiple skills are found, the selection prompt groups them by directory for easier browsing.
+? Install which skills?
+› ○ academy-guide        Complete terms in LICENSE.txt
+  ○ algorithmic-art      Complete terms in LICENSE.txt
+  ○ brand-guidelines     Complete terms in LICENSE.txt
+  ○ canvas-design        Complete terms in LICENSE.txt
+  ○ claude-api           Complete terms in LICENSE.txt
+  ○ discernment-nudge
+  ○ doc-coauthoring
+  ○ docx                 Proprietary. LICENSE.txt has complete terms
+  …
+
+  ↑↓ move · space toggle · ctrl+a all · enter confirm · / filter · esc cancel
+```
+
+Discovery scans all directories for `SKILL.md` files except `.git` and target directories such as `.claude/` and `.agents/`, which usually hold copies of the repository's skills. Other hidden directories like `.curated/` or `.system/` are scanned, so their skills are discovered automatically. A repository with no other skills has its root `.agents/skills/` scanned instead. When multiple skills are found, the prompt lists skills from the same folder together and shows each one's description and folder; press `/` to narrow a long list.
+
+The `.agents/skills/` fallback requires both `.agents` and `skills` to be real directories, not symlinks or junctions, even with `follow_source_links: true`. An intentionally followed repository root remains supported. Discovered agent installs and updates reject intermediate or final destination links; audits run before publication, and a blocked audit leaves existing agent contents unchanged.
 
 If the repository contains a `.skillignore` file at its root, matching skills are automatically excluded from discovery. See [.skillignore](#skillignore) below.
 
@@ -173,13 +198,19 @@ skillshare install ~/Downloads/my-skill
 skillshare install /absolute/path/to/skill
 ```
 
+A local path is copied into the source directory. In global mode, a relative path such as `./my-skill` is recorded as an absolute path, so `update` and [`check`](./check.md#local-path-installs) find it from any directory. In project mode it is recorded as written, because `.skillshare/config.yaml` is shared across machines.
+
 :::tip Fuzzy subdirectory resolution
 When specifying a subdirectory path like `owner/repo/skill-name`, if the exact path doesn't exist in the repo, skillshare scans all `SKILL.md` files and matches by directory basename. If multiple skills share the same name, an ambiguity error is shown with full paths so you can specify the exact one.
 :::
 
-## Install from Config (No Arguments)
+:::note Git submodules are not fetched
+skillshare does not fetch git submodules. Installing a path that is a submodule, or lies inside one, fails with an error that names the submodule, its pinned commit, and its upstream URL; install from that upstream repository instead, or copy the files into the hub. When you browse a whole repository, `install`, `--track` and `update` warn about each submodule they skip.
+:::
 
-When run without a source argument, `skillshare install` reads the `skills:` section from `config.yaml` and installs all listed remote skills that don't already exist locally:
+## Install from Config (No Arguments) {#install-from-config-no-arguments}
+
+When run without a source argument, `skillshare install` reads the recorded remote skill metadata (global mode) or the project `skills:` manifest (project mode) and installs all remote skills that don't already exist locally:
 
 ```bash
 # Global — reads ~/.config/skillshare/config.yaml
@@ -189,11 +220,11 @@ skillshare install
 skillshare install -p
 ```
 
-This makes `config.yaml` a **portable skill manifest** — share it to reproduce the same skill setup on any machine:
+This makes the recorded metadata/manifest a **portable skill setup** — share it to reproduce the same skills on any machine:
 
 ```bash
 # New machine setup
-skillshare install       # Installs all skills from config
+skillshare install       # Rehydrates remote skills and tracked repos from metadata
 skillshare sync          # Sync to targets
 
 # New team member onboarding
@@ -202,7 +233,7 @@ skillshare install -p    # Install all remote skills from project config
 skillshare sync
 ```
 
-Skills with `tracked: true` are cloned with full git history (same as `--track`), so `skillshare update` works correctly. Skills already present on disk are skipped.
+Skills with `tracked: true` are cloned with full git history (same as `--track`), so `skillshare update` works correctly. Skills already present on disk are skipped. This is the recovery command to run after a fresh clone when tracked repo directories were gitignored and are missing locally.
 
 :::tip push/pull vs install from config
 `push`/`pull` syncs actual skill **files** via git. `install` from config re-downloads from **source URLs**. They're complementary — see [Cross-Machine Sync](/docs/how-to/sharing/cross-machine-sync#alternative-install-from-config) for when to use which.
@@ -226,6 +257,16 @@ skillshare install anthropics/skills -s pdf --into tools -p
 skillshare install -p
 ```
 
+:::caution Don't install the project root into itself
+In project mode, installing a local path that resolves to the project root (e.g. `skillshare install ./ -p`) is rejected — copying the root into its own `.skillshare/skills/` subtree would recurse into the destination. Point at a specific skill subdirectory instead:
+
+```bash
+skillshare install ./my-skill -p
+```
+
+This guard applies to both the CLI and the Web UI ([`skillshare ui`](./ui.md)).
+:::
+
 ### How It Differs
 
 | | Global | Project (`-p`) |
@@ -235,7 +276,9 @@ skillshare install -p
 | Config update | Auto-reconciles `config.yaml` `skills:` | Auto-reconciles `.skillshare/config.yaml` `skills:` |
 | No-arg install | Installs all skills listed in config | Installs all skills listed in config |
 
-**Tracked repos in project mode** work the same as global — the repo is cloned with `.git` preserved and added to `.skillshare/.gitignore` (which also ignores `.skillshare/logs/` by default). The `tracked: true` flag is auto-recorded in `.skillshare/config.yaml`:
+Installing a skill again from another source or branch (after an uninstall, or over the existing copy with `--force`) replaces its entry in `.skillshare/config.yaml` and its pin in `skills.lock.json`, so teammates install from the new source. Other entries are never rewritten from this machine's install records.
+
+**Tracked repos in project mode** work the same as global — the repo is cloned with `.git` preserved and added to `.skillshare/.gitignore` (which also ignores `.skillshare/logs/`, `.skillshare/trash/`, `.skillshare/backups/`, and the `.metadata.json` files by default). The `tracked: true` flag is auto-recorded in `.skillshare/config.yaml`:
 
 ```bash
 skillshare install github.com/team/skills --track -p
@@ -250,10 +293,13 @@ See [Project Setup](/docs/how-to/sharing/project-setup) for the full guide.
 |------|-------|-------------|
 | `--name <name>` | | Override installed name when exactly one skill is installed |
 | `--into <dir>` | | Install into subdirectory (e.g. `--into frontend` or `--into frontend/react`) |
-| `--force` | `-f` | Overwrite existing skill; override audit blocking and cross-path duplicate check |
+| `--force` | `-f` | Overwrite existing skill; override audit blocking from findings (not a failed scan) and cross-path duplicate check |
 | `--update` | `-u` | Update if exists (git pull or reinstall) |
-| `--track` | `-t` | Keep `.git` for tracked repos |
-| `--skill` | `-s` | Select specific skills from multi-skill repo (comma-separated; supports glob patterns like `core-*`) |
+| `--branch <ref>` | `-b` | Git branch, tag, or commit SHA to install from (default: remote default branch) |
+| `--track` | `-t` | Keep `.git` for tracked repos. Cannot combine with `--all`, `--yes`, `--skill`, or `--agent`. |
+| `--kind <skill\|agent>` | | Limit install to one resource kind |
+| `--agent <names>` | `-a` | Select specific agents from a repo (comma-separated) |
+| `--skill` | `-s` | Select specific skills from multi-skill repo (comma-separated; supports glob patterns like `core-*`). Rejects `--all` and `--yes`. |
 | `--exclude` | | Skip specific skills during install (comma-separated; supports glob patterns like `test-*`) |
 | `--all` | | Install all discovered skills without prompting |
 | `--yes` | `-y` | Auto-accept all prompts (CI/CD friendly) |
@@ -263,13 +309,15 @@ See [Project Setup](/docs/how-to/sharing/project-setup) for the full guide.
 | `--project` | `-p` | Install into project `.skillshare/skills/` |
 | `--global` | `-g` | Install into global `~/.config/skillshare/skills/` |
 | `--dry-run` | `-n` | Preview only |
-| `--json` | | Output as JSON (implies `--force` and `--all`, non-interactive) |
+| `--json` | | Output as JSON (permits overwriting existing skills like `--force`, but audit blocking still applies; also implies non-interactive selection when no `--skill`/`--agent` filter is given) |
 
 ## JSON Output
 
 ```bash
 skillshare install anthropics/skills --json
 ```
+
+For an explicit, untracked skill source, add `--dry-run --json` to read a `planned` array of `{name, path}` objects without installing. Names are the CLI's install names; Git paths are relative to the repository root (including any selected subdirectory), and a local skill uses `.`. The plan follows discovery, `.skillignore`, and selection rules. Without a selection filter, JSON mode selects all skills. `skills` still reports only installed names and stays empty in a dry run. A discovered source with no selected skills returns `planned: []`; tracked and config-based installs do not provide this field.
 
 ```json
 {
@@ -300,6 +348,37 @@ skillshare install anthropics/skills --json --into frontend
 }
 ```
 
+For agent-only installs, the JSON output still uses the `skills` array to report installed names:
+
+```bash
+skillshare install github.com/user/agents --kind agent --json
+```
+
+```json
+{
+  "source": "github.com/user/agents",
+  "tracked": false,
+  "dry_run": false,
+  "skills": ["reviewer", "tutor"],
+  "failed": [],
+  "duration": "1.234s"
+}
+```
+
+When the install fails as a whole, for example when the security audit blocks a tracked repository, a single skill, or every skill from a source or from config, the command exits non-zero and the `error` field says why, naming each failed skill. When only some skills fail, they are listed in `failed` and the command exits 0. Add `--force` to install despite audit findings.
+
+```json
+{
+  "source": "github.com/user/evil-skills",
+  "tracked": true,
+  "dry_run": false,
+  "skills": [],
+  "failed": [],
+  "duration": "0.412s",
+  "error": "blocked by security audit (use --force to override)"
+}
+```
+
 ## Duplicate Detection
 
 skillshare automatically detects when you're about to install something that already exists:
@@ -317,6 +396,8 @@ skillshare install anthropics/skills/skills/pdf
 ```
 
 Use `--update` to refresh, or `--force` to overwrite.
+
+`--update` on a tracked repo behind a [followed source link](../targets/configuration.md#follow_source_links) refuses to pull while that checkout has uncommitted changes. Commit or stash first.
 
 ### Cross-path duplicate
 
@@ -348,6 +429,8 @@ The `--force` hint always includes the correct flags (including `--into` if appl
 
 ## Common Scenarios
 
+**Default install names:** Skills keep their directory name. If that name is the generic `skill` or `skills`, a valid `SKILL.md` frontmatter `name` is used instead, lowercased with spaces normalized to hyphens (for example, `MinerU Document Extractor` → `mineru-document-extractor`). Missing, invalid, or conflicting frontmatter names fall back to the directory name. `--name` overrides this default. Updates preserve existing install names, and `--track` keeps its existing repository naming.
+
 **Install with custom name:**
 ```bash
 skillshare install google-gemini/gemini-cli/.../skill-creator --name my-creator
@@ -356,6 +439,7 @@ skillshare install google-gemini/gemini-cli/.../skill-creator --name my-creator
 
 `--name` only works when install resolves to a single skill.
 In `--track` mode, custom names are stored as tracked repo directories (auto-prefixed with `_`) and must not contain path separators or `..`.
+`--track` accepts a local path when that path is the root of a git repository (it is cloned like `file:///path`); for any other local folder, install it without `--track`. With `--track --force`, the existing tracked repo is replaced only after the new clone succeeds, so a failed reinstall keeps the old one; a local source (path or `file://` URL) that is, or lies inside, that tracked repo is refused.
 
 ```bash
 # ✅ Single skill (works)
@@ -394,16 +478,53 @@ skillshare install anthropics/skills -s pdf --into frontend/react
 
 See [Organizing Skills](/docs/how-to/daily-tasks/organizing-skills) for folder strategies.
 
-**Install team repo (tracked):**
+**Install from a specific branch:**
 ```bash
-skillshare install anthropics/skills --track
+# Regular install from a branch
+skillshare install github.com/team/skills --branch develop --all
+
+# Track a specific branch
+skillshare install github.com/team/skills --track --branch frontend
+
+# Same repo, different branches (use --name to avoid collision)
+skillshare install github.com/team/skills --track --branch frontend --name team-frontend
+skillshare install github.com/team/skills --track --branch backend --name team-backend
 ```
 
-<p>
-  <img src="/img/team-reack-demo.png" alt="tracked repo install demo" width="720" />
-</p>
+**Pin to a tag or commit SHA (reproducible installs):**
+```bash
+# Pin to a release tag
+skillshare install github.com/team/skills --branch v1.2.0 --all
 
-## Private Repositories
+# Pin to an exact commit (full or abbreviated SHA)
+skillshare install github.com/team/skills --branch 8f14e45fceea167a5a36dedd4bea2543ce848564 --all
+```
+
+A web URL pins the same way: `skillshare install github.com/team/skills/tree/v1.2.0/skills/foo` installs from tag `v1.2.0`. GitLab (`-/tree/<ref>/`) and Bitbucket (`src/<ref>/`) URLs work too. Branch names containing `/`, such as `tree/feature/x/skills/foo`, are matched against the remote's branches and tags. A ref the remote no longer has, such as `tree/master/` after a rename to `main`, fails the install instead of falling back to the default branch. `tree/HEAD/` links, which GitHub uses for the default branch, install from the remote's default branch. An explicit `--branch` overrides the ref in the URL.
+
+In a project you usually do not need this: `.skillshare/skills.lock.json` already pins every remote skill to the commit it was installed from, and `skillshare update` moves the pin. See [Lockfile](/docs/understand/project-skills#lockfile).
+
+The pinned ref is stored in skill metadata, so `skillshare update` reinstalls the same revision and `skillshare check` reports a SHA pin as up to date without contacting the remote. `--track` requires a branch: a tag or commit SHA leaves the clone detached with nothing for `skillshare update` to pull, so the install is rejected.
+
+**Install team repo (tracked):**
+```bash
+skillshare install addyosmani/web-quality-skills --track --name team-skills
+```
+
+```text
+$ skillshare install addyosmani/web-quality-skills --track --name team-skills
+✓ Source    github.com/addyosmani/web-quality-skills
+  Found     6 skills
+  Skills    accessibility, best-practices, core-web-vitals, performance, seo, web-quality-audit
+! Audit     63 findings: HIGH=1, MEDIUM=1, LOW=60, INFO=1 — findings detected, but none at/above block threshold (CRITICAL) · risk CRITICAL (100/100)
+✓ Install   _team-skills → ~/.config/skillshare/skills/_team-skills · 1.9s
+
+Next
+  skillshare sync                 link them into your targets
+  skillshare update _team-skills  update this repo later
+```
+
+## Private Repositories {#private-repositories}
 
 ### SSH (recommended)
 
@@ -430,13 +551,19 @@ skillshare install https://github.com/org/private-skills.git --track
 
 | Platform | Env Var | Token Type |
 |----------|---------|------------|
-| GitHub | `GITHUB_TOKEN` | Personal access token (`repo` scope) |
-| GitLab | `GITLAB_TOKEN` | Personal access or CI job token |
+| `github.com` | `GITHUB_TOKEN` | Personal access token (`repo` scope) |
+| `gitlab.com` | `GITLAB_TOKEN` | Personal access or CI job token |
 | Bitbucket | `BITBUCKET_TOKEN` | Repository token, or app password (with `BITBUCKET_USERNAME`) |
 | Azure DevOps | `AZURE_DEVOPS_TOKEN` | Personal Access Token (Code: Read scope) |
+| Gitea | `GITEA_TOKEN` | Access token (repository: Read) |
+| CNB | `CNB_TOKEN` | Access token with repository read permission |
 | Any host | `SKILLSHARE_GIT_TOKEN` | Generic fallback |
 
+Provider tokens are sent only over HTTPS on the default port (or 443): `github.com`, `gitlab.com`, `bitbucket.org`, `dev.azure.com`, `*.visualstudio.com`, `gitea.com`, and `cnb.cool`. Self-hosted Gitea/CNB requires an exact hostname in `gitea_hosts`/`cnb_hosts`, even if its name contains the provider name. For self-hosted GitHub/GitLab or other hosts, use a host-scoped Git credential helper, or set `SKILLSHARE_GIT_TOKEN` only for the intended invocation. That generic fallback can be sent to **any HTTPS source**; provider-looking names do not authorize provider tokens.
+
 Platform-specific variables take priority over `SKILLSHARE_GIT_TOKEN`.
+
+The token reaches git through a credential helper scoped to the host, so it never appears in process arguments such as `ps` output. While a token applies to a host, git does not ask your own credential helper or keychain for that host and stores nothing there.
 
 Official token documentation:
 - GitHub: [Managing your personal access tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
@@ -498,6 +625,7 @@ install-skills:
 Every skill is automatically scanned for security threats during installation:
 
 - Findings at or above `audit.block_threshold` **block installation** (default: `CRITICAL`)
+- If the scan cannot run (for example, `audit-rules.yaml` has an invalid regex), the install is blocked and removed. `--force` does not override this; fix the cause or use `--skip-audit`
 - Lower findings are shown as warnings and include risk score context
 - `audit.block_threshold` only controls block level; it does **not** disable scanning
 - There is no config switch to always skip audit; use `--skip-audit` per command when needed
@@ -527,7 +655,7 @@ skillshare install suspicious-skill --threshold high
 skillshare install suspicious-skill -T h
 ```
 
-Use `--force` to override block decisions, or `--skip-audit` to bypass scanning entirely. See [audit](/docs/reference/commands/audit) for scanning details.
+Use `--force` to override block decisions from findings, or `--skip-audit` to bypass scanning entirely. See [audit](/docs/reference/commands/audit) for scanning details.
 
 The install decision uses **finding severity vs threshold**. Risk score/label is reported for context and does not by itself block installs. By default, audit findings are shown as a compact summary (grouped by severity and message). Use `--audit-verbose` to see the full list.
 
@@ -537,15 +665,16 @@ Tracked repos use the same threshold model, but the scan scope and failure handl
 
 - Fresh `--track` install scans the **entire cloned repository** (not just one skill folder)
 - Findings at/above threshold block install unless `--force` is used
+- A scan that cannot run also blocks install, even with `--force`
 - On blocked fresh install, skillshare automatically removes the cloned repo from source
 - If automatic cleanup fails, install returns an explicit error and tells you to remove the path manually
 
-Tracked repo updates through install (`skillshare install <repo> --track --update`) are audited after `git pull`:
+Tracked repo updates through install (`skillshare install <repo> --track --update`) use the same isolated-candidate audit gate:
 
-- skillshare captures a pre-pull commit hash first
-- If hash capture fails, update aborts immediately (fail-closed)
-- If findings at/above threshold are detected, update is rolled back to the pre-pull commit
-- If rollback fails, command exits with a warning that malicious content may remain
+- Pull and audit happen in a temporary checkout, not the active source directory
+- Rejection or a scan error leaves the active checkout and metadata unchanged
+- Approval publishes the exact audited commit without another upstream pull
+- `--force` can override findings, but cannot override a scan error
 
 ### `--force` vs `--skip-audit`
 
@@ -562,7 +691,7 @@ Recommended usage:
 - Use `--skip-audit` only when you intentionally need to bypass scanning.
 - If both are set, `--skip-audit` takes precedence in practice (scan is skipped).
 
-## Excluding Skills
+## Excluding Skills {#excluding-skills}
 
 ### `--exclude` flag
 
@@ -582,7 +711,7 @@ skillshare install org/skills -y --exclude internal-tool
 skillshare install org/skills -s pdf,commit,docs --exclude docs
 ```
 
-When skills are excluded, a message shows what was skipped: `Excluded 2 skill(s): cli-sentry, delayed-command`.
+When skills are excluded, a message shows what was skipped: `Excluded 2 skills: cli-sentry, delayed-command`.
 
 :::note Requires multi-skill discovery
 `--exclude` only works when installing from a **git repo** that contains multiple skills. It works with `--all`, `--yes`, `--skill`, and interactive selection modes. For direct installs (local paths or single-skill git URLs), `--exclude` is not applicable — a warning is shown if specified.
@@ -617,14 +746,23 @@ Combined with `--exclude`, users can further narrow the selection:
 skillshare install runkids/my-skills --exclude seo
 ```
 
-**Format:**
-- One pattern per line
-- Lines starting with `#` are comments
-- Empty lines are ignored
-- Exact path match: `validation-scripts` (matches a skill at that path)
-- Group match: `feature-radar` (matches **all** skills under `feature-radar/`)
-- Precise path: `feature-radar/feature-radar` (matches only that specific skill, not the whole group)
-- Trailing wildcard: `prompt-eval-*` (matches any path starting with `prompt-eval-`)
+**Format** — uses [gitignore syntax](https://git-scm.com/docs/gitignore):
+
+| Pattern | Example | Behavior |
+|---------|---------|----------|
+| Exact name | `validation-scripts` | Matches a skill at that path |
+| Group match | `feature-radar` | Matches **all** skills under `feature-radar/` |
+| Precise path | `feature-radar/feature-radar` | Only that specific skill |
+| `*` wildcard | `prompt-eval-*` | Matches one segment (does not cross `/`) |
+| `**` | `**/temp` | Matches at any directory depth |
+| `?` | `?.md` | Matches a single character |
+| `[abc]` | `[Tt]est` | Character class |
+| `!pattern` | `!important` | Negation — un-ignore a previously matched skill |
+| `/pattern` | `/root-only` | Anchored to the `.skillignore` location |
+| `pattern/` | `build/` | Directory-only match |
+| `\#`, `\!` | `\#file` | Escaped literal characters |
+
+Lines starting with `#` are comments. Empty lines are ignored.
 
 **Recommended scenarios:**
 - Publishing a multi-skill repository while hiding internal tools or work-in-progress skills
@@ -637,8 +775,10 @@ skillshare install runkids/my-skills --exclude seo
 
 `.skillignore` is applied during git repo discovery, so it affects all discovery-based install paths: `--all`, `--skill`, `--yes`, and interactive selection. It does **not** apply to direct local-path installs (which skip discovery entirely).
 
-:::tip Where to place .skillignore
-The `.skillignore` file must be at the **repository root**, not inside individual skill directories. It controls which skills are discoverable when users install from your repo.
+:::tip .skillignore scope
+**Repo-level** `.skillignore` (in a repository root) controls which skills are discoverable when users install from your repo. After installation, tracked repos retain their `.skillignore` — it is also respected by `doctor`, `status`, `list`, `sync`, `audit`, `diff`, and `check`.
+
+**Source-root** `.skillignore` (`~/.config/skillshare/skills/.skillignore`) applies globally to all skills — tracked and non-tracked. Use it to temporarily mute skills or exclude patterns (e.g., `draft-*`) without uninstalling.
 :::
 
 ### `.skillignore` vs `--exclude`
@@ -650,6 +790,51 @@ The `.skillignore` file must be at the **repository root**, not inside individua
 | **When it applies** | During discovery (before selection) | After discovery (before prompt) |
 | **Scope** | All users installing from this repo | This install only |
 | **Requires** | Git repo with multiple skills | Git repo with multiple skills |
+
+## Agent Support
+
+When installing a repository, skillshare auto-detects agents (standalone `.md` files) alongside skills:
+
+- If the repo contains an `agents/` directory, `.md` files inside are discovered as agent candidates
+- If the repo has both `skills/` and `agents/`, both are installed
+- If the repo has only loose `.md` files at root (no `SKILL.md`), they are treated as agents
+
+### Explicit agent flags
+
+```bash
+# Install only agents from a repo
+skillshare install github.com/user/repo --kind agent
+
+# Install specific agents by name (-a shorthand)
+skillshare install github.com/user/repo -a tutor,reviewer
+
+# Combine with project mode
+skillshare install github.com/user/repo --kind agent -p
+```
+
+The `-a <name>` flag is the agent equivalent of `-s <name>` for skills. Agents are installed into `~/.config/skillshare/agents/` (global) or `.skillshare/agents/` (project). See [Agents](/docs/understand/agents) for the full concepts.
+
+### Scoping skills vs agents in a mixed repo
+
+When a repo contains both skills and agents, the filters control exactly what is installed:
+
+| Flags | What gets installed |
+|-------|---------------------|
+| _(none)_ | All skills and all agents |
+| `--all` / `--yes` | All skills and all agents |
+| `-s <names>` | Only the named skills — **no agents** |
+| `-s <names> -a <names>` | The named skills and the named agents |
+| `-a <names>` | Only the named agents |
+
+```bash
+# Install just one skill from a mixed repo — agents are NOT pulled in
+skillshare install github.com/user/repo -s pdf
+
+# Install one skill and one agent together
+skillshare install github.com/user/repo -s pdf -a tutor
+```
+
+An unknown `-a` name fails the whole command up front — before any skill is installed — so automation never sees a half-completed install.
 
 ## After Installing
 

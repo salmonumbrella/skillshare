@@ -4,14 +4,84 @@
   "title": "Skillshare Global Configuration",
   "description": "Configuration file for skillshare — the universal AI skill manager. Location: ~/.config/skillshare/config.yaml",
   "type": "object",
-  "required": ["source"],
   "additionalProperties": false,
+  "allOf": [{"not": {"required": ["sources", "mcp"], "properties": {"sources": {"required": ["mcp"]}, "mcp": {"required": ["servers"]}}}}],
   "properties": {
+    "mcp": {"$ref": "mcp.schema.json#/$defs/globalConfiguration"},
+    "hooks": {"$ref": "hooks.schema.json#/$defs/globalConfiguration"},
     "source": {
       "type": "string",
-      "description": "Path to the skills source directory (single source of truth). Supports ~ for home directory.",
+      "description": "Legacy top-level skills source path. Prefer sources.skills (added in v0.19.16). When both are set, sources.skills wins. Supports ~ for home directory.",
       "default": "~/.config/skillshare/skills",
       "examples": ["~/.config/skillshare/skills", "/home/user/my-skills"]
+    },
+    "agents_source": {
+      "type": "string",
+      "description": "Legacy top-level agents source path. Prefer sources.agents (added in v0.19.16). When both are set, sources.agents wins. Supports ~ for home directory.",
+      "default": "~/.config/skillshare/agents",
+      "examples": ["~/.config/skillshare/agents", "/home/user/my-agents"]
+    },
+    "extras_source": {
+      "type": "string",
+      "description": "Legacy top-level extras source path. Prefer sources.extras. When both are set, sources.extras wins. Supports ~ for home directory.",
+      "default": "~/.config/skillshare/extras",
+      "examples": ["~/.config/skillshare/extras"]
+    },
+    "updates": {
+      "type": "object",
+      "description": "Automatic version checks and notifications for the CLI, built-in skill and desktop app. Manual checks and upgrades remain available.",
+      "additionalProperties": false,
+      "properties": {
+        "auto_check": { "type": "boolean", "default": true, "description": "Overridden by SKILLSHARE_AUTO_UPDATE_CHECK." }
+      }
+    },
+    "log": {
+      "type": "object",
+      "description": "Operation log retention.",
+      "additionalProperties": false,
+      "properties": {
+        "max_entries": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Maximum number of operation log entries to keep. 0 keeps every entry.",
+          "default": 1000
+        }
+      }
+    },
+    "sources": {
+      "type": "object",
+      "description": "Custom source directories for global resources (added in v0.19.16). Mirrors project-mode sources. When set, each key overrides the corresponding legacy top-level field (source / agents_source / extras_source). Supports ~ for home directory.",
+      "additionalProperties": false,
+      "properties": {
+        "mcp": {"type": "string", "minLength": 1, "description": "External MCP YAML file. Relative to this config.yaml; mutually exclusive with mcp.servers."},
+        "skills": {
+          "type": "string",
+          "description": "Custom skills source directory. Falls back to source (legacy) or ~/.config/skillshare/skills.",
+          "examples": ["~/work/skills", "/home/user/my-skills"]
+        },
+        "agents": {
+          "type": "string",
+          "description": "Custom agents source directory. Falls back to agents_source (legacy) or ~/.config/skillshare/agents.",
+          "examples": ["~/work/agents"]
+        },
+        "extras": {
+          "type": "string",
+          "description": "Custom extras parent directory. Falls back to extras_source (legacy) or the sibling 'extras' directory next to the skills source.",
+          "examples": ["~/work/extras"]
+        }
+      }
+    },
+    "follow_source_links": {
+      "type": "boolean",
+      "description": "When true, a directory link (symlink or Windows junction) directly under the skills source is treated as a directory: its contents are discovered, synced, and updated under the link's name. Links nested deeper are not followed. A link whose directory is missing, that points to the source or a parent of it, or that overlaps a skills target is skipped with a warning.",
+      "default": false
+    },
+    "git_root": {
+      "type": "string",
+      "description": "Directory scope that the git integration (commit/push/pull) operates on. 'skills' (default) versions the skills source; 'agents' and 'extras' version those sources; 'root' versions the entire ~/.config/skillshare/ directory (skills + agents + extras) under one repo. Changing this requires re-running 'skillshare init' so git is set up at the new directory.",
+      "enum": ["skills", "agents", "extras", "root"],
+      "default": "skills",
+      "examples": ["skills", "root"]
     },
     "mode": {
       "type": "string",
@@ -20,16 +90,42 @@
       "default": "merge",
       "examples": ["merge"]
     },
+    "target_naming": {
+      "type": "string",
+      "description": "Default target entry naming strategy for merge/copy sync. 'flat' preserves flattened parent directory prefixes; 'standard' uses the SKILL.md name and enforces the Agent Skills standard; 'prefixed' (copy mode only) is standard plus the tracked repo name in front, '<repo>-<name>', for both the folder and name: in the copy.",
+      "enum": ["flat", "standard", "prefixed"],
+      "default": "flat",
+      "examples": ["flat", "standard", "prefixed"]
+    },
     "targets": {
       "type": "object",
-      "description": "AI CLI skill directories to sync to. Keys are target names (e.g. claude, cursor, codex).",
+      "description": "AI CLI targets to sync skills and agents to. Keys are target names (e.g. claude, cursor, codex).",
       "additionalProperties": {
         "$ref": "#/$defs/targetConfig"
       },
       "examples": [
         {
-          "claude": { "path": "~/.claude/skills" },
-          "cursor": { "path": "~/.cursor/skills" }
+          "claude": { "skills": { "mode": "merge" } },
+          "cursor": { "skills": { "path": "~/.cursor/skills" } },
+          "claude-work": { "agent": "claude", "config_dir": "~/.claude-work" }
+        }
+      ]
+    },
+    "projects_storage": {
+      "type": "string",
+      "enum": ["shared", "machine-local"],
+      "default": "shared",
+      "description": "Where skillshare project add and the dashboard save a new project. shared writes it under projects in this file, so every machine that uses this config gets it. machine-local keeps it in this machine's project registry instead. project add --shared or --machine-local overrides it for one project."
+    },
+    "projects": {
+      "type": "object",
+      "description": "Project folders to sync skills and agents into from this global config. Keys are absolute paths or start with ~. Each target's project path is used (for example .claude/skills), so the folder needs no .skillshare/. MCP servers for the same folder go under mcp.projects.",
+      "additionalProperties": {
+        "$ref": "#/$defs/managedProject"
+      },
+      "examples": [
+        {
+          "~/work/app": { "targets": ["claude", "codex"], "skills": { "mode": "copy", "include": ["team-*"] }, "agents": {} }
         }
       ]
     },
@@ -39,49 +135,337 @@
       "items": {
         "type": "string"
       },
-      "default": ["**/.DS_Store", "**/.git/**"],
-      "examples": [["**/.DS_Store", "**/.git/**", "**/node_modules/**"]]
+      "default": [".DS_Store", ".git/", "__pycache__/"],
+      "examples": [[".DS_Store", ".git/", "__pycache__/", "node_modules/"]]
     },
     "audit": {
       "$ref": "#/$defs/auditConfig"
     },
+    "context_budget": {
+      "$ref": "#/$defs/contextBudgetConfig"
+    },
     "hub": {
       "$ref": "#/$defs/hubConfig"
+    },
+    "backup": {
+      "type": "object",
+      "description": "Retention limits for target folder backups, applied after each sync and by backup --cleanup. Backups older than 30 days are always removed, and the newest is always kept.",
+      "additionalProperties": false,
+      "properties": {
+        "max_count": {"type": "integer", "minimum": 0, "default": 10, "description": "Most backups to keep. 0 for unlimited."},
+        "max_size_mb": {"type": "integer", "minimum": 0, "default": 500, "description": "Most total size in MB. 0 for unlimited."}
+      }
     },
     "tui": {
       "type": "boolean",
       "description": "Enable or disable interactive TUI mode globally. When false, all commands use plain text output (equivalent to --no-tui on every command).",
       "default": true
+    },
+    "gitlab_hosts": {
+      "type": "array",
+      "description": "Hostnames of self-managed GitLab instances that use nested subgroups. Hosts containing 'gitlab' are detected automatically.",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "examples": [["git.company.com", "code.internal.io"]]
+    },
+    "azure_hosts": {
+      "type": "array",
+      "description": "Hostnames of self-hosted Azure DevOps Server instances. The built-in patterns for dev.azure.com and *.visualstudio.com are always active.",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "examples": [["azuredevops.mycompany.com"]]
+    },
+    "cnb_hosts": {
+      "type": "array",
+      "description": "Hostnames of CNB instances. cnb.cool is detected automatically.",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "examples": [["cnb.company.com"]]
+    },
+    "gitea_hosts": {
+      "type": "array",
+      "description": "Hostnames of self-hosted Gitea instances. Hosts containing 'gitea' are detected automatically.",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "examples": [["git.company.com"]]
+    },
+    "plugins": {
+      "type": "object",
+      "description": "Shared plugin declarations written by the CLI and dashboard; edit with those rather than by hand, while native receipts and pending operations remain in machine-local state.",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 2
+        },
+        "packages": {
+          "description": "Managed plugin recipes and target selections, keyed by logical package name.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "object"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "version"
+            ]
+          },
+          "then": {
+            "properties": {
+              "packages": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "source": {
+                      "type": "string"
+                    },
+                    "source_ref": {
+                      "type": "string"
+                    },
+                    "plugin": {
+                      "type": "string"
+                    },
+                    "entry": {
+                      "type": "string"
+                    },
+                    "bindings": {
+                      "type": "object",
+                      "additionalProperties": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                          "source": {
+                            "type": "string"
+                          },
+                          "source_ref": {
+                            "type": "string"
+                          },
+                          "plugin": {
+                            "type": "string"
+                          },
+                          "entry": {
+                            "type": "string"
+                          },
+                          "imported": {
+                            "type": "boolean"
+                          },
+                          "sync": {
+                            "type": "boolean"
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "required": [
+                    "bindings"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "preserve_tilde_on_save": {
+      "type": "boolean",
+      "description": "When true, fold $HOME prefixes back to ~ when serializing this config to YAML. Keeps the on-disk config portable across machines (e.g. when shared via dotfiles). The in-memory config is unaffected; Load() still expands ~ as usual.",
+      "default": false
+    },
+    "extras": {
+      "type": "array",
+      "description": "Non-skill resources (rules, commands, etc.) to sync to specific target paths.",
+      "items": {
+        "$ref": "#/$defs/extraConfig"
+      },
+      "examples": [
+        [
+          {
+            "name": "rules",
+            "targets": [
+              { "path": "~/.claude/rules" },
+              { "path": "~/.cursor/rules", "mode": "copy" }
+            ]
+          }
+        ]
+      ]
     }
   },
   "$defs": {
-    "targetConfig": {
+    "managedProject": {
       "type": "object",
-      "description": "Configuration for a single sync target.",
-      "required": ["path"],
       "additionalProperties": false,
       "properties": {
+        "name": {
+          "type": "string",
+          "description": "Label for this project's targets, shown as <name>@<target>. Defaults to the folder name. Must be unique and cannot contain @, / or \\.",
+          "pattern": "^[^@/\\\\]+$"
+        },
+        "targets": {
+          "type": "array",
+          "description": "Tools used in this project. Tools that share a skills folder, such as .agents/skills, are written once.",
+          "items": { "type": "string" },
+          "uniqueItems": true,
+          "examples": [["claude", "codex"]]
+        },
+        "skills": {
+          "type": "object",
+          "description": "Send skills into this project. An empty value sends all of them.",
+          "additionalProperties": false,
+          "properties": {
+            "mode": { "type": "string", "enum": ["merge", "symlink", "copy"] },
+            "target_naming": { "type": "string", "enum": ["flat", "standard", "prefixed"] },
+            "include": { "type": "array", "items": { "type": "string" } },
+            "exclude": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "agents": {
+          "type": "object",
+          "description": "Send agents into this project. An empty value sends all of them.",
+          "additionalProperties": false,
+          "properties": {
+            "mode": { "type": "string", "enum": ["merge", "symlink", "copy"] },
+            "include": { "type": "array", "items": { "type": "string" } },
+            "exclude": { "type": "array", "items": { "type": "string" } },
+            "extension": { "type": "string", "description": "Convert each agent through an extension before writing it to this target (copy mode; an unset mode becomes copy). A bare name resolves under the extensions directory; a path (containing a separator or starting with '.') is used directly.", "examples": ["opencode-agents", "codex-agents"] }
+          }
+        }
+      }
+    },
+    "targetConfig": {
+      "type": "object",
+      "description": "Configuration for a single sync target. Supports both legacy flat format (path/mode/include/exclude) and new resource sub-keys (skills/agents). Legacy flat fields are auto-migrated to skills: on load.",
+      "additionalProperties": false,
+      "dependentRequired": { "agent": ["config_dir"], "config_dir": ["agent"], "cli": ["agent", "config_dir"] },
+      "properties": {
+        "agent": {
+          "type": "string",
+          "description": "Makes this target another config directory of a built-in Agent, such as a second account. Goes with config_dir. The skills and agents paths follow config_dir unless skills.path or agents.path is set.",
+          "enum": ["claude", "codex", "opencode", "pi", "omp"]
+        },
+        "config_dir": {
+          "type": "string",
+          "description": "The config directory this account of the Agent uses, the one CLAUDE_CONFIG_DIR, CODEX_HOME, OPENCODE_CONFIG_DIR or PI_CODING_AGENT_DIR points at. Absolute or starting with ~, and not the Agent's default one.",
+          "examples": ["~/.claude-work", "~/.codex-work", "~/.pi/work"]
+        },
+        "cli": {
+          "type": "string",
+          "description": "Runs this account's plugin commands with a compatible CLI instead of the Agent's own, such as omo for Pi. A name found on PATH, or an absolute path that may start with ~. One executable, without arguments; shell aliases are not seen. Goes with agent and config_dir.",
+          "examples": ["omo", "~/bin/omo"]
+        },
         "path": {
           "type": "string",
-          "description": "Absolute path to the target skills directory. Supports ~ for home directory.",
-          "examples": ["~/.claude/skills", "~/.cursor/skills"]
+          "description": "[Legacy] Absolute path to the target skills directory. Prefer skills.path instead.",
+          "examples": ["~/.claude/skills"]
         },
         "mode": {
           "type": "string",
-          "description": "Sync mode override for this target. If omitted, inherits the top-level mode.",
+          "description": "[Legacy] Sync mode override. Prefer skills.mode instead.",
           "enum": ["merge", "symlink", "copy"]
         },
         "include": {
           "type": "array",
-          "description": "Glob patterns — only matching skills are synced (merge and copy modes).",
-          "items": { "type": "string" },
-          "examples": [["codex-*", "shared-*"]]
+          "description": "[Legacy] Glob patterns for skill include filter. Prefer skills.include instead.",
+          "items": { "type": "string" }
         },
         "exclude": {
           "type": "array",
-          "description": "Glob patterns — matching skills are excluded from sync (merge and copy modes).",
-          "items": { "type": "string" },
-          "examples": [["*-experimental", "codex-*"]]
+          "description": "[Legacy] Glob patterns for skill exclude filter. Prefer skills.exclude instead.",
+          "items": { "type": "string" }
+        },
+        "skills": {
+          "type": "object",
+          "description": "Skills-specific target configuration. Controls which skills are synced to this target, the sync mode, and the target directory path.",
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Override the target skills directory path. If omitted, the built-in default for this target is used. Supports ~ for home directory.",
+              "examples": ["~/.claude/skills", "~/.custom-ide/skills"]
+            },
+            "mode": {
+              "type": "string",
+              "description": "Sync mode for skills. If omitted, inherits the top-level mode (defaults to merge).",
+              "enum": ["merge", "symlink", "copy"]
+            },
+            "target_naming": {
+              "type": "string",
+              "description": "Target entry naming strategy for skills. If omitted, inherits the top-level target_naming (defaults to flat). 'flat' and 'standard' are ignored in symlink mode; 'prefixed' requires copy mode.",
+              "enum": ["flat", "standard", "prefixed"]
+            },
+            "include": {
+              "type": "array",
+              "description": "Glob patterns — only matching skills are synced (merge and copy modes).",
+              "items": { "type": "string" },
+              "examples": [["team-*", "shared-*"]]
+            },
+            "exclude": {
+              "type": "array",
+              "description": "Glob patterns — matching skills are excluded from sync (merge and copy modes).",
+              "items": { "type": "string" },
+              "examples": [["draft-*", "*-experimental"]]
+            },
+            "enabled": {
+              "type": "boolean",
+              "default": true,
+              "description": "Set to false to stop syncing skills to this target while it keeps managing agents, MCP servers and instructions. Turning it off removes only links into the skills source; path, mode and filters are kept for turning it back on."
+            }
+          },
+          "examples": [
+            { "mode": "merge" },
+            { "enabled": false },
+            { "path": "~/.custom-ide/skills", "mode": "symlink" },
+            { "mode": "merge", "include": ["team-*"], "exclude": ["wip-*"] }
+          ]
+        },
+        "agents": {
+          "type": "object",
+          "description": "Agents-specific target configuration. Controls which agents are synced to this target, the sync mode, and the target path.",
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string" },
+            "mode": { "type": "string", "enum": ["merge", "symlink", "copy"] },
+            "include": { "type": "array", "items": { "type": "string" } },
+            "exclude": { "type": "array", "items": { "type": "string" } },
+            "extension": { "type": "string", "description": "Convert each agent through an extension before writing it to this target (copy mode; an unset mode becomes copy). A bare name resolves under the extensions directory; a path (containing a separator or starting with '.') is used directly.", "examples": ["opencode-agents", "codex-agents"] }
+          }
+        },
+        "files": {
+          "type": "array",
+          "description": "Extra plain files this tool reads besides its instruction file, shown as tabs in the dashboard. Relative to the tool's own directory (its config directory, else the parent of its skills directory). Removing an entry never deletes the file.",
+          "items": { "type": "string", "minLength": 1, "examples": ["prompts/review.md"] }
+        },
+        "instructions": {
+          "type": "object",
+          "description": "The instruction file (CLAUDE.md, AGENTS.md, ...) this tool reads, for a tool skillshare does not know. Overrides the built-in file. Absolute or starting with ~/.",
+          "additionalProperties": false,
+          "required": ["path"],
+          "properties": {
+            "path": { "type": "string", "minLength": 1, "description": "The instruction file this tool reads.", "examples": ["~/.myagent/AGENTS.md"] },
+            "import": { "type": "boolean", "default": false, "description": "The tool follows @path lines in its instruction file, so several shared instruction files can be attached to it." }
+          }
+        }
+      }
+    },
+    "contextBudgetConfig": {
+      "type": "object",
+      "description": "Token budget warning thresholds. Warnings appear after sync and analyze when token count exceeds budget.",
+      "additionalProperties": false,
+      "properties": {
+        "warn_always_loaded_tokens": {
+          "type": "integer",
+          "description": "Warn when always-loaded tokens exceed this value. 0 disables the warning.",
+          "default": 10000,
+          "minimum": 0
+        },
+        "warn_on_demand_tokens": {
+          "type": "integer",
+          "description": "Warn when on-demand tokens exceed this value. 0 disables the warning.",
+          "default": 100000,
+          "minimum": 0
         }
       }
     },
@@ -157,6 +541,84 @@
           "type": "boolean",
           "description": "Whether this hub is built-in (auto-added on init).",
           "default": false
+        }
+      }
+    },
+    "extraConfig": {
+      "type": "object",
+      "description": "Configuration for a non-skill resource type (rules, commands, etc.).",
+      "required": ["name", "targets"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Name of the extra resource (matches a subdirectory under the source extras directory).",
+          "examples": ["rules", "commands"]
+        },
+        "source": {
+          "type": "string",
+          "description": "Custom source directory for this extra (overrides extras_source and the default). Several single-file extras can share one directory. Supports ~ for home directory.",
+          "examples": ["~/dotfiles/prompts"]
+        },
+        "file": {
+          "type": "string",
+          "description": "Sync one file instead of the whole source directory: a plain filename inside the extra's source directory. Each target receives <path>/<as or file>.",
+          "pattern": "^[^/\\\\]+$",
+          "examples": ["AGENTS.md"]
+        },
+        "targets": {
+          "type": "array",
+          "description": "Target directories to sync this extra resource to.",
+          "items": {
+            "$ref": "#/$defs/extraTargetConfig"
+          }
+        }
+      }
+    },
+    "extraTargetConfig": {
+      "type": "object",
+      "description": "Configuration for one target of an extra resource.",
+      "required": ["path"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Absolute path to the target directory. Supports ~ for home directory.",
+          "examples": ["~/.claude/rules", "~/.cursor/rules"]
+        },
+        "mode": {
+          "type": "string",
+          "description": "Sync mode for this extra target. Defaults to merge. import (single-file extras only) keeps an @<source file> line in a managed block of the target file; prepend and append (single-file extras only) keep the source's content in a managed block at the top or end of the target file, for tools that do not read @ imports.",
+          "enum": ["merge", "symlink", "copy", "import", "prepend", "append"],
+          "default": "merge"
+        },
+        "as": {
+          "type": "string",
+          "description": "Target filename for a single-file extra (requires file on the extra). Defaults to the extra's file.",
+          "pattern": "^[^/\\\\]+$",
+          "examples": ["CLAUDE.md", "GEMINI.md"]
+        },
+        "flatten": {
+          "type": "boolean",
+          "description": "When true, files from subdirectories are synced directly into the target root instead of preserving directory structure.",
+          "default": false
+        },
+        "include": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Sync only source files that match one of these .gitignore-style patterns (path inside the source). A pattern without '/' matches at any depth; 'dir/' covers a folder. Not allowed with symlink mode or a single-file extra.",
+          "examples": [["index.md", "learning.md"], ["guides/", "**/*.md"]]
+        },
+        "exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Skip source files that match one of these .gitignore-style patterns. Applied after include. Not allowed with symlink mode or a single-file extra.",
+          "examples": [["draft*", "images/"]]
+        },
+        "extension": {
+          "type": "string",
+          "description": "Transform each file through an extension before writing it to this target (copy mode only). A bare name resolves under the extensions directory; a path (containing a separator or starting with '.') is used directly.",
+          "examples": ["md2gemini", "./my-converter.js"]
         }
       }
     }

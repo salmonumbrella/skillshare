@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	gosync "sync"
@@ -14,6 +15,7 @@ import (
 	"skillshare/internal/config"
 	"skillshare/internal/oplog"
 	"skillshare/internal/sync"
+	"skillshare/internal/textdiff"
 	"skillshare/internal/ui"
 	"skillshare/internal/utils"
 )
@@ -24,6 +26,7 @@ type diffRenderOpts struct {
 	showPatch  bool
 	showStat   bool
 	jsonOutput bool
+	noTargets  bool // the config has no targets at all
 }
 
 // diffJSONOutput is the JSON representation for diff --json output.
@@ -45,6 +48,7 @@ type diffJSONTarget struct {
 type diffJSONItem struct {
 	Action string `json:"action"`
 	Name   string `json:"name"`
+	Kind   string `json:"kind,omitempty"` // "skill" or "agent"
 	Reason string `json:"reason"`
 	IsSync bool   `json:"is_sync"`
 }
@@ -62,15 +66,16 @@ func cmdDiff(args []string) error {
 		return fmt.Errorf("cannot determine working directory: %w", err)
 	}
 
-	if mode == modeAuto {
-		if projectConfigExists(cwd) {
-			mode = modeProject
-		} else {
-			mode = modeGlobal
-		}
-	}
+	mode = resolveAutoMode(mode, cwd)
 
 	applyModeLabel(mode)
+
+	// Extract kind filter (e.g. "skillshare diff agents"). "all" is the
+	// default: skills and agents together, plus extras.
+	if len(rest) > 0 && rest[0] == "all" {
+		rest = rest[1:]
+	}
+	kind, rest := parseKindArg(rest)
 
 	scope := "global"
 	cfgPath := config.ConfigPath()
@@ -104,9 +109,9 @@ func cmdDiff(args []string) error {
 
 	var cmdErr error
 	if mode == modeProject {
-		cmdErr = cmdDiffProject(cwd, targetName, opts, start)
+		cmdErr = cmdDiffProject(cwd, targetName, kind, opts, start)
 	} else {
-		cmdErr = cmdDiffGlobal(targetName, opts, start)
+		cmdErr = cmdDiffGlobal(targetName, kind, opts, start)
 	}
 	logDiffOp(cfgPath, targetName, scope, 0, start, cmdErr)
 	return cmdErr
@@ -143,11 +148,19 @@ type targetDiffResult struct {
 	dstMtime   time.Time // newest file mtime in target dir
 }
 
+// inSync reports no pending work or selection diagnostics. Folders only the
+// target holds stay listed, but sync never touches them.
+func (r targetDiffResult) inSync() bool {
+	return r.errMsg == "" && r.syncCount == 0 && !slices.ContainsFunc(r.items, func(item copyDiffEntry) bool { return item.action == "skip" })
+}
+
 type copyDiffEntry struct {
 	action string // "add", "modify", "remove"
 	name   string
+	kind   string // "skill" or "agent" (empty defaults to "skill")
 	reason string
 	isSync bool            // true = needs sync, false = local-only
+	keptAt string          // old name a skill stays at while a local folder holds its new one; sync changes nothing, so no dstDir
 	files  []fileDiffEntry // file-level diffs (nil until populated)
 	srcDir string          // source directory path (for lazy diff)
 	dstDir string          // target directory path (for lazy diff)
@@ -163,6 +176,25 @@ func (e *copyDiffEntry) ensureFiles() {
 		return
 	}
 	e.files = diffSkillFiles(e.srcDir, e.dstDir)
+}
+
+// label is the item's name, plus the old name a kept skill stays at.
+func (e copyDiffEntry) label() string {
+	if e.keptAt == "" {
+		return e.name
+	}
+	return e.name + " (stays at " + e.keptAt + ")"
+}
+
+// keptCount counts the skills kept under their old name.
+func (r targetDiffResult) keptCount() int {
+	n := 0
+	for _, item := range r.items {
+		if item.keptAt != "" {
+			n++
+		}
+	}
+	return n
 }
 
 // latestMtime returns the newest file mtime under dir.
@@ -284,9 +316,6 @@ func (dp *diffProgress) startTarget(name string) {
 			break
 		}
 	}
-	if !dp.isTTY {
-		fmt.Printf("  %s: scanning...\n", name)
-	}
 }
 
 func (dp *diffProgress) update(targetName, skillName string) {
@@ -331,17 +360,9 @@ func (dp *diffProgress) doneTarget(name string, r targetDiffResult) {
 			dp.details[i] = "fully synced"
 		} else {
 			dp.states[i] = "done"
-			dp.details[i] = fmt.Sprintf("%d difference(s)", r.syncCount+r.localCount)
+			dp.details[i] = fmt.Sprintf("%d difference(s)", len(r.items))
 		}
 		break
-	}
-	if !dp.isTTY {
-		for i, n := range dp.names {
-			if n == name {
-				fmt.Printf("  %s: %s\n", name, dp.details[i])
-				break
-			}
-		}
 	}
 }
 
@@ -357,17 +378,22 @@ func (dp *diffProgress) stop() {
 	}
 }
 
-func cmdDiffGlobal(targetName string, opts diffRenderOpts, start time.Time) error {
+func cmdDiffGlobal(targetName string, kind resourceKindFilter, opts diffRenderOpts, start time.Time) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+
+	// Agent-only diff
+	if kind == kindAgents {
+		return diffGlobalAgents(cfg, targetName, opts, start)
 	}
 
 	var spinner *ui.Spinner
 	if !opts.jsonOutput {
 		spinner = ui.StartSpinner("Discovering skills")
 	}
-	discovered, discoverErr := sync.DiscoverSourceSkills(cfg.Source)
+	discovered, discoverErr := sync.DiscoverSourceSkills(cfg.EffectiveSkillsSource(), cfg.SkillsWalk())
 	if discoverErr != nil {
 		if spinner != nil {
 			spinner.Fail("Discovery failed")
@@ -375,7 +401,7 @@ func cmdDiffGlobal(targetName string, opts diffRenderOpts, start time.Time) erro
 		return fmt.Errorf("failed to discover skills: %w", discoverErr)
 	}
 	if spinner != nil {
-		spinner.Success(fmt.Sprintf("Discovered %d skills", len(discovered)))
+		spinner.Stop()
 	}
 
 	targets := cfg.Targets
@@ -395,7 +421,11 @@ func cmdDiffGlobal(targetName string, opts diffRenderOpts, start time.Time) erro
 	}
 	var entries []targetEntry
 	for name, target := range targets {
-		mode := target.Mode
+		// Skills off: nothing is synced, so there is nothing to compare.
+		if !target.SkillsConfig().IsEnabled() {
+			continue
+		}
+		mode := target.SkillsConfig().Mode
 		if mode == "" {
 			mode = cfg.Mode
 			if mode == "" {
@@ -408,21 +438,22 @@ func cmdDiffGlobal(targetName string, opts diffRenderOpts, start time.Time) erro
 		return entries[i].name < entries[j].name
 	})
 
-	// Pre-filter skills per target and compute total for progress bar
+	// Resolve each target once, preserving selection diagnostics for the preview.
 	type filteredEntry struct {
 		targetEntry
-		filtered []sync.DiscoveredSkill
+		resolution *sync.TargetSkillResolution
 	}
 	var fentries []filteredEntry
 	totalSkills := 0
 	hasCopyMode := false
 	for _, e := range entries {
-		filtered, err := sync.FilterSkills(discovered, e.target.Include, e.target.Exclude)
+		sc := e.target.SkillsConfig()
+		resolution, err := sync.ResolveTargetSkillsForTarget(e.name, sc, discovered)
 		if err != nil {
 			return fmt.Errorf("target %s has invalid include/exclude config: %w", e.name, err)
 		}
-		fentries = append(fentries, filteredEntry{e, filtered})
-		totalSkills += len(filtered)
+		fentries = append(fentries, filteredEntry{e, resolution})
+		totalSkills += len(resolution.Skills)
 		if e.mode == "copy" {
 			hasCopyMode = true
 		}
@@ -448,7 +479,7 @@ func cmdDiffGlobal(targetName string, opts diffRenderOpts, start time.Time) erro
 			defer wg.Done()
 			defer func() { <-sem }()
 			progress.startTarget(fe.name)
-			r := collectTargetDiff(fe.name, fe.target, cfg.Source, fe.mode, fe.filtered, progress)
+			r := collectTargetDiff(fe.name, fe.target, cfg.EffectiveSkillsSource(), fe.mode, fe.resolution, sync.EffectiveFileIgnorePatterns(cfg.Ignore), progress)
 			progress.doneTarget(fe.name, r)
 			results[idx] = r
 		}(i, fe)
@@ -459,14 +490,44 @@ func cmdDiffGlobal(targetName string, opts diffRenderOpts, start time.Time) erro
 		progress.stop()
 	}
 
+	// Extras diff (always included when extras are configured)
+	var extrasResults []extraDiffResult
+	if len(cfg.Extras) > 0 {
+		extrasResults = collectExtrasDiff(cfg.Extras, func(extra config.ExtraConfig) string {
+			return config.ResolveExtrasSourceDir(extra, cfg.EffectiveExtrasSource(), cfg.EffectiveSkillsSource())
+		})
+	}
+
+	// Merge agent diffs into skill results so they appear together
+	results = mergeAgentDiffsGlobal(cfg, results, targetName)
+
 	if opts.jsonOutput {
-		return diffOutputJSON(results, start)
+		return diffOutputJSONWithExtras(results, extrasResults, start)
 	}
 	if shouldLaunchTUI(opts.noTUI, cfg) && len(results) > 0 {
-		return runDiffTUI(results)
+		return runDiffTUI(results, extrasResults)
 	}
-	renderGroupedDiffs(results, opts)
+	opts.noTargets = len(cfg.Targets) == 0
+	renderGroupedDiffs(results, extrasResults, opts)
 	return nil
+}
+
+func diffItemToJSON(item copyDiffEntry) diffJSONItem {
+	k := item.kind
+	if k == "" {
+		k = "skill"
+	}
+	action := item.action
+	if item.keptAt != "" {
+		action = "kept" // as the Web API reports it
+	}
+	return diffJSONItem{
+		Action: action,
+		Name:   item.name,
+		Kind:   k,
+		Reason: item.reason,
+		IsSync: item.isSync,
+	}
 }
 
 func diffOutputJSON(results []targetDiffResult, start time.Time) error {
@@ -477,69 +538,102 @@ func diffOutputJSON(results []targetDiffResult, start time.Time) error {
 		jt := diffJSONTarget{
 			Name:    r.name,
 			Mode:    r.mode,
-			Synced:  r.synced,
+			Synced:  r.inSync(),
 			Error:   r.errMsg,
 			Include: r.include,
 			Exclude: r.exclude,
 		}
 		for _, item := range r.items {
-			jt.Items = append(jt.Items, diffJSONItem{
-				Action: item.action,
-				Name:   item.name,
-				Reason: item.reason,
-				IsSync: item.isSync,
-			})
+			jt.Items = append(jt.Items, diffItemToJSON(item))
 		}
 		output.Targets = append(output.Targets, jt)
 	}
 	return writeJSON(&output)
 }
 
-func collectTargetDiff(name string, target config.TargetConfig, source, mode string, filtered []sync.DiscoveredSkill, dp *diffProgress) targetDiffResult {
+func diffOutputJSONWithExtras(results []targetDiffResult, extrasResults []extraDiffResult, start time.Time) error {
+	type outputWithExtras struct {
+		Targets  []diffJSONTarget     `json:"targets"`
+		Extras   []extraDiffJSONEntry `json:"extras,omitempty"`
+		Duration string               `json:"duration"`
+	}
+	o := outputWithExtras{
+		Duration: formatDuration(start),
+		Extras:   extrasDiffToJSON(extrasResults),
+	}
+	for _, r := range results {
+		jt := diffJSONTarget{
+			Name:    r.name,
+			Mode:    r.mode,
+			Synced:  r.inSync(),
+			Error:   r.errMsg,
+			Include: r.include,
+			Exclude: r.exclude,
+		}
+		for _, item := range r.items {
+			jt.Items = append(jt.Items, diffItemToJSON(item))
+		}
+		o.Targets = append(o.Targets, jt)
+	}
+	return writeJSON(&o)
+}
+
+func collectTargetDiff(name string, target config.TargetConfig, source, mode string, resolution *sync.TargetSkillResolution, ignorePatterns []string, dp *diffProgress) targetDiffResult {
+	sc := target.SkillsConfig()
 	r := targetDiffResult{
 		name:    name,
 		mode:    mode,
-		include: target.Include,
-		exclude: target.Exclude,
+		include: sc.Include,
+		exclude: sc.Exclude,
 	}
 
 	// Check if target is accessible
-	_, err := os.Lstat(target.Path)
+	_, err := os.Lstat(sc.Path)
 	if err != nil {
 		r.errMsg = fmt.Sprintf("Cannot access target: %v", err)
-		dp.add(len(filtered))
+		dp.add(len(resolution.Skills))
 		return r
 	}
 
-	sourceSkills := make(map[string]bool, len(filtered))
-	sourceMap := make(map[string]string, len(filtered))
-	for _, skill := range filtered {
-		sourceSkills[skill.FlatName] = true
-		sourceMap[skill.FlatName] = skill.SourcePath
+	sourceSkills := resolution.ValidTargetNames()
+	sourceMap := make(map[string]string, len(resolution.Skills))
+	for _, resolved := range resolution.Skills {
+		sourceMap[resolved.TargetName] = resolved.Skill.SourcePath
 	}
 
-	if utils.IsSymlinkOrJunction(target.Path) {
+	if utils.IsSymlinkOrJunction(sc.Path) {
 		r.mode = "symlink"
-		collectSymlinkDiff(&r, target.Path, source)
-		dp.add(len(filtered))
+		collectSymlinkDiff(&r, sc.Path, source)
+		dp.add(len(resolution.Skills))
 		return r
 	}
 
+	var manifest *sync.Manifest // only copy-mode legacy lookups read it
 	if mode == "copy" {
-		manifest, _ := sync.ReadManifest(target.Path)
-		collectCopyDiff(&r, name, target.Path, filtered, sourceSkills, manifest, dp)
+		manifest, _ = sync.ReadManifest(sc.Path)
+	}
+	legacyNames := resolution.LegacyNames(mode, sc.Path, manifest)
+	if mode == "copy" {
+		collectCopyDiff(&r, name, sc.Path, resolution.Skills, resolution.Naming, sourceSkills, legacyNames, manifest, ignorePatterns, dp)
 	} else {
 		// Merge mode (instant)
-		collectMergeDiff(&r, target.Path, sourceSkills, sourceMap)
-		dp.add(len(filtered))
+		collectMergeDiff(&r, sc.Path, sourceSkills, sourceMap, legacyNames)
+		dp.add(len(resolution.Skills))
+	}
+
+	for _, warning := range resolution.SelectionWarnings {
+		r.items = append(r.items, copyDiffEntry{action: "skip", name: "(skill selection)", reason: warning})
+	}
+	if len(resolution.SelectionWarnings) > 0 {
+		r.synced = false
 	}
 
 	// Compute mtime only for copy mode (merge uses symlinks, mtime is misleading)
 	if mode == "copy" {
-		r.dstMtime = latestMtime(target.Path)
+		r.dstMtime = latestMtime(sc.Path)
 		var srcLatest time.Time
-		for _, skill := range filtered {
-			mt := latestMtime(skill.SourcePath)
+		for _, resolved := range resolution.Skills {
+			mt := latestMtime(resolved.Skill.SourcePath)
 			if mt.After(srcLatest) {
 				srcLatest = mt
 			}
@@ -564,58 +658,72 @@ func collectSymlinkDiff(r *targetDiffResult, targetPath, source string) {
 	}
 }
 
-func collectCopyDiff(r *targetDiffResult, targetName, targetPath string, filtered []sync.DiscoveredSkill, sourceSkills map[string]bool, manifest *sync.Manifest, dp *diffProgress) {
-	for _, skill := range filtered {
-		dp.update(targetName, skill.FlatName)
-		oldChecksum, isManaged := manifest.Managed[skill.FlatName]
-		targetSkillPath := filepath.Join(targetPath, skill.FlatName)
+func collectCopyDiff(r *targetDiffResult, targetName, targetPath string, filtered []sync.ResolvedTargetSkill, naming string, sourceSkills map[string]bool, legacyNames map[string]sync.ResolvedTargetSkill, manifest *sync.Manifest, ignorePatterns []string, dp *diffProgress) {
+	renamedFrom := sync.RenamedFrom(legacyNames)
+	for _, resolved := range filtered {
+		skill := resolved.Skill
+		dp.update(targetName, resolved.TargetName)
+		oldChecksum, isManaged := manifest.Managed[resolved.TargetName]
+		targetSkillPath := filepath.Join(targetPath, resolved.TargetName)
 		srcDir := skill.SourcePath
 		dstDir := targetSkillPath
 		if !isManaged {
 			if info, err := os.Stat(targetSkillPath); err == nil {
-				if info.IsDir() {
-					r.items = append(r.items, copyDiffEntry{action: "modify", name: skill.FlatName, reason: "local copy (sync --force to replace)", isSync: true, srcDir: srcDir, dstDir: dstDir})
+				if old, ok := renamedFrom[resolved.TargetName]; ok {
+					r.items = append(r.items, copyDiffEntry{action: "remove", name: resolved.TargetName, reason: sync.KeptLegacyReason(old), keptAt: old})
+				} else if info.IsDir() {
+					r.items = append(r.items, copyDiffEntry{action: "modify", name: resolved.TargetName, reason: "local copy (sync --force to replace)", isSync: true, srcDir: srcDir, dstDir: dstDir})
 				} else {
-					r.items = append(r.items, copyDiffEntry{action: "modify", name: skill.FlatName, reason: "target entry is not a directory", isSync: true, srcDir: srcDir, dstDir: dstDir})
+					r.items = append(r.items, copyDiffEntry{action: "modify", name: resolved.TargetName, reason: "target entry is not a directory", isSync: true, srcDir: srcDir, dstDir: dstDir})
 				}
+			} else if old, ok := renamedFrom[resolved.TargetName]; ok && os.IsNotExist(err) {
+				r.items = append(r.items, copyDiffEntry{action: "modify", name: resolved.TargetName, reason: sync.RenameReason(old), isSync: true, srcDir: srcDir, dstDir: filepath.Join(targetPath, old)})
 			} else if os.IsNotExist(err) {
-				r.items = append(r.items, copyDiffEntry{action: "add", name: skill.FlatName, reason: "source only", isSync: true, srcDir: srcDir, dstDir: dstDir})
+				r.items = append(r.items, copyDiffEntry{action: "add", name: resolved.TargetName, reason: "source only", isSync: true, srcDir: srcDir, dstDir: dstDir})
 			} else {
-				r.items = append(r.items, copyDiffEntry{action: "modify", name: skill.FlatName, reason: "cannot access target entry", isSync: true, srcDir: srcDir, dstDir: dstDir})
+				r.items = append(r.items, copyDiffEntry{action: "modify", name: resolved.TargetName, reason: "cannot access target entry", isSync: true, srcDir: srcDir, dstDir: dstDir})
 			}
 			continue
 		}
 		targetInfo, err := os.Stat(targetSkillPath)
 		if os.IsNotExist(err) {
-			r.items = append(r.items, copyDiffEntry{action: "add", name: skill.FlatName, reason: "deleted from target", isSync: true, srcDir: srcDir, dstDir: dstDir})
+			r.items = append(r.items, copyDiffEntry{action: "add", name: resolved.TargetName, reason: "deleted from target", isSync: true, srcDir: srcDir, dstDir: dstDir})
 			continue
 		}
 		if err != nil {
-			r.items = append(r.items, copyDiffEntry{action: "modify", name: skill.FlatName, reason: "cannot access target entry", isSync: true, srcDir: srcDir, dstDir: dstDir})
+			r.items = append(r.items, copyDiffEntry{action: "modify", name: resolved.TargetName, reason: "cannot access target entry", isSync: true, srcDir: srcDir, dstDir: dstDir})
 			continue
 		}
 		if !targetInfo.IsDir() {
-			r.items = append(r.items, copyDiffEntry{action: "modify", name: skill.FlatName, reason: "target entry is not a directory", isSync: true, srcDir: srcDir, dstDir: dstDir})
+			r.items = append(r.items, copyDiffEntry{action: "modify", name: resolved.TargetName, reason: "target entry is not a directory", isSync: true, srcDir: srcDir, dstDir: dstDir})
+			continue
+		}
+		// A copy made under another naming carries another name:, so sync re-copies it.
+		if recorded := manifest.Naming[resolved.TargetName]; recorded != "" && recorded != naming {
+			r.items = append(r.items, copyDiffEntry{action: "modify", name: resolved.TargetName, reason: sync.NamingChangedReason, isSync: true, srcDir: srcDir, dstDir: dstDir})
 			continue
 		}
 		// mtime fast-path
-		oldMtime := manifest.Mtimes[skill.FlatName]
-		currentMtime, mtimeErr := sync.DirMaxMtime(skill.SourcePath)
+		oldMtime := manifest.Mtimes[resolved.TargetName]
+		currentMtime, mtimeErr := sync.DirMaxMtimeWithIgnore(skill.SourcePath, ignorePatterns)
 		if mtimeErr == nil && oldMtime > 0 && currentMtime == oldMtime {
 			continue
 		}
-		srcChecksum, err := sync.DirChecksum(skill.SourcePath)
+		srcChecksum, err := sync.DirChecksumWithIgnore(skill.SourcePath, ignorePatterns)
 		if err != nil {
-			r.items = append(r.items, copyDiffEntry{action: "modify", name: skill.FlatName, reason: "cannot compute checksum", isSync: true, srcDir: srcDir, dstDir: dstDir})
+			r.items = append(r.items, copyDiffEntry{action: "modify", name: resolved.TargetName, reason: "cannot compute checksum", isSync: true, srcDir: srcDir, dstDir: dstDir})
 			continue
 		}
 		if srcChecksum != oldChecksum {
-			r.items = append(r.items, copyDiffEntry{action: "modify", name: skill.FlatName, reason: "content changed", isSync: true, srcDir: srcDir, dstDir: dstDir})
+			r.items = append(r.items, copyDiffEntry{action: "modify", name: resolved.TargetName, reason: "content changed", isSync: true, srcDir: srcDir, dstDir: dstDir})
 		}
 	}
 
 	// Orphan managed copies
 	for name := range manifest.Managed {
+		if _, keepLegacy := legacyNames[name]; keepLegacy {
+			continue
+		}
 		if !sourceSkills[name] {
 			r.items = append(r.items, copyDiffEntry{action: "remove", name: name, reason: "orphan (will be pruned)", isSync: true, dstDir: filepath.Join(targetPath, name)})
 		}
@@ -630,24 +738,28 @@ func collectCopyDiff(r *targetDiffResult, targetName, targetPath string, filtere
 		if sourceSkills[e.Name()] {
 			continue
 		}
+		if _, keepLegacy := legacyNames[e.Name()]; keepLegacy {
+			continue
+		}
 		if _, isManaged := manifest.Managed[e.Name()]; isManaged {
 			continue
 		}
 		r.items = append(r.items, copyDiffEntry{action: "remove", name: e.Name(), reason: "local only", isSync: false, dstDir: filepath.Join(targetPath, e.Name())})
 	}
 
-	// Compute counts
+	// Compute counts. A kept legacy entry is shown but counts as neither:
+	// sync changes nothing until the user moves the folder.
 	for _, item := range r.items {
 		if item.isSync {
 			r.syncCount++
-		} else {
+		} else if item.keptAt == "" {
 			r.localCount++
 		}
 	}
-	r.synced = r.syncCount == 0 && r.localCount == 0
+	r.synced = len(r.items) == 0
 }
 
-func collectMergeDiff(r *targetDiffResult, targetPath string, sourceSkills map[string]bool, sourceMap map[string]string) {
+func collectMergeDiff(r *targetDiffResult, targetPath string, sourceSkills map[string]bool, sourceMap map[string]string, legacyNames map[string]sync.ResolvedTargetSkill) {
 	targetSkills := make(map[string]bool)
 	targetSymlinks := make(map[string]bool)
 	entries, err := os.ReadDir(targetPath)
@@ -656,8 +768,9 @@ func collectMergeDiff(r *targetDiffResult, targetPath string, sourceSkills map[s
 		return
 	}
 
+	manifest, _ := sync.ReadManifest(targetPath)
 	for _, e := range entries {
-		if utils.IsHidden(e.Name()) {
+		if manifest.SkipsHidden(e.Name()) {
 			continue
 		}
 		skillPath := filepath.Join(targetPath, e.Name())
@@ -668,27 +781,40 @@ func collectMergeDiff(r *targetDiffResult, targetPath string, sourceSkills map[s
 	}
 
 	// Skills only in source (not synced)
+	renamedFrom := sync.RenamedFrom(legacyNames)
 	for skill := range sourceSkills {
 		srcDir := sourceMap[skill]
 		dstDir := filepath.Join(targetPath, skill)
-		if !targetSkills[skill] {
+		if old, ok := renamedFrom[skill]; ok && !targetSkills[skill] {
+			r.items = append(r.items, copyDiffEntry{action: "modify", name: skill, reason: sync.RenameReason(old), isSync: true, srcDir: srcDir, dstDir: filepath.Join(targetPath, old)})
+			r.syncCount++
+		} else if !targetSkills[skill] {
 			r.items = append(r.items, copyDiffEntry{action: "add", name: skill, reason: "source only", isSync: true, srcDir: srcDir, dstDir: dstDir})
 			r.syncCount++
+		} else if old, ok := renamedFrom[skill]; ok && !targetSymlinks[skill] {
+			r.items = append(r.items, copyDiffEntry{action: "remove", name: skill, reason: sync.KeptLegacyReason(old), keptAt: old})
 		} else if !targetSymlinks[skill] {
-			r.items = append(r.items, copyDiffEntry{action: "modify", name: skill, reason: "local copy (sync --force to replace)", isSync: true, srcDir: srcDir, dstDir: dstDir})
+			reason := "local copy (sync --force to replace)"
+			if manifest.OwnsCopy(skill, dstDir) {
+				reason = sync.CopyToLinkReason
+			}
+			r.items = append(r.items, copyDiffEntry{action: "modify", name: skill, reason: reason, isSync: true, srcDir: srcDir, dstDir: dstDir})
 			r.syncCount++
 		}
 	}
 
 	// Skills only in target (local only)
 	for skill := range targetSkills {
+		if _, keepLegacy := legacyNames[skill]; keepLegacy {
+			continue
+		}
 		if !sourceSkills[skill] && !targetSymlinks[skill] {
 			r.items = append(r.items, copyDiffEntry{action: "remove", name: skill, reason: "local only", isSync: false, dstDir: filepath.Join(targetPath, skill)})
 			r.localCount++
 		}
 	}
 
-	r.synced = r.syncCount == 0 && r.localCount == 0
+	r.synced = len(r.items) == 0
 }
 
 // diffFingerprint generates a grouping key from diff items.
@@ -711,7 +837,7 @@ func diffFingerprint(items []copyDiffEntry) string {
 
 // actionCategory groups diff items by the user action needed.
 type actionCategory struct {
-	kind   string // "new", "modified", "restore", "override", "orphan", "local", "warn"
+	kind   string // "new", "modified", "restore", "override", "kept", "orphan", "local", "warn"
 	label  string // e.g. "New", "Modified", "Local Override"
 	names  []string
 	expand bool // true = list skill names
@@ -738,20 +864,24 @@ func categorizeItems(items []copyDiffEntry) []actionCategory {
 
 	for _, item := range items {
 		switch {
-		case item.reason == "source only":
+		case item.reason == "source only" || item.reason == "not in target":
 			add("new", "new", "New", item.name)
 		case item.reason == "deleted from target":
 			add("restore", "new", "Restore", item.name)
-		case item.reason == "content changed":
+		case item.reason == "content changed" || item.reason == sync.NamingChangedReason || item.reason == sync.CopyToLinkReason:
 			add("modified", "modified", "Modified", item.name)
+		case strings.HasPrefix(item.reason, "renamed from "):
+			add("renamed", "modified", "Renamed", item.name)
 		case strings.Contains(item.reason, "local copy"):
 			add("override", "override", "Local Override", item.name)
 		case strings.Contains(item.reason, "orphan"):
 			add("orphan", "orphan", "Orphan", item.name)
-		case item.reason == "local only" || item.reason == "not in source":
+		case item.keptAt != "":
+			add("kept", "kept", "Local only, skill kept under old name", item.name)
+		case item.reason == "local only" || item.reason == "not in source" || item.reason == "local file":
 			add("local", "local", "Local Only", item.name)
 		default:
-			add("warn", "warn", item.reason, item.name)
+			add("warn:"+item.reason, "warn", item.reason, item.name)
 		}
 	}
 
@@ -769,15 +899,27 @@ func categorizeItems(items []copyDiffEntry) []actionCategory {
 	return cats
 }
 
-// renderGroupedDiffs groups targets with identical diff results and renders
-// merged output. Targets with errors are always shown individually.
-func renderGroupedDiffs(results []targetDiffResult, opts diffRenderOpts) {
+// renderGroupedDiffs prints each group of targets with identical
+// differences, the targets that are in sync or unreadable, the extras, and
+// a closing line with what to run next. Targets with errors are always
+// shown individually.
+func renderGroupedDiffs(results []targetDiffResult, extras []extraDiffResult, opts diffRenderOpts) {
+	if len(results) == 0 && len(extras) == 0 {
+		if opts.noTargets {
+			ui.Done(ui.MarkNone, "No targets configured", 0)
+			ui.Next("skillshare target add <name> <path>", "add one")
+		} else {
+			ui.Done(ui.MarkNone, "Nothing to compare: no target takes skills", 0)
+		}
+		return
+	}
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].name < results[j].name
 	})
 
 	var errorResults []targetDiffResult
 	var syncedNames []string
+	localOnly := 0 // in sync, but listed for the folders only the target holds
 	type diffGroup struct {
 		names  []string
 		result targetDiffResult
@@ -803,124 +945,286 @@ func renderGroupedDiffs(results []targetDiffResult, opts diffRenderOpts) {
 		}
 	}
 
-	// Overall summary (skip when all targets are fully synced — the ✓ line is enough)
-	needCount := 0
-	for _, g := range groups {
-		needCount += len(g.names)
+	// One label width for every group, so values line up across sections.
+	var groupLabels []string
+	for _, fp := range groupOrder {
+		for _, cat := range categorizeItems(groups[fp].result.items) {
+			groupLabels = append(groupLabels, sentenceCase(cat.label))
+		}
 	}
-	if needCount > 0 || len(errorResults) > 0 {
-		renderOverallSummary(len(errorResults), needCount, len(syncedNames))
-	}
+	groupWidth := ui.RowWidth(groupLabels...)
 
-	// Error targets
-	for _, r := range errorResults {
-		ui.Header(r.name)
-		ui.Warning("%s", r.errMsg)
-	}
-
-	// Grouped diffs
-	var anySyncNeeded, anyForceNeeded, anyCollectNeeded bool
+	out := &diffOutput{}
+	var next diffNext
+	needCount, keptCount := 0, 0
 	for _, fp := range groupOrder {
 		g := groups[fp]
 		sort.Strings(g.names)
-		ui.Header(strings.Join(g.names, ", "))
-
-		items := make([]copyDiffEntry, len(g.result.items))
-		copy(items, g.result.items)
-		sort.Slice(items, func(i, j int) bool {
-			return items[i].name < items[j].name
-		})
-
-		cats := categorizeItems(items)
-
-		// Per-group stat line
-		var statParts []string
-		for _, cat := range cats {
-			n := len(cat.names)
-			statParts = append(statParts, fmt.Sprintf("%d %s", n, strings.ToLower(cat.label)))
+		// Kept rows need the user to move a folder first, so they are neither
+		// in sync nor something sync can apply.
+		switch {
+		case g.result.syncCount == 0 && g.result.keptCount() > 0:
+			keptCount += len(g.names)
+		case g.result.inSync():
+			localOnly += len(g.names)
+		default:
+			needCount += len(g.names)
 		}
-		if len(statParts) > 0 {
-			fmt.Printf("  %s%s%s\n", ui.Dim, strings.Join(statParts, ", "), ui.Reset)
+		out.section(strings.Join(g.names, ", "))
+		renderDiffGroup(g.result, opts, &next, groupWidth)
+	}
+
+	// Unreadable targets, then the ones in sync on a single row
+	syncedLabel := strings.Join(syncedNames, ", ")
+	var statusNames []string
+	for _, r := range errorResults {
+		statusNames = append(statusNames, r.name)
+	}
+	if syncedLabel != "" {
+		statusNames = append(statusNames, syncedLabel)
+	}
+	if len(statusNames) > 0 {
+		out.gap()
+		width := ui.RowWidth(statusNames...)
+		for _, r := range errorResults {
+			ui.Row(ui.MarkFail, r.name, r.errMsg, width)
 		}
-
-		for _, cat := range cats {
-			n := len(cat.names)
-			switch cat.kind {
-			case "new", "modified", "restore", "orphan":
-				anySyncNeeded = true
-			case "override":
-				anyForceNeeded = true
-			case "local":
-				anyCollectNeeded = true
-			}
-
-			skillWord := "skills"
-			if n == 1 {
-				skillWord = "skill"
-			}
-			if cat.expand && n > 0 {
-				ui.ActionLine(cat.kind, fmt.Sprintf("%s %d %s:", cat.label, n, skillWord))
-				for _, name := range cat.names {
-					fmt.Printf("      %s\n", name)
-					if opts.showStat || opts.showPatch || cat.kind == "modified" {
-						item := findDiffItem(items, name)
-						if item != nil {
-							item.ensureFiles()
-							if len(item.files) > 0 {
-								fmt.Print(renderFileStat(item.files))
-							}
-							if opts.showPatch {
-								for _, f := range item.files {
-									if f.Action == "modify" && item.srcDir != "" {
-										srcFile := filepath.Join(item.srcDir, f.RelPath)
-										dstFile := filepath.Join(item.dstDir, f.RelPath)
-										diffText := generateUnifiedDiff(srcFile, dstFile)
-										if diffText != "" {
-											fmt.Printf("      --- %s\n", f.RelPath)
-											fmt.Print(colorizePlainDiff(diffText))
-										}
-									}
-								}
-							}
-						}
-					}
-				}
-			} else {
-				ui.ActionLine(cat.kind, fmt.Sprintf("%s %d %s", cat.label, n, skillWord))
-			}
-		}
-
-		// Time info
-		if !g.result.srcMtime.IsZero() || !g.result.dstMtime.IsZero() {
-			if !g.result.srcMtime.IsZero() {
-				fmt.Printf("  %sSource modified: %s%s\n", ui.Dim, g.result.srcMtime.Format("2006-01-02 15:04"), ui.Reset)
-			}
-			if !g.result.dstMtime.IsZero() {
-				fmt.Printf("  %sTarget modified: %s%s\n", ui.Dim, g.result.dstMtime.Format("2006-01-02 15:04"), ui.Reset)
-			}
+		if syncedLabel != "" {
+			ui.Row(ui.MarkOK, syncedLabel, "in sync", width)
 		}
 	}
 
-	// Conditional hints
-	if anySyncNeeded || anyForceNeeded || anyCollectNeeded {
+	extrasNeed := 0
+	if len(extras) > 0 {
+		out.section("Extras")
+		extrasNeed = renderExtrasDiffPlain(extras)
+		if extrasNeed > 0 {
+			next.extras = true
+		}
+	}
+
+	if out.printed {
 		fmt.Println()
 	}
-	if anySyncNeeded || anyForceNeeded {
-		if anyForceNeeded {
-			ui.Info("Run 'skillshare sync' to apply changes, 'skillshare sync --force' to also replace local copies")
+	total := len(results)
+	if needCount == 0 && keptCount == 0 && len(errorResults) == 0 {
+		text := "No differences"
+		switch {
+		case total == 1:
+			text = results[0].name + " is in sync"
+		case total > 1:
+			text = fmt.Sprintf("All %d targets in sync", total)
+		}
+		if extrasNeed == 0 {
+			ui.Done(ui.MarkOK, text, 0)
+			ui.Next(next.pairs()...)
+			return
+		}
+		if total == 0 {
+			text = ""
 		} else {
-			ui.Info("Run 'skillshare sync' to apply changes")
+			text += " · "
+		}
+		ui.Done(ui.MarkWarn, text+plural(extrasNeed, "extra")+" to sync", 0)
+		ui.Next(next.pairs()...)
+		return
+	}
+	var parts []string
+	if needCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d to sync", needCount))
+	}
+	if keptCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d kept under old name", keptCount))
+	}
+	if len(errorResults) > 0 {
+		parts = append(parts, fmt.Sprintf("%d unreadable", len(errorResults)))
+	}
+	if n := len(syncedNames) + localOnly; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d in sync", n))
+	}
+	text := plural(total, "target")
+	if len(parts) > 0 {
+		text += ": " + strings.Join(parts, ", ")
+	}
+	if extrasNeed > 0 {
+		text += " · " + plural(extrasNeed, "extra") + " to sync"
+	}
+	mark := ui.MarkWarn
+	if len(errorResults) > 0 {
+		mark = ui.MarkFail
+	}
+	ui.Done(mark, text, 0)
+	ui.Next(next.pairs()...)
+}
+
+// diffOutput tracks whether anything was printed, so the first section
+// starts at the top and later ones are set off by a blank line.
+type diffOutput struct{ printed bool }
+
+func (o *diffOutput) gap() {
+	if o.printed {
+		fmt.Println()
+	}
+	o.printed = true
+}
+
+func (o *diffOutput) section(name string) {
+	o.gap()
+	fmt.Println(ui.Bold + name + ui.Reset)
+}
+
+// keptSyncHint says when sync moves a skill kept under its old name.
+const keptSyncHint = "after renaming or removing the local folders kept under the old name"
+
+// diffNext collects which commands would resolve the differences shown.
+type diffNext struct {
+	skills, agents, extras bool // something to sync
+	force                  bool // local copies sync would only replace with --force
+	kept                   bool // local folders holding a skill's new name
+	collectSkills          bool // local-only skills
+	collectAgents          bool // local-only agents
+}
+
+func (n diffNext) pairs() []string {
+	var pairs []string
+	switch {
+	case n.skills && n.agents:
+		pairs = append(pairs, "skillshare sync --all", "apply the changes")
+	case n.skills:
+		pairs = append(pairs, "skillshare sync", "apply the changes")
+	case n.agents:
+		pairs = append(pairs, "skillshare sync agents", "apply the changes")
+	}
+	if n.extras && !(n.skills && n.agents) {
+		pairs = append(pairs, "skillshare sync extras", "update the extras")
+	}
+	if n.force {
+		pairs = append(pairs, "skillshare sync --force", "also replace local copies")
+	}
+	if n.kept {
+		pairs = append(pairs, "skillshare sync", keptSyncHint)
+	}
+	if n.collectSkills {
+		pairs = append(pairs, "skillshare collect", "copy local-only skills into source")
+	}
+	if n.collectAgents {
+		pairs = append(pairs, "skillshare collect agents", "copy local-only agents into source")
+	}
+	if len(pairs) > 6 {
+		pairs = pairs[:6]
+	}
+	return pairs
+}
+
+// renderDiffGroup prints one row per kind of change, such as "New  a, b".
+// With --stat or --patch, and for modified items, each item gets its own
+// row followed by its file changes.
+func renderDiffGroup(r targetDiffResult, opts diffRenderOpts, next *diffNext, width int) {
+	items := make([]copyDiffEntry, len(r.items))
+	copy(items, r.items)
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].name < items[j].name
+	})
+
+	cats := categorizeItems(items)
+	labels := make([]string, len(cats))
+	for i, cat := range cats {
+		labels[i] = sentenceCase(cat.label)
+	}
+	fileIndent := strings.Repeat(" ", width+4)
+
+	for i, cat := range cats {
+		for _, name := range cat.names {
+			agent := false
+			if item := findDiffItem(items, name); item != nil && item.kind == "agent" {
+				agent = true
+			}
+			switch {
+			case cat.kind == "warn":
+				// Selection diagnostics describe skipped files, not sync work.
+			case cat.kind == "override":
+				next.force = true
+			case cat.kind == "kept":
+				next.kept = true
+			case cat.kind == "local" && agent:
+				next.collectAgents = true
+			case cat.kind == "local":
+				next.collectSkills = true
+			case agent:
+				next.agents = true
+			default:
+				next.skills = true
+			}
+		}
+
+		if !cat.expand {
+			ui.Row(ui.MarkNone, labels[i], plural(len(cat.names), "item"), width)
+			continue
+		}
+		shown := cat.names
+		if cat.kind == "kept" {
+			shown = make([]string, len(cat.names))
+			for j, name := range cat.names {
+				shown[j] = findDiffItem(items, name).label()
+			}
+		}
+		if !opts.showStat && !opts.showPatch && cat.kind != "modified" {
+			ui.Row(ui.MarkNone, labels[i], strings.Join(shown, ", "), width)
+			continue
+		}
+		for j, name := range cat.names {
+			label := ""
+			if j == 0 {
+				label = labels[i]
+			}
+			ui.Row(ui.MarkNone, label, shown[j], width)
+			item := findDiffItem(items, name)
+			if item == nil {
+				continue
+			}
+			item.ensureFiles()
+			for _, line := range strings.Split(strings.TrimRight(renderFileStat(item.files), "\n"), "\n") {
+				if line = strings.TrimSpace(line); line != "" {
+					fmt.Println(fileIndent + ui.DimText(line))
+				}
+			}
+			if !opts.showPatch {
+				continue
+			}
+			for _, f := range item.files {
+				if f.Action != "modify" || item.srcDir == "" {
+					continue
+				}
+				diffText := textdiff.Files(filepath.Join(item.dstDir, f.RelPath), filepath.Join(item.srcDir, f.RelPath))
+				if diffText == "" {
+					continue
+				}
+				fmt.Println(fileIndent + "--- " + f.RelPath)
+				for _, line := range strings.Split(strings.TrimRight(colorizePlainDiff(diffText), "\n"), "\n") {
+					fmt.Println(fileIndent + line)
+				}
+			}
 		}
 	}
-	if anyCollectNeeded {
-		ui.Info("Run 'skillshare collect' to import local skills to source")
-	}
 
-	// Fully synced
-	if len(syncedNames) > 0 {
-		sort.Strings(syncedNames)
-		ui.Success("%s: fully synced", strings.Join(syncedNames, ", "))
+	var times []string
+	if !r.srcMtime.IsZero() {
+		times = append(times, "source changed "+r.srcMtime.Format("2006-01-02 15:04"))
 	}
+	if !r.dstMtime.IsZero() {
+		times = append(times, "target changed "+r.dstMtime.Format("2006-01-02 15:04"))
+	}
+	if len(times) > 0 {
+		ui.Note(strings.Join(times, " · "))
+	}
+}
+
+// sentenceCase turns "Local Only" into "Local only".
+func sentenceCase(s string) string {
+	if s == "" {
+		return s
+	}
+	return s[:1] + strings.ToLower(s[1:])
 }
 
 func findDiffItem(items []copyDiffEntry, name string) *copyDiffEntry {
@@ -950,23 +1254,6 @@ func colorizePlainDiff(diff string) string {
 	return b.String()
 }
 
-func renderOverallSummary(errCount, needCount, syncCount int) {
-	var parts []string
-	total := errCount + needCount + syncCount
-	if errCount > 0 {
-		parts = append(parts, fmt.Sprintf("%s%d error%s%s", ui.Red, errCount, pluralS(errCount), ui.Reset))
-	}
-	if needCount > 0 {
-		parts = append(parts, fmt.Sprintf("%s%d need sync%s", ui.Yellow, needCount, ui.Reset))
-	}
-	if syncCount > 0 {
-		parts = append(parts, fmt.Sprintf("%s%d synced%s", ui.Green, syncCount, ui.Reset))
-	}
-	if len(parts) > 0 {
-		fmt.Printf("\n%sSummary:%s %d target%s — %s\n", ui.Bold, ui.Reset, total, pluralS(total), strings.Join(parts, ", "))
-	}
-}
-
 func pluralS(n int) string {
 	if n == 1 {
 		return ""
@@ -975,27 +1262,25 @@ func pluralS(n int) string {
 }
 
 func printDiffHelp() {
-	fmt.Println(`Usage: skillshare diff [target] [options]
-
-Show differences between source skills and target directories.
-Previews what 'sync' would change without modifying anything.
-
-Arguments:
-  target               Target name to diff (optional; diffs all if omitted)
-
-Options:
-  --project, -p        Diff project-level skills (.skillshare/)
-  --global, -g         Diff global skills (~/.config/skillshare)
-  --stat               Show file-level changes (implies --no-tui)
-  --patch              Show full unified diff (implies --no-tui)
-  --json               Output results as JSON
-  --no-tui             Plain text output (skip interactive TUI)
-  --help, -h           Show this help
-
-Examples:
-  skillshare diff                      # Diff all targets
-  skillshare diff claude               # Diff a single target
-  skillshare diff -p                   # Diff project-mode targets
-  skillshare diff --stat               # Show file-level stat
-  skillshare diff --patch              # Show full text diff`)
+	printHelp("skillshare diff [agents|all] [target] [options]", "Show differences between source skills and target directories.\nPreviews what 'sync' would change without modifying anything.",
+		helpGroup{title: "Arguments", rows: []helpRow{
+			{"target", "Target name to diff (optional; diffs all if omitted)"},
+		}},
+		helpGroup{title: "Options", rows: []helpRow{
+			{"-p, --project", "Diff project-level skills (.skillshare/)"},
+			{"-g, --global", "Diff global skills (~/.config/skillshare)"},
+			{"--stat", "Show file-level changes (implies --no-tui)"},
+			{"--patch", "Show full unified diff (implies --no-tui)"},
+			{"--json", "Output results as JSON"},
+			{"--no-tui", "Plain text output (skip interactive TUI)"},
+		}},
+		helpExamples(
+			helpRow{"skillshare diff", "Diff all targets"},
+			helpRow{"skillshare diff claude", "Diff a single target"},
+			helpRow{"skillshare diff -p", "Diff project-mode targets"},
+			helpRow{"skillshare diff --stat", "Show file-level stat"},
+			helpRow{"skillshare diff --patch", "Show full text diff"},
+			helpRow{"skillshare diff agents", "Diff agents targets only"},
+		),
+	)
 }

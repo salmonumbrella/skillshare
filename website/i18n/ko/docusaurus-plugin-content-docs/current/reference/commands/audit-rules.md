@@ -1,0 +1,463 @@
+---
+sidebar_position: 4
+---
+
+# audit rules
+
+audit 규칙을 탐색, 활성화, 비활성화, 커스터마이징합니다.
+
+```bash
+skillshare audit rules                          # 대화형 TUI 규칙 브라우저
+skillshare audit rules --no-tui                 # 일반 텍스트 표
+skillshare audit rules --pattern credential-access  # 패턴으로 필터링
+skillshare audit rules --severity high          # 심각도로 필터링
+skillshare audit rules --disabled               # 비활성화된 규칙만 표시
+skillshare audit rules --format json            # JSON 출력
+
+skillshare audit rules disable prompt-injection-0           # 단일 규칙 비활성화
+skillshare audit rules disable --pattern credential-access  # 그룹 전체 비활성화
+skillshare audit rules enable prompt-injection-0            # 규칙 재활성화
+skillshare audit rules enable --pattern credential-access   # 그룹 재활성화
+
+skillshare audit rules severity destructive-commands-2 medium      # 단일 규칙 하향 조정
+skillshare audit rules severity --pattern destructive-commands low  # 그룹 전체 하향 조정
+skillshare audit rules reset                    # 모든 커스텀 규칙 제거, 기본값 복원
+
+skillshare audit rules init                     # 시작용 audit-rules.yaml 생성
+skillshare audit rules init -p                  # project 수준 규칙 파일 생성
+```
+
+## 패턴 수준 규칙
+
+`audit-rules.yaml`에서 전체 패턴 그룹을 비활성화하거나 재정의할 수 있습니다:
+
+```yaml
+rules:
+  # 모든 credential-access 규칙 비활성화
+  - pattern: credential-access
+    enabled: false
+
+  # 하지만 .env 탐지는 유지
+  - id: credential-access-env-file
+    enabled: true
+
+  # 모든 destructive-commands를 MEDIUM으로 하향 조정
+  - pattern: destructive-commands
+    severity: MEDIUM
+```
+
+패턴 수준 항목은 `id` 없이 `pattern`을 사용합니다. 병합 순서: 패턴 수준 규칙이 먼저 적용되고, 그 다음 id 수준 규칙이 비활성화된 그룹 내 개별 항목을 재정의할 수 있습니다.
+
+## 커스텀 규칙 {#custom-rules}
+
+YAML 파일을 사용하여 audit 규칙을 추가, 재정의, 비활성화할 수 있습니다. 규칙은 **내장 규칙 → global 사용자 → project 사용자** 순서로 병합됩니다.
+
+주석이 달린 예시가 포함된 시작용 파일을 만들려면 `--init-rules`(또는 `audit rules init`)를 사용하십시오:
+
+```bash
+skillshare audit --init-rules         # global 규칙 파일 생성
+skillshare audit -p --init-rules      # project 규칙 파일 생성
+```
+
+### 파일 위치
+
+| Scope | Path |
+|-------|------|
+| Global | `~/.config/skillshare/audit-rules.yaml` |
+| Project | `.skillshare/audit-rules.yaml` |
+
+### 형식
+
+```yaml
+rules:
+  # 새 규칙 추가
+  - id: my-custom-rule
+    severity: HIGH
+    pattern: custom-check
+    message: "Custom pattern detected"
+    regex: 'DANGEROUS_PATTERN'
+
+  # exclude가 있는 규칙 추가 (특정 줄에서 매칭 억제)
+  - id: url-check
+    severity: MEDIUM
+    pattern: url-usage
+    message: "External URL detected"
+    regex: 'https?://\S+'
+    exclude: 'https?://(localhost|127\.0\.0\.1)'
+
+  # 기존 내장 규칙 재정의 (id로 매칭)
+  - id: destructive-commands-2
+    severity: MEDIUM
+    pattern: destructive-commands
+    message: "Sudo usage (downgraded to MEDIUM)"
+    regex: '(?i)\bsudo\s+'
+
+  # 내장 규칙 비활성화
+  - id: insecure-http-0
+    enabled: false
+
+  # dangling-link 구조적 검사 비활성화
+  - id: dangling-link
+    enabled: false
+```
+
+### 필드
+
+| Field | 필수 여부 | 설명 |
+|-------|----------|------|
+| `id` | 예 | 안정적인 식별자. 일치하는 ID는 내장 규칙을 재정의합니다. |
+| `severity` | 예* | `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO` 중 하나 |
+| `pattern` | 예* | 규칙 카테고리 이름 (예: `prompt-injection`) |
+| `message` | 예* | findings에 표시되는 사람이 읽을 수 있는 설명 |
+| `regex` | 예* | 각 줄에 대해 매칭할 정규식 |
+| `confidence` | 아니요 | 0에서 1 사이의 신뢰도; 기본값은 0.95 |
+| `exclude` | 아니오 | 줄이 `regex`와 `exclude` 둘 다에 매칭되면 finding이 억제됨 |
+| `files` | 아니오 | 규칙이 적용되는 파일을 제한하는 glob 패턴. 자세한 내용은 [파일 적용 범위](#file-applicability)를 참조. |
+| `enabled` | 아니오 | 규칙을 비활성화하려면 `false`로 설정. 비활성화 시 `id`만 필요 |
+
+*`enabled: false`가 아닌 경우 필수.
+
+### 병합 규칙
+
+각 레이어(global, 그다음 project)는 이전 레이어 위에 적용됩니다:
+
+- **동일한 `id`** + `enabled: false` → 해당 규칙 비활성화
+- **동일한 `id`** + `regex` → 규칙 전체를 교체; `severity` 또는 `confidence`만 있으면 해당 필드만 재정의
+- **새로운 `id`** → 커스텀 규칙으로 추가
+- **`pattern`만** (id 없음) + `enabled: false` → 해당 패턴에 일치하는 모든 규칙 비활성화
+- **`pattern`만** + `severity` 또는 `confidence` → 일치하는 모든 규칙의 해당 필드를 재정의
+- **패턴 다음 id** → id 수준 항목이 비활성화된 패턴 그룹 내 개별 규칙을 재활성화할 수 있음
+
+### 실전 템플릿
+
+실제 정책 조정을 위한 시작점으로 다음을 사용하십시오:
+
+```yaml
+rules:
+  # 교육/참고용 skill을 위해 hardcoded-secret을 MEDIUM으로 하향 조정
+  - pattern: hardcoded-secret
+    severity: MEDIUM
+
+  # 내장 suspicious-fetch를 내부 allowlist로 재정의
+  - id: suspicious-fetch-0
+    severity: MEDIUM
+    pattern: suspicious-fetch
+    message: "External URL used in command context"
+    regex: '(?i)(curl|wget|invoke-webrequest|iwr)\s+https?://'
+    exclude: '(?i)https?://(localhost|127\.0\.0\.1|artifacts\.company\.internal|registry\.company\.internal)'
+
+  # 거버넌스 예외: 노이즈가 많은 insecure-http 신호 비활성화
+  - id: insecure-http-0
+    enabled: false
+```
+
+### `init`으로 시작하기
+
+`audit rules init`(또는 `audit --init-rules`)는 주석이 달린 예시가 포함된 시작용 `audit-rules.yaml`을 생성하며, 이를 주석 해제하여 수정할 수 있습니다:
+
+```bash
+skillshare audit rules init          # → ~/.config/skillshare/audit-rules.yaml
+skillshare audit rules init -p       # → .skillshare/audit-rules.yaml
+```
+
+생성된 파일은 다음과 같습니다:
+
+```yaml
+# Custom audit rules for skillshare.
+# Rules are merged on top of built-in rules in order:
+#   built-in → global (~/.config/skillshare/audit-rules.yaml)
+#            → project (.skillshare/audit-rules.yaml)
+#
+# Each rule needs: id, severity, pattern, message, regex.
+# Optional: exclude (suppress match), files (scope), enabled (false to disable).
+
+rules:
+  # Example: flag TODO comments as informational
+  # - id: flag-todo
+  #   severity: MEDIUM
+  #   pattern: todo-comment
+  #   message: "TODO comment found"
+  #   regex: '(?i)\bTODO\b'
+
+  # Example: disable a built-in rule by id
+  # - id: insecure-http-0
+  #   enabled: false
+
+  # Example: disable the dangling-link structural check
+  # - id: dangling-link
+  #   enabled: false
+
+  # Example: override a built-in rule (match by id, change severity)
+  # - id: destructive-commands-2
+  #   severity: MEDIUM
+  #   pattern: destructive-commands
+  #   message: "Sudo usage (downgraded)"
+  #   regex: '(?i)\bsudo\s+'
+```
+
+파일이 이미 존재하면 `init`은 오류와 함께 종료됩니다 — 기존 규칙을 절대 덮어쓰지 않습니다.
+
+## 워크플로우: False Positive 수정하기
+
+규칙을 커스터마이징하는 흔한 이유는 정상적인 skill이 내장 규칙을 트리거하는 경우입니다. 단계별 예시는 다음과 같습니다:
+
+**1. audit를 실행하고 false positive 확인:**
+
+```bash
+$ skillshare audit ci-helper
+Audit  ~/.config/skillshare/skills
+  global · blocks at CRITICAL · policy DEFAULT / dedupe:GLOBAL / analyzers:ALL
+
+HIGH      Sudo escalation  SKILL.md:42
+  destructive-commands-2 / static
+  "sudo apt-get install -y jq"
+
+  Risk       HIGH 15/100
+  Auditable  100%
+
+! ci-helper has findings below CRITICAL · 0.2s
+```
+
+**2. [내장 규칙 표](#built-in-rule-ids)에서 규칙 ID 확인:**
+
+`sudo`가 포함된 `destructive-commands` 패턴은 규칙 `destructive-commands-2`에 매칭됩니다.
+
+**3. 커스텀 규칙 파일 생성 (아직 없다면):**
+
+```bash
+skillshare audit rules init
+```
+
+**4. 억제 또는 하향 조정을 위한 규칙 재정의 추가:**
+
+```yaml
+# ~/.config/skillshare/audit-rules.yaml
+rules:
+  # CI 자동화 skill을 위해 sudo를 MEDIUM으로 하향 조정
+  - id: destructive-commands-2
+    severity: MEDIUM
+    pattern: destructive-commands
+    message: "Sudo usage (downgraded for CI automation)"
+    regex: '(?i)\bsudo\s+'
+```
+
+또는 완전히 비활성화:
+
+```yaml
+rules:
+  - id: destructive-commands-2
+    enabled: false
+```
+
+**5. audit를 다시 실행하여 확인:**
+
+```bash
+$ skillshare audit ci-helper
+Audit  ~/.config/skillshare/skills
+  global · blocks at CRITICAL · policy DEFAULT / dedupe:GLOBAL / analyzers:ALL
+
+✓ No issues found in ci-helper · 0.1s   # 이제 통과함 (또는 HIGH 대신 MEDIUM 표시)
+```
+
+### 변경 사항 검증
+
+규칙을 편집한 후, audit를 다시 실행하여 확인하십시오:
+
+```bash
+skillshare audit                     # 모든 skill 확인
+skillshare audit <name>              # 특정 skill 확인
+skillshare audit --json | jq '.skills[].findings'  # findings를 프로그래밍 방식으로 검사
+```
+
+규칙 파일을 읽거나 파싱하거나 컴파일할 수 없으면(예: 잘못된 정규식), 그 파일을 사용하는 모든 스캔이 파일 경로를 포함한 스캔 오류를 보고하고 `audit`는 `2`로 종료합니다. 파일을 고칠 때까지 설치는 차단됩니다.
+
+요약 해석:
+
+- `Failed`는 활성 threshold 이상의 findings가 있는 skill 수입니다.
+- `Warning`은 threshold 미만이지만 clean보다 높은 findings가 있는 skill 수입니다 (예: threshold가 `CRITICAL`일 때 `HIGH/MEDIUM/LOW/INFO`).
+
+## 내장 규칙 ID {#built-in-rule-ids}
+
+특정 내장 규칙을 재정의하거나 비활성화하려면 `id` 값을 사용하십시오:
+
+정규식 기반 규칙의 소스:
+[`internal/audit/rules.yaml`](https://github.com/runkids/skillshare/blob/main/internal/audit/rules.yaml)
+
+파일 단위 감지기 `whitespace-padding`도 `rules.yaml`에 등록됩니다. 임계값과 예외는 Go로 구현되며 `regex` 또는 `exclude` 없이 활성 상태, 심각도, 신뢰도를 설정합니다. [공백 패딩](/docs/understand/audit-engine#whitespace-padding)을 참고하세요. 이 ID에 `regex` 또는 `exclude`를 설정한 규칙은 거부됩니다.
+
+:::note 구조적, tier, cross-skill 검사
+
+`dangling-link`, `reference-escapes-root`, `reference-check-incomplete`, `content-tampered`, `content-oversize`, `content-missing`, `content-unexpected`는 (정규식이 아닌 파일시스템 조회와 해시 비교를 수행하는) **구조적 검사**입니다. `low-analyzability`는 [Analyzability Score](/docs/understand/audit-engine#analyzability-score)에서 생성되는 **analyzability finding**입니다. `tier-stealth`, `tier-destructive-network`, `tier-network-heavy`, `tier-interpreter`, `tier-interpreter-network`는 [Command Safety Tiering](/docs/understand/audit-engine#command-safety-tiering) 프로파일에서 생성되는 **tier 조합 findings**입니다. `cross-skill-*` findings는 [Cross-Skill Interaction Detection](/docs/understand/audit-engine#cross-skill-interaction-detection)에서 생성됩니다. 헤더 검사는 [Executable and archive headers](/docs/understand/audit-engine#executable-headers)에 설명된 `disguised-executable`, `python-bytecode`, `executable-artifact`, `archive-artifact`, `uncertain-header`도 생성합니다. 이들은 모두 아래 표에 나타나지만 `rules.yaml`에는 정의되어 있지 않습니다.
+
+`bundled-*`는 `structure`의 구조화된 JSON 검사입니다. 목록, 비활성화, 심각도 재정의를 지원하며 메타데이터 정규식은 텍스트와 일치하지 않습니다. [번들 훅과 설정](/docs/understand/audit-engine#bundled-hooks-and-settings)。
+
+:::
+
+| ID | Pattern | Severity |
+|----|---------|----------|
+| `bundled-hook-command` | bundled-hook-command | MEDIUM |
+| `bundled-network-command` | bundled-network-command | HIGH |
+| `bundled-remote-post` | bundled-remote-post | HIGH |
+| `bundled-permission` | bundled-permission | HIGH |
+| `bundled-helper-command` | bundled-helper-command | HIGH |
+| `bundled-config-unparsed` | bundled-config-unparsed | INFO |
+| `prompt-injection-0` | prompt-injection | CRITICAL |
+| `prompt-injection-1` | prompt-injection | CRITICAL |
+| `prompt-injection-2` | prompt-injection | HIGH |
+| `prompt-injection-3` | prompt-injection | CRITICAL |
+| `prompt-injection-4` | prompt-injection | CRITICAL |
+| `prompt-injection-5` | prompt-injection | HIGH |
+| `hidden-unicode-1` | invisible-payload | CRITICAL |
+| `data-exfiltration-0` | data-exfiltration | CRITICAL |
+| `data-exfiltration-1` | data-exfiltration | CRITICAL |
+| `data-exfiltration-2` | data-exfiltration | MEDIUM |
+| `data-exfiltration-3` | data-exfiltration | HIGH |
+| `credential-access-ssh-private-key` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-env-file` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-aws-credentials` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-etc-shadow` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-git-credentials` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-netrc` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-gnupg` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-kube-config` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-vault-token` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-terraform-creds` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-gnome-keyring` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-npmrc` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-pypirc` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-gem-credentials` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-ssl-private` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-ssh-host-key` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-pgpass` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-mysql-cnf` | credential-access | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#credential-access)) |
+| `credential-access-etc-passwd` | credential-access | MEDIUM |
+| `credential-access-azure-creds` | credential-access | HIGH |
+| `credential-access-gcloud-creds` | credential-access | HIGH |
+| `credential-access-docker-config` | credential-access | HIGH |
+| `credential-access-gh-cli-token` | credential-access | HIGH |
+| `credential-access-password-store` | credential-access | HIGH |
+| `credential-access-macos-keychain-user` | credential-access | HIGH |
+| `credential-access-macos-keychain-sys` | credential-access | HIGH |
+| `credential-access-terraformrc` | credential-access | HIGH |
+| `credential-access-cargo-credentials` | credential-access | HIGH |
+| `credential-access-op-cli` | credential-access | HIGH |
+| `credential-access-age-keys` | credential-access | HIGH |
+| `credential-access-shell-history` | credential-access | LOW |
+| `credential-access-openvpn` | credential-access | LOW |
+| `credential-access-auth-log` | credential-access | INFO |
+| `credential-access-unknown-dotdir` | credential-access | INFO |
+
+> **참고:** 위의 각 credential 항목은 접근 방법별로 변형 ID도 생성합니다: `-copy`, `-redirect`, `-dd`, `-exfil` (예: `credential-access-ssh-private-key-copy`). 특정 변형을 비활성화하려면 `audit-rules.yaml`에서 전체 ID를 사용하십시오.
+
+| ID | Pattern | Severity |
+|----|---------|----------|
+| `hidden-unicode-0` | hidden-unicode | HIGH |
+| `hidden-unicode-2` | hidden-unicode | HIGH |
+| `config-manipulation-0` | config-manipulation | HIGH |
+| `anti-refusal-0` | anti-refusal | HIGH |
+| `prompt-leakage-0` | prompt-leakage | HIGH |
+| `memory-poisoning-0` | memory-poisoning | HIGH |
+| `agent-snooping-0` | agent-snooping | HIGH |
+| `persistence-0` | persistence | HIGH |
+| `hidden-comment-injection-1` | hidden-comment-injection | HIGH |
+| `self-propagation-0` | self-propagation | HIGH |
+| `destructive-commands-0` | destructive-commands | HIGH |
+| `destructive-commands-1` | destructive-commands | HIGH |
+| `destructive-commands-2` | destructive-commands | HIGH |
+| `destructive-commands-3` | destructive-commands | HIGH |
+| `destructive-commands-4` | destructive-commands | HIGH |
+| `dynamic-code-exec-0` | dynamic-code-exec | HIGH |
+| `dynamic-code-exec-1` | dynamic-code-exec | HIGH |
+| `shell-execution-0` | shell-execution | HIGH |
+| `hidden-comment-injection-0` | hidden-comment-injection | HIGH |
+| `obfuscation-0` | obfuscation | HIGH |
+| `fetch-with-pipe-0` | fetch-with-pipe | HIGH |
+| `fetch-with-pipe-1` | fetch-with-pipe | HIGH |
+| `fetch-with-pipe-2` | fetch-with-pipe | HIGH |
+| `hardcoded-secret-0` | hardcoded-secret | HIGH |
+| `hardcoded-secret-1` | hardcoded-secret | HIGH |
+| `hardcoded-secret-2` | hardcoded-secret | HIGH |
+| `hardcoded-secret-3` | hardcoded-secret | HIGH |
+| `hardcoded-secret-4` | hardcoded-secret | HIGH |
+| `hardcoded-secret-5` | hardcoded-secret | HIGH |
+| `hardcoded-secret-6` | hardcoded-secret | HIGH |
+| `hardcoded-secret-7` | hardcoded-secret | HIGH |
+| `hardcoded-secret-8` | hardcoded-secret | HIGH |
+| `hardcoded-secret-9` | hardcoded-secret | HIGH |
+| `data-uri-0` | data-uri | MEDIUM |
+| `escape-obfuscation-0` | escape-obfuscation | MEDIUM |
+| `whitespace-padding` | whitespace-padding | MEDIUM (비어 있지 않은 텍스트 앞 빈 줄 ≥40개: HIGH) |
+| `suspicious-fetch-0` | suspicious-fetch | MEDIUM |
+| `ip-address-url-0` | ip-address-url | MEDIUM |
+| `hidden-unicode-3` | hidden-unicode | MEDIUM |
+| `untrusted-install-0` | untrusted-install | MEDIUM |
+| `untrusted-install-1` | untrusted-install | MEDIUM |
+| `insecure-http-0` | insecure-http | LOW |
+| `external-link-0` | external-link | LOW |
+| `dangling-link` | dangling-link | LOW |
+| `reference-escapes-root` | reference-escapes-root | HIGH |
+| `reference-check-incomplete` | reference-check-incomplete | LOW |
+| `content-tampered` | content-tampered | MEDIUM |
+| `content-oversize` | content-oversize | MEDIUM |
+| `content-missing` | content-missing | LOW |
+| `content-unexpected` | content-unexpected | LOW |
+| `shell-chain-0` | shell-chain | INFO |
+| `low-analyzability` | low-analyzability | INFO |
+| `tier-stealth` | tier-stealth | CRITICAL |
+| `tier-destructive-network` | tier-destructive-network | HIGH |
+| `tier-network-heavy` | tier-network-heavy | MEDIUM |
+| `tier-interpreter` | tier-interpreter | INFO |
+| `tier-interpreter-network` | tier-interpreter-network | MEDIUM |
+| `cross-skill-exfiltration` | cross-skill-exfiltration | HIGH |
+| `cross-skill-privilege-network` | cross-skill-privilege-network | MEDIUM |
+| `cross-skill-stealth` | cross-skill-stealth | HIGH |
+| `cross-skill-cred-interpreter` | cross-skill-cred-interpreter | MEDIUM |
+| `disguised-executable` | disguised-executable | HIGH |
+| `python-bytecode` | python-bytecode | HIGH |
+| `executable-artifact` | executable-artifact | MEDIUM |
+| `archive-artifact` | archive-artifact | INFO |
+| `uncertain-header` | uncertain-header | INFO |
+| `ssrf-metadata-0` | ssrf-metadata | CRITICAL / HIGH ([문맥](/docs/understand/audit-engine#sensitive-destinations)) |
+| `ssrf-internal-0` | ssrf-internal | MEDIUM |
+| `ssrf-dynamic-0` | ssrf-dynamic | MEDIUM |
+| `unsafe-deserialization-python` | unsafe-deserialization | HIGH |
+| `unsafe-deserialization-yaml` | unsafe-deserialization | HIGH |
+| `unsafe-deserialization-torch` | unsafe-deserialization | HIGH |
+| `unsafe-deserialization-php` | unsafe-deserialization | HIGH |
+| `unsafe-deserialization-ruby` | unsafe-deserialization | HIGH |
+| `unsafe-deserialization-js` | unsafe-deserialization | HIGH |
+
+`audit rules --format json`에서 위 표의 *문맥* 표시 규칙은 내장 CRITICAL 심각도와 정규식을 유지하는 동안 `"severityContext": "python-inert"`를 가집니다. 심각도를 지정하거나 정규식을 교체하면 낮춤이 적용되지 않으므로 사라집니다.
+
+## 하위 명령
+
+| 하위 명령 | 설명 |
+|-----------|-------------|
+| `rules` | audit 규칙 탐색, 활성화, 비활성화 |
+| `rules disable <id>` | ID로 단일 규칙 비활성화 |
+| `rules disable --pattern <p>` | 패턴에 일치하는 모든 규칙 비활성화 |
+| `rules enable <id>` | ID로 단일 규칙 재활성화 |
+| `rules enable --pattern <p>` | 패턴에 일치하는 모든 규칙 재활성화 |
+| `rules severity <id> <level>` | 단일 규칙의 severity 재정의 |
+| `rules severity --pattern <p> <level>` | 패턴 그룹 내 모든 규칙의 severity 재정의 |
+| `rules reset` | 모든 커스텀 규칙 제거 (내장 기본값 복원) |
+| `rules init` | 시작용 `audit-rules.yaml` 생성 (`audit --init-rules`와 동일) |
+
+## 참고
+
+- [`audit`](/docs/reference/commands/audit) — 메인 audit 명령 레퍼런스
+- [Audit Engine](/docs/understand/audit-engine) — 엔진의 동작 방식 (위협 모델, 위험 점수, 등급)
+- [Securing Your Skills](/docs/how-to/advanced/security) — 팀을 위한 보안 가이드
+- [CI/CD Skill Validation](/docs/how-to/recipes/ci-cd-skill-validation) — 파이프라인 자동화 레시피
+
+## 파일 적용 범위 {#file-applicability}
+
+선택적 `files` 목록은 Go `path.Match` 문법(`*`, `?`, 문자 클래스)을 사용합니다. `/`가 없는 `*.py`는 모든 깊이의 파일 이름에, `/`가 있는 `scripts/*.php`는 스킬 루트 기준 전체 상대 경로에 일치합니다. `*`는 `/`를 넘지 않으며 대소문자를 구분하지 않습니다. 단일 파일 스캔은 파일 이름을, 원시 콘텐츠 스캔은 전달된 이름을 사용합니다. 기존 수집 파일만 필터링하며 확장자를 추가하지 않습니다.
+
+절대 경로, 빈 패턴, 빈 경로 요소와 `.`/`..`, 역슬래시, 콜론, 잘못된 문자 클래스, 재귀 `**`는 비활성 규칙과 대상 없는 재정의에서도 거부합니다. 생략하면 상속하고 `files: []`는 제한을 해제합니다. ID와 패턴 재정의를 지원하며 ID가 우선합니다. 전체 정규식 교체는 적용 범위와 내장 호출 검사도 교체합니다. `audit rules --format json`은 비어 있지 않은 유효 `files`를 반환합니다.
+
+```yaml
+rules:
+  - id: unsafe-deserialization-python
+    files: ['*.py', 'scripts/*.txt']
+```

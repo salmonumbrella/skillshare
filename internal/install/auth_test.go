@@ -1,8 +1,28 @@
 package install
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
+
+// wantAuthEnv is the env authEnv returns for host, appending at config index base.
+func wantAuthEnv(base int, host, user, token string) []string {
+	key := "credential.https://" + host + ".helper"
+	return []string{
+		fmt.Sprintf("GIT_CONFIG_COUNT=%d", base+2),
+		fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", base, key),
+		fmt.Sprintf("GIT_CONFIG_VALUE_%d=", base),
+		fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", base+1, key),
+		fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", base+1, gitCredentialHelper),
+		"SKILLSHARE_GIT_AUTH_USERNAME=" + user,
+		"SKILLSHARE_GIT_AUTH_PASSWORD=" + token,
+	}
+}
 
 var authTestEnvKeys = []string{
 	"GITHUB_TOKEN",
@@ -11,6 +31,8 @@ var authTestEnvKeys = []string{
 	"BITBUCKET_TOKEN",
 	"BITBUCKET_USERNAME",
 	"AZURE_DEVOPS_TOKEN",
+	"CNB_TOKEN",
+	"GITEA_TOKEN",
 	"SKILLSHARE_GIT_TOKEN",
 	"GIT_CONFIG_COUNT",
 }
@@ -57,6 +79,8 @@ func TestDetectPlatform(t *testing.T) {
 	}{
 		{"github.com", "https://github.com/org/repo.git", PlatformGitHub},
 		{"github enterprise", "https://github.mycompany.com/org/repo.git", PlatformGitHub},
+		{"github enterprise data residency", "https://acme.ghe.com/org/repo.git", PlatformGitHub},
+		{"github enterprise data residency ssh", "acme@acme.ghe.com:org/repo.git", PlatformGitHub},
 		{"gitlab.com", "https://gitlab.com/org/repo.git", PlatformGitLab},
 		{"self-hosted gitlab", "https://gitlab.internal.co/org/repo.git", PlatformGitLab},
 		{"bitbucket.org", "https://bitbucket.org/team/repo.git", PlatformBitbucket},
@@ -162,6 +186,21 @@ func TestResolveToken(t *testing.T) {
 			wantTok:  "tok",
 			wantUser: "oauth2",
 		},
+
+		{
+			name:     "cnb token",
+			url:      "https://cnb.cool/org/repo.git",
+			envVars:  map[string]string{"CNB_TOKEN": "cnb_pat"},
+			wantTok:  "cnb_pat",
+			wantUser: "cnb",
+		},
+		{
+			name:     "gitea token",
+			url:      "https://gitea.com/org/repo.git",
+			envVars:  map[string]string{"GITEA_TOKEN": "gitea_pat"},
+			wantTok:  "gitea_pat",
+			wantUser: "x-access-token",
+		},
 		{
 			name:     "azure devops token",
 			url:      "https://dev.azure.com/org/proj/_git/repo",
@@ -229,120 +268,142 @@ func TestResolveToken(t *testing.T) {
 	}
 }
 
-func TestAuthEnv(t *testing.T) {
+func TestSourceAuthEnv_ConfiguredCNBGiteaHosts(t *testing.T) {
 	tests := []struct {
-		name      string
-		url       string
-		envVars   map[string]string
-		wantNil   bool
-		wantCount string // expected GIT_CONFIG_COUNT value
-		wantIdx   string // expected index in KEY/VALUE names
-		wantKey   string // expected GIT_CONFIG_KEY_<idx> value
-		wantVal   string // expected GIT_CONFIG_VALUE_<idx> value
+		name    string
+		source  *Source
+		envVars map[string]string
+		want    []string
 	}{
 		{
-			name:      "github with token",
-			url:       "https://github.com/org/repo.git",
-			envVars:   map[string]string{"GITHUB_TOKEN": "ghp_abc"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://x-access-token:ghp_abc@github.com/.insteadOf",
-			wantVal: "https://github.com/",
+			name: "configured CNB host uses CNB_TOKEN",
+			source: &Source{
+				CloneURL: "https://git.corp.example/org/repo.git",
+				CNBHosts: []string{"git.corp.example"},
+			},
+			envVars: map[string]string{"CNB_TOKEN": "cnb_private"},
+			want:    wantAuthEnv(0, "git.corp.example", "cnb", "cnb_private"),
 		},
 		{
-			name:      "gitlab with token",
-			url:       "https://gitlab.com/org/repo.git",
-			envVars:   map[string]string{"GITLAB_TOKEN": "glpat-xyz"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://oauth2:glpat-xyz@gitlab.com/.insteadOf",
-			wantVal: "https://gitlab.com/",
+			name: "configured Gitea host uses GITEA_TOKEN",
+			source: &Source{
+				CloneURL:   "https://git.example.com/org/repo.git",
+				GiteaHosts: []string{"git.example.com"},
+			},
+			envVars: map[string]string{"GITEA_TOKEN": "gitea_private"},
+			want:    wantAuthEnv(0, "git.example.com", "x-access-token", "gitea_private"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetAuthTestEnv(t)
+			for k, v := range tt.envVars {
+				t.Setenv(k, v)
+			}
+			if got := tt.source.authEnv(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("authEnv() =\n%q\nwant\n%q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAPISourceDetection_UsesConfiguredHosts(t *testing.T) {
+	cnb := &Source{CloneURL: "https://git.corp.example/org/repo.git", CNBHosts: []string{"git.corp.example"}}
+	if !isCNBAPISource(cnb) {
+		t.Fatalf("configured CNB host was not treated as CNB API source")
+	}
+	gitea := &Source{CloneURL: "https://git.example.com/org/repo.git", GiteaHosts: []string{"git.example.com"}}
+	if !isGiteaAPISource(gitea) {
+		t.Fatalf("configured Gitea host was not treated as Gitea API source")
+	}
+}
+
+func TestAuthEnv(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		envVars map[string]string
+		wantNil bool
+		want    []string
+	}{
+		{
+			name:    "github with token",
+			url:     "https://github.com/org/repo.git",
+			envVars: map[string]string{"GITHUB_TOKEN": "ghp_abc"},
+			want:    wantAuthEnv(0, "github.com", "x-access-token", "ghp_abc"),
 		},
 		{
-			name:      "bitbucket with token",
-			url:       "https://bitbucket.org/team/repo.git",
-			envVars:   map[string]string{"BITBUCKET_TOKEN": "bb_tok"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://x-token-auth:bb_tok@bitbucket.org/.insteadOf",
-			wantVal: "https://bitbucket.org/",
+			name:    "gitlab with token",
+			url:     "https://gitlab.com/org/repo.git",
+			envVars: map[string]string{"GITLAB_TOKEN": "glpat-xyz"},
+			want:    wantAuthEnv(0, "gitlab.com", "oauth2", "glpat-xyz"),
 		},
 		{
-			name:      "bitbucket token auth key ignores url username by default",
-			url:       "https://willie0903@bitbucket.org/team/repo.git",
-			envVars:   map[string]string{"BITBUCKET_TOKEN": "app_pwd"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://x-token-auth:app_pwd@bitbucket.org/.insteadOf",
-			wantVal: "https://willie0903@bitbucket.org/",
+			name:    "bitbucket with token",
+			url:     "https://bitbucket.org/team/repo.git",
+			envVars: map[string]string{"BITBUCKET_TOKEN": "bb_tok"},
+			want:    wantAuthEnv(0, "bitbucket.org", "x-token-auth", "bb_tok"),
 		},
 		{
-			name:      "bitbucket app password with BITBUCKET_USERNAME",
-			url:       "https://bitbucket.org/team/repo.git",
-			envVars:   map[string]string{"BITBUCKET_TOKEN": "app_pwd", "BITBUCKET_USERNAME": "willie0903"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://willie0903:app_pwd@bitbucket.org/.insteadOf",
-			wantVal: "https://bitbucket.org/",
+			name:    "bitbucket token auth key ignores url username by default",
+			url:     "https://willie0903@bitbucket.org/team/repo.git",
+			envVars: map[string]string{"BITBUCKET_TOKEN": "app_pwd"},
+			want:    wantAuthEnv(0, "bitbucket.org", "x-token-auth", "app_pwd"),
 		},
 		{
-			name:      "token with equals sign",
-			url:       "https://bitbucket.org/team/repo.git",
-			envVars:   map[string]string{"BITBUCKET_TOKEN": "ATATT3x_test=FBFF"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://x-token-auth:ATATT3x_test=FBFF@bitbucket.org/.insteadOf",
-			wantVal: "https://bitbucket.org/",
+			name:    "bitbucket app password with BITBUCKET_USERNAME",
+			url:     "https://bitbucket.org/team/repo.git",
+			envVars: map[string]string{"BITBUCKET_TOKEN": "app_pwd", "BITBUCKET_USERNAME": "willie0903"},
+			want:    wantAuthEnv(0, "bitbucket.org", "willie0903", "app_pwd"),
 		},
 		{
-			name:      "azure devops with token",
-			url:       "https://dev.azure.com/org/proj/_git/repo",
-			envVars:   map[string]string{"AZURE_DEVOPS_TOKEN": "ado_pat"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://x-access-token:ado_pat@dev.azure.com/.insteadOf",
-			wantVal: "https://dev.azure.com/",
+			name:    "token with equals sign",
+			url:     "https://bitbucket.org/team/repo.git",
+			envVars: map[string]string{"BITBUCKET_TOKEN": "ATATT3x_test=FBFF"},
+			want:    wantAuthEnv(0, "bitbucket.org", "x-token-auth", "ATATT3x_test=FBFF"),
 		},
 		{
-			name:      "token with at sign",
-			url:       "https://github.com/org/repo.git",
-			envVars:   map[string]string{"GITHUB_TOKEN": "ghp_abc@def"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://x-access-token:ghp_abc@def@github.com/.insteadOf",
-			wantVal: "https://github.com/",
+			name:    "azure devops with token",
+			url:     "https://dev.azure.com/org/proj/_git/repo",
+			envVars: map[string]string{"AZURE_DEVOPS_TOKEN": "ado_pat"},
+			want:    wantAuthEnv(0, "dev.azure.com", "x-access-token", "ado_pat"),
 		},
 		{
-			name:      "token with percent and hash",
-			url:       "https://gitlab.com/org/repo.git",
-			envVars:   map[string]string{"GITLAB_TOKEN": "tok%20val#frag"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://oauth2:tok%20val#frag@gitlab.com/.insteadOf",
-			wantVal: "https://gitlab.com/",
+			name:    "token with at sign",
+			url:     "https://github.com/org/repo.git",
+			envVars: map[string]string{"GITHUB_TOKEN": "ghp_abc@def"},
+			want:    wantAuthEnv(0, "github.com", "x-access-token", "ghp_abc@def"),
 		},
 		{
-			name:      "token with slash",
-			url:       "https://bitbucket.org/team/repo.git",
-			envVars:   map[string]string{"BITBUCKET_TOKEN": "tok/with/slashes"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://x-token-auth:tok/with/slashes@bitbucket.org/.insteadOf",
-			wantVal: "https://bitbucket.org/",
+			name:    "token with percent and hash",
+			url:     "https://gitlab.com/org/repo.git",
+			envVars: map[string]string{"GITLAB_TOKEN": "tok%20val#frag"},
+			want:    wantAuthEnv(0, "gitlab.com", "oauth2", "tok%20val#frag"),
 		},
 		{
-			name:      "url with existing username preserves it",
-			url:       "https://demouser@bitbucket.org/team/repo.git",
-			envVars:   map[string]string{"SKILLSHARE_GIT_TOKEN": "tok123"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://demouser:tok123@bitbucket.org/.insteadOf",
-			wantVal: "https://demouser@bitbucket.org/",
+			name:    "token with slash",
+			url:     "https://bitbucket.org/team/repo.git",
+			envVars: map[string]string{"BITBUCKET_TOKEN": "tok/with/slashes"},
+			want:    wantAuthEnv(0, "bitbucket.org", "x-token-auth", "tok/with/slashes"),
 		},
 		{
-			name:      "appends to existing GIT_CONFIG_COUNT",
-			url:       "https://github.com/org/repo.git",
-			envVars:   map[string]string{"GITHUB_TOKEN": "ghp_abc", "GIT_CONFIG_COUNT": "2"},
-			wantCount: "3", wantIdx: "2",
-			wantKey: "url.https://x-access-token:ghp_abc@github.com/.insteadOf",
-			wantVal: "https://github.com/",
+			name:    "url with existing username preserves it",
+			url:     "https://demouser@bitbucket.org/team/repo.git",
+			envVars: map[string]string{"SKILLSHARE_GIT_TOKEN": "tok123"},
+			want:    wantAuthEnv(0, "bitbucket.org", "demouser", "tok123"),
 		},
 		{
-			name:      "invalid GIT_CONFIG_COUNT treated as zero",
-			url:       "https://github.com/org/repo.git",
-			envVars:   map[string]string{"GITHUB_TOKEN": "ghp_abc", "GIT_CONFIG_COUNT": "abc"},
-			wantCount: "1", wantIdx: "0",
-			wantKey: "url.https://x-access-token:ghp_abc@github.com/.insteadOf",
-			wantVal: "https://github.com/",
+			name:    "appends to existing GIT_CONFIG_COUNT",
+			url:     "https://github.com/org/repo.git",
+			envVars: map[string]string{"GITHUB_TOKEN": "ghp_abc", "GIT_CONFIG_COUNT": "2"},
+			want:    wantAuthEnv(2, "github.com", "x-access-token", "ghp_abc"),
+		},
+		{
+			name:    "invalid GIT_CONFIG_COUNT treated as zero",
+			url:     "https://github.com/org/repo.git",
+			envVars: map[string]string{"GITHUB_TOKEN": "ghp_abc", "GIT_CONFIG_COUNT": "abc"},
+			want:    wantAuthEnv(0, "github.com", "x-access-token", "ghp_abc"),
 		},
 		{
 			name:    "ssh returns nil",
@@ -375,19 +436,47 @@ func TestAuthEnv(t *testing.T) {
 				}
 				return
 			}
-			wantCountEnv := "GIT_CONFIG_COUNT=" + tt.wantCount
-			if len(got) != 3 || got[0] != wantCountEnv {
-				t.Fatalf("authEnv(%q) = %v, want [%q, ...]", tt.url, got, wantCountEnv)
-			}
-			wantKeyEnv := "GIT_CONFIG_KEY_" + tt.wantIdx + "=" + tt.wantKey
-			wantValEnv := "GIT_CONFIG_VALUE_" + tt.wantIdx + "=" + tt.wantVal
-			if got[1] != wantKeyEnv {
-				t.Errorf("authEnv(%q)[1] = %q, want %q", tt.url, got[1], wantKeyEnv)
-			}
-			if got[2] != wantValEnv {
-				t.Errorf("authEnv(%q)[2] = %q, want %q", tt.url, got[2], wantValEnv)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("authEnv(%q) =\n%q\nwant\n%q", tt.url, got, tt.want)
 			}
 		})
+	}
+}
+
+// Real git must take the token from skillshare's helper and never ask or
+// erase the user's own helper (their keychain) for that host (#565).
+func TestAuthEnv_GitAsksOnlySkillshareHelper(t *testing.T) {
+	resetAuthTestEnv(t)
+	t.Setenv("GITHUB_TOKEN", "ghp_from_env")
+	dir := t.TempDir()
+	global := filepath.Join(dir, "gitconfig")
+	userLog := filepath.ToSlash(filepath.Join(dir, "user-helper.log"))
+	userHelper := `!f() { echo "$1" >> '` + userLog + `'; echo username=realuser; echo password=stored; }; f`
+	if out, err := exec.Command("git", "config", "--file", global, "credential.helper", userHelper).CombinedOutput(); err != nil {
+		t.Fatalf("git config: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command("git", "credential", "fill")
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL="+global, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+	cmd.Env = append(cmd.Env, authEnv("https://github.com/org/repo.git")...)
+	cmd.Stdin = strings.NewReader("protocol=https\nhost=github.com\n\n")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git credential fill: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "username=x-access-token\npassword=ghp_from_env\n") {
+		t.Errorf("credential fill = %q, want skillshare's token", out)
+	}
+
+	// A rejected token must not erase the user's stored credentials either.
+	reject := exec.Command("git", "credential", "reject")
+	reject.Env = cmd.Env
+	reject.Stdin = strings.NewReader("protocol=https\nhost=github.com\nusername=x-access-token\npassword=ghp_from_env\n\n")
+	if out, err := reject.CombinedOutput(); err != nil {
+		t.Fatalf("git credential reject: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(userLog); err == nil {
+		t.Errorf("user's credential helper was called")
 	}
 }
 
@@ -464,6 +553,72 @@ func TestSanitizeTokens(t *testing.T) {
 			got := sanitizeTokens(tt.text)
 			if got != tt.want {
 				t.Errorf("sanitizeTokens() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProviderCredentialsRejectUntrustedOrigins(t *testing.T) {
+	tests := []struct {
+		url, variable string
+	}{
+		{"https://github.attacker.invalid/o/r.git", "GITHUB_TOKEN"},
+		{"https://github.attacker.invalid/o/r.git", "GH_TOKEN"},
+		{"https://gitlab.attacker.invalid/o/r.git", "GITLAB_TOKEN"},
+		{"https://bitbucket.attacker.invalid/o/r.git", "BITBUCKET_TOKEN"},
+		{"https://cnb.cool.attacker.invalid/o/r.git", "CNB_TOKEN"},
+		{"https://gitea.attacker.invalid/o/r.git", "GITEA_TOKEN"},
+		{"https://github.com:8443/o/r.git", "GITHUB_TOKEN"},
+		{"https://github.company.invalid/o/r.git", "GITHUB_TOKEN"},
+		{"https://gitlab.company.invalid/o/r.git", "GITLAB_TOKEN"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.variable+"/"+tt.url, func(t *testing.T) {
+			resetAuthTestEnv(t)
+			t.Setenv(tt.variable, "audit-dummy-provider-token")
+			if token, _ := resolveToken(tt.url); token != "" {
+				t.Fatal("provider credential selected for an untrusted origin")
+			}
+			if got := authEnv(tt.url); got != nil {
+				t.Fatal("Git credential helper exposes a provider credential to an untrusted origin")
+			}
+		})
+	}
+}
+
+func TestRedactRepoURL(t *testing.T) {
+	tests := []struct {
+		name, repoURL, want string
+		leaks               []string
+	}{
+		{"userinfo", "https://someone:s3cret-token@git.example.com/owner/skills.git", "https://git.example.com/owner/skills.git", []string{"s3cret-token", "someone"}},
+		{"token as username", "https://s3cret-token@git.example.com/owner/skills.git", "https://git.example.com/owner/skills.git", []string{"s3cret-token"}},
+		{"query token", "https://git.example.com/owner/skills?token=s3cret-token.git", "https://git.example.com/owner/skills", []string{"s3cret-token"}},
+		{"fragment", "https://git.example.com/owner/skills.git#s3cret-token", "https://git.example.com/owner/skills.git", []string{"s3cret-token"}},
+		{"question mark in password", "https://someone:s3cret?token@git.example.com/owner/skills.git", "https://git.example.com/owner/skills.git", []string{"s3cret?token", "someone"}},
+		{"git+https scheme", "git+https://someone:s3cret-token@git.example.com/owner/skills.git", "git+https://git.example.com/owner/skills.git", []string{"s3cret-token", "someone"}},
+		{"ssh password", "ssh://someone:s3cret-token@git.example.com/owner/skills.git", "ssh://git.example.com/owner/skills.git", []string{"s3cret-token", "someone"}},
+		{"no scheme, cloned over https", "someone:s3cret-token@git.example.com/owner/skills", "git.example.com/owner/skills", []string{"s3cret-token", "someone"}},
+		{"at sign in https path", "https://git.example.com/team@archive/skills.git", "https://git.example.com/team@archive/skills.git", nil},
+		{"at sign in file path", "file:///tmp/team@archive.git", "file:///tmp/team@archive.git", nil},
+		{"scp style", "git@github.com:owner/skills.git", "git@github.com:owner/skills.git", nil},
+		{"github shorthand", "anthropics/skills/skills/pdf", "anthropics/skills/skills/pdf", nil},
+		{"local path", "~/skills/team@archive", "~/skills/team@archive", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, redact := RedactRepoURL(tt.repoURL)
+			if got != tt.want {
+				t.Errorf("RedactRepoURL() = %q, want %q", got, tt.want)
+			}
+			echoed := redact.Replace("fatal: unable to access '" + tt.repoURL + "/': Failed to connect")
+			for _, leak := range tt.leaks {
+				if strings.Contains(echoed, leak) {
+					t.Errorf("replacer leaked %q: %q", leak, echoed)
+				}
+			}
+			if !strings.Contains(echoed, "Failed to connect") {
+				t.Errorf("replacer lost the error text: %q", echoed)
 			}
 		})
 	}

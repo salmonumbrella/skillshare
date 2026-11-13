@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"skillshare/internal/install"
 	"skillshare/internal/testutil"
 )
 
@@ -33,18 +34,18 @@ targets: {}
 		t.Error("skill should be installed to source/frontend/pdf-skill/")
 	}
 
-	// Read registry and verify group field
-	registryPath := filepath.Join(filepath.Dir(sb.ConfigPath), "registry.yaml")
-	registryContent := sb.ReadFile(registryPath)
-	if !strings.Contains(registryContent, "group: frontend") {
-		t.Errorf("registry should contain 'group: frontend', got:\n%s", registryContent)
+	// Read centralized metadata and verify group field
+	store, err := install.LoadMetadata(sb.SourcePath)
+	if err != nil {
+		t.Fatalf("failed to load metadata: %v", err)
 	}
-	// Name should be the bare name, not "frontend/pdf-skill"
-	if strings.Contains(registryContent, "name: frontend/pdf-skill") {
-		t.Errorf("registry should NOT contain legacy slash name 'frontend/pdf-skill', got:\n%s", registryContent)
+	// Full-path key: "frontend/pdf-skill" (not just basename "pdf-skill")
+	entry := store.Get("frontend/pdf-skill")
+	if entry == nil {
+		t.Fatal("expected metadata entry for 'frontend/pdf-skill'")
 	}
-	if !strings.Contains(registryContent, "name: pdf-skill") {
-		t.Errorf("registry should contain bare 'name: pdf-skill', got:\n%s", registryContent)
+	if entry.Group != "frontend" {
+		t.Errorf("metadata group = %q, want %q", entry.Group, "frontend")
 	}
 }
 
@@ -64,49 +65,18 @@ targets: {}
 	result := sb.RunCLI("install", localSkill, "--into", "frontend/vue")
 	result.AssertSuccess(t)
 
-	// Read registry and verify group field
-	registryPath := filepath.Join(filepath.Dir(sb.ConfigPath), "registry.yaml")
-	registryContent := sb.ReadFile(registryPath)
-	if !strings.Contains(registryContent, "group: frontend/vue") {
-		t.Errorf("registry should contain 'group: frontend/vue', got:\n%s", registryContent)
+	// Read centralized metadata and verify group field
+	store, err := install.LoadMetadata(sb.SourcePath)
+	if err != nil {
+		t.Fatalf("failed to load metadata: %v", err)
 	}
-	if !strings.Contains(registryContent, "name: ui-skill") {
-		t.Errorf("registry should contain bare 'name: ui-skill', got:\n%s", registryContent)
+	// Full-path key: "frontend/vue/ui-skill"
+	entry := store.Get("frontend/vue/ui-skill")
+	if entry == nil {
+		t.Fatal("expected metadata entry for 'frontend/vue/ui-skill'")
 	}
-}
-
-func TestInstall_ConfigBased_WithGroup(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	// Create a local skill to use as source
-	sourceSkill := filepath.Join(sb.Root, "source-pdf")
-	os.MkdirAll(sourceSkill, 0755)
-	os.WriteFile(filepath.Join(sourceSkill, "SKILL.md"), []byte("# PDF Skill"), 0644)
-
-	// First install normally with --into to populate config
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets: {}
-`)
-	result := sb.RunCLI("install", sourceSkill, "--into", "frontend")
-	result.AssertSuccess(t)
-
-	// Verify skill exists
-	skillPath := filepath.Join(sb.SourcePath, "frontend", "source-pdf", "SKILL.md")
-	if !sb.FileExists(skillPath) {
-		t.Fatal("skill should exist after initial install")
-	}
-
-	// Remove the installed skill (simulate fresh machine)
-	os.RemoveAll(filepath.Join(sb.SourcePath, "frontend"))
-
-	// Now run config-based install — this is the bug fix test
-	result = sb.RunCLI("install")
-	result.AssertSuccess(t)
-
-	// Verify skill was recreated in the correct group directory
-	if !sb.FileExists(skillPath) {
-		t.Error("config-based install should recreate skill at frontend/source-pdf/")
+	if entry.Group != "frontend/vue" {
+		t.Errorf("metadata group = %q, want %q", entry.Group, "frontend/vue")
 	}
 }
 
@@ -151,13 +121,75 @@ func TestInstallProject_Into_RecordsGroupField(t *testing.T) {
 	result := sb.RunCLIInDir(projectRoot, "install", sourceSkill, "--into", "tools", "-p")
 	result.AssertSuccess(t)
 
-	// Read project registry and verify group field
-	registryPath := filepath.Join(projectRoot, ".skillshare", "registry.yaml")
-	registryContent := sb.ReadFile(registryPath)
-	if !strings.Contains(registryContent, "group: tools") {
-		t.Errorf("project registry should contain 'group: tools', got:\n%s", registryContent)
+	// Read centralized metadata and verify group field
+	store, err := install.LoadMetadata(filepath.Join(projectRoot, ".skillshare", "skills"))
+	if err != nil {
+		t.Fatalf("failed to load metadata: %v", err)
 	}
-	if !strings.Contains(registryContent, "name: my-skill") {
-		t.Errorf("project registry should contain bare 'name: my-skill', got:\n%s", registryContent)
+	// Full-path key: "tools/my-skill"
+	entry := store.Get("tools/my-skill")
+	if entry == nil {
+		t.Fatal("expected metadata entry for 'tools/my-skill'")
 	}
+	if entry.Group != "tools" {
+		t.Errorf("metadata group = %q, want %q", entry.Group, "tools")
+	}
+}
+
+// assertGroupedMetadata checks the skills root records name and that no stray
+// metadata file sits in the group folder instead.
+func assertGroupedMetadata(t *testing.T, skillsRoot, name string) {
+	t.Helper()
+	store, err := install.LoadMetadata(skillsRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Get(name) == nil {
+		t.Errorf("no metadata entry %q at the skills root, have %v", name, store.List())
+	}
+	stray := filepath.Join(skillsRoot, filepath.Dir(name), install.MetadataFileName)
+	if _, err := os.Stat(stray); err == nil {
+		t.Errorf("metadata was written into the group folder: %s", stray)
+	}
+}
+
+func TestInstallProject_IntoGitSource_RecordedInConfig(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	source, _ := lockRemote(t, sb)
+	project := sb.SetupProjectDir("claude")
+
+	sb.RunCLIInDir(project, "install", source, "--into", "frontend", "-p").AssertSuccess(t)
+
+	assertGroupedMetadata(t, filepath.Join(project, ".skillshare", "skills"), "frontend/demo")
+	cfg, err := os.ReadFile(filepath.Join(project, ".skillshare", "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(cfg), "group: frontend") {
+		t.Errorf("config.yaml does not list the grouped skill, so teammates never install it:\n%s", cfg)
+	}
+}
+
+func TestInstallProject_FromConfig_GroupedSkill(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	source, _ := lockRemote(t, sb)
+	project := sb.SetupProjectDir("claude")
+	sb.WriteProjectConfig(project, "targets:\n  - claude\nskills:\n  - name: demo\n    source: "+source+"\n    group: frontend\n")
+
+	sb.RunCLIInDir(project, "install", "-p").AssertSuccess(t)
+
+	assertGroupedMetadata(t, filepath.Join(project, ".skillshare", "skills"), "frontend/demo")
+}
+
+func TestInstallGlobal_FromConfig_GroupedSkill(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	source, _ := lockRemote(t, sb)
+	sb.WriteConfig("source: " + sb.SourcePath + "\ntargets: {}\nskills:\n  - name: demo\n    source: " + source + "\n    group: frontend\n")
+
+	sb.RunCLI("install", "-g").AssertSuccess(t)
+
+	assertGroupedMetadata(t, sb.SourcePath, "frontend/demo")
 }

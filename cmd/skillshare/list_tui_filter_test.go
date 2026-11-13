@@ -68,13 +68,46 @@ func TestParseFilterQuery_RepoTag(t *testing.T) {
 	}
 }
 
+func TestParseFilterQuery_StatusTag(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"s:enabled", "enabled"},
+		{"s:disabled", "disabled"},
+		{"status:enabled", "enabled"},
+		{"status:disabled", "disabled"},
+		{"S:Disabled", "disabled"}, // case-insensitive
+	}
+	for _, tt := range tests {
+		q := parseFilterQuery(tt.input)
+		if q.StatusTag != tt.want {
+			t.Errorf("parseFilterQuery(%q).StatusTag = %q, want %q", tt.input, q.StatusTag, tt.want)
+		}
+	}
+}
+
+func TestParseFilterQuery_StatusUnknownIsFreeText(t *testing.T) {
+	// Unknown status values fall back to free text (no aliases supported).
+	q := parseFilterQuery("s:on")
+	if q.StatusTag != "" {
+		t.Fatalf("StatusTag = %q, want empty for unknown value", q.StatusTag)
+	}
+	if q.FreeText != "s:on" {
+		t.Fatalf("FreeText = %q, want %q", q.FreeText, "s:on")
+	}
+}
+
 func TestParseFilterQuery_MultipleTags(t *testing.T) {
-	q := parseFilterQuery("t:tracked g:security audit")
+	q := parseFilterQuery("t:tracked g:security s:disabled audit")
 	if q.TypeTag != "tracked" {
 		t.Fatalf("TypeTag = %q, want %q", q.TypeTag, "tracked")
 	}
 	if q.GroupTag != "security" {
 		t.Fatalf("GroupTag = %q, want %q", q.GroupTag, "security")
+	}
+	if q.StatusTag != "disabled" {
+		t.Fatalf("StatusTag = %q, want %q", q.StatusTag, "disabled")
 	}
 	if q.FreeText != "audit" {
 		t.Fatalf("FreeText = %q, want %q", q.FreeText, "audit")
@@ -100,14 +133,28 @@ func TestParseFilterQuery_EmptyValueIgnored(t *testing.T) {
 }
 
 func TestSkillGroup_TrackedNested(t *testing.T) {
-	e := skillEntry{RelPath: "_team-repo/security/audit", RepoName: "team/repo"}
+	e := skillEntry{RelPath: "_team-repo/security/audit", RepoName: "_team-repo"}
 	if got := skillGroup(e); got != "security" {
 		t.Fatalf("skillGroup() = %q, want %q", got, "security")
 	}
 }
 
+func TestSkillGroup_TrackedInstalledInto(t *testing.T) {
+	e := skillEntry{RelPath: "org/_team-repo/security/audit", RepoName: "org/_team-repo"}
+	if got := skillGroup(e); got != "security" {
+		t.Fatalf("skillGroup() = %q, want %q", got, "security")
+	}
+}
+
+func TestSkillGroup_TrackedInstalledIntoRootSkill(t *testing.T) {
+	e := skillEntry{RelPath: "org/_team-repo", RepoName: "org/_team-repo"}
+	if got := skillGroup(e); got != "" {
+		t.Fatalf("skillGroup() = %q, want empty for the repo's root skill", got)
+	}
+}
+
 func TestSkillGroup_TrackedRoot(t *testing.T) {
-	e := skillEntry{RelPath: "_team-repo/my-skill", RepoName: "team/repo"}
+	e := skillEntry{RelPath: "_team-repo/my-skill", RepoName: "_team-repo"}
 	if got := skillGroup(e); got != "" {
 		t.Fatalf("skillGroup() = %q, want empty for tracked root-level", got)
 	}
@@ -191,11 +238,37 @@ func TestMatchSkillItem_FreeTextMatch(t *testing.T) {
 	}
 }
 
+func TestMatchSkillItem_StatusDisabled(t *testing.T) {
+	disabled := skillItem{entry: skillEntry{Name: "old", RelPath: "misc/old", Disabled: true}}
+	enabled := skillItem{entry: skillEntry{Name: "new", RelPath: "misc/new"}}
+
+	q := filterQuery{StatusTag: "disabled"}
+	if !matchSkillItem(disabled, q) {
+		t.Fatal("expected disabled item to match s:disabled")
+	}
+	if matchSkillItem(enabled, q) {
+		t.Fatal("expected enabled item NOT to match s:disabled")
+	}
+}
+
+func TestMatchSkillItem_StatusEnabled(t *testing.T) {
+	disabled := skillItem{entry: skillEntry{Name: "old", RelPath: "misc/old", Disabled: true}}
+	enabled := skillItem{entry: skillEntry{Name: "new", RelPath: "misc/new"}}
+
+	q := filterQuery{StatusTag: "enabled"}
+	if !matchSkillItem(enabled, q) {
+		t.Fatal("expected enabled item to match s:enabled")
+	}
+	if matchSkillItem(disabled, q) {
+		t.Fatal("expected disabled item NOT to match s:enabled")
+	}
+}
+
 func TestMatchSkillItem_ANDLogic(t *testing.T) {
 	item := skillItem{entry: skillEntry{
 		Name:     "audit",
 		RelPath:  "_team-repo/security/audit",
-		RepoName: "team/repo",
+		RepoName: "_team-repo",
 	}}
 
 	// All conditions match

@@ -1,0 +1,64 @@
+package server
+
+import (
+	"net/http"
+
+	"skillshare/internal/mcp"
+	"skillshare/internal/version"
+)
+
+// handleMCPCheck answers `skillshare mcp check --json` for the dashboard. It writes no
+// config and no operation log entry. Findings that are errors still return 200; only a
+// check that cannot run fails the request. ?dns=0 skips host lookups. ?live=1 also probes
+// the servers, as `mcp check --live` does, and each server's live result lists the tool
+// names it reported; it also pins and compares tool definitions as the CLI does, which
+// writes mcp/tool-pins.json, but never accepts a change. Repeated ?name= limits the check
+// to those servers.
+func (s *Server) handleMCPCheck(w http.ResponseWriter, r *http.Request) {
+	// Release s.mu before the lookups and probes: every other API request waits on it.
+	s.mu.RLock()
+	service := s.mcpService()
+	s.mu.RUnlock()
+	query := r.URL.Query()
+	report, err := service.Check(mcp.CheckOptions{
+		SkipDNS:       query.Get("dns") == "0",
+		Live:          query.Get("live") == "1",
+		Names:         query["name"],
+		ClientVersion: version.Version,
+	})
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, report)
+}
+
+// handleMCPProbe probes the server in the request, as the dashboard's form describes it
+// before it is saved, the way ?live=1 probes a saved one. It saves and syncs nothing.
+func (s *Server) handleMCPProbe(w http.ResponseWriter, r *http.Request) {
+	var body mcpRequest
+	if !decodeMCPRequest(w, r, &body) {
+		return
+	}
+	if body.Mutation.Server == nil {
+		writeError(w, 400, "server is required")
+		return
+	}
+	s.mu.RLock()
+	service, ok := s.mcpProjectService(w, body.Mutation.Project)
+	s.mu.RUnlock()
+	if !ok {
+		return
+	}
+	// A project server starts in its root, as a live check of a saved one does.
+	root := ""
+	if body.Mutation.Project != "" {
+		root = service.ProjectRoot
+	}
+	result, err := mcp.ProbeDraft(*body.Mutation.Server, root, mcp.CheckOptions{ClientVersion: version.Version})
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	writeJSON(w, result)
+}

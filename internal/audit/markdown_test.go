@@ -271,3 +271,60 @@ func TestToMarkdown_NoScanErrorsRow(t *testing.T) {
 		t.Error("should not show scan errors when count is 0")
 	}
 }
+
+func TestMarkdownCoverageIncludesCleanResources(t *testing.T) {
+	result := ToMarkdown([]*Result{{SkillName: "clean", SkippedFiles: 2, BinaryFiles: 1, OversizedFiles: 1}}, MarkdownOptions{SkippedFiles: 2, BinaryFiles: 1, OversizedFiles: 1})
+	if !strings.Contains(result, "| clean | 2 | 1 | 1 |") {
+		t.Fatalf("missing resource coverage: %s", result)
+	}
+}
+
+func TestToMarkdown_SourceLinkWarningsSurviveTheFloor(t *testing.T) {
+	t.Parallel()
+
+	md := ToMarkdown(nil, MarkdownOptions{
+		Mode:           "global",
+		Threshold:      "CRITICAL",
+		RiskLabel:      "clean",
+		MinSeverity:    SeverityCritical,
+		SourceWarnings: []string{"source link _dev not followed: target is missing"},
+		Incomplete:     true,
+	})
+
+	if !strings.Contains(md, "**Incomplete scan:**") || !strings.Contains(md, "- source link _dev not followed: target is missing\n") {
+		t.Fatal(md)
+	}
+}
+
+func TestToMarkdown_NoSourceLinkSection(t *testing.T) {
+	t.Parallel()
+
+	md := ToMarkdown(nil, MarkdownOptions{Mode: "global", Threshold: "CRITICAL", RiskLabel: "clean"})
+
+	if strings.Contains(md, "Source links") {
+		t.Fatal(md)
+	}
+}
+
+func TestToMarkdown_ExplainsLoweredSeverity(t *testing.T) {
+	results := []*Result{{SkillName: "sentinel", Findings: []Finding{
+		{Severity: SeverityHigh, Pattern: "credential-access", Message: "m", File: "hook.py", Line: 3, Snippet: "# cat ~/.aws/credentials", SeverityContext: SeverityContextPythonInert},
+	}}}
+	md := ToMarkdown(results, MarkdownOptions{})
+	for _, line := range strings.Split(md, "\n") {
+		if strings.HasPrefix(line, "| 1 |") {
+			if !strings.Contains(line, "lowered from CRITICAL") {
+				t.Fatalf("findings table row does not explain the lowered severity: %s", line)
+			}
+			return
+		}
+	}
+	t.Fatalf("no findings table row:\n%s", md)
+}
+
+func TestToMarkdown_SummaryCountsAccepted(t *testing.T) {
+	md := ToMarkdown(nil, MarkdownOptions{Accepted: 2})
+	if !strings.Contains(md, "| Accepted | 2 |") {
+		t.Errorf("summary table must count accepted findings:\n%s", md)
+	}
+}

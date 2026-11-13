@@ -1,0 +1,42 @@
+{
+  "title": {
+    "message": "skillshare",
+    "description": "The title in the navbar"
+  },
+  "logo.alt": {
+    "message": "skillshare",
+    "description": "The alt text of navbar logo"
+  },
+  "item.label.Learn": {
+    "message": "학습",
+    "description": "Navbar item with label Learn"
+  },
+  "item.label.How-To": {
+    "message": "사용 방법",
+    "description": "Navbar item with label How-To"
+  },
+  "item.label.Reference": {
+    "message": "레퍼런스",
+    "description": "Navbar item with label Reference"
+  },
+  "item.label.Feature map": {
+    "message": "기능 맵",
+    "description": "Navbar item with label Feature map"
+  },
+  "item.label.Blog": {
+    "message": "블로그",
+    "description": "Navbar item with label Blog"
+  },
+  "item.label.Changelog": {
+    "message": "변경 내역",
+    "description": "Navbar item with label Changelog"
+  },
+  "item.label.GitHub": {
+    "message": "GitHub",
+    "description": "Navbar item with label GitHub"
+  },
+  "item.label.Desktop App": {
+    "message": "데스크톱 앱",
+    "description": "Navbar item with label Desktop App"
+  }
+}

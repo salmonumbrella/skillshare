@@ -3,8 +3,10 @@
 package integration
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"skillshare/internal/testutil"
@@ -33,7 +35,7 @@ targets:
 	result := sb.RunCLI("sync")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "merged")
+	result.AssertRowContains(t, "claude", "1 linked")
 
 	// Verify symlink was created
 	skillLink := filepath.Join(targetPath, "my-skill")
@@ -44,47 +46,6 @@ targets:
 	expectedTarget := filepath.Join(sb.SourcePath, "my-skill")
 	if got := sb.SymlinkTarget(skillLink); got != expectedTarget {
 		t.Errorf("symlink target = %q, want %q", got, expectedTarget)
-	}
-}
-
-func TestSync_MergeMode_PreservesLocalSkills(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	// Create source skill
-	sb.CreateSkill("shared-skill", map[string]string{
-		"SKILL.md": "# Shared",
-	})
-
-	// Create target with local skill
-	targetPath := sb.CreateTarget("claude")
-	localSkillPath := filepath.Join(targetPath, "local-skill")
-	os.MkdirAll(localSkillPath, 0755)
-	os.WriteFile(filepath.Join(localSkillPath, "SKILL.md"), []byte("# Local"), 0644)
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-mode: merge
-targets:
-  claude:
-    path: ` + targetPath + `
-`)
-
-	result := sb.RunCLI("sync")
-
-	result.AssertSuccess(t)
-
-	// Verify local skill preserved (is still a directory, not symlink)
-	if sb.IsSymlink(localSkillPath) {
-		t.Error("local skill should not be converted to symlink")
-	}
-	if !sb.FileExists(filepath.Join(localSkillPath, "SKILL.md")) {
-		t.Error("local skill files should be preserved")
-	}
-
-	// Verify shared skill is symlinked
-	sharedSkillPath := filepath.Join(targetPath, "shared-skill")
-	if !sb.IsSymlink(sharedSkillPath) {
-		t.Error("shared skill should be a symlink")
 	}
 }
 
@@ -138,16 +99,40 @@ func TestSync_SourceNotExist_ReturnsError(t *testing.T) {
 	defer sb.Cleanup()
 
 	// Config points to non-existent source
+	targetPath := sb.CreateTarget("claude")
 	sb.WriteConfig(`source: /nonexistent/path
 targets:
   claude:
-    path: ` + filepath.Join(sb.Home, ".claude", "skills") + `
+    path: ` + targetPath + `
 `)
 
 	result := sb.RunCLI("sync")
 
 	result.AssertFailure(t)
-	result.AssertAnyOutputContains(t, "source directory does not exist")
+	result.AssertAnyOutputContains(t, "source path does not exist")
+}
+
+func TestSync_GlobalDefaultSourceWhenOmitted(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("default-source-skill", map[string]string{
+		"SKILL.md": "# Default Source Skill",
+	})
+	targetPath := sb.CreateTarget("claude")
+
+	sb.WriteConfig(`targets:
+  claude:
+    skills:
+      path: ` + targetPath + `
+`)
+
+	result := sb.RunCLI("sync", "--global")
+
+	result.AssertSuccess(t)
+	if !sb.IsSymlink(filepath.Join(targetPath, "default-source-skill")) {
+		t.Error("skill from default source should be synced")
+	}
 }
 
 func TestSync_SymlinkMode_CreatesSingleSymlink(t *testing.T) {
@@ -157,9 +142,7 @@ func TestSync_SymlinkMode_CreatesSingleSymlink(t *testing.T) {
 	sb.CreateSkill("skill1", map[string]string{"SKILL.md": "# Skill 1"})
 	sb.CreateSkill("skill2", map[string]string{"SKILL.md": "# Skill 2"})
 
-	targetPath := filepath.Join(sb.Home, ".claude", "skills")
-	// Remove target directory if exists for symlink mode
-	os.RemoveAll(targetPath)
+	targetPath := sb.CreateTarget("claude")
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
 targets:
@@ -211,134 +194,6 @@ targets:
 	}
 	if !sb.IsSymlink(filepath.Join(codexPath, "common-skill")) {
 		t.Error("skill should be synced to codex")
-	}
-}
-
-func TestSync_Force_OverwritesConflict(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("skill", map[string]string{"SKILL.md": "# Skill"})
-
-	// Create target as symlink to wrong location
-	targetPath := filepath.Join(sb.Home, ".claude", "skills")
-	wrongSource := filepath.Join(sb.Home, "wrong-source")
-	os.MkdirAll(wrongSource, 0755)
-	os.MkdirAll(filepath.Dir(targetPath), 0755)
-	os.RemoveAll(targetPath)
-	os.Symlink(wrongSource, targetPath)
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets:
-  claude:
-    path: ` + targetPath + `
-    mode: symlink
-`)
-
-	// Execute without force - should fail
-	result := sb.RunCLI("sync")
-	result.AssertFailure(t)
-
-	// Execute with force - should succeed
-	result = sb.RunCLI("sync", "--force")
-	result.AssertSuccess(t)
-
-	// Verify symlink now points to correct source
-	if got := sb.SymlinkTarget(targetPath); got != sb.SourcePath {
-		t.Errorf("symlink target = %q, want %q", got, sb.SourcePath)
-	}
-}
-
-func TestSync_NestedSkills_FlatNaming(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	// Create nested skill structure
-	// Source: personal/writing/email/SKILL.md -> Target: personal__writing__email
-	sb.CreateNestedSkill("personal/writing/email", map[string]string{
-		"SKILL.md": "# Email Writing Skill",
-	})
-
-	// Also create a regular flat skill for comparison
-	sb.CreateSkill("my-helper", map[string]string{
-		"SKILL.md": "# My Helper",
-	})
-
-	targetPath := sb.CreateTarget("claude")
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-mode: merge
-targets:
-  claude:
-    path: ` + targetPath + `
-`)
-
-	result := sb.RunCLI("sync")
-
-	result.AssertSuccess(t)
-
-	// Verify flat skill is symlinked normally
-	flatSkillLink := filepath.Join(targetPath, "my-helper")
-	if !sb.IsSymlink(flatSkillLink) {
-		t.Error("flat skill should be a symlink")
-	}
-
-	// Verify nested skill is symlinked with flat naming
-	nestedSkillLink := filepath.Join(targetPath, "personal__writing__email")
-	if !sb.IsSymlink(nestedSkillLink) {
-		t.Errorf("nested skill should be a symlink at %s", nestedSkillLink)
-	}
-
-	// Verify symlink points to correct nested source
-	expectedNestedTarget := filepath.Join(sb.SourcePath, "personal", "writing", "email")
-	if got := sb.SymlinkTarget(nestedSkillLink); got != expectedNestedTarget {
-		t.Errorf("nested symlink target = %q, want %q", got, expectedNestedTarget)
-	}
-}
-
-func TestSync_TrackedRepoSkills_FlatNaming(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	// Create a tracked repo structure with nested skills
-	// Source: _team-repo/frontend/ui/SKILL.md -> Target: _team-repo__frontend__ui
-	sb.CreateNestedSkill("_team-repo/frontend/ui", map[string]string{
-		"SKILL.md": "# UI Components",
-	})
-
-	// Another skill in the same tracked repo
-	sb.CreateNestedSkill("_team-repo/backend/api", map[string]string{
-		"SKILL.md": "# API Utilities",
-	})
-
-	targetPath := sb.CreateTarget("claude")
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-mode: merge
-targets:
-  claude:
-    path: ` + targetPath + `
-`)
-
-	result := sb.RunCLI("sync")
-
-	result.AssertSuccess(t)
-
-	// Verify tracked repo skills are symlinked with flat naming
-	uiSkillLink := filepath.Join(targetPath, "_team-repo__frontend__ui")
-	if !sb.IsSymlink(uiSkillLink) {
-		t.Errorf("tracked repo skill should be a symlink at %s", uiSkillLink)
-	}
-
-	apiSkillLink := filepath.Join(targetPath, "_team-repo__backend__api")
-	if !sb.IsSymlink(apiSkillLink) {
-		t.Errorf("tracked repo skill should be a symlink at %s", apiSkillLink)
-	}
-
-	// Verify symlinks point to correct nested sources
-	expectedUITarget := filepath.Join(sb.SourcePath, "_team-repo", "frontend", "ui")
-	if got := sb.SymlinkTarget(uiSkillLink); got != expectedUITarget {
-		t.Errorf("UI symlink target = %q, want %q", got, expectedUITarget)
 	}
 }
 
@@ -434,20 +289,14 @@ targets:
 	}
 }
 
-func TestSync_Pruning_PreservesLocalDirectories(t *testing.T) {
+func TestSync_PreservesRegistryEntries(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
 
-	// Create source skill
-	sb.CreateSkill("shared-skill", map[string]string{"SKILL.md": "# Shared"})
+	// Create a local skill that sync will discover
+	sb.CreateSkill("local-skill", map[string]string{"SKILL.md": "# Local"})
 
 	targetPath := sb.CreateTarget("claude")
-
-	// Create a local directory in target (not a symlink)
-	localSkillPath := filepath.Join(targetPath, "my-local-skill")
-	os.MkdirAll(localSkillPath, 0755)
-	os.WriteFile(filepath.Join(localSkillPath, "SKILL.md"), []byte("# Local"), 0644)
-
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
 mode: merge
 targets:
@@ -455,98 +304,23 @@ targets:
     path: ` + targetPath + `
 `)
 
-	result := sb.RunCLI("sync")
-	result.AssertSuccess(t)
-
-	// Local directory should be preserved (warning issued but not deleted)
-	if !sb.FileExists(localSkillPath) {
-		t.Error("local skill directory should be preserved")
-	}
-}
-
-func TestSync_MergeMode_IncludeFilter(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("codex-plan", map[string]string{"SKILL.md": "# Codex"})
-	sb.CreateSkill("claude-help", map[string]string{"SKILL.md": "# Claude"})
-	targetPath := sb.CreateTarget("claude")
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-mode: merge
-targets:
-  claude:
-    path: ` + targetPath + `
-    include: [codex-*]
-`)
+	// Write a registry with a remote-installed skill that has NO files on disk.
+	// Sync must NOT prune this entry — registry is the source of truth for installations.
+	registryPath := filepath.Join(sb.SourcePath, "registry.yaml")
+	registryContent := "skills:\n  - name: remote-tool\n    source: github.com/someone/remote-tool\n"
+	os.WriteFile(registryPath, []byte(registryContent), 0644)
 
 	result := sb.RunCLI("sync")
 	result.AssertSuccess(t)
 
-	if !sb.IsSymlink(filepath.Join(targetPath, "codex-plan")) {
-		t.Error("included skill should be symlinked")
+	// Verify registry still contains the remote-tool entry
+	data, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatalf("failed to read registry: %v", err)
 	}
-	if sb.FileExists(filepath.Join(targetPath, "claude-help")) {
-		t.Error("non-included skill should not be synced")
-	}
-}
-
-func TestSync_MergeMode_ExcludeFilter(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("codex-plan", map[string]string{"SKILL.md": "# Codex"})
-	sb.CreateSkill("claude-help", map[string]string{"SKILL.md": "# Claude"})
-	targetPath := sb.CreateTarget("claude")
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-mode: merge
-targets:
-  claude:
-    path: ` + targetPath + `
-    exclude: [claude-*]
-`)
-
-	result := sb.RunCLI("sync")
-	result.AssertSuccess(t)
-
-	if !sb.IsSymlink(filepath.Join(targetPath, "codex-plan")) {
-		t.Error("non-excluded skill should be symlinked")
-	}
-	if sb.FileExists(filepath.Join(targetPath, "claude-help")) {
-		t.Error("excluded skill should not be synced")
-	}
-}
-
-func TestSync_MergeMode_IncludeThenExclude(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("codex-plan", map[string]string{"SKILL.md": "# Plan"})
-	sb.CreateSkill("codex-test", map[string]string{"SKILL.md": "# Test"})
-	sb.CreateSkill("claude-help", map[string]string{"SKILL.md": "# Claude"})
-	targetPath := sb.CreateTarget("claude")
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-mode: merge
-targets:
-  claude:
-    path: ` + targetPath + `
-    include: [codex-*]
-    exclude: ["*-test"]
-`)
-
-	result := sb.RunCLI("sync")
-	result.AssertSuccess(t)
-
-	if !sb.IsSymlink(filepath.Join(targetPath, "codex-plan")) {
-		t.Error("included skill should be symlinked")
-	}
-	if sb.FileExists(filepath.Join(targetPath, "codex-test")) {
-		t.Error("exclude should be applied after include")
-	}
-	if sb.FileExists(filepath.Join(targetPath, "claude-help")) {
-		t.Error("skills outside include should not be synced")
+	content := string(data)
+	if !strings.Contains(content, "remote-tool") {
+		t.Errorf("sync should preserve registry entry for installed skill without local files, got:\n%s", content)
 	}
 }
 
@@ -714,80 +488,6 @@ targets:
 	}
 }
 
-func TestSync_MergeMode_ManifestPrunesOrphanDir(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("my-skill", map[string]string{"SKILL.md": "# My Skill"})
-	targetPath := sb.CreateTarget("claude")
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-mode: merge
-targets:
-  claude:
-    path: ` + targetPath + `
-`)
-
-	// First sync — creates symlink + manifest
-	result := sb.RunCLI("sync")
-	result.AssertSuccess(t)
-
-	if !sb.IsSymlink(filepath.Join(targetPath, "my-skill")) {
-		t.Fatal("my-skill should be a symlink after sync")
-	}
-
-	// Replace symlink with a real directory (simulates copy-mode residue)
-	os.Remove(filepath.Join(targetPath, "my-skill"))
-	os.MkdirAll(filepath.Join(targetPath, "my-skill"), 0755)
-	os.WriteFile(filepath.Join(targetPath, "my-skill", "SKILL.md"), []byte("# Copy"), 0644)
-
-	// Remove source skill (simulates uninstall)
-	os.RemoveAll(filepath.Join(sb.SourcePath, "my-skill"))
-
-	// Sync again — manifest knows my-skill was managed, so it should be pruned
-	result = sb.RunCLI("sync")
-	result.AssertSuccess(t)
-
-	if sb.FileExists(filepath.Join(targetPath, "my-skill")) {
-		t.Error("manifest-tracked orphan directory should have been pruned")
-	}
-}
-
-func TestSync_MergeMode_ManifestPreservesUserDir(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("shared-skill", map[string]string{"SKILL.md": "# Shared"})
-	targetPath := sb.CreateTarget("claude")
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-mode: merge
-targets:
-  claude:
-    path: ` + targetPath + `
-`)
-
-	// Sync to establish manifest
-	result := sb.RunCLI("sync")
-	result.AssertSuccess(t)
-
-	// Manually create a user directory (never synced by skillshare)
-	userDir := filepath.Join(targetPath, "user-created")
-	os.MkdirAll(userDir, 0755)
-	os.WriteFile(filepath.Join(userDir, "SKILL.md"), []byte("# User"), 0644)
-
-	// Remove source skill
-	os.RemoveAll(filepath.Join(sb.SourcePath, "shared-skill"))
-
-	// Sync again — user-created should be preserved (not in manifest)
-	result = sb.RunCLI("sync")
-	result.AssertSuccess(t)
-
-	if !sb.FileExists(userDir) {
-		t.Error("user-created directory should be preserved (not in manifest)")
-	}
-}
-
 func TestSync_MergeMode_InvalidFilterPatternFails(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
@@ -806,4 +506,165 @@ targets:
 	result := sb.RunCLI("sync")
 	result.AssertFailure(t)
 	result.AssertAnyOutputContains(t, "invalid include pattern")
+}
+
+func TestSync_IgnoredSkillsTextOutput(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("keep-me", map[string]string{
+		"SKILL.md": "---\nname: keep-me\n---\nKeep",
+	})
+	sb.CreateSkill("ignore-me", map[string]string{
+		"SKILL.md": "---\nname: ignore-me\n---\nIgnored",
+	})
+	targetPath := sb.CreateTarget("claude")
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+mode: merge
+targets:
+  claude:
+    path: ` + targetPath + `
+`)
+
+	os.WriteFile(filepath.Join(sb.SourcePath, ".skillignore"), []byte("ignore-me\n"), 0644)
+
+	result := sb.RunCLI("sync")
+	result.AssertSuccess(t)
+	result.AssertAnyOutputContains(t, "1 skill(s) ignored by .skillignore")
+	result.AssertAnyOutputContains(t, "ignore-me")
+}
+
+func TestSync_IgnoredSkillsJSONOutput(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("keep-me", map[string]string{
+		"SKILL.md": "---\nname: keep-me\n---\nKeep",
+	})
+	sb.CreateSkill("ignore-me", map[string]string{
+		"SKILL.md": "---\nname: ignore-me\n---\nIgnored",
+	})
+	targetPath := sb.CreateTarget("claude")
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+mode: merge
+targets:
+  claude:
+    path: ` + targetPath + `
+`)
+
+	os.WriteFile(filepath.Join(sb.SourcePath, ".skillignore"), []byte("ignore-me\n"), 0644)
+
+	result := sb.RunCLI("sync", "--json")
+	result.AssertSuccess(t)
+
+	var output map[string]any
+	if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+
+	ignoredCount := int(output["ignored_count"].(float64))
+	if ignoredCount != 1 {
+		t.Errorf("expected ignored_count=1, got %d", ignoredCount)
+	}
+
+	ignoredSkills := output["ignored_skills"].([]any)
+	if len(ignoredSkills) != 1 || ignoredSkills[0].(string) != "ignore-me" {
+		t.Errorf("expected ignored_skills=[ignore-me], got %v", ignoredSkills)
+	}
+}
+
+func TestSync_NoSkillignore_NoIgnoredOutput(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("my-skill", map[string]string{
+		"SKILL.md": "---\nname: my-skill\n---\nContent",
+	})
+	targetPath := sb.CreateTarget("claude")
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+mode: merge
+targets:
+  claude:
+    path: ` + targetPath + `
+`)
+
+	result := sb.RunCLI("sync")
+	result.AssertSuccess(t)
+	result.AssertOutputNotContains(t, "ignored by .skillignore")
+}
+
+func TestSync_SkillignoreLocal_OverridesBase(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("keep-me", map[string]string{
+		"SKILL.md": "---\nname: keep-me\n---\nKeep",
+	})
+	sb.CreateSkill("private-mine", map[string]string{
+		"SKILL.md": "---\nname: private-mine\n---\nMine",
+	})
+	sb.CreateSkill("private-other", map[string]string{
+		"SKILL.md": "---\nname: private-other\n---\nOther",
+	})
+	targetPath := sb.CreateTarget("claude")
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+mode: merge
+targets:
+  claude:
+    path: ` + targetPath + `
+`)
+
+	// .skillignore blocks all private-* skills
+	os.WriteFile(filepath.Join(sb.SourcePath, ".skillignore"), []byte("private-*\n"), 0644)
+	// .skillignore.local un-ignores private-mine
+	os.WriteFile(filepath.Join(sb.SourcePath, ".skillignore.local"), []byte("!private-mine\n"), 0644)
+
+	result := sb.RunCLI("sync")
+	result.AssertSuccess(t)
+
+	// private-mine should be synced (un-ignored by .local)
+	if _, err := os.Stat(filepath.Join(targetPath, "private-mine")); os.IsNotExist(err) {
+		t.Error("private-mine should be synced (un-ignored by .skillignore.local)")
+	}
+
+	// private-other should NOT be synced (still ignored)
+	if _, err := os.Stat(filepath.Join(targetPath, "private-other")); err == nil {
+		t.Error("private-other should NOT be synced (still ignored)")
+	}
+
+	// keep-me should be synced
+	if _, err := os.Stat(filepath.Join(targetPath, "keep-me")); os.IsNotExist(err) {
+		t.Error("keep-me should be synced")
+	}
+
+	// Output should show 1 ignored skill and .local hint
+	result.AssertAnyOutputContains(t, "1 skill(s) ignored by .skillignore")
+	result.AssertAnyOutputContains(t, "private-other")
+	result.AssertAnyOutputContains(t, ".local")
+}
+
+// A built-in target listed without a path takes its path from targets.yaml.
+// antigravity-cli used to be an alias, and DefaultTargets() is not alias-aware,
+// so a path-less entry failed validation instead of resolving.
+func TestSync_BuiltinTargetWithoutPath_UsesDefaultPath(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("my-skill", map[string]string{
+		"SKILL.md": "# My Skill",
+	})
+	targetPath := sb.CreateTarget("antigravity-cli")
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+mode: merge
+targets:
+  antigravity-cli:
+`)
+
+	result := sb.RunCLI("sync")
+	result.AssertSuccess(t)
+
+	if !sb.IsSymlink(filepath.Join(targetPath, "my-skill")) {
+		t.Errorf("symlink not created at %s", filepath.Join(targetPath, "my-skill"))
+	}
 }

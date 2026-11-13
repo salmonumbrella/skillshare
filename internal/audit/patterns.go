@@ -3,6 +3,7 @@ package audit
 import (
 	_ "embed"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,7 +11,12 @@ import (
 	"sync"
 
 	"gopkg.in/yaml.v3"
+	"skillshare/internal/projectdir"
 )
+
+// auditRulesFileName is the per-project audit rule override file, resolved
+// inside whichever project directory is active.
+const auditRulesFileName = "audit-rules.yaml"
 
 // Severity levels for audit findings.
 const (
@@ -89,31 +95,62 @@ func SeverityRank(sev string) int {
 
 // rule defines a single compiled scanning pattern.
 type rule struct {
-	ID       string
-	Severity string
-	Pattern  string // rule name
-	Message  string
-	Regex    *regexp.Regexp
-	Exclude  *regexp.Regexp // if non-nil, suppress match when this also matches
+	Files              []string
+	matchKind          string
+	requestRegex       *regexp.Regexp // embedded metadata request context
+	ID                 string
+	Severity           string
+	Pattern            string // rule name
+	Message            string
+	Confidence         float64
+	Regex              *regexp.Regexp
+	Exclude            *regexp.Regexp // if non-nil, suppress match when this also matches
+	severityOverridden bool
+	excludePhrase      bool
+	pythonInertContext bool // built-in credential rule; see inertSeverity
 	// prefilter is a conservative literal that must appear in a candidate line
 	// before running the full regex. Empty means no fast prefilter is available.
 	prefilter     string
 	prefilterFold bool
 }
 
+const defaultRuleConfidence = 0.95
+
 // yamlRule is the YAML deserialization type for a single rule.
 type yamlRule struct {
-	ID       string `yaml:"id"`
-	Severity string `yaml:"severity"`
-	Pattern  string `yaml:"pattern"`
-	Message  string `yaml:"message"`
-	Regex    string `yaml:"regex"`
-	Exclude  string `yaml:"exclude,omitempty"`
-	Enabled  *bool  `yaml:"enabled,omitempty"` // nil = true; false = disable
+	Files                fileGlobs `yaml:"files,omitempty"`
+	matchKind            string    `yaml:"-"`
+	requestRegex         string    `yaml:"-"`
+	ID                   string    `yaml:"id"`
+	Severity             string    `yaml:"severity"`
+	Pattern              string    `yaml:"pattern"`
+	Message              string    `yaml:"message"`
+	Confidence           *float64  `yaml:"confidence,omitempty"`
+	Regex                string    `yaml:"regex"`
+	Exclude              string    `yaml:"exclude,omitempty"`
+	Enabled              *bool     `yaml:"enabled,omitempty"` // nil = true; false = disable
+	severityOverridden   bool      `yaml:"-"`
+	confidenceOverridden bool      `yaml:"-"`
+	excludePhrase        bool      `yaml:"-"`
+	pythonInertContext   bool      `yaml:"-"`
 }
 
 type rulesFile struct {
 	Rules []yamlRule `yaml:"rules"`
+}
+
+func (r rule) matchesLine(line string) bool {
+	if r.ID == ruleWhitespacePadding || !r.matchesSensitiveLine(line) {
+		return false
+	}
+	if r.Exclude == nil || !r.Exclude.MatchString(line) {
+		return true
+	}
+	if r.excludePhrase {
+		// Exclude explicit-concealment phrases, not separate generic directives.
+		return r.Regex.MatchString(r.Exclude.ReplaceAllString(line, " "))
+	}
+	return false
 }
 
 //go:embed rules.yaml
@@ -135,12 +172,11 @@ var (
 // loadBuiltinRules parses and compiles the embedded rules.yaml + table-driven credential rules.
 func loadBuiltinRules() ([]rule, error) {
 	builtinOnce.Do(func() {
-		yr, err := parseRulesYAML(defaultRulesData)
+		yr, err := parseBuiltinRulesYAML()
 		if err != nil {
 			builtinRulesErr = fmt.Errorf("builtin rules: %w", err)
 			return
 		}
-		yr = append(yr, credentialYAMLRules()...)
 		builtinRules, builtinRulesErr = compileRules(yr)
 	})
 	return builtinRules, builtinRulesErr
@@ -155,7 +191,8 @@ func Rules() ([]rule, error) {
 			return
 		}
 
-		userYAML, err := loadUserRules(globalAuditRulesPath())
+		path := globalAuditRulesPath()
+		userYAML, err := loadUserRules(path)
 		if err != nil {
 			globalRulesErr = fmt.Errorf("global user rules: %w", err)
 			return
@@ -167,7 +204,10 @@ func Rules() ([]rule, error) {
 		}
 
 		merged := mergeYAMLRules(builtinYAML(), userYAML)
-		globalRules, globalRulesErr = compileRules(merged)
+		globalRules, err = compileRules(merged)
+		if err != nil {
+			globalRulesErr = fmt.Errorf("global user rules: %s: %w", path, err)
+		}
 	})
 	return globalRules, globalRulesErr
 }
@@ -191,7 +231,7 @@ func RulesWithProject(projectRoot string) ([]rule, error) {
 		baseYAML = mergeYAMLRules(baseYAML, globalUserYAML)
 	}
 
-	projectPath := filepath.Join(projectRoot, ".skillshare", "audit-rules.yaml")
+	projectPath := filepath.Join(projectdir.Resolve(projectRoot), auditRulesFileName)
 	projectYAML, err := loadUserRules(projectPath)
 	if err != nil {
 		return nil, fmt.Errorf("project user rules: %w", err)
@@ -210,7 +250,17 @@ func RulesWithProject(projectRoot string) ([]rule, error) {
 	}
 
 	merged := mergeYAMLRules(baseYAML, projectYAML)
-	return compileRules(merged)
+	rules, err := compileRules(merged)
+	if err != nil {
+		// Blame the global file when its rules fail on their own.
+		if globalUserYAML != nil {
+			if _, globalErr := Rules(); globalErr != nil {
+				return nil, globalErr
+			}
+		}
+		return nil, fmt.Errorf("project user rules: %s: %w", projectPath, err)
+	}
+	return rules, nil
 }
 
 // builtinYAML returns the parsed (not compiled) builtin rules for merging.
@@ -218,14 +268,39 @@ func RulesWithProject(projectRoot string) ([]rule, error) {
 // Result is cached; returns a copy to prevent mutation of the cache.
 func builtinYAML() []yamlRule {
 	builtinYAMLOnce.Do(func() {
-		var f rulesFile
 		// Already validated in loadBuiltinRules, safe to ignore error
-		yaml.Unmarshal(defaultRulesData, &f) //nolint:errcheck
-		builtinYAMLCache = append(f.Rules, credentialYAMLRules()...)
+		builtinYAMLCache, _ = parseBuiltinRulesYAML()
 	})
 	result := make([]yamlRule, len(builtinYAMLCache))
 	copy(result, builtinYAMLCache)
 	return result
+}
+
+func parseBuiltinRulesYAML() ([]yamlRule, error) {
+	rules, err := parseRulesYAML(defaultRulesData)
+	if err != nil {
+		return nil, err
+	}
+	rules = append(rules, credentialYAMLRules()...)
+	rules = append(rules, bundledYAMLRules()...)
+	var requestRegex string
+	for _, r := range rules {
+		if r.ID == "ssrf-internal-0" {
+			requestRegex = r.Regex
+		}
+	}
+	for i := range rules {
+		rules[i].excludePhrase = rules[i].ID == "prompt-injection-5"
+		rules[i].pythonInertContext = rules[i].Pattern == "credential-access"
+		switch rules[i].ID {
+		case "ssrf-metadata-0":
+			rules[i].matchKind = rules[i].ID
+			rules[i].requestRegex = requestRegex
+		case "ssrf-internal-0", "unsafe-deserialization-yaml", "unsafe-deserialization-torch", "unsafe-deserialization-php":
+			rules[i].matchKind = rules[i].ID
+		}
+	}
+	return rules, nil
 }
 
 // parseRulesYAML parses YAML bytes into yamlRule slice.
@@ -234,6 +309,14 @@ func parseRulesYAML(data []byte) ([]yamlRule, error) {
 	if err := yaml.Unmarshal(data, &f); err != nil {
 		return nil, fmt.Errorf("parse YAML: %w", err)
 	}
+	for _, r := range f.Rules {
+		if err := validateRuleFiles(r.Files); err != nil {
+			return nil, fmt.Errorf("rule %q: %w", r.ID, err)
+		}
+		if r.ID == ruleWhitespacePadding && (r.Regex != "" || r.Exclude != "") {
+			return nil, fmt.Errorf("rule %q: regex and exclude are not supported", r.ID)
+		}
+	}
 	return f.Rules, nil
 }
 
@@ -241,6 +324,9 @@ func parseRulesYAML(data []byte) ([]yamlRule, error) {
 func compileRules(yr []yamlRule) ([]rule, error) {
 	var rules []rule
 	for _, y := range yr {
+		if err := validateRuleFiles(y.Files); err != nil {
+			return nil, fmt.Errorf("rule %q: %w", y.ID, err)
+		}
 		if y.Enabled != nil && !*y.Enabled {
 			continue // disabled rule
 		}
@@ -248,7 +334,7 @@ func compileRules(yr []yamlRule) ([]rule, error) {
 		if err != nil {
 			return nil, fmt.Errorf("rule %q: %w", y.ID, err)
 		}
-		if y.Regex == "" {
+		if y.Regex == "" && y.ID != ruleWhitespacePadding {
 			return nil, fmt.Errorf("rule %q: empty regex", y.ID)
 		}
 		re, err := regexp.Compile(y.Regex)
@@ -256,14 +342,34 @@ func compileRules(yr []yamlRule) ([]rule, error) {
 			return nil, fmt.Errorf("rule %q: invalid regex: %w", y.ID, err)
 		}
 
+		confidence := defaultRuleConfidence
+		if y.Confidence != nil {
+			confidence = *y.Confidence
+			if math.IsNaN(confidence) || confidence < 0 || confidence > 1 {
+				return nil, fmt.Errorf("rule %q: confidence must be between 0 and 1", y.ID)
+			}
+		}
+
 		r := rule{
-			ID:       y.ID,
-			Severity: sev,
-			Pattern:  y.Pattern,
-			Message:  y.Message,
-			Regex:    re,
+			Files:              append([]string(nil), y.Files...),
+			matchKind:          y.matchKind,
+			ID:                 y.ID,
+			Severity:           sev,
+			Pattern:            y.Pattern,
+			Message:            y.Message,
+			Confidence:         confidence,
+			Regex:              re,
+			severityOverridden: y.severityOverridden,
+			excludePhrase:      y.excludePhrase,
+			pythonInertContext: y.pythonInertContext,
 		}
 		r.prefilter, r.prefilterFold = deriveRulePrefilter(y.Regex, re)
+		if y.requestRegex != "" {
+			r.requestRegex, err = regexp.Compile(y.requestRegex)
+			if err != nil {
+				return nil, fmt.Errorf("rule %q: invalid request context: %w", y.ID, err)
+			}
+		}
 		if y.Exclude != "" {
 			excl, err := regexp.Compile(y.Exclude)
 			if err != nil {
@@ -286,7 +392,11 @@ func loadUserRules(path string) ([]yamlRule, error) {
 		}
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	return parseRulesYAML(data)
+	rules, err := parseRulesYAML(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return rules, nil
 }
 
 // isPatternLevel returns true when an overlay entry targets all rules
@@ -310,6 +420,7 @@ func mergeYAMLRules(base, overlay []yamlRule) []yamlRule {
 	// Separate overlay into pattern-level and id-level entries.
 	var patternOverlays, idOverlays []yamlRule
 	for _, o := range overlay {
+		o.severityOverridden = o.severityOverridden || o.Severity != ""
 		if isPatternLevel(o) {
 			patternOverlays = append(patternOverlays, o)
 		} else {
@@ -334,8 +445,16 @@ func mergeYAMLRules(base, overlay []yamlRule) []yamlRule {
 			if po.Enabled != nil && !*po.Enabled {
 				result[i].Enabled = po.Enabled
 			}
+			if po.Files != nil {
+				result[i].Files = po.Files
+			}
+			if po.Confidence != nil {
+				result[i].Confidence = po.Confidence
+				result[i].confidenceOverridden = true
+			}
 			if po.Severity != "" {
 				result[i].Severity = po.Severity
+				result[i].severityOverridden = true
 			}
 		}
 	}
@@ -346,6 +465,7 @@ func mergeYAMLRules(base, overlay []yamlRule) []yamlRule {
 			if o.Regex != "" {
 				// Full custom rule (has regex) → replace entirely.
 				result[pos] = o
+				result[pos].confidenceOverridden = o.Confidence != nil
 			} else {
 				// Partial overlay (toggle / severity override) → merge fields.
 				if o.Enabled != nil {
@@ -357,8 +477,16 @@ func mergeYAMLRules(base, overlay []yamlRule) []yamlRule {
 						result[pos].Enabled = o.Enabled
 					}
 				}
+				if o.Files != nil {
+					result[pos].Files = o.Files
+				}
+				if o.Confidence != nil {
+					result[pos].Confidence = o.Confidence
+					result[pos].confidenceOverridden = true
+				}
 				if o.Severity != "" {
 					result[pos].Severity = o.Severity
+					result[pos].severityOverridden = true
 				}
 			}
 		} else {
@@ -383,7 +511,7 @@ func GlobalAuditRulesPath() string {
 
 // ProjectAuditRulesPath returns the path to a project's audit-rules.yaml.
 func ProjectAuditRulesPath(projectRoot string) string {
-	return filepath.Join(projectRoot, ".skillshare", "audit-rules.yaml")
+	return filepath.Join(projectdir.Resolve(projectRoot), auditRulesFileName)
 }
 
 // configDir returns the skillshare config directory without importing
@@ -403,7 +531,8 @@ func DefaultRulesTemplate() string {
 #   built-in → global (~/.config/skillshare/audit-rules.yaml) → project (.skillshare/audit-rules.yaml)
 #
 # Each rule needs: id, severity (CRITICAL/HIGH/MEDIUM/LOW/INFO), pattern, message, regex.
-# Optional: exclude (suppress match when line also matches), enabled (false to disable).
+# Optional: files (relative path.Match globs, e.g. ["*.py"]),
+# exclude (suppress match when line also matches), enabled (false to disable).
 
 rules:
   # Example: flag TODO comments as informational
@@ -490,6 +619,17 @@ func disabledIDsGlobal() map[string]bool {
 	return disabledGlobalResult
 }
 
+// DisabledRuleIDs returns the set of rule IDs disabled (enabled: false) in
+// global mode. Used by callers (cmd, server) that build cross-skill findings
+// outside the scan pipeline and must honour audit-rules.yaml.
+func DisabledRuleIDs() map[string]bool { return disabledIDsGlobal() }
+
+// DisabledRuleIDsForProject returns the set of rule IDs disabled in project
+// mode (builtin + global user + project user overrides).
+func DisabledRuleIDsForProject(projectRoot string) map[string]bool {
+	return disabledIDsForProject(projectRoot)
+}
+
 // disabledIDsForProject returns IDs disabled in project mode
 // (builtin + global user + project user overrides).
 func disabledIDsForProject(projectRoot string) map[string]bool {
@@ -498,7 +638,7 @@ func disabledIDsForProject(projectRoot string) map[string]bool {
 	if globalUser != nil {
 		base = mergeYAMLRules(base, globalUser)
 	}
-	projectUser, _ := loadUserRules(filepath.Join(projectRoot, ".skillshare", "audit-rules.yaml"))
+	projectUser, _ := loadUserRules(filepath.Join(projectdir.Resolve(projectRoot), auditRulesFileName))
 	if projectUser != nil {
 		base = mergeYAMLRules(base, projectUser)
 	}

@@ -1,20 +1,37 @@
 package server
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
+	"fmt"
+	"maps"
 	"net/http"
+	"slices"
+	"sort"
 	"time"
 
+	"skillshare/internal/config"
+	"skillshare/internal/projects"
+	"skillshare/internal/resource"
+	"skillshare/internal/skillignore"
 	ssync "skillshare/internal/sync"
+	"skillshare/internal/utils"
 )
 
-type syncTargetResult struct {
-	Target  string   `json:"target"`
-	Linked  []string `json:"linked"`
-	Updated []string `json:"updated"`
-	Skipped []string `json:"skipped"`
-	Pruned  []string `json:"pruned"`
+// ignorePayload builds the common ignored-skills fields for JSON responses.
+func ignorePayload(stats *skillignore.IgnoreStats) map[string]any {
+	r := ssync.NewIgnoreReport(stats, "", nil)
+	return map[string]any{
+		"ignored_count":  r.IgnoredCount,
+		"ignored_skills": r.IgnoredSkills,
+		"ignore_root":    r.IgnoreRoot,
+		"ignore_repos":   r.IgnoreRepos,
+	}
 }
+
+type syncFailure = ssync.TargetFailure
+type unmatchedInclude = ssync.TargetUnmatchedInclude
+type syncTargetResult = ssync.TargetResult
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
@@ -22,144 +39,419 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 
 	var body struct {
-		DryRun bool `json:"dryRun"`
-		Force  bool `json:"force"`
+		DryRun bool   `json:"dryRun"`
+		Force  bool   `json:"force"`
+		Kind   string `json:"kind"`
+		// Project limits the sync to one declared project's targets.
+		Project string `json:"project"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		// Default to non-dry-run, non-force
+	if err := decodeJSON(w, r, &body, defaultJSONBodyLimit); errors.Is(err, errBodyTooLarge) {
+		return
 	}
+	// Any other decode error keeps the defaults: non-dry-run, non-force, empty kind (both)
 
-	globalMode := s.cfg.Mode
-	if globalMode == "" {
-		globalMode = "merge"
-	}
-
-	// Discover skills once for all targets
-	allSkills, err := ssync.DiscoverSourceSkills(s.cfg.Source)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to discover skills: "+err.Error())
+	if body.Kind != "" && body.Kind != kindSkill && body.Kind != kindAgent {
+		writeError(w, http.StatusBadRequest, "invalid kind: must be 'skill', 'agent', or empty")
 		return
 	}
 
-	results := make([]syncTargetResult, 0)
-
-	for name, target := range s.cfg.Targets {
-		mode := target.Mode
-		if mode == "" {
-			mode = globalMode
+	if body.Project != "" {
+		root, lookupErr := lookupProjectRoot(s.cfg.Projects, body.Project)
+		if lookupErr != nil && !errors.Is(lookupErr, projects.ErrNotFound) {
+			writeError(w, http.StatusBadRequest, lookupErr.Error())
+			return
 		}
-
-		res := syncTargetResult{
-			Target:  name,
-			Linked:  make([]string, 0),
-			Updated: make([]string, 0),
-			Skipped: make([]string, 0),
-			Pruned:  make([]string, 0),
+		if _, ok := s.cfg.Projects[root]; !ok {
+			writeError(w, http.StatusBadRequest, "unknown project: "+body.Project)
+			return
 		}
-
-		syncErrArgs := map[string]any{
-			"targets_total":  len(s.cfg.Targets),
-			"targets_failed": 1,
-			"target":         name,
-			"dry_run":        body.DryRun,
-			"force":          body.Force,
-			"scope":          "ui",
-		}
-
-		switch mode {
-		case "merge":
-			mergeResult, err := ssync.SyncTargetMergeWithSkills(name, target, allSkills, s.cfg.Source, body.DryRun, body.Force)
-			if err != nil {
-				s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
-				writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
-				return
-			}
-			res.Linked = mergeResult.Linked
-			res.Updated = mergeResult.Updated
-			res.Skipped = mergeResult.Skipped
-
-			pruneResult, err := ssync.PruneOrphanLinksWithSkills(ssync.PruneOptions{
-				TargetPath: target.Path, SourcePath: s.cfg.Source, Skills: allSkills,
-				Include: target.Include, Exclude: target.Exclude, TargetName: name,
-				DryRun: body.DryRun, Force: body.Force,
-			})
-			if err == nil {
-				res.Pruned = pruneResult.Removed
-			}
-
-		case "copy":
-			copyResult, err := ssync.SyncTargetCopyWithSkills(name, target, allSkills, s.cfg.Source, body.DryRun, body.Force, nil)
-			if err != nil {
-				s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
-				writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
-				return
-			}
-			res.Linked = copyResult.Copied
-			res.Updated = copyResult.Updated
-			res.Skipped = copyResult.Skipped
-
-			pruneResult, err := ssync.PruneOrphanCopiesWithSkills(target.Path, allSkills, target.Include, target.Exclude, name, body.DryRun)
-			if err == nil {
-				res.Pruned = pruneResult.Removed
-			}
-
-		default:
-			err := ssync.SyncTarget(name, target, s.cfg.Source, body.DryRun)
-			if err != nil {
-				s.writeOpsLog("sync", "error", start, syncErrArgs, err.Error())
-				writeError(w, http.StatusInternalServerError, "sync failed for "+name+": "+err.Error())
-				return
-			}
-			res.Linked = []string{"(symlink mode)"}
-		}
-
-		results = append(results, res)
+		body.Project = root
 	}
 
-	// Log the sync operation
-	s.writeOpsLog("sync", "ok", start, map[string]any{
-		"targets_total":  len(results),
-		"targets_failed": 0,
-		"dry_run":        body.DryRun,
-		"force":          body.Force,
-		"scope":          "ui",
-	}, "")
+	out, code, err := s.syncResources(start, body.DryRun, body.Force, body.Kind, body.Project)
+	if err != nil {
+		writeError(w, code, err.Error())
+		return
+	}
 
-	writeJSON(w, map[string]any{"results": results})
+	resp := map[string]any{
+		"results":          out.results,
+		"warnings":         out.warnings,
+		"unmatched":        out.unmatched,
+		"failed":           out.failed,
+		"folder_conflicts": out.folderConflicts,
+		"path_overlap":     out.pathOverlap,
+	}
+	if len(out.skills) > 0 {
+		if contextCost := s.computeContextCost(out.skills); contextCost != nil {
+			resp["context_cost"] = contextCost
+		}
+	}
+	maps.Copy(resp, ignorePayload(out.ignoreStats))
+	maps.Copy(resp, agentIgnorePayload(s.agentsSource(), out.allAgents))
+	writeJSON(w, resp)
+}
+
+type syncOutcome struct {
+	results         []syncTargetResult
+	warnings        []string
+	unmatched       []unmatchedInclude
+	failed          []syncFailure
+	folderConflicts []config.SkillsFolderConflict
+	pathOverlap     int // targets whose path overlap the folder conflicts don't explain
+	skills          []ssync.DiscoveredSkill
+	ignoreStats     *skillignore.IgnoreStats
+	allAgents       []resource.DiscoveredResource // nil when agents were not synced
+}
+
+// folderConflicts returns the skills folders whose targets undo each other's
+// sync, never nil, plus how many targets overlap in a way they don't explain.
+// harmless is passed on to config.DetectPathOverlap.
+func folderConflicts(targets map[string]config.TargetConfig, isProject bool, defaultMode string, harmless func(scanner, writer string) bool) ([]config.SkillsFolderConflict, int) {
+	return ssync.TargetFolderConflicts(targets, isProject, defaultMode, harmless)
+}
+
+// projectTargets returns the targets of the project declared under root.
+func (s *Server) projectTargets(root string) map[string]config.TargetConfig {
+	abs := config.ExpandPath(root)
+	targets := map[string]config.TargetConfig{}
+	for name, target := range s.cfg.Targets {
+		if target.ProjectRoot() != "" && utils.PathsEqual(target.ProjectRoot(), abs) {
+			targets[name] = target
+		}
+	}
+	return targets
+}
+
+// syncResources links skills and agents (kind "" means both) into every target,
+// or only the targets of the project declared under project, and logs the sync.
+// A failed target, even when every target fails, is reported in failed and
+// warnings; an error, with the HTTP status to report, means nothing could run.
+// Callers must hold s.mu.
+func (s *Server) syncResources(start time.Time, dryRun, force bool, kind, project string) (*syncOutcome, int, error) {
+	targets := s.cfg.Targets
+	if project != "" {
+		targets = s.projectTargets(project)
+	}
+
+	// Pre-check warnings via shared config validation
+	warnings, invalid, validErr := config.ValidateConfigForSync(s.cfg)
+	if validErr != nil {
+		return nil, http.StatusBadRequest, validErr
+	}
+
+	// A project target that cannot resolve (no path) is not in s.cfg.Targets;
+	// it fails like one with invalid settings.
+	maps.Copy(invalid, s.unresolvedTargets)
+	total := len(targets) + len(s.unresolvedTargets)
+
+	results := make([]syncTargetResult, 0)
+	failed := make([]syncFailure, 0)
+	unmatched := make([]unmatchedInclude, 0)
+
+	// A target with invalid settings fails alone: it is skipped for skills and agents.
+	runTargets := maps.Clone(targets)
+	for _, name := range slices.Sorted(maps.Keys(invalid)) {
+		if _, ok := targets[name]; !ok && s.unresolvedTargets[name] == nil {
+			continue
+		}
+		delete(runTargets, name)
+		err := invalid[name]
+		msg := name + ": invalid config: " + err.Error()
+		warnings = append(warnings, msg)
+		failed = append(failed, syncFailure{Target: name, Part: "config", Error: err.Error(), Message: msg})
+	}
+
+	if !dryRun {
+		warnings = append(warnings, s.backupBeforeSync(runTargets, kind != kindAgent, kind != kindSkill)...)
+	}
+
+	var ignoreStats *skillignore.IgnoreStats
+	var allSkills []ssync.DiscoveredSkill
+	var sourceIncomplete bool
+
+	// Skill sync (skip when kind == "agent")
+	if kind != kindAgent {
+		var err error
+		if !dryRun {
+			if adoptErr := s.adoptMovedSkills(); adoptErr != nil {
+				warnings = append(warnings, "install metadata not updated: "+adoptErr.Error())
+			}
+		}
+		walk := s.skillsWalk()
+		allSkills, ignoreStats, err = ssync.DiscoverSourceSkillsWithStatsAndContext(s.cfg.EffectiveSkillsSource(), walk)
+		if err != nil {
+			return nil, http.StatusInternalServerError, fmt.Errorf("failed to discover skills: %w", err)
+		}
+		sourceIncomplete = walk.Follow.Incomplete()
+		warnings = append(warnings, ssync.SourceLinkWarnings(walk, sourceIncomplete)...)
+
+		if len(allSkills) == 0 {
+			warnings = append(warnings, "source directory is empty (0 skills)")
+		}
+	}
+	discovery := ssync.TargetDiscovery{Skills: allSkills, IgnoreStats: ignoreStats, SourceIncomplete: sourceIncomplete}
+	if kind != kindSkill {
+		discovery.Agents, discovery.AllAgents, discovery.AgentsAvailable = ssync.DiscoverTargetAgents(s.agentsSource())
+	}
+	kinds := []string(nil)
+	if kind != "" {
+		kinds = []string{kind}
+	}
+	executed, err := ssync.ExecuteTargets(context.Background(), s.cfg, runTargets, ssync.ExecuteOptions{
+		Kinds: kinds, DryRun: dryRun, Force: force, ProjectMode: s.IsProjectMode(), ProjectRoot: s.projectRoot,
+		AgentsSource: s.agentsSource(), Discovery: discovery, BuiltinAgentTargets: s.builtinAgentTargets(),
+		ResolveExtension: s.resolveExtensionSpec, DiagnosticsTargets: s.cfg.Targets,
+		MovedTargets: ssync.MovedProjectTargets(s.projectCfg, s.cfg.Targets),
+	})
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+	results = executed.Results
+	failed = append(failed, executed.Failed...)
+	unmatched = executed.Unmatched
+	warnings = append(warnings, executed.Warnings...)
+
+	// Log the sync operation. A target counts once however many parts failed.
+	failedNames := failedTargetNames(failed)
+	logArgs := map[string]any{
+		"targets_total":  total,
+		"targets_failed": len(failedNames),
+		"dry_run":        dryRun,
+		"force":          force,
+		"kind":           kind,
+		"scope":          "ui",
+	}
+	if len(failedNames) > 0 {
+		logArgs["failed_targets"] = failedNames
+	}
+	if project != "" {
+		logArgs["project"] = project
+	}
+	status := "ok"
+	switch {
+	case len(failedNames) >= total && len(failedNames) > 0:
+		status = "error"
+	case len(failedNames) > 0:
+		status = "partial"
+	}
+	s.writeOpsLog("sync", status, start, logArgs, "")
+
+	return &syncOutcome{results: results, warnings: warnings, unmatched: unmatched, failed: failed, folderConflicts: executed.FolderConflicts, pathOverlap: executed.PathOverlap, skills: executed.Skills, ignoreStats: executed.IgnoreStats, allAgents: executed.AllAgents}, 0, nil
+}
+
+// failedTargetNames returns the distinct targets in failed, sorted.
+func failedTargetNames(failed []syncFailure) []string {
+	names := make([]string, 0, len(failed))
+	for _, f := range failed {
+		names = append(names, f.Target)
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+// backupBeforeSync snapshots the target folders a sync may overwrite, as the
+// CLI does, then trims old snapshots. Project mode backs up agents only, like
+// `sync -p`. Failures come back as warnings. Callers must hold s.mu.
+func (s *Server) backupBeforeSync(targets map[string]config.TargetConfig, skills, agents bool) []string {
+	return ssync.BackupTargets(targets, skills, agents, ssync.BackupTargetsOptions{
+		Dir: s.backupDir(), Retention: s.backupRetention(), ProjectMode: s.IsProjectMode(), ProjectRoot: s.projectRoot,
+		BuiltinAgentTargets: s.builtinAgentTargets(),
+	})
+}
+
+func (s *Server) computeContextCost(skills []ssync.DiscoveredSkill) map[string]any {
+	type tokenPair struct{ always, onDemand int }
+	groupMap := make(map[tokenPair][]string)
+
+	type skillToken struct {
+		name       string
+		descTokens int
+		bodyTokens int
+	}
+
+	var maxAlways, maxOnDemand int
+	var worstAlwaysSkills, worstOnDemandSkills []skillToken
+	var worstAlwaysTarget, worstOnDemandTarget string
+
+	cfgMode := s.cfg.Mode
+	if cfgMode == "" {
+		cfgMode = "merge"
+	}
+
+	for name, target := range s.cfg.Targets {
+		filtered, fErr := ssync.TargetSkills(name, target, cfgMode, s.cfg.EffectiveSkillsSource(), skills)
+		if fErr != nil {
+			filtered = skills
+		}
+
+		var at, ot int
+		var perSkill []skillToken
+		for _, sk := range filtered {
+			at += sk.DescTokens
+			ot += sk.BodyTokens
+			perSkill = append(perSkill, skillToken{
+				name:       sk.FlatName,
+				descTokens: sk.DescTokens,
+				bodyTokens: sk.BodyTokens,
+			})
+		}
+
+		groupMap[tokenPair{at, ot}] = append(groupMap[tokenPair{at, ot}], name)
+
+		if at > maxAlways {
+			maxAlways = at
+			worstAlwaysSkills = perSkill
+			worstAlwaysTarget = name
+		} else if at > 0 && at == maxAlways && name < worstAlwaysTarget {
+			worstAlwaysTarget = name
+			worstAlwaysSkills = perSkill
+		}
+		if ot > maxOnDemand {
+			maxOnDemand = ot
+			worstOnDemandSkills = perSkill
+			worstOnDemandTarget = name
+		} else if ot > 0 && ot == maxOnDemand && name < worstOnDemandTarget {
+			worstOnDemandTarget = name
+			worstOnDemandSkills = perSkill
+		}
+	}
+
+	type group struct {
+		Targets            []string `json:"targets"`
+		AlwaysLoadedTokens int      `json:"always_loaded_tokens"`
+		OnDemandTokens     int      `json:"on_demand_tokens"`
+	}
+
+	groups := make([]group, 0, len(groupMap))
+	for pair, names := range groupMap {
+		sort.Strings(names)
+		groups = append(groups, group{
+			Targets:            names,
+			AlwaysLoadedTokens: pair.always,
+			OnDemandTokens:     pair.onDemand,
+		})
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].Targets[0] < groups[j].Targets[0] })
+
+	budget := s.cfg.ContextBudget
+	if s.IsProjectMode() && s.projectCfg != nil {
+		budget = s.projectCfg.ContextBudget
+	}
+
+	result := map[string]any{"groups": groups}
+
+	type offender struct {
+		Name   string `json:"name"`
+		Tokens int    `json:"tokens"`
+	}
+	type warning struct {
+		Type         string     `json:"type"`
+		Target       string     `json:"target"`
+		Actual       int        `json:"actual"`
+		Budget       int        `json:"budget"`
+		TopOffenders []offender `json:"top_offenders"`
+	}
+
+	topN := func(perSkill []skillToken, n int, byDesc bool) []offender {
+		type pair struct {
+			name   string
+			tokens int
+		}
+		pairs := make([]pair, 0, len(perSkill))
+		for _, sk := range perSkill {
+			t := sk.bodyTokens
+			if byDesc {
+				t = sk.descTokens
+			}
+			if t > 0 {
+				pairs = append(pairs, pair{sk.name, t})
+			}
+		}
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].tokens > pairs[j].tokens })
+		if len(pairs) > n {
+			pairs = pairs[:n]
+		}
+		out := make([]offender, len(pairs))
+		for i, p := range pairs {
+			out[i] = offender{Name: p.name, Tokens: p.tokens}
+		}
+		return out
+	}
+
+	var warns []warning
+	if t := budget.AlwaysLoadedThreshold(); t > 0 && maxAlways > t {
+		warns = append(warns, warning{
+			Type: "always_loaded", Target: worstAlwaysTarget,
+			Actual: maxAlways, Budget: t,
+			TopOffenders: topN(worstAlwaysSkills, 3, true),
+		})
+	}
+	if t := budget.OnDemandThreshold(); t > 0 && maxOnDemand > t {
+		warns = append(warns, warning{
+			Type: "on_demand", Target: worstOnDemandTarget,
+			Actual: maxOnDemand, Budget: t,
+			TopOffenders: topN(worstOnDemandSkills, 3, false),
+		})
+	}
+	if len(warns) > 0 {
+		result["warnings"] = warns
+	}
+	return result
 }
 
 type diffItem struct {
 	Skill  string `json:"skill"`
-	Action string `json:"action"` // "link", "update", "skip", "prune", "local"
+	Action string `json:"action"` // "link", "update", "skip", "prune", "local", "kept" (the skill stays at a legacy entry; force changes nothing)
 	Reason string `json:"reason"` // human-readable description
+	Kind   string `json:"kind,omitempty"`
 }
 
 type diffTarget struct {
-	Target string     `json:"target"`
-	Items  []diffItem `json:"items"`
+	Target         string     `json:"target"`
+	Warnings       []string   `json:"warnings,omitempty"`
+	Items          []diffItem `json:"items"`
+	SkippedCount   int        `json:"skippedCount,omitempty"`
+	CollisionCount int        `json:"collisionCount,omitempty"`
+	// NamingSkippedCount is how many of SkippedCount break naming rules rather than collide.
+	NamingSkippedCount int `json:"namingSkippedCount,omitempty"`
 }
 
 func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
-	filterTarget := r.URL.Query().Get("target")
-
+	// Snapshot config under RLock, then release before slow I/O.
+	s.mu.RLock()
+	source := s.cfg.EffectiveSkillsSource()
+	agentsSource := s.agentsSource()
 	globalMode := s.cfg.Mode
+	ignorePatterns := ssync.EffectiveFileIgnorePatterns(s.cfg.Ignore)
+	targets := s.cloneTargets()
+	conflicts, _ := folderConflicts(targets, s.IsProjectMode(), globalMode, nil)
+	s.mu.RUnlock()
+
 	if globalMode == "" {
 		globalMode = "merge"
 	}
 
-	discovered, err := ssync.DiscoverSourceSkills(s.cfg.Source)
+	filterTarget := r.URL.Query().Get("target")
+
+	discovered, ignoreStats, err := ssync.DiscoverSourceSkillsWithStats(source, s.skillsWalk())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
 	diffs := make([]diffTarget, 0)
-	for name, target := range s.cfg.Targets {
+	for name, target := range targets {
 		if filterTarget != "" && filterTarget != name {
 			continue
 		}
-		diffs = append(diffs, s.computeTargetDiff(name, target, discovered, globalMode))
+		diffs = append(diffs, s.computeTargetDiff(name, target, discovered, globalMode, source, ignorePatterns))
 	}
 
-	writeJSON(w, map[string]any{"diffs": diffs})
+	diffs = s.appendAgentDiffs(diffs, targets, agentsSource, filterTarget)
+
+	resp := map[string]any{"diffs": diffs, "folder_conflicts": conflicts}
+	maps.Copy(resp, ignorePayload(ignoreStats))
+	maps.Copy(resp, agentIgnorePayload(agentsSource, nil))
+	writeJSON(w, resp)
 }

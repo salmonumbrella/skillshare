@@ -35,6 +35,7 @@ flowchart TD
 |------|-------------|
 | `--project`, `-p` | Create in project (`.skillshare/skills/`) |
 | `--global`, `-g` | Create in global (`~/.config/skillshare/skills/`) |
+| `--pattern`, `-P` | Use a design pattern (`tool-wrapper`, `generator`, `reviewer`, `inversion`, `pipeline`, `none`) |
 | `--dry-run`, `-n` | Preview without creating files |
 | `--help`, `-h` | Show help |
 
@@ -125,13 +126,10 @@ skillshare new code-review
 
 Output:
 ```
-New Skill Created
-─────────────────────────────────────────────
-✓ Created: ~/.config/skillshare/skills/code-review/SKILL.md
+✓ Created   ~/.config/skillshare/skills/code-review/SKILL.md
 
-Next steps:
-  1. Edit ~/.config/skillshare/skills/code-review/SKILL.md
-  2. Run 'skillshare sync' to deploy
+Next
+  skillshare sync  link it into your targets once you've edited it
 ```
 
 ### Create in a project
@@ -142,13 +140,10 @@ skillshare new code-review -p
 
 Output:
 ```
-New Skill Created (project)
-─────────────────────────────────────────────
-✓ Created: .skillshare/skills/code-review/SKILL.md
+✓ Created   ~/my-project/.skillshare/skills/code-review/SKILL.md
 
-Next steps:
-  1. Edit .skillshare/skills/code-review/SKILL.md
-  2. Run 'skillshare sync' to deploy
+Next
+  skillshare sync  link it into your targets once you've edited it
 ```
 
 ### Preview before creating
@@ -159,20 +154,63 @@ skillshare new my-skill --dry-run
 
 Output:
 ```
-New Skill (dry-run)
-─────────────────────────────────────────────
-→ Would create: ~/.config/skillshare/skills/my-skill
-→ Would write: ~/.config/skillshare/skills/my-skill/SKILL.md
+  Would create  ~/.config/skillshare/skills/my-skill/SKILL.md
 
-Template preview:
-─────────────────────────────────────────────
+Preview
 ---
 name: my-skill
 description: >-
   Describe what this skill does. Use when user asks to ...
 ---
 ...
+
+Dry run — nothing was written
 ```
+
+---
+
+## Pattern Templates
+
+Use `-P` to generate a pattern-specific template with recommended directory structure:
+
+```bash
+skillshare new my-reviewer -P reviewer     # Reviewer pattern
+skillshare new my-pipeline -P pipeline     # Pipeline with references/, assets/, scripts/
+skillshare new my-skill                    # Interactive TUI to choose
+```
+
+Available patterns:
+
+| Pattern | Scaffold Directories |
+|---------|---------------------|
+| `tool-wrapper` | `references/` |
+| `generator` | `assets/`, `references/` |
+| `reviewer` | `references/` |
+| `inversion` | `assets/` |
+| `pipeline` | `references/`, `assets/`, `scripts/` |
+| `none` | *(plain template, no directories)* |
+
+See [Skill Design Patterns](/docs/understand/philosophy/skill-design-patterns) for details on each pattern.
+
+---
+
+## Web UI Wizard
+
+You can also create skills from the web dashboard — no terminal needed.
+
+1. Run `skillshare ui`
+2. Navigate to **Skills** → click **"+ New Skill"**
+3. Follow the wizard:
+
+| Step | What |
+|------|------|
+| **Name** | Enter skill name with real-time validation |
+| **Pattern** | Choose from 6 design patterns (card grid) |
+| **Category** | Pick a domain category — skipped if pattern is `none` |
+| **Scaffold** | Toggle recommended directories — skipped if pattern has no dirs |
+| **Confirm** | Review selections and create |
+
+The wizard follows the current mode — if the dashboard is running in project mode (`-p`), the skill is created in `.skillshare/skills/`.
 
 ---
 

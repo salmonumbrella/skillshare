@@ -12,6 +12,8 @@ skillshare list --verbose    # Detailed plain text view
 skillshare list --json       # JSON output for CI/scripts
 ```
 
+With `follow_source_links: true`, unavailable first-level source links produce a warning naming the link while healthy skills remain listed. With `--json`, these warnings go to stderr and stdout remains valid JSON.
+
 ## When to Use
 
 - See what skills are installed and where they came from
@@ -19,11 +21,38 @@ skillshare list --json       # JSON output for CI/scripts
 - Check which skills are tracked repos vs local
 - Audit your skill collection before a cleanup
 
-![list demo](/img/list-demo.png)
+```text
+skillshare list --no-tui
+
+Skills
+  _superpowers/skills/
+    brainstorming                tracked: _superpowers
+    dispatching-parallel-agents  tracked: _superpowers
+    systematic-debugging         tracked: _superpowers
+    …
+  frontend/
+    react-components             local
+  web/
+    accessibility                github.com/addyosmani/web-quality-skills/skills...
+    core-web-vitals              github.com/addyosmani/web-quality-skills/skills...
+    …
+  docx                           github.com/anthropics/skills/skills/docx
+  frontend-design                github.com/anthropics/skills/skills/frontend-de...
+  pdf                            github.com/anthropics/skills/skills/pdf
+  skill-creator                  github.com/anthropics/skills/skills/skill-creator
+  skillshare                     github.com/runkids/skillshare/skills/skillshare
+  …
+
+Tracked repos
+✓ _superpowers  up to date · 15 skills
+
+28 skills · 15 tracked, 9 remote, 4 local
+  Add -v for sources and install dates
+```
 
 ## Interactive TUI
 
-On a TTY, `skillshare list` launches an interactive terminal UI with:
+On a TTY, `skillshare list` opens an interactive view with skills and agents in two tabs: the list on the left, and details for the selected item on the right. From there you can update, uninstall or audit a skill, turn it on or off (written to `.skillignore` right away), and read its files. The common keys are at the bottom of the screen; press `?` for all of them.
 
 - **Smart filtering** — press `/` to filter by name, path, or source. Supports tag syntax for precise filtering:
 
@@ -32,6 +61,8 @@ On a TTY, `skillshare list` launches an interactive terminal UI with:
   | `type:` | `t:` | `tracked`, `remote`, `local`, `github` | `t:tracked` |
   | `group:` | `g:` | any directory name | `g:security` |
   | `repo:` | `r:` | any repo name | `r:team` |
+  | `kind:` | `k:` | `skill`, `agent` | `k:agent` |
+  | `status:` | `s:` | `enabled`, `disabled` | `s:disabled` |
 
   Tags can be combined with free text (AND logic):
   ```
@@ -39,9 +70,7 @@ On a TTY, `skillshare list` launches an interactive terminal UI with:
   ```
   This shows only tracked skills in the "security" group whose name contains "audit".
 
-- **Keyboard navigation** — arrow keys to browse, `q` to quit
-- **Detail panel** — shows description, disk path, files, and synced targets for the selected skill
-- **Content viewer** — press `Enter` to open a dual-pane viewer with a file tree on the left and Markdown-rendered content on the right. `j`/`k` browse files (auto-preview), `l`/`Enter` expand directories, `h` collapse. `Ctrl+d`/`u` scroll content half-page, `g`/`G` jump to top/bottom. Mouse wheel and click are also supported.
+- **Manual only toggle** — press `m` to toggle `disable-model-invocation` in the selected skill's `SKILL.md`. The skill stays installed and you can still invoke it by name, but the model stops loading it on its own; the detail panel shows **manual only**. Unlike `t`, this edits the skill file itself: for a tracked or installed skill the TUI asks first, because `skillshare update` skips tracked repos and installed skills with local changes until you press `m` again or update with `--force`, which drops the edit. Pressing `m` again removes the line and restores the file exactly. Agents are not affected. The [dashboard](/docs/reference/commands/ui) shows the same **manual only** tag and has the switch in its skill editor.
 
 Use `--no-tui` to skip the TUI and print plain text instead:
 
@@ -58,9 +87,17 @@ Filter skills without entering the TUI:
 skillshare list react                     # Filter by name/path/source
 skillshare list --type local              # Only local skills
 skillshare list --type github             # Only GitHub-sourced skills
+skillshare list --status disabled         # Only skills disabled via .skillignore
+skillshare list --status enabled --json   # Enabled skills, as JSON
 skillshare list react --sort newest       # Sort by install date
 skillshare list --json | jq '.[].name'   # JSON for scripting
 ```
+
+The default view (`--status all`) includes entries marked disabled. `--status`
+combines with the pattern and `--type` using AND semantics, works in project
+mode and for `list agents` / `list --all`, and narrows the TUI the same way; its
+top line then says, for example, `disabled only`. Inside the TUI, type
+`s:disabled` in the filter instead.
 
 :::tip AI Usage
 Use `--json` mode when inspecting skills programmatically:
@@ -76,19 +113,19 @@ skillshare list --json | jq '.[] | {name, source, type}'
 Skills are automatically grouped by directory when you use folders to organize them:
 
 ```
-Installed skills
-─────────────────────────────────────────
-
+Skills
   frontend/
-    → react-helper        github.com/user/skills
-    → vue-helper          github.com/user/skills
+    react-helper   github.com/user/skills
+    vue-helper     github.com/user/skills
+  my-skill         local
+  commit-commands  github.com/user/skills
+  old-draft        local · disabled
 
-  → my-skill              local
-  → commit-commands       github.com/user/skills
+Tracked repos
+✓ _team-skills  up to date · 3 skills, 5 variants
 
-Tracked repositories
-─────────────────────────────────────────
-  ✓ _team-skills          3 skills, up-to-date
+8 skills · 3 tracked, 3 remote, 2 local
+  Add -v for sources and install dates
 ```
 
 If all skills are at the top level (no folders), the output is a flat list — identical to previous versions.
@@ -100,32 +137,28 @@ skillshare list --verbose
 ```
 
 ```
-Installed skills
-─────────────────────────────────────────
-
+Skills
   frontend/
     react-helper
-      Source:      github.com/user/skills
-      Type:        github
-      Installed:   2026-01-15
-
+      Source     github.com/user/skills
+      Type       github
+      Installed  2026-01-15
     vue-helper
-      Source:      github.com/user/skills
-      Type:        github
-      Installed:   2026-01-15
-
+      Source     github.com/user/skills
+      Type       github
+      Installed  2026-01-15
   my-skill
-    Source:      (local - no metadata)
-
+    Source     local
   commit-commands
-    Source:      github.com/user/skills
-    Type:        github
-    Installed:   2026-01-15
+    Source     github.com/user/skills
+    Type       github
+    Installed  2026-01-15
 
-Tracked repositories
-─────────────────────────────────────────
-  ✓ _team-skills          3 skills, up-to-date
-  ! _other-repo           5 skills, has changes
+Tracked repos
+✓ _team-skills  up to date · 3 skills, 5 variants
+! _other-repo   has changes · 5 skills
+
+12 skills · 8 tracked, 3 remote, 1 local
 ```
 
 ## Global vs Project
@@ -166,10 +199,10 @@ flowchart LR
 
 ```bash
 cd my-project/            # Has .skillshare/config.yaml
-skillshare list           # → Installed skills (project)
+skillshare list           # → Skills · project
 
 cd ~
-skillshare list           # → Installed skills (global)
+skillshare list           # → Skills
 ```
 
 Use `-p` or `-g` to override auto-detection:
@@ -189,19 +222,17 @@ skillshare list -p       # Explicit project mode
 ### Example Output
 
 ```
-Installed skills (project)
-─────────────────────────────────────────
-
+Skills · project
   tools/
-    → pdf               anthropic/skills/pdf
-    → review            github.com/team/tools
+    pdf     anthropic/skills/pdf
+    review  github.com/team/tools
+  my-skill  local
 
-  → my-skill            local
-
-→ 3 skill(s): 2 remote, 1 local
+3 skills · 2 remote, 1 local
+  Add -v for sources and install dates
 ```
 
-Project list uses the same visual format as global list, with `(project)` label in the header. Skills are grouped by directory and categorized as `local` (no metadata) or by source URL (remote).
+Project list uses the same visual format as global list, with `· project` label in the header. Skills are grouped by directory and categorized as `local` (no metadata) or by source URL (remote).
 
 ## Options
 
@@ -212,6 +243,7 @@ Project list uses the same visual format as global list, with `(project)` label 
 | `--json, -j` | Output as JSON (useful for CI/scripts) |
 | `--no-tui` | Disable interactive TUI, use plain text output |
 | `--type, -t <type>` | Filter by type: `tracked`, `local`, `github` |
+| `--status <status>` | Filter by status: `all` (default), `enabled`, `disabled` |
 | `--sort, -s <order>` | Sort order: `name` (default), `newest`, `oldest` |
 | `--project, -p` | List project skills |
 | `--global, -g` | List global skills |
@@ -219,14 +251,13 @@ Project list uses the same visual format as global list, with `(project)` label 
 
 ## Directory Grouping
 
-When skills are organized into folders (via [`--into`](/docs/reference/commands/install) during install or manual `mv` + `sync`), `list` automatically groups them by directory:
+When skills are organized into folders (via [`--into`](/docs/reference/commands/install) during install or [`move`](/docs/reference/commands/move) + `sync`), `list` automatically groups them by directory:
 
 ```
   frontend/
-    → react-helper        github.com/user/skills
-    → vue-helper          github.com/user/skills
-
-  → my-skill              local
+    react-helper  github.com/user/skills
+    vue-helper    github.com/user/skills
+  my-skill        local
 ```
 
 - Skills under the same folder share a group header (e.g., `frontend/`)
@@ -252,6 +283,7 @@ For more details, see [Organizing Skills with Folders](/docs/how-to/daily-tasks/
 | `local` | Created locally, no metadata |
 | `github.com/...` | Installed from GitHub |
 | `tracked: <repo>` | Part of a tracked repository |
+| `[disabled]` | Skill is excluded via `.skillignore` (see [enable/disable](./enable.md)) |
 
 ### Repository Status
 
@@ -259,9 +291,26 @@ For more details, see [Organizing Skills with Folders](/docs/how-to/daily-tasks/
 |------|---------|
 | `✓` | Up-to-date, no local changes |
 | `!` | Has uncommitted changes |
+| `!` + warning | Git status unknown (could not be read); a warning line names the repo and error |
+
+## Agent Support
+
+`skillshare list agents` filters to agents only, showing `.md` files from the agents source directory (`~/.config/skillshare/agents/` or `.skillshare/agents/`).
+
+```bash
+skillshare list agents              # List agents only
+skillshare list agents --json       # JSON output for agents
+skillshare list agents --verbose    # Detailed agent list
+```
+
+In the interactive TUI, agents display an **[A]** badge to distinguish them from skills. All TUI features (filtering, detail panel, enable/disable toggle) work the same way.
+
+Without the `agents` argument, `list` shows skills only (default behavior). See [Agents](/docs/understand/agents) for background.
 
 ## See Also
 
+- [enable / disable](/docs/reference/commands/enable) — Toggle skills without removing
 - [install](/docs/reference/commands/install) — Install skills
 - [uninstall](/docs/reference/commands/uninstall) — Remove skills
 - [status](/docs/reference/commands/status) — Show sync status
+- [Agents](/docs/understand/agents) — Agent concepts

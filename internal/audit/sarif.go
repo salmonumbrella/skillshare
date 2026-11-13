@@ -16,8 +16,9 @@ type sarifLog struct {
 }
 
 type sarifRun struct {
-	Tool    sarifTool     `json:"tool"`
-	Results []sarifResult `json:"results"`
+	Tool       sarifTool      `json:"tool"`
+	Results    []sarifResult  `json:"results"`
+	Properties map[string]any `json:"properties,omitempty"`
 }
 
 type sarifTool struct {
@@ -47,13 +48,20 @@ type sarifRuleProps struct {
 }
 
 type sarifResult struct {
-	RuleID       string            `json:"ruleId"`
-	RuleIndex    int               `json:"ruleIndex"`
-	Level        string            `json:"level"`
-	Message      sarifMessage      `json:"message"`
-	Locations    []sarifLocation   `json:"locations"`
-	Fingerprints map[string]string `json:"fingerprints,omitempty"`
-	Properties   map[string]any    `json:"properties,omitempty"`
+	RuleID       string             `json:"ruleId"`
+	RuleIndex    int                `json:"ruleIndex"`
+	Level        string             `json:"level"`
+	Message      sarifMessage       `json:"message"`
+	Locations    []sarifLocation    `json:"locations"`
+	Fingerprints map[string]string  `json:"fingerprints,omitempty"`
+	Suppressions []sarifSuppression `json:"suppressions,omitempty"`
+	Properties   map[string]any     `json:"properties,omitempty"`
+}
+
+// sarifSuppression records a finding accepted earlier with --force.
+type sarifSuppression struct {
+	Kind          string `json:"kind"`
+	Justification string `json:"justification,omitempty"`
 }
 
 type sarifMessage struct {
@@ -103,8 +111,10 @@ func ToSARIF(results []*Result, opts SARIFOptions) *sarifLog {
 	ruleIndex := map[string]int{} // pattern → index in rules slice
 	var rules []sarifReportingDesc
 	var sarifResults []sarifResult
+	var coverage []map[string]any
 
 	for _, r := range results {
+		coverage = append(coverage, map[string]any{"resource": r.SkillName, "binaryFiles": r.BinaryFiles, "skippedFiles": r.SkippedFiles, "oversizedFiles": r.OversizedFiles})
 		for _, f := range r.Findings {
 			// Use RuleID when available, fall back to Pattern.
 			ruleID := f.RuleID
@@ -119,9 +129,22 @@ func ToSARIF(results []*Result, opts SARIFOptions) *sarifLog {
 				ruleIndex[ruleID] = idx
 
 				mapping := severityToSARIF[f.Severity]
+				description := f.Message
+				switch ruleID {
+				case "executable-artifact":
+					description = "Executable artifact detected; runtime behavior has not been analyzed"
+				case "disguised-executable":
+					description = "Executable artifact detected in a disguised location; runtime behavior has not been analyzed"
+				case "python-bytecode":
+					description = "Python bytecode detected; runtime behavior has not been analyzed"
+				case "archive-artifact":
+					description = "Archive signature detected; contents have not been inspected"
+				case "uncertain-header":
+					description = "Uncertain executable or bytecode header detected"
+				}
 				rules = append(rules, sarifReportingDesc{
 					ID:               ruleID,
-					ShortDescription: sarifMessage{Text: f.Message},
+					ShortDescription: sarifMessage{Text: description},
 					DefaultConfig:    sarifDefaultConf{Level: mapping.level},
 					Properties:       sarifRuleProps{SecuritySeverity: mapping.secSev},
 				})
@@ -140,6 +163,9 @@ func ToSARIF(results []*Result, opts SARIFOptions) *sarifLog {
 			if f.Fingerprint != "" {
 				sr.Fingerprints = map[string]string{"skillshare/v1": f.Fingerprint}
 			}
+			if f.Acknowledged {
+				sr.Suppressions = []sarifSuppression{{Kind: "external", Justification: "accepted earlier with --force"}}
+			}
 
 			props := map[string]any{}
 			if f.Analyzer != "" {
@@ -150,6 +176,9 @@ func ToSARIF(results []*Result, opts SARIFOptions) *sarifLog {
 			}
 			if f.Confidence > 0 {
 				props["confidence"] = f.Confidence
+			}
+			if f.SeverityContext != "" {
+				props["severityContext"] = f.SeverityContext
 			}
 			if len(props) > 0 {
 				sr.Properties = props
@@ -190,7 +219,8 @@ func ToSARIF(results []*Result, opts SARIFOptions) *sarifLog {
 						Rules:          rules,
 					},
 				},
-				Results: sarifResults,
+				Results:    sarifResults,
+				Properties: map[string]any{"skillshareCoverage": coverage},
 			},
 		},
 	}

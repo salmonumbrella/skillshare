@@ -1,300 +1,191 @@
-import { useState } from 'react';
-import {
-  Trash2,
-  Clock,
-  RotateCcw,
-  X,
-} from 'lucide-react';
+import { useMemo, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { Bot, CircleX, Puzzle, Trash2, Undo2 } from 'lucide-react';
 import { api } from '../api/client';
-import type { TrashedSkill } from '../api/client';
+import type { Skill, TrashedSkill } from '../api/client';
 import { queryKeys, staleTimes } from '../lib/queryKeys';
-import { useAppContext } from '../context/AppContext';
-import { formatSize } from '../lib/format';
-import Card from '../components/Card';
-import HandButton from '../components/HandButton';
-import Badge from '../components/Badge';
+import { formatRelativeTime, useI18n, useT, type Locale } from '../i18n';
+import Button from '../components/Button';
 import ConfirmDialog from '../components/ConfirmDialog';
 import EmptyState from '../components/EmptyState';
-import { PageSkeleton } from '../components/Skeleton';
 import { useToast } from '../components/Toast';
+import { invalidate } from '../lib/queryEvents';
 
-function timeAgo(dateStr: string): string {
-  const now = Date.now();
-  const then = new Date(dateStr).getTime();
-  const diff = now - then;
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  if (days < 30) return `${days}d ago`;
-  return `${Math.floor(days / 30)}mo ago`;
-}
+const HOUR = 60 * 60 * 1000;
+const DAY = 24 * HOUR;
+// ponytail: mirrors defaultMaxAge in internal/trash; send it from the API if it becomes configurable.
+const TRASH_TTL = 7 * DAY;
 
-export default function TrashPage() {
-  const { isProjectMode } = useAppContext();
+export default function TrashPage({ kind }: { kind: Skill['kind'] }) {
+  const t = useT();
+  const { locale } = useI18n();
   const { toast } = useToast();
   const queryClient = useQueryClient();
 
-  const { data, isPending, error } = useQuery({
+  const { data, error } = useQuery({
     queryKey: queryKeys.trash,
     queryFn: () => api.listTrash(),
     staleTime: staleTimes.trash,
   });
+  const items = useMemo(
+    () => (data?.items ?? [])
+      .filter((i) => (i.kind ?? 'skill') === kind)
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()),
+    [data, kind],
+  );
 
-  const [restoreName, setRestoreName] = useState<string | null>(null);
-  const [restoring, setRestoring] = useState(false);
-  const [deleteName, setDeleteName] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState<string | null>(null);
+  const [deleteItem, setDeleteItem] = useState<TrashedSkill | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [emptyOpen, setEmptyOpen] = useState(false);
   const [emptying, setEmptying] = useState(false);
 
-  const items = data?.items ?? [];
+  const refresh = () => void invalidate(queryClient, 'trashChanged');
 
-  const handleRestore = async () => {
-    if (!restoreName) return;
-    setRestoring(true);
+  const restore = async (item: TrashedSkill) => {
+    setRestoring(itemKey(item));
     try {
-      await api.restoreTrash(restoreName);
-      toast(`Restored "${restoreName}" from trash`, 'success');
-      queryClient.invalidateQueries({ queryKey: queryKeys.trash });
-      queryClient.invalidateQueries({ queryKey: queryKeys.skills.all });
-    } catch (e: any) {
-      toast(e.message, 'error');
+      await api.restoreTrash(item.name, kind);
+      toast(t('trash.toast.restored', { name: item.name }), 'success');
+      refresh();
+    } catch (e) {
+      toast((e as Error).message, 'error');
     } finally {
-      setRestoring(false);
-      setRestoreName(null);
+      setRestoring(null);
     }
   };
 
-  const handleDelete = async () => {
-    if (!deleteName) return;
+  const remove = async () => {
+    if (!deleteItem) return;
     setDeleting(true);
     try {
-      await api.deleteTrash(deleteName);
-      toast(`Permanently deleted "${deleteName}"`, 'success');
-      queryClient.invalidateQueries({ queryKey: queryKeys.trash });
-      queryClient.invalidateQueries({ queryKey: queryKeys.skills.all });
-    } catch (e: any) {
-      toast(e.message, 'error');
+      await api.deleteTrash(deleteItem.name, kind);
+      toast(t('trash.toast.deleted', { name: deleteItem.name }), 'success');
+      refresh();
+    } catch (e) {
+      toast((e as Error).message, 'error');
     } finally {
       setDeleting(false);
-      setDeleteName(null);
+      setDeleteItem(null);
     }
   };
 
-  const handleEmpty = async () => {
+  const empty = async () => {
     setEmptying(true);
     try {
-      const res = await api.emptyTrash();
-      toast(`Emptied trash (${res.removed} item${res.removed !== 1 ? 's' : ''} removed)`, 'success');
-      queryClient.invalidateQueries({ queryKey: queryKeys.trash });
-      queryClient.invalidateQueries({ queryKey: queryKeys.skills.all });
-    } catch (e: any) {
-      toast(e.message, 'error');
+      const res = await api.emptyTrash(kind);
+      toast(t('trash.toast.emptied', { count: res.removed, s: res.removed !== 1 ? 's' : '' }), 'success');
+      refresh();
+    } catch (e) {
+      toast((e as Error).message, 'error');
     } finally {
       setEmptying(false);
       setEmptyOpen(false);
     }
   };
 
-  if (isPending) return <PageSkeleton />;
-
   if (error) {
     return (
-      <Card>
-        <p className="text-danger">{error.message}</p>
-      </Card>
+      <div className="ss-note bad">
+        <CircleX size={16} />
+        <div className="flex-1">{error.message}</div>
+      </div>
     );
   }
+  if (!data) return null;
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div>
-        <h2
-          className="text-3xl font-bold text-pencil"
-          style={{ fontFamily: 'var(--font-heading)' }}
-        >
-          Trash
-        </h2>
-        <p
-          className="text-pencil-light mt-1"
-          style={{ fontFamily: 'var(--font-hand)' }}
-        >
-          {isProjectMode
-            ? 'Recently deleted project skills are kept for 7 days before automatic cleanup'
-            : 'Recently deleted skills are kept for 7 days before automatic cleanup'}
-        </p>
+    <>
+      <div className="flex flex-wrap items-center gap-2 -mt-2">
+        <span className="flex-1 text-[13px] text-ink-2">{t('trash.summary')}</span>
+        {items.length > 0 && (
+          <Button variant="danger" onClick={() => setEmptyOpen(true)}>
+            <Trash2 size={15} />
+            {t('trash.emptyButton')}
+          </Button>
+        )}
       </div>
 
-      {/* Summary Card */}
-      <Card variant="postit">
-        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-          <div>
-            <p
-              className="text-lg font-medium text-pencil"
-              style={{ fontFamily: 'var(--font-hand)' }}
-            >
-              {items.length === 0
-                ? 'Trash is empty'
-                : `${items.length} item${items.length !== 1 ? 's' : ''} in trash`}
-            </p>
-            {data && data.totalSize > 0 && (
-              <p className="text-sm text-pencil-light">
-                Total size: {formatSize(data.totalSize)}
-              </p>
-            )}
+      <div className="-mt-3">
+        {items.length === 0 ? (
+          <EmptyState
+            icon={Trash2}
+            title={t(kind === 'agent' ? 'trash.emptyState.agents.title' : 'trash.emptyState.skills.title')}
+            description={t(kind === 'agent' ? 'trash.emptyState.agents.description' : 'trash.emptyState.skills.description')}
+          />
+        ) : (
+          <div className="ss-list">
+            <div className="ss-lh">
+              <span className="w-[26px]" />
+              <span className="flex-1">{t('resources.col.name')}</span>
+              <span className="w-[130px]">{t('trash.col.uninstalled')}</span>
+              <span className="w-[130px]">{t('trash.col.deletedIn')}</span>
+              <span className="w-[132px]" />
+            </div>
+            {items.map((item) => {
+              const left = timeLeft(item.date, locale);
+              return (
+                <div key={itemKey(item)} className="ss-r">
+                  <span className={`ss-cat sm ${kind}`}>{kind === 'agent' ? <Bot size={14} /> : <Puzzle size={14} />}</span>
+                  <span className="nm m flex-1 truncate">{item.name}</span>
+                  <span className="w-[130px] text-[13px] text-ink-2">{formatRelativeTime(item.date, locale)}</span>
+                  <span className={`w-[130px] text-[13px] ${left.soon ? 'text-warn' : 'text-ink-2'}`}>{left.text}</span>
+                  <span className="w-[132px] flex items-center justify-end gap-1">
+                    <Button variant="secondary" size="sm" loading={restoring === itemKey(item)} disabled={restoring !== null} onClick={() => restore(item)}>
+                      <Undo2 size={14} />
+                      {t('trash.actions.restore')}
+                    </Button>
+                    <button
+                      type="button"
+                      className="ss-ib"
+                      title={t('trash.confirm.delete.confirmText')}
+                      aria-label={t('trash.confirm.delete.confirmText')}
+                      onClick={() => setDeleteItem(item)}
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </span>
+                </div>
+              );
+            })}
           </div>
-          {items.length > 0 && (
-            <HandButton
-              variant="danger"
-              size="lg"
-              onClick={() => setEmptyOpen(true)}
-            >
-              <Trash2 size={18} strokeWidth={2.5} /> Empty Trash
-            </HandButton>
-          )}
-        </div>
-      </Card>
+        )}
+      </div>
 
-      {/* Item List */}
-      {items.length === 0 ? (
-        <EmptyState
-          icon={Trash2}
-          title="Trash is empty"
-          description="Deleted skills will appear here for 7 days"
-        />
-      ) : (
-        <div className="space-y-4">
-          {items.map((item, i) => (
-            <TrashCard
-              key={`${item.name}-${item.timestamp}`}
-              item={item}
-              index={i}
-              onRestore={() => setRestoreName(item.name)}
-              onDelete={() => setDeleteName(item.name)}
-            />
-          ))}
-        </div>
-      )}
-
-      {/* Restore Dialog */}
       <ConfirmDialog
-        open={restoreName !== null}
-        title="Restore Skill"
-        message={
-          restoreName ? (
-            <span>
-              Restore <strong>{restoreName}</strong> back to your skills directory?
-            </span>
-          ) : <span />
-        }
-        confirmText="Restore"
-        variant="default"
-        loading={restoring}
-        onConfirm={handleRestore}
-        onCancel={() => setRestoreName(null)}
-      />
-
-      {/* Delete Dialog */}
-      <ConfirmDialog
-        open={deleteName !== null}
-        title="Permanently Delete"
-        message={
-          deleteName ? (
-            <span>
-              Permanently delete <strong>{deleteName}</strong>? This cannot be undone.
-            </span>
-          ) : <span />
-        }
-        confirmText="Delete Forever"
+        open={deleteItem !== null}
+        title={t('trash.confirm.delete.title')}
+        message={t('trash.confirm.delete.message', { name: deleteItem?.name ?? '' })}
+        confirmText={t('trash.confirm.delete.confirmText')}
         variant="danger"
         loading={deleting}
-        onConfirm={handleDelete}
-        onCancel={() => setDeleteName(null)}
+        onConfirm={remove}
+        onCancel={() => setDeleteItem(null)}
       />
-
-      {/* Empty Trash Dialog */}
       <ConfirmDialog
         open={emptyOpen}
-        title="Empty Trash"
-        message={
-          <span>
-            Permanently delete all <strong>{items.length}</strong> item{items.length !== 1 ? 's' : ''} from trash?
-            This cannot be undone.
-          </span>
-        }
-        confirmText="Empty Trash"
+        title={t('trash.confirm.empty.title')}
+        message={t('trash.confirm.empty.message', { count: items.length, s: items.length !== 1 ? 's' : '' })}
+        confirmText={t('trash.confirm.empty.confirmText')}
         variant="danger"
         loading={emptying}
-        onConfirm={handleEmpty}
+        onConfirm={empty}
         onCancel={() => setEmptyOpen(false)}
       />
-    </div>
+    </>
   );
 }
 
-function TrashCard({
-  item,
-  index,
-  onRestore,
-  onDelete,
-}: {
-  item: TrashedSkill;
-  index: number;
-  onRestore: () => void;
-  onDelete: () => void;
-}) {
-  return (
-    <Card
-      decoration={index === 0 ? 'tape' : 'none'}
-      style={{
-        transform: `rotate(${index % 2 === 0 ? '-0.2' : '0.2'}deg)`,
-      }}
-    >
-      <div className="space-y-3">
-        {/* Name + time */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 text-pencil">
-            <Trash2 size={16} strokeWidth={2.5} />
-            <span
-              className="font-medium"
-              style={{ fontFamily: 'var(--font-hand)' }}
-            >
-              {item.name}
-            </span>
-            <span className="text-sm text-pencil-light">
-              {timeAgo(item.date)}
-            </span>
-          </div>
-          <Badge variant="default">{formatSize(item.size)}</Badge>
-        </div>
+function itemKey(item: TrashedSkill) {
+  return `${item.name}-${item.timestamp}`;
+}
 
-        {/* Deleted at */}
-        <div className="flex items-center gap-2 text-sm text-pencil-light">
-          <Clock size={14} strokeWidth={2.5} />
-          <span>Deleted {new Date(item.date).toLocaleString(undefined, {
-            year: 'numeric',
-            month: 'short',
-            day: 'numeric',
-            hour: 'numeric',
-            minute: '2-digit',
-          })}</span>
-        </div>
-
-        {/* Actions */}
-        <div className="border-t border-dashed border-pencil-light/40 pt-3 flex gap-2">
-          <HandButton variant="secondary" size="sm" onClick={onRestore}>
-            <RotateCcw size={14} strokeWidth={2.5} /> Restore
-          </HandButton>
-          <HandButton variant="ghost" size="sm" onClick={onDelete}>
-            <X size={14} strokeWidth={2.5} /> Delete
-          </HandButton>
-        </div>
-      </div>
-    </Card>
-  );
+function timeLeft(date: string, locale: Locale) {
+  const ms = new Date(date).getTime() + TRASH_TTL - Date.now();
+  const unit = ms >= DAY ? 'day' : 'hour';
+  const n = Math.max(1, Math.ceil(ms / (unit === 'day' ? DAY : HOUR)));
+  return {
+    text: new Intl.NumberFormat(locale, { style: 'unit', unit, unitDisplay: 'long' }).format(n),
+    soon: ms <= 2 * DAY,
+  };
 }

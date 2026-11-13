@@ -55,6 +55,9 @@ cmd_up() {
 
   if is_initialised; then
     echo "▸ Already initialised — running start-dev.sh …"
+    echo "▸ Checking UI dependencies …"
+    docker compose -f "$COMPOSE_FILE" exec -T -w /workspace/ui "$SERVICE" \
+      pnpm install --frozen-lockfile
     docker compose -f "$COMPOSE_FILE" exec -T -w /workspace "$SERVICE" \
       bash -c '/workspace/.devcontainer/start-dev.sh'
   else

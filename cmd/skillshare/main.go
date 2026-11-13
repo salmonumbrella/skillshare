@@ -3,11 +3,18 @@ package main
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strings"
 
+	"skillshare/internal/childproc"
 	"skillshare/internal/config"
+	"skillshare/internal/install"
+	"skillshare/internal/sourcewalk"
+	"skillshare/internal/theme"
 	"skillshare/internal/ui"
 	versioncheck "skillshare/internal/version"
 )
@@ -16,46 +23,90 @@ var version = "dev"
 
 // commands maps command names to their handler functions
 var commands = map[string]func([]string) error{
-	"init":      cmdInit,
-	"install":   cmdInstall,
-	"uninstall": cmdUninstall,
-	"list":      cmdList,
-	"sync":      cmdSync,
-	"status":    cmdStatus,
-	"diff":      cmdDiff,
-	"backup":    cmdBackup,
-	"restore":   cmdRestore,
-	"collect":   cmdCollect,
-	"pull":      cmdPull,
-	"push":      cmdPush,
-	"doctor":    cmdDoctor,
-	"target":    cmdTarget,
-	"upgrade":   cmdUpgrade,
-	"update":    cmdUpdate,
-	"check":     cmdCheck,
-	"new":       cmdNew,
-	"search":    cmdSearch,
-	"trash":     cmdTrash,
-	"audit":     cmdAudit,
-	"hub":       cmdHub,
-	"log":       cmdLog,
-	"ui":        cmdUI,
-	"tui":       cmdTUIToggle,
+	"init":         cmdInit,
+	"install":      cmdInstall,
+	"uninstall":    cmdUninstall,
+	"link":         cmdLink,
+	"unlink":       cmdUnlink,
+	"list":         cmdList,
+	"sync":         cmdSync,
+	"status":       cmdStatus,
+	"diff":         cmdDiff,
+	"backup":       cmdBackup,
+	"restore":      cmdRestore,
+	"collect":      cmdCollect,
+	"pull":         cmdPull,
+	"push":         cmdPush,
+	"commit":       cmdCommit,
+	"doctor":       cmdDoctor,
+	"target":       cmdTarget,
+	"project":      cmdProject,
+	"upgrade":      cmdUpgrade,
+	"updates":      cmdUpdates,
+	"update":       cmdUpdate,
+	"check":        cmdCheck,
+	"new":          cmdNew,
+	"search":       cmdSearch,
+	"trash":        cmdTrash,
+	"analyze":      cmdAnalyze,
+	"audit":        cmdAudit,
+	"hub":          cmdHub,
+	"log":          cmdLog,
+	"ui":           cmdUI,
+	"__ui-restart": cmdUIRestart,
+	"tui":          cmdTUIToggle,
+	"extras":       cmdExtras,
+	"mcp":          cmdMCP,
+	"hooks":        cmdHooks,
+	"plugin":       cmdPlugin,
+	"enable":       cmdEnable,
+	"disable":      cmdDisable,
+	"move":         cmdMove,
+	"completion":   cmdCompletion,
 }
 
 func main() {
-	// Clean up any leftover .old files from Windows self-upgrade
-	cleanupOldBinary()
+	// Windows: children stop when this process is terminated, and without a
+	// console it reruns inside a hidden one so they do not each open a window.
+	relaunchInHiddenConsole(childproc.BindToProcess())
+
+	// Project commands must not migrate or rewrite shared config at startup,
+	// so they all skip opportunistic maintenance.
+	skipMaintenance := len(os.Args) > 1 && (os.Args[1] == "updates" || os.Args[1] == "project" && projectSkipsMaintenance(os.Args[2:]))
+	if !skipMaintenance {
+		cleanupOldBinary()
+	}
+
+	// Resolve theme early so OSC 11 probe overhead happens at startup,
+	// not inside a TUI render loop.
+	if t := theme.Get(); t.NoColor || t.Plain {
+		ui.DisableColors()
+	}
 
 	// Migrate Windows legacy ~/.config/skillshare → %AppData%\skillshare
-	results := config.MigrateWindowsLegacyDir()
+	var results []config.MigrationResult
+	if !skipMaintenance {
+		results = config.MigrateWindowsLegacyDir()
 
-	// Migrate legacy dirs (backups/trash/logs) to XDG data/state dirs
-	results = append(results, config.MigrateXDGDirs()...)
+		// Migrate legacy dirs (backups/trash/logs) to XDG data/state dirs
+		results = append(results, config.MigrateXDGDirs()...)
+	}
+	// mcp serve speaks the protocol on stdout, so its errors, notices and trailers stay off it.
+	serving := len(os.Args) > 2 && os.Args[1] == "mcp" && os.Args[2] == "serve"
+	stdout := os.Stdout
+	if serving {
+		os.Stdout = os.Stderr // ui writes through fmt.Printf
+	}
 	reportMigrationResults(results)
+	os.Stdout = stdout
 
 	// Set version for other packages to use
 	versioncheck.Version = version
+
+	// Inject target dotdirs for skill discovery (avoids circular import)
+	targetDotDirs := config.ProjectTargetDotDirs()
+	install.TargetDotDirs = targetDotDirs
+	sourcewalk.TargetDotDirs = targetDotDirs
 
 	if len(os.Args) < 2 {
 		printUsage()
@@ -68,10 +119,10 @@ func main() {
 	// Handle special commands (no error return)
 	switch cmd {
 	case "version":
-		ui.Logo(version)
+		fmt.Printf("skillshare %s\n", ui.VersionLabel(version))
 		return
 	case "-v", "--version":
-		fmt.Printf("skillshare v%s\n", version)
+		fmt.Printf("skillshare %s\n", ui.VersionLabel(version))
 		return
 	case "help", "-h", "--help":
 		printUsage()
@@ -81,57 +132,62 @@ func main() {
 	// Look up and execute command
 	handler, ok := commands[cmd]
 	if !ok {
-		ui.Error("Unknown command: %s", cmd)
-		printUsage()
+		// A lone option such as --no-tui names no command: show the help.
+		if strings.HasPrefix(cmd, "-") {
+			printUsage()
+		} else {
+			printUnknownCommand(cmd)
+		}
 		os.Exit(1)
 	}
 
 	if err := handler(args); err != nil {
+		exitCode := 1
+		var auditErr *auditExecutionError
+		if errors.As(err, &auditErr) {
+			exitCode = 2
+		}
 		// jsonSilentError means JSON output was already written to stdout;
 		// exit non-zero without adding plain-text noise.
 		var silent *jsonSilentError
 		if errors.As(err, &silent) {
+			os.Exit(exitCode)
+		}
+		if serving {
+			fmt.Fprintf(os.Stderr, "✗ %v\n", err)
 			os.Exit(1)
 		}
 		fmt.Println()
 		ui.Error("%v", err)
-		os.Exit(1)
+		os.Exit(exitCode)
 	}
 
-	fmt.Println()
+	// Structured-output contract: machine-readable modes (--json, -j,
+	// --format json/sarif/markdown) must produce only structured data on
+	// stdout and nothing on stderr.  Skip the trailing newline and update
+	// check entirely so machine consumers get a clean payload.
+	if !isStructuredOutput(args) && !serving {
+		fmt.Println()
 
-	// Check for updates (non-blocking, silent on errors)
-	// Skip for upgrade (just upgraded, old version in process) and doctor (has its own check)
-	if cmd != "upgrade" && cmd != "doctor" {
-		method := detectInstallMethod()
-		if result := versioncheck.Check(version, method); result != nil && result.UpdateAvailable {
-			ui.UpdateNotification(result.CurrentVersion, result.LatestVersion, result.InstallMethod.UpgradeCommand())
+		// Check for updates (non-blocking, silent on errors)
+		// Skip for upgrade (just upgraded, old version in process) and doctor (has its own check)
+		if !skipMaintenance && cmd != "upgrade" && cmd != "doctor" && cmd != "updates" && config.AutoUpdateCheckEnabled() {
+			method := versioncheck.DetectCurrentInstallMethod()
+			if result := versioncheck.Check(version, method); result != nil && result.UpdateAvailable && config.AutoUpdateCheckEnabled() {
+				ui.UpdateNotification(result.CurrentVersion, result.LatestVersion, result.InstallMethod.UpgradeCommand(), versioncheck.NixConfigUpgradeHint)
+			}
 		}
 	}
-}
-
-// detectInstallMethod resolves the current executable path and determines
-// how skillshare was installed (Homebrew vs direct download).
-func detectInstallMethod() versioncheck.InstallMethod {
-	execPath, err := os.Executable()
-	if err != nil {
-		return versioncheck.InstallDirect
-	}
-	execPath, err = filepath.EvalSymlinks(execPath)
-	if err != nil {
-		return versioncheck.InstallDirect
-	}
-	return versioncheck.DetectInstallMethod(execPath)
 }
 
 func reportMigrationResults(results []config.MigrationResult) {
 	for _, r := range results {
 		switch r.Status {
 		case config.MigrationMoved:
-			ui.Info("Migrated legacy data: %s -> %s", r.From, r.To)
+			ui.Success("Moved legacy data %s → %s", shortenPath(r.From), shortenPath(r.To))
 		case config.MigrationFailed:
 			if r.From != "" && r.To != "" {
-				ui.Warning("Legacy migration failed: %s -> %s (%v)", r.From, r.To, r.Err)
+				ui.Warning("Moving legacy data %s → %s failed: %v", shortenPath(r.From), shortenPath(r.To), r.Err)
 				continue
 			}
 			ui.Warning("Legacy migration failed: %v", r.Err)
@@ -142,121 +198,74 @@ func reportMigrationResults(results []config.MigrationResult) {
 }
 
 func printUsage() {
-	// Colors
-	y := "\033[33m" // yellow - commands
-	c := "\033[36m" // cyan - arguments
-	g := ui.Dim // dim
-	r := "\033[0m"  // reset
+	fmt.Println(theme.Primary().Bold(true).Render("skillshare") + " " + ui.DimText(ui.VersionLabel(version)+"  Your AI coding setup, everywhere."))
+	fmt.Println()
+	printHelp("skillshare <command> [options]", "",
+		helpGroup{title: "Start", rows: []helpRow{
+			{"init", "Set up the source and pick Targets"},
+			{"status", "Show the source and every Target"},
+			{"sync", "Link skills, agents, extras and MCP into Targets"},
+			{"ui", "Open the web dashboard"},
+			{"doctor", "Find and explain setup problems"},
+		}},
+		helpGroup{title: "Skills and agents", rows: []helpRow{
+			{"install", "Install from a repo or path"},
+			{"uninstall", "Remove from the source"},
+			{"move", "Move skills or folders within the source"},
+			{"link", "Link a folder of your own skills into the source"},
+			{"unlink", "Remove a link from the source"},
+			{"list", "List what is installed"},
+			{"search", "Find skills on GitHub or a hub"},
+			{"new", "Create a skill from a template"},
+			{"enable", "Turn a skill or agent back on"},
+			{"disable", "Turn a skill or agent off"},
+			{"check", "See which ones have updates"},
+			{"update", "Pull updates"},
+			{"collect", "Bring local skills from a Target into the source"},
+			{"audit", "Scan for security problems"},
+			{"analyze", "Show how much context each Target's skills use"},
+		}},
+		helpGroup{title: "More to sync", rows: []helpRow{
+			{"extras", "Rules, commands and other shared files"},
+			{"mcp", "MCP servers"},
+			{"hooks", "Agent hooks"},
+			{"plugin", "Agent plugins"},
+		}},
+		helpGroup{title: "Targets", rows: []helpRow{
+			{"target", "Add, remove and list Targets"},
+			{"project", "Manage shared and local project folders"},
+			{"diff", "Compare the source with a Target"},
+		}},
+		helpGroup{title: "History", rows: []helpRow{
+			{"backup", "Back up Targets"},
+			{"restore", "Roll a Target back"},
+			{"trash", "Restore something you uninstalled"},
+			{"log", "See what ran"},
+		}},
+		helpGroup{title: "Git", rows: []helpRow{{"commit · push · pull", ""}}},
+		helpGroup{title: "CLI", rows: []helpRow{{"upgrade · updates · hub · tui · completion · version", ""}}},
+		helpGroup{title: "Common options", rows: []helpRow{
+			{"-p, --project", "Use this project's config"},
+			{"-g, --global", "Use the global config"},
+			{"-n, --dry-run", "Preview, write nothing"},
+			{"--json", "Machine-readable output"},
+			{"--no-tui", "Plain prompts, no full-screen UI"},
+			{"-h, --help", "Help for any command"},
+		}},
+	)
+	fmt.Println()
+	fmt.Println(ui.DimText("Run 'skillshare <command> --help' for its subcommands and options."))
+	fmt.Println(ui.DimText("Docs  https://skillshare.runkids.cc"))
+}
 
-	// ASCII art logo
-	ui.Logo("")
-
-	// Command width for alignment
-	const w = 35
-
-	// Helper: pad command to fixed width
-	pad := func(s string, width int) string {
-		// Count visible characters (exclude ANSI codes)
-		visible := 0
-		inEscape := false
-		for _, ch := range s {
-			if ch == '\033' {
-				inEscape = true
-			} else if inEscape && ch == 'm' {
-				inEscape = false
-			} else if !inEscape {
-				visible++
-			}
-		}
-		if visible < width {
-			return s + fmt.Sprintf("%*s", width-visible, "")
-		}
-		return s
+// printUnknownCommand names the mistyped command, the closest real one,
+// and where to find the rest.
+func printUnknownCommand(cmd string) {
+	ui.Error("Unknown command: %s", cmd)
+	if s := suggestCommand(cmd, slices.Collect(maps.Keys(commands))); s != "" {
+		ui.Note(fmt.Sprintf("Did you mean %q?", s))
 	}
-
-	// Helper: format command line
-	cmd := func(name, args, desc string) {
-		var cmdPart string
-		if args != "" {
-			cmdPart = y + name + r + " " + c + args + r
-		} else {
-			cmdPart = y + name + r
-		}
-		fmt.Printf("  %s %s\n", pad(cmdPart, w), desc)
-	}
-
-	// Core Commands
-	fmt.Println("CORE COMMANDS")
-	cmd("init", "", "Initialize skillshare")
-	cmd("install", "<source>", "Install a skill from local path or git repo")
-	cmd("uninstall", "<name>...", "Remove skills from source directory")
-	cmd("list", "", "List all installed skills")
-	cmd("search", "[query]", "Search or browse GitHub for skills")
-	cmd("sync", "[extras] [--all]", "Sync skills (or extras) to targets")
-	cmd("status", "", "Show status of all targets")
-	fmt.Println()
-
-	// Skill Management
-	fmt.Println("SKILL MANAGEMENT")
-	cmd("new", "<name>", "Create a new skill with SKILL.md template")
-	cmd("check", "", "Check for available updates")
-	cmd("update", "<name>", "Update a skill or tracked repository")
-	cmd("update", "--all", "Update all tracked repositories")
-	cmd("upgrade", "", "Upgrade CLI and/or skillshare skill")
-	fmt.Println()
-
-	// Target Management
-	fmt.Println("TARGET MANAGEMENT")
-	cmd("target add", "<name> [path]", "Add a target (path optional in project mode)")
-	cmd("target remove", "<name>", "Unlink target and restore skills")
-	cmd("target list", "", "List all targets")
-	cmd("diff", "", "Show differences between source and targets")
-	fmt.Println()
-
-	// Sync & Backup
-	fmt.Println("SYNC & BACKUP")
-	cmd("collect", "[target]", "Collect local skills from target(s) to source")
-	cmd("backup", "", "Create backup of target(s)")
-	cmd("restore", "<target>", "Restore target from latest backup")
-	cmd("trash", "list", "List trashed skills")
-	cmd("trash", "restore <name>", "Restore a skill from trash")
-	fmt.Println()
-
-	// Git Remote
-	fmt.Println("GIT REMOTE")
-	cmd("push", "", "Commit and push source to git remote")
-	cmd("pull", "", "Pull from git remote and sync to targets")
-	fmt.Println()
-
-	// Utilities
-	fmt.Println("UTILITIES")
-	cmd("audit", "[name]", "Scan skills for security threats")
-	cmd("hub", "<subcommand>", "Manage hubs (add, list, remove, default, index)")
-	cmd("log", "", "View operation log")
-	cmd("tui", "[on|off]", "Toggle interactive TUI mode")
-	cmd("ui", "", "Launch web dashboard")
-	cmd("doctor", "", "Check environment and diagnose issues")
-	cmd("version", "", "Show version")
-	cmd("help", "", "Show this help")
-	fmt.Println()
-
-	// Global Options
-	fmt.Println("GLOBAL OPTIONS")
-	fmt.Printf("  %s%-33s%s %s\n", c, "--project, -p", r, "Use project-level config in current directory")
-	fmt.Printf("  %s%-33s%s %s\n", c, "--global, -g", r, "Use global config (~/.config/skillshare)")
-	fmt.Println()
-
-	// Examples
-	fmt.Println("EXAMPLES")
-	fmt.Println(g + "  skillshare status                                   # Check current state")
-	fmt.Println("  skillshare sync --dry-run                           # Preview before sync")
-	fmt.Println("  skillshare collect claude                           # Import local skills")
-	fmt.Println("  skillshare install anthropics/skills/pdf -p         # Project install")
-	fmt.Println("  skillshare target add cursor -p                     # Project target")
-	fmt.Println("  skillshare push -m \"Add new skill\"                  # Push to remote")
-	fmt.Println("  skillshare pull                                     # Pull from remote")
-	fmt.Println("  skillshare install github.com/team/skills --track   # Team repo")
-	fmt.Println("  skillshare update --all                             # Update all repos" + r)
+	ui.Note("Run 'skillshare help' to see all commands")
 }
 
 // cleanupOldBinary removes leftover .old files from Windows self-upgrade.

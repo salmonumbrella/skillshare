@@ -28,6 +28,37 @@ skillshare audit --analyzer static      # Run only the static analyzer
 skillshare audit --analyzer static --analyzer dataflow  # Multiple analyzers
 ```
 
+## Display severity floor
+
+```bash
+skillshare audit --min-severity high
+skillshare audit --format markdown --min-severity medium
+```
+
+`--min-severity <level>` shows findings at or above `critical`, `high`, `medium`, `low`, or `info` (case-insensitive; severity aliases such as `h` also work). The default shows all findings. It applies only to terminal findings, including the TUI, and Markdown tables/snippets. Human reports show visible and hidden counts even when every finding is hidden. Scores, maximum severity (`summary.maxSeverity`), block thresholds, exit codes, scan errors and incomplete-scan warnings still describe the full scan. JSON and SARIF ignore the display floor and keep their complete output unchanged; no display metadata or top-level severity alias is added.
+
+In the dashboard, choose **Minimum severity** in the severity filter, then select a severity count to show that level and above. **Exact severity** preserves the previous selection behavior. Click the selected severity again to clear it. Without a selection, LOW/INFO findings retain their per-resource expander; visible/hidden counts include collapsed findings. Filtering never rescans or changes policy, scores or blocked status.
+
+## Accepted findings {#accepted-findings}
+
+```bash
+skillshare audit --respect-accepted
+skillshare audit --respect-accepted --threshold high --format json
+```
+
+Findings you accepted with `--force` during `install` or `update` are recorded in `.metadata.json` (see [Accepted Findings](/docs/reference/commands/update#accepted-findings)). A plain `audit` still fails on them. With `--respect-accepted`, audit applies those acceptances the way the update gate does: the findings stay in the report, but they no longer fail it. A resource whose other findings are below the threshold counts as a warning, and the exit code is `0` unless another finding reaches the threshold. A changed finding needs a new acceptance.
+
+Accepted findings are marked in every output format:
+
+| Format | Mark |
+|--------|------|
+| Text and TUI | `accepted earlier with --force` under the finding; the text summary adds an **Accepted** row |
+| JSON | `"acknowledged": true` on the finding; `summary.accepted` counts them, and the severity counts such as `summary.critical` leave them out |
+| Markdown | `(accepted earlier)` after the message; the summary table adds an **Accepted** row |
+| SARIF | a `suppressions` entry with kind `external` |
+
+A skill inside a tracked repository also matches the acceptances recorded for the whole repository. Bundled hook and settings findings are the exception: their evidence names the file as the repository scan saw it, so they still fail a single-skill audit.
+
 ## When to Use
 
 - Review security findings after installing a new skill
@@ -41,36 +72,34 @@ skillshare audit --analyzer static --analyzer dataflow  # Multiple analyzers
 
 The audit engine scans every text-based file in a skill directory against 100+ built-in rules (regex patterns, table-driven credential detection, structural checks, content integrity verification, and supply-chain trust analysis), organized into 5 severity levels: **CRITICAL**, **HIGH**, **MEDIUM**, **LOW**, and **INFO**.
 
+Markdown examples are still scanned. SDK-style `system:` / `System:` parameters in parsed fenced code blocks (`prompt-injection-1`) are reported as HIGH rather than CRITICAL when their value has a parameter-like shape. Generic disclosure restrictions such as "Do not tell the user they need to adopt an eval framework" use the HIGH rule `prompt-injection-5` in all file types. Explicit concealment remains CRITICAL under `prompt-injection-4`. In `.py` files, built-in CRITICAL credential-access matches on comment-only lines and docstrings are reported as HIGH; see [Credential Access](../../understand/audit-engine.md#credential-access). HIGH warns at the default CRITICAL threshold and blocks under `strict`; see [Prompt Injection](../../understand/audit-engine.md#prompt-injection) for limitations and rule-override compatibility.
+
 For the full detection catalog, threat categories deep dive, risk scoring algorithm, command safety tiering, and cross-skill interaction analysis, see [Audit Engine](/docs/understand/audit-engine).
 
 ## Example Output
 
 ```
 skillshare audit
-──────────────────────────────────────────────────
-Scanning 12 skills for threats
-mode: global
-path: /Users/alice/.config/skillshare/skills
-block rule: finding severity >= CRITICAL
-policy: DEFAULT / dedupe:GLOBAL / analyzers:ALL
+Audit  ~/.config/skillshare/skills
+  global · blocks at CRITICAL · policy DEFAULT / dedupe:GLOBAL / analyzers:ALL
 
-[3/12] ! ci-release-helper  (AGG MEDIUM 25/100, max HIGH)
-[4/12] ✗ suspicious-skill   (AGG HIGH 35/100, max CRITICAL)
+! ci-release-helper  HIGH · risk 25/100
+✗ suspicious-skill   CRITICAL · risk 35/100
 
 Summary
-──────────────────────────────────────────────────
-  Block:     severity >= CRITICAL
-  Policy:    DEFAULT / dedupe:GLOBAL / analyzers:ALL
-  Max sev:   CRITICAL
-  Scanned:   12 skill(s)
-  Passed:    9
-  Warning:   2
-  Failed:    1
-  Severity:  c/h/m/l/i = 1/2/1/0/0
-  Threats:   inj:1 exfil:1 cred:1 priv:1
-  Aggregate: HIGH (35/100)
-  Auditable: 100% avg
-  Note:      Failed uses severity gate; aggregate is informational
+  Scanned      12 skills
+✓ Passed       9
+! Warning      2
+✗ Failed       1
+  Severity     1 critical, 2 high, 1 medium
+  Threats      credential:1 exfiltration:1 injection:1 privilege:1
+  Risk         HIGH 35/100 · 100% auditable
+
+✗ Blocked 1 of 12 skills: findings at CRITICAL or above · 2.1s
+  The risk score is informational; only the severity blocks
+
+Next
+  skillshare audit suspicious-skill  see its findings
 ```
 
 `Failed` counts skills with findings at or above the active threshold (`--threshold` or config `audit.block_threshold`; default `CRITICAL`).
@@ -81,23 +110,9 @@ Summary
 
 ### Interactive TUI Mode
 
-When scanning multiple skills in an interactive terminal, the audit command launches a **full-screen TUI** (powered by bubbletea) instead of printing results line-by-line. The TUI uses a side-by-side layout:
+When scanning several skills in an interactive terminal, `audit` opens a full-screen view instead of printing results line by line: skills on the left with findings first, and the risk summary and findings of the selected skill on the right. Opening a skill shows its files at each finding, with the flagged line marked and its line number. The keys are listed at the bottom of the screen.
 
-**Left panel** — skill list sorted by severity (findings first), with `✗`/`!`/`✓` status badges and aggregate risk scores.
-
-**Right panel** — detail for the currently selected skill, automatically updated as you navigate:
-
-- **Summary**: risk score (colorized), max severity, block status, threshold, scan time, severity breakdown (c/h/m/l/i)
-- **Findings**: each finding shows `[N] SEVERITY pattern`, message, `file:line` location, and matched snippet
-
-**Controls:**
-- `↑↓` navigate skills, `←→` page
-- `/` filter skills by name
-- `Ctrl+d`/`Ctrl+u` scroll the detail panel
-- Mouse wheel scrolls the detail panel
-- `q`/`Esc` quit
-
-The TUI activates automatically when all conditions are met: interactive terminal, non-JSON output, and multiple results. Use `--no-tui` to force plain text output. Narrow terminals (`<70` columns) fall back to a vertical layout.
+It opens only when the terminal is interactive, the output is not JSON, and there is more than one result. Use `--no-tui` to force plain text.
 
 ### Large Scan Confirmation
 
@@ -148,12 +163,12 @@ skillshare audit --analyzer static --analyzer dataflow # Multiple analyzers
 
 | Analyzer | Scope | Description |
 |----------|-------|-------------|
-| `static` | Per-file | Regex-based pattern matching against audit rules |
+| `static` | Per-file | Regex pattern matching and file-level whitespace-padding checks |
 | `dataflow` | Per-file | Taint tracking for shell scripts and markdown code blocks |
 | `tier` | Per-skill | Capability tier combination risk analysis |
 | `integrity` | Per-skill | Content hash verification (`file_hashes` in SKILL.md) |
 | `metadata` | Per-skill | Supply-chain trust verification (publisher mismatch, authority claims) |
-| `structure` | Per-skill | Dangling markdown link detection |
+| `structure` | Per-skill | Checks missing and out-of-root Markdown links/images and declared bundled paths; [bundled hooks/settings](/docs/understand/audit-engine#bundled-hooks-and-settings) |
 | `cross-skill` | Bundle | Cross-skill exfiltration and privilege escalation analysis |
 
 You can also set this in config:
@@ -163,7 +178,7 @@ audit:
   enabled_analyzers: [static, dataflow]
 ```
 
-### Precedence
+### Precedence {#precedence}
 
 Settings resolve in this order (first non-empty wins):
 
@@ -195,7 +210,7 @@ skillshare install /path/to/skill --skip-audit
 # Bypasses scanning (use with caution)
 ```
 
-`--force` overrides block decisions. `--skip-audit` disables scanning for that install command.
+`--force` overrides block decisions from findings; a scan that cannot run still blocks. `--skip-audit` disables scanning for that install command.
 
 There is no config flag to globally disable install-time audit. Use `--skip-audit` only for commands where you intentionally want to bypass scanning.
 
@@ -210,7 +225,9 @@ If both are provided, `--skip-audit` effectively wins because audit is not execu
 
 ### Update-time
 
-`skillshare update` runs a security audit after pulling tracked repos. Findings at or above the active threshold (`audit.block_threshold` by default, or `--audit-threshold` / `--threshold` / `-T` override) trigger rollback. See [`update --skip-audit`](/docs/reference/commands/update#security-audit-gate) for details.
+`skillshare update` pulls tracked repos into an isolated candidate and audits it before publication. Findings at or above the active threshold (`audit.block_threshold` by default, or `--audit-threshold` / `--threshold` / `-T` override) block publication unless explicitly accepted; rejection leaves the active checkout unchanged. See [`update --skip-audit`](/docs/reference/commands/update#security-audit-gate) for details.
+
+Findings accepted with `--force` are remembered for that skill. Acceptance keys ignore line numbers and include the rule, file, matched text, and any detector-specific evidence. For `whitespace-padding`, changed padded content produces a new key; density findings use all eligible file content as evidence. See [Accepted Findings](/docs/reference/commands/update#accepted-findings).
 
 When updating tracked repos via install (`skillshare install <repo> --track --update`), the gate uses the same threshold policy (`audit.block_threshold` or `--audit-threshold` / `--threshold` / `-T`).
 
@@ -304,6 +321,8 @@ skillshare ui
 
 The Dashboard page includes a Security Audit section with a quick-scan summary.
 
+The Audit page always applies [accepted findings](#accepted-findings): it shows them muted with the note accepted earlier with `--force`, counts them under **Accepted** instead of their severity, and does not count them as blocked. Clear **Show accepted** to hide them. A skill's Audit tab collapses them behind their own expander, and the Dashboard's attention card leaves them out of the high-risk count.
+
 ### Custom Rules Editor
 
 The web dashboard includes a dedicated **Audit Rules** page at `/audit/rules` for creating and editing custom rules directly in the browser:
@@ -318,8 +337,13 @@ Access it from the Audit page via the "Custom Rules" button.
 
 | Code | Meaning |
 |------|---------|
-| `0` | No findings at or above active threshold |
-| `1` | One or more findings at or above active threshold |
+| `0` | No scan errors and no findings at or above active threshold |
+| `1` | One or more findings at or above active threshold, with no scan errors |
+| `2` | Audit execution, usage, or configuration error, including a failed scan |
+
+With `--respect-accepted`, findings accepted earlier with `--force` do not count toward `1`. Declining the large-scan confirmation exits `0` without scanning. Audits launched from `list` use the same exit codes.
+
+Scan errors take precedence over findings. Partial structured reports are still emitted when available.
 
 ## Scanned Files
 
@@ -327,12 +351,12 @@ The audit scans text-based files in skill directories:
 
 - `.md`, `.txt`, `.yaml`, `.yml`, `.json`, `.toml`
 - `.sh`, `.bash`, `.zsh`, `.fish`
-- `.py`, `.js`, `.ts`, `.rb`, `.go`, `.rs`
+- `.py`, `.js`, `.ts`, `.rb`, `.php`, `.php3`, `.php4`, `.php5`, `.phtml`, `.go`, `.rs`, `.swift`
 - Files without extensions (e.g., `Makefile`, `Dockerfile`)
 
-Scanning is recursive within each skill directory, so `SKILL.md`, nested `references/*.md`, and `scripts/*.sh` are all inspected when they match supported text file types.
+Text scanning skips hidden directories and is recursive within the remaining skill directory, so `SKILL.md`, nested `references/*.md`, and `scripts/*.sh` are all inspected when they match supported text file types. A whole-repository scan, such as the one `install --track` and tracked updates run, measures hidden directories inside each skill it contains, so a skill in `.agents/skills/` or `.curated/` gets the full text scan while target copies such as `.claude/skills/` stay header-only.
 
-Binary files (images, `.wasm`, etc.) and hidden directories (`.git`) are skipped.
+Before text filtering, audit checks the first 512 bytes of each regular file (and reads a bounded PE header at its declared offset when needed) to classify executables, CPython bytecode, ZIP/JAR archives, and disguised shebang scripts. Hidden directories inside a skill receive header classification only; `__pycache__` is also included. Symlinks to non-special files retain their existing text scanning; special targets are skipped and direct audits of them return an error; `.git`, `.skillshare`, internal metadata, OS metadata, symlinks and special files are excluded from header reads. Binary and oversized files receive no full text analysis. Summaries report `binaryFiles`, `skippedFiles` and `oversizedFiles`; these counts overlap. Header classification does not analyze runtime behavior or archive contents. See [Executable and archive headers](../../understand/audit-engine.md#executable-headers) for formats, severity and limits. The structure analyzer also reads the skill’s `.claude/settings.json` and `.claude/settings.local.json` for [bundled hooks and settings](../../understand/audit-engine.md#bundled-hooks-and-settings).
 
 ## Options
 
@@ -342,14 +366,16 @@ Binary files (images, `.wasm`, etc.) and hidden directories (`.git`) are skipped
 | `-p`, `--project` | Scan project-level skills |
 | `-g`, `--global` | Scan global skills |
 | `--threshold` `<t>`, `-T` `<t>` | Block threshold: `critical`\|`high`\|`medium`\|`low`\|`info` (shorthand: `c`\|`h`\|`m`\|`l`\|`i`, plus `crit`, `med`) |
+| `--min-severity <level>` | Display findings at/above a severity; scores, gates and machine output stay unchanged |
 | `--profile` `<p>` | Audit profile preset: `default`, `strict`, `permissive` |
 | `--dedupe` `<mode>` | Dedup mode: `legacy`, `global` (default) |
 | `--analyzer` `<id>` | Only run specified analyzer (repeatable). IDs: `static`, `dataflow`, `tier`, `integrity`, `metadata`, `structure`, `cross-skill` |
-| `--format` `<f>` | Output format: `text` (default), `json`, `sarif`, `markdown` |
+| `--format` `<f>` | Output format: `text` (default), `json`, `sarif`, `markdown`. JSON adds `warnings` and `incomplete: true` when a [followed source link](../targets/configuration.md#follow_source_links) could not be read, so a partial scan is not mistaken for a full one; Markdown lists those links under **Source links not followed**, and the TUI summary line counts them |
 | `--json` | Output JSON (**deprecated**: use `--format json`) |
 | `--yes`, `-y` | Skip large-scan confirmation prompt (auto-confirms) |
 | `--quiet`, `-q` | Only show skills with findings + summary (suppress clean ✓ lines) |
 | `--no-tui` | Disable interactive TUI, print plain text output |
+| `--respect-accepted` | Do not fail on findings accepted earlier with `--force`; they are marked as accepted. See [Accepted findings](#accepted-findings) |
 | `--init-rules` | Create a starter `audit-rules.yaml` (respects `-p`/`-g`) |
 | `-h`, `--help` | Show help |
 
@@ -358,6 +384,19 @@ Binary files (images, `.wasm`, etc.) and hidden directories (`.git`) are skipped
 | Subcommand | Description |
 |-----------|-------------|
 | `rules` | Browse, enable, and disable audit rules (see [`audit rules`](/docs/reference/commands/audit-rules)) |
+
+## Agent Support
+
+`skillshare audit agents` scopes the security scan to agents only, scanning `.md` files in the agents source directory:
+
+```bash
+skillshare audit agents                    # Scan all agents
+skillshare audit agents --threshold high   # Block on HIGH+ for agents
+skillshare audit agents --format sarif     # SARIF output for agents
+skillshare audit agents -p                 # Scan project agents
+```
+
+Agents are subject to the same audit rules, severity levels, and threshold gating as skills. Without the `agents` argument, `audit` scans skills only (default behavior). See [Agents](/docs/understand/agents) for background.
 
 ## See Also
 
@@ -370,3 +409,4 @@ Binary files (images, `.wasm`, etc.) and hidden directories (`.git`) are skipped
 - [Securing Your Skills](/docs/how-to/advanced/security) — Security guide for teams and organizations
 - [CI/CD Skill Validation](/docs/how-to/recipes/ci-cd-skill-validation) — Pipeline automation recipe
 - [Pre-commit Hook](/docs/how-to/recipes/pre-commit-hook) — Automatic audit on every commit
+- [Agents](/docs/understand/agents) — Agent concepts

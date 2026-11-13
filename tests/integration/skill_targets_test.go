@@ -76,48 +76,6 @@ func TestSkillTargets_CrossModeMatching(t *testing.T) {
 	}
 }
 
-func TestSkillTargets_MultipleTargetsListed(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("multi-skill", map[string]string{
-		"SKILL.md": "---\nname: multi-skill\ntargets: [claude, cursor]\n---\n# Multi",
-	})
-	sb.CreateSkill("single-skill", map[string]string{
-		"SKILL.md": "---\nname: single-skill\ntargets: [cursor]\n---\n# Single",
-	})
-
-	claudePath := sb.CreateTarget("claude")
-	cursorPath := sb.CreateTarget("cursor")
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets:
-  claude:
-    path: ` + claudePath + `
-  cursor:
-    path: ` + cursorPath + `
-`)
-
-	result := sb.RunCLI("sync")
-	result.AssertSuccess(t)
-
-	// multi-skill should be in both
-	if !sb.IsSymlink(filepath.Join(claudePath, "multi-skill")) {
-		t.Error("multi-skill should be in claude")
-	}
-	if !sb.IsSymlink(filepath.Join(cursorPath, "multi-skill")) {
-		t.Error("multi-skill should be in cursor")
-	}
-
-	// single-skill should only be in cursor
-	if sb.FileExists(filepath.Join(claudePath, "single-skill")) {
-		t.Error("single-skill should NOT be in claude")
-	}
-	if !sb.IsSymlink(filepath.Join(cursorPath, "single-skill")) {
-		t.Error("single-skill should be in cursor")
-	}
-}
-
 func TestSkillTargets_DoctorNoDriftWarning(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()

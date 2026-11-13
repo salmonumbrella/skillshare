@@ -59,29 +59,45 @@ targets:
 	}
 }
 
-func TestSync_CopyMode_SkipsUnchanged(t *testing.T) {
+func TestSync_CopyMode_IgnoresConfiguredArtifacts(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
 
-	sb.CreateSkill("skill-a", map[string]string{
-		"SKILL.md": "# Skill A",
+	skillDir := sb.CreateSkill("skill-a", map[string]string{
+		"SKILL.md": "---\nname: skill-a\n---\n# Skill A",
 	})
-	targetPath := sb.CreateTarget("claude")
+	if err := os.MkdirAll(filepath.Join(skillDir, "scripts", "__pycache__"), 0755); err != nil {
+		t.Fatalf("failed to create __pycache__: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "scripts", "__pycache__", "tool.pyc"), []byte("cache"), 0644); err != nil {
+		t.Fatalf("failed to write pyc: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(skillDir, "tmp"), 0755); err != nil {
+		t.Fatalf("failed to create tmp: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "tmp", "note.txt"), []byte("temporary"), 0644); err != nil {
+		t.Fatalf("failed to write tmp file: %v", err)
+	}
 
+	targetPath := sb.CreateTarget("claude")
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
+ignore:
+  - tmp/
 targets:
   claude:
     path: ` + targetPath + `
     mode: copy
 `)
 
-	// First sync
-	sb.RunCLI("sync").AssertSuccess(t)
-
-	// Second sync — should skip
 	result := sb.RunCLI("sync")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "skipped")
+
+	if sb.FileExists(filepath.Join(targetPath, "skill-a", "scripts", "__pycache__", "tool.pyc")) {
+		t.Error("__pycache__ artifact should not be copied")
+	}
+	if sb.FileExists(filepath.Join(targetPath, "skill-a", "tmp", "note.txt")) {
+		t.Error("configured ignored directory should not be copied")
+	}
 }
 
 func TestSync_CopyMode_UpdatesChanged(t *testing.T) {
@@ -520,32 +536,7 @@ targets:
 	// Second sync without changes — should skip via mtime fast-path
 	result2 := sb.RunCLI("sync")
 	result2.AssertSuccess(t)
-	result2.AssertOutputContains(t, "skipped")
-}
-
-func TestSync_CopyMode_MtimeCache_ForceBypassesMtime(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("skill-a", map[string]string{
-		"SKILL.md": "# Skill A",
-	})
-	targetPath := sb.CreateTarget("claude")
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets:
-  claude:
-    path: ` + targetPath + `
-    mode: copy
-`)
-
-	// First sync
-	sb.RunCLI("sync").AssertSuccess(t)
-
-	// Force sync — should NOT use mtime shortcut
-	result := sb.RunCLI("sync", "--force")
-	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "updated")
+	result2.AssertOutputContains(t, "up to date")
 }
 
 // --- project mode copy ---

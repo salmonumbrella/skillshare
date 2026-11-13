@@ -1,0 +1,691 @@
+// Authoring this harness is not evidence. Only an executed hosted run can certify it.
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { lstat, mkdir, readFile, readlink, readdir, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { command, makeFixture, pins } from './fixture.mjs';
+
+assert.equal(process.env.CI, 'true', 'This helper is for hosted CI only');
+assert.ok(process.env.RUNNER_TEMP);
+const workspace = process.env.GITHUB_WORKSPACE;
+const output = path.join(workspace, 'evidence');
+const stateRoot = process.env.CAPTURE_STATE_ROOT;
+assert.equal(stateRoot, path.join(process.env.RUNNER_TEMP, 'pr880-fixtures'));
+const { chromium } = await import(pathToFileURL(process.env.CAPTURE_PLAYWRIGHT).href);
+const viewport = { width: 1440, height: 1100 };
+const narrowViewport = { width: 1024, height: 900 };
+const annotationHeight = 56;
+let captureTitle = '';
+const names = ['_absent', '_occupied', '_blocked', '_restored', '_restored-dirty', '_restored-status', '_clean', '_dirty'];
+const declarationStates = [
+  'absent-row', 'occupied-row', 'absent-confirm', 'absent-result', 'occupied-confirm', 'occupied-result',
+  'blocked-confirm', 'blocked-error',
+  'restored-confirm', 'restored-guard', 'restored-checkout-confirm', 'restored-result',
+  'restored-dirty-confirm', 'restored-dirty-guard', 'restored-dirty-checkout-confirm', 'restored-dirty-refusal', 'restored-dirty-result',
+  'restored-status-confirm', 'restored-status-guard', 'restored-status-checkout-confirm', 'restored-status-refusal', 'restored-status-result',
+];
+const manifest = {
+  status: 'incomplete', pins, captures: [], checks: [], deleteRequests: [], requestIntents: [],
+  provenance: 'Actual pinned dashboard builds and actual isolated backend; synthetic filesystem data. No native clients exercised.',
+  syntheticInterceptions: [
+    '_blocked recordOnly DELETE: synthetic nonforceable 500; not backend failure proof',
+    '_restored-status ordinary checkout DELETE after real restore guard and reconfirmation: synthetic repo_status_failed 409; not backend failure proof',
+    'unlink-warning DELETE on both pins: real successful unlink, then synthetic warning field added to its response; no metadata persistence fault or partial oplog is proven',
+  ],
+  media: 'Dark clean style; complete app viewport below an external 56px caption matte, no scaling. Browser devicePixelRatio measured; no physical display claim. Pointer is a capture overlay. Recording has an explicit Dashboard → Skills chapter cut, not continuous real-time.',
+  presentation: { annotationHeight, appOrigin: { x: 0, y: annotationHeight }, exportedCanvases: [viewport, narrowViewport], appViewports: [viewport, narrowViewport].map(size => ({ ...size, height: size.height - annotationHeight })) },
+};
+let browser;
+let activeFixture;
+let activeContext;
+let recorder;
+await mkdir(output, { recursive: true });
+
+function check(description) { manifest.checks.push(description); }
+function translate(messages, key, params = {}) {
+  assert.equal(typeof messages[key], 'string', `Missing source locale key ${key}`);
+  return messages[key].replace(/\{(\w+)\}/g, (_, name) => String(params[name] ?? `{${name}}`));
+}
+async function caption(page, text) {
+  captureTitle = text;
+}
+async function annotate(raw, file, title) {
+  // Hash-only relative textfile paths avoid filter escaping; title bytes never enter argv or a shell.
+  const textfile = `caption-${createHash('sha256').update(title).digest('hex')}.txt`;
+  await writeFile(path.join(output, textfile), title);
+  command('ffmpeg', ['-y', '-f', 'image2pipe', '-c:v', file.endsWith('.png') ? 'png' : 'mjpeg', '-i', 'pipe:0', '-vf',
+    `pad=iw:ih+${annotationHeight}:0:${annotationHeight}:color=0x15171b,drawtext=fontfile=caption-font.ttf:textfile=${textfile}:expansion=none:fontcolor=white:fontsize=20:x=(w-text_w)/2:y=(${annotationHeight}-text_h)/2`,
+    '-frames:v', '1', file], { input: raw, stdio: ['pipe', 'pipe', 'pipe'], cwd: output });
+}
+async function overlays(page) {
+  // Only annotations are injected. No app DOM, API result or product assertion is replaced.
+  await page.evaluate(() => {
+    const pointer = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    pointer.id = 'ci-pointer';
+    pointer.setAttribute('width', '28'); pointer.setAttribute('height', '36');
+    pointer.setAttribute('viewBox', '-2 -2 28 36');
+    // macOS-style black arrow, white outline; its tip is at CSS (left, top).
+    pointer.innerHTML = '<path d="M0 0 L0 25 L6 19 L11 31 L16 29 L11 17 L21 17 Z" fill="black" stroke="white" stroke-width="1.5" stroke-linejoin="round"/>';
+    Object.assign(pointer.style, { position: 'fixed', left: '320px', top: '170px', zIndex: '2147483647', pointerEvents: 'none', overflow: 'visible', transform: 'translate(-2px,-2px)' });
+    document.body.append(pointer);
+  });
+}
+
+async function click(page, target) {
+  await target.waitFor({ state: 'visible' });
+  await target.scrollIntoViewIfNeeded();
+  const box = await target.boundingBox();
+  assert.ok(box);
+  const tip = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  assert.ok(tip.x >= 0 && tip.x < page.viewportSize().width && tip.y >= 0 && tip.y < page.viewportSize().height, 'Click target must remain inside app viewport');
+  const from = await page.locator('#ci-pointer').evaluate(el => ({ x: parseFloat(el.style.left), y: parseFloat(el.style.top) }));
+  for (let i = 1; i <= 24; i++) {
+    const t = i / 24;
+    const eased = t * t * (3 - 2 * t);
+    const x = from.x + (tip.x - from.x) * eased;
+    const y = from.y + (tip.y - from.y) * eased;
+    await page.mouse.move(x, y);
+    await page.locator('#ci-pointer').evaluate((el, { x, y }) => { el.style.left = `${x}px`; el.style.top = `${y}px`; }, { x, y });
+    await page.waitForTimeout(28);
+  }
+  await page.mouse.click(tip.x, tip.y);
+}
+
+async function settleCapture(page, expectDialog) {
+  // Role visibility excludes exit ghosts and can precede the first opaque paint.
+  // Observe real animations; never finish/disable them (the recorder needs them).
+  await page.waitForFunction(expectDialog => {
+    if (document.querySelector('.ss-ghost, .ss-menu')) return false;
+    const dialogs = [...document.querySelectorAll('.ss-scrim[role="dialog"][aria-modal="true"]')];
+    if (dialogs.length !== Number(expectDialog)) return false;
+    if (document.querySelectorAll('.ss-dlg').length !== Number(expectDialog)) return false;
+    if (!expectDialog && document.querySelector('.ss-scrim')) return false;
+    const layers = [...document.querySelectorAll('.ss-scrim, .ss-dlg, .ss-toast')];
+    return layers.every(el => {
+      const style = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return !el.closest('[inert], [aria-hidden="true"]') && style.visibility === 'visible'
+        && Number(style.opacity) === 1 && r.width > 0 && r.height > 0
+        && r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth
+        // Own animations only: a toast's countdown and loading spinners keep running.
+        && el.getAnimations().every(animation => !animation.pending
+          && (animation.playState === 'finished' || animation.playState === 'idle'));
+    });
+  }, expectDialog, { timeout: 10000, polling: 'raf' });
+}
+
+function captureMetrics() {
+  return {
+    viewport: { width: innerWidth, height: innerHeight }, devicePixelRatio,
+    scroll: { x: scrollX, y: scrollY }, crop: { x: 0, y: 0, width: innerWidth, height: innerHeight },
+    background: getComputedStyle(document.body).backgroundColor,
+    regions: [...document.querySelectorAll('.ss-dlg, .ss-dlg .db, .ss-dlg .df, .ss-r:has(button[aria-expanded]), .ss-gh')].map(el => {
+      const r = el.getBoundingClientRect();
+      return { text: el.textContent, x: r.x, y: r.y, width: r.width, height: r.height, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth };
+    }),
+    layers: [...document.querySelectorAll('.ss-scrim, .ss-dlg, .ss-menu, .ss-toast, .ss-ghost')].map(el => {
+      const r = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      return {
+        classes: el.className, text: el.textContent, x: r.x, y: r.y, width: r.width, height: r.height,
+        opacity: style.opacity, visibility: style.visibility, transform: style.transform,
+        hidden: Boolean(el.closest('[inert], [aria-hidden="true"]')),
+        moving: el.getAnimations().some(animation => animation.pending
+          || (animation.playState !== 'finished' && animation.playState !== 'idle')),
+      };
+    }),
+  };
+}
+
+async function shot(page, side, state, title, { group = 'desktop', dialog = false } = {}) {
+  await caption(page, title);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  assert.ok(await page.locator('html').evaluate(el => el.classList.contains('dark')));
+  await settleCapture(page, dialog);
+  const metrics = await page.evaluate(captureMetrics);
+  assert.equal(await page.getByRole('dialog').count(), Number(dialog), `${state}: expected live dialog state`);
+  assert.equal(await page.locator('.ss-ghost, .ss-menu').count(), 0, `${state}: no closing overlay or menu`);
+  const file = `${group}-${side}-${state}.png`;
+  const raw = await page.screenshot({ fullPage: false });
+  assert.deepEqual(await page.evaluate(captureMetrics), metrics, `${state}: frame changed during PNG capture`);
+  await annotate(raw, path.join(output, file), title);
+  manifest.captures.push({ side, state, group, file, title, metrics, exportedCanvas: { width: metrics.viewport.width, height: metrics.viewport.height + annotationHeight }, annotationHeight });
+}
+
+async function startRecording(page) {
+  const directory = path.join(output, 'recording-frames');
+  await mkdir(directory, { recursive: true });
+  let stop = false;
+  let paused = false;
+  let sampling;
+  const cuts = [];
+  let recordingError;
+  const frames = [];
+  const loop = (async () => {
+    while (!stop) {
+      if (paused) { await page.waitForTimeout(25); continue; }
+      sampling = (async () => {
+        assert.ok(await page.locator('html').evaluate(el => el.classList.contains('dark')));
+        const name = `${String(frames.length).padStart(6, '0')}.jpg`;
+        const time = performance.now();
+        const title = captureTitle;
+        const raw = await page.screenshot({ type: 'jpeg', quality: 90, fullPage: false });
+        await writeFile(path.join(directory, name), raw);
+        frames.push({ name, time, title });
+      })();
+      await sampling;
+      await page.waitForTimeout(100);
+    }
+  })().catch(error => { recordingError = error; stop = true; });
+  const finish = async () => {
+    stop = true;
+    await loop;
+    if (paused && cuts.length) cuts.at(-1).end = performance.now();
+    if (recordingError) throw recordingError;
+    assert.ok(frames.length > 1);
+    // Keep actual sample timestamps; only the explicitly marked route-loading interval is omitted.
+    let timeline = 0;
+    for (const [i, frame] of frames.entries()) {
+      const next = frames[i + 1]?.time;
+      frame.duration = next === undefined ? 0.15 : (next - frame.time - cuts.reduce((sum, cut) => sum + Math.max(0, Math.min(next, cut.end) - Math.max(frame.time, cut.start)), 0)) / 1000;
+      assert.ok(frame.duration > 0, 'Exported sample duration must remain positive');
+      frame.timeline = timeline;
+      timeline += frame.duration;
+      await annotate(await readFile(path.join(directory, frame.name)), path.join(directory, frame.name), frame.title);
+    }
+    for (const cut of cuts) {
+      const resumed = frames.find(frame => frame.time >= cut.end);
+      Object.assign(cut, { resumeFrame: resumed?.name, timeline: resumed?.timeline });
+    }
+    const list = frames.flatMap(frame => [
+      `file '${frame.name}'`,
+      `duration ${frame.duration}`,
+    ]);
+    list.push(`file '${frames.at(-1).name}'`);
+    await writeFile(path.join(directory, 'frames.txt'), list.join('\n'));
+    await writeFile(path.join(directory, 'frames.json'), JSON.stringify(frames, null, 2));
+    command('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', path.join(directory, 'frames.txt'), '-vf', 'fps=30', '-c:v', 'libx264', '-crf', '18', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', path.join(output, 'removal-sequence.mp4')]);
+    const probe = JSON.parse(command('ffprobe', ['-v', 'error', '-show_streams', '-show_format', '-of', 'json', path.join(output, 'removal-sequence.mp4')]));
+    assert.equal(probe.streams[0].codec_name, 'h264');
+    assert.equal(probe.streams[0].width, viewport.width);
+    assert.equal(probe.streams[0].height, viewport.height);
+    manifest.recording = {
+      file: 'removal-sequence.mp4', frames: frames.length, probe,
+      timing: 'time: screenshot-request monotonic ms; cut start/end: monotonic ms. timeline/duration: concat seconds, quantized to 30fps; final sample holds 0.15s, probe gives encoded duration. Only the marked route-loading cut is omitted; not continuous real-time.', cuts,
+      sampleTimings: frames.map(({ name, time, timeline, duration }) => ({ name, time, timeline, duration })),
+      captionFrames: frames.filter((frame, i) => i === 0 || frame.title !== frames[i - 1].title),
+    };
+  };
+  finish.pause = async () => { paused = true; await sampling; cuts.push({ reason: 'Dashboard → Skills: unrelated route loading omitted', start: performance.now(), afterFrame: frames.at(-1).name }); };
+  finish.resume = async () => {
+    cuts.at(-1).end = performance.now(); paused = false;
+    const previous = frames.length;
+    while (frames.length === previous && !stop) await page.waitForTimeout(25);
+    if (recordingError) throw recordingError;
+    assert.ok(frames.length > previous, 'Resume must capture the loaded Skills chapter before its first action');
+  };
+  return finish;
+}
+
+async function session(side, group, size, locale, fixtureNames = names) {
+  const app = path.join(workspace, side);
+  assert.equal(command('git', ['-C', app, 'rev-parse', 'HEAD']).trim(), pins[side]);
+  // Reuse the SAME logical and absolute fixture paths after the previous side's cleanup.
+  const fixture = await makeFixture(path.join(stateRoot, group), app, path.join(process.env.RUNNER_TEMP, `pr880-${side}`), fixtureNames);
+  activeFixture = fixture;
+  const url = await fixture.start(side === 'before' ? 19421 : 19422);
+  const context = await browser.newContext({ viewport: { ...size, height: size.height - annotationHeight }, deviceScaleFactor: 1, colorScheme: 'dark', locale: locale === 'de' ? 'de-DE' : 'en-US', serviceWorkers: 'block' });
+  activeContext = context;
+  await context.addInitScript(locale => {
+    localStorage.setItem('skillshare-theme-preference', 'dark');
+    localStorage.setItem('skillshare-style', 'clean');
+    localStorage.setItem('skillshare:locale', locale);
+    localStorage.setItem('skillshare:skills-view', 'list');
+    localStorage.setItem('skillshare.tour.completed', 'true');
+    localStorage.setItem('skillshare.dashboard.starCta.dismissed', '1');
+  }, locale);
+  // Block external browser traffic, without fabricating any successful API payload.
+  await context.route('**/*', route => new URL(route.request().url()).origin === url ? route.continue() : route.abort('blockedbyclient'));
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+  const page = await context.newPage();
+  const errors = [];
+  const requests = [];
+  page.on('pageerror', error => errors.push(error.message));
+  page.on('request', request => {
+    const pathname = new URL(request.url()).pathname;
+    if (request.method() === 'DELETE' && /^\/api\/(repos|source-links)\//.test(pathname)) {
+      const intent = { side, group, method: request.method(), url: request.url() };
+      requests.push(intent);
+      manifest.requestIntents.push(intent);
+    }
+  });
+  page.on('response', async response => {
+    if (response.request().method() === 'DELETE' && /\/api\/(repos|source-links)\//.test(new URL(response.url()).pathname)) {
+      try {
+        manifest.deleteRequests.push({ side, group, url: response.url(), status: response.status(), body: await response.text() });
+      } catch (error) { errors.push(`Unable to retain DELETE response: ${error.message}`); }
+    }
+  });
+  const messages = JSON.parse(await readFile(path.join(app, `ui/src/i18n/locales/${locale}.json`), 'utf8'));
+  const t = (key, params) => translate(messages, key, params);
+  await page.goto(`${url}/?theme=dark`, { waitUntil: 'networkidle' });
+  await page.getByRole('heading', { name: t('dashboard.title'), exact: true }).waitFor();
+  const cleanStatus = row(page, '_clean').locator('.ss-st');
+  await cleanStatus.waitFor();
+  assert.equal(await cleanStatus.innerText(), t('dashboard.trackedRepos.clean'));
+  await page.evaluate(() => document.fonts.ready);
+  await overlays(page);
+  // Use one fixed scroll/crop in both sides, retaining navigation and section chrome.
+  await page.evaluate(() => window.scrollTo(0, 0));
+  async function overview() {
+    const response = await context.request.get(`${url}/api/overview`);
+    assert.equal(response.status(), 200);
+    return response.json();
+  }
+  async function trash() {
+    const response = await context.request.get(`${url}/api/trash`);
+    assert.equal(response.status(), 200);
+    return (await response.json()).items;
+  }
+  async function close() {
+    await context.tracing.stop({ path: path.join(output, `${side}-${group}-trace.zip`) });
+    await writeFile(path.join(output, `${side}-${group}-backend.log`), fixture.log.join(''));
+    assert.deepEqual(errors, [], 'Unhandled browser exceptions');
+    await context.close(); activeContext = undefined;
+    await fixture.cleanup(); activeFixture = undefined;
+  }
+  return { page, context, fixture, url, t, overview, trash, requests, close };
+}
+
+function row(page, name) { return page.locator('.ss-r').filter({ has: page.getByText(name.replace(/^_/, ''), { exact: true }) }); }
+async function openConfirmation(s, name) {
+  await caption(s.page, `Open ${name} actions, then select Uninstall`);
+  await click(s.page, row(s.page, name).getByRole('button', { name: s.t('dashboard.trackedRepos.actions'), exact: true }));
+  await click(s.page, s.page.getByRole('menuitem', { name: s.t('dashboard.trackedRepos.uninstall'), exact: true }));
+  await s.page.getByRole('dialog').waitFor();
+  await settleCapture(s.page, true);
+}
+function assertRepoIntent(response, recordOnly, force = false) {
+  assert.equal(response.request().method(), 'DELETE');
+  const params = new URL(response.url()).searchParams;
+  assert.equal(params.get('recordOnly'), recordOnly ? 'true' : null, 'Removal must preserve selected record/checkout intent');
+  assert.equal(params.get('force'), force ? 'true' : null, 'Only explicit checkout force confirmation may send force=true');
+}
+async function deleteClick(s, recordOnly = false) {
+  await caption(s.page, recordOnly ? 'Confirm record removal: files stay in place' : 'Confirm checkout removal: move skills to trash');
+  const response = s.page.waitForResponse(response => response.request().method() === 'DELETE' && response.url().includes('/api/repos/'));
+  await click(s.page, s.page.getByRole('dialog').getByRole('button', { name: s.t('dashboard.trackedRepos.uninstall'), exact: true }));
+  const result = await response;
+  assert.equal(new URL(result.url()).searchParams.has('force'), false, 'Initial removal must use force=false');
+  assertRepoIntent(result, recordOnly);
+  return result;
+}
+async function success(s, name, response, movedToTrash) {
+  assert.equal(response.status(), 200);
+  const result = await response.json();
+  assert.equal(result.movedToTrash, movedToTrash);
+  assert.equal(result.name, name);
+  const trashed = (await s.trash()).filter(item => item.name === name);
+  assert.equal(trashed.length, Number(movedToTrash), 'Record removal must not create trash; checkout removal must create it');
+  if (movedToTrash) await assert.rejects(lstat(path.join(s.fixture.source, name)), { code: 'ENOENT' });
+  await s.page.getByRole('dialog').waitFor({ state: 'hidden' });
+  const toast = s.t(movedToTrash ? 'dashboard.toast.repoUninstalled' : 'dashboard.toast.repoRecordRemoved', { name: movedToTrash ? name.slice(1) : name });
+  await s.page.getByText(toast, { exact: true }).waitFor();
+  await row(s.page, name).waitFor({ state: 'hidden' });
+  await s.fixture.assertRecordRemoved(name);
+  check(`after ${name}: actual response movedToTrash=${movedToTrash}, toast and row invalidation`);
+}
+
+async function desktop(side) {
+  const s = await session(side, 'desktop', viewport, 'en');
+  const { page, fixture } = s;
+  const overview = await s.overview();
+  await writeFile(path.join(output, `${side}-initial-overview.json`), JSON.stringify(overview, null, 2));
+  const declarations = names.filter(name => !['_clean', '_dirty'].includes(name));
+  assert.deepEqual(overview.trackedRepos.filter(repo => repo.noCheckout).map(repo => repo.name).sort(), side === 'after' ? declarations.sort() : []);
+  if (side === 'before') {
+    assert.deepEqual(overview.trackedRepos.map(repo => repo.name).sort(), ['_clean', '_dirty']);
+    for (const state of declarationStates) {
+      await shot(page, side, state, 'Before: declarations have no dashboard row (same synthetic filesystem)');
+    }
+    check('before: no impossible declaration rows injected; actual old overview contains only clean/dirty checkouts');
+  } else {
+    for (const name of declarations) {
+      const r = row(page, name);
+      assert.ok((await r.innerText()).includes(s.t('dashboard.trackedRepos.noCheckout')));
+      assert.equal(await r.getByRole('button', { name: s.t('dashboard.trackedRepos.update'), exact: true }).count(), 0);
+      assert.equal(await r.locator('.ss-st').count(), 0);
+      assert.equal(/\b\d+ skills?\b/.test(await r.innerText()), false);
+    }
+    check('after: declaration-only rows have no Update, checkout status or skill count');
+    const occupant = await readFile(fixture.occupant, 'utf8');
+    const ignore = await readFile(fixture.ignore, 'utf8');
+    await shot(page, side, 'absent-row', 'Absent checkout: a removable repository record');
+    await shot(page, side, 'occupied-row', 'Occupied path: the record is separate from the folder');
+    await caption(page, 'Remove the absent repository record');
+    recorder = await startRecording(page);
+    for (const name of ['_absent', '_occupied']) {
+      await openConfirmation(s, name);
+      const text = await page.getByRole('dialog').innerText();
+      assert.ok(text.includes(s.t('dashboard.trackedRepos.uninstallConfirm.record', { name })));
+      assert.equal(/trash|force/i.test(text), false);
+      await shot(page, side, `${name.slice(1)}-confirm`, 'Record-only confirmation: files stay in place', { dialog: true });
+      const response = await deleteClick(s, true);
+      await success(s, name, response, false);
+      await shot(page, side, `${name.slice(1)}-result`, 'Record removed: row gone and actual record-removal toast');
+      await page.waitForTimeout(2000);
+    }
+    assert.equal(await readFile(fixture.occupant, 'utf8'), occupant);
+    assert.equal(await readFile(fixture.ignore, 'utf8'), ignore);
+    check('after: occupied file and .gitignore remain byte-identical after real record removal');
+
+    await page.route('**/api/repos/_blocked*', route => route.request().method() === 'DELETE'
+      ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Synthetic CI record-removal failure' }) }) : route.fallback());
+    await openConfirmation(s, '_blocked');
+    await shot(page, side, 'blocked-confirm', 'Synthetic error fixture: initial record-only confirmation', { dialog: true });
+    const blocked = await deleteClick(s, true);
+    assert.equal(blocked.status(), 500);
+    await page.getByText('Synthetic CI record-removal failure', { exact: true }).waitFor();
+    assert.equal(await page.getByRole('button', { name: s.t('resources.uninstall.retryForce'), exact: true }).count(), 0);
+    assert.ok(await row(page, '_blocked').isVisible());
+    assert.ok(JSON.parse(await readFile(fixture.metadata, 'utf8')).entries._blocked);
+    await shot(page, side, 'blocked-error', 'Synthetic nonforceable failure: record stays, no force action', { dialog: true });
+    await page.waitForTimeout(2000);
+    await caption(page, 'Cancel the failed record removal; keep the repository record');
+    await click(page, page.getByRole('dialog').getByRole('button', { name: s.t('common.cancel'), exact: true }));
+    check('after: labelled synthetic nonforceable error keeps record/row and offers no force');
+
+    for (const [name, refusal] of [['_restored', null], ['_restored-dirty', 'repo_dirty'], ['_restored-status', 'repo_status_failed']]) {
+      await openConfirmation(s, name);
+      await shot(page, side, `${name.slice(1)}-confirm`, 'Selected declaration: confirmation still describes the record', { dialog: true });
+      // Synthetic filesystem restore AFTER selection, with a real local Git checkout.
+      await fixture.restore(name, refusal === 'repo_dirty');
+      const contentPath = path.join(fixture.source, name, 'sample/SKILL.md');
+      const content = await readFile(contentPath, 'utf8');
+      const metadata = await readFile(fixture.metadata, 'utf8');
+      const currentIgnore = await readFile(fixture.ignore, 'utf8');
+      const requests = () => s.requests.filter(request => new URL(request.url).pathname === `/api/repos/${name}`);
+      const guard = await deleteClick(s, true);
+      assert.equal(guard.status(), 409);
+      assert.equal((await guard.json()).error_code, 'repo_checkout_restored');
+      await page.getByRole('dialog').waitFor({ state: 'hidden' });
+      await page.getByText(s.t('dashboard.trackedRepos.checkoutRestored'), { exact: true }).waitFor();
+      assert.equal(await page.getByRole('button', { name: s.t('resources.uninstall.retryForce'), exact: true }).count(), 0);
+      const refreshed = row(page, name);
+      await refreshed.locator('.ss-st').waitFor();
+      assert.equal(await refreshed.locator('.ss-st').innerText(), s.t(refusal === 'repo_dirty' ? 'dashboard.trackedRepos.modified' : 'dashboard.trackedRepos.clean'));
+      assert.equal((await refreshed.innerText()).includes(s.t('dashboard.trackedRepos.noCheckout')), false);
+      await shot(page, side, `${name.slice(1)}-guard`, 'Real restore guard: record intent refused; select Uninstall again');
+      assert.equal(await readFile(contentPath, 'utf8'), content);
+      assert.equal(await readFile(fixture.metadata, 'utf8'), metadata);
+      assert.equal(await readFile(fixture.ignore, 'utf8'), currentIgnore);
+      assert.equal((await s.trash()).some(item => item.name === name), false);
+      assert.equal(requests().length, 1, 'Restore guard must not automatically retry or force checkout removal');
+      await page.waitForTimeout(2000);
+      await page.getByText(s.t('dashboard.trackedRepos.checkoutRestored'), { exact: true }).waitFor({ state: 'hidden', timeout: 15000 });
+
+      // A separate menu selection and ordinary confirmation explicitly authorize checkout removal.
+      await openConfirmation(s, name);
+      const ordinary = page.getByRole('dialog');
+      await ordinary.getByText(s.t('dashboard.trackedRepos.uninstallConfirm.message', { name: name.slice(1) }), { exact: true }).waitFor();
+      assert.equal((await ordinary.innerText()).includes(s.t('dashboard.trackedRepos.uninstallConfirm.record', { name })), false);
+      assert.equal(await ordinary.getByRole('button', { name: s.t('resources.uninstall.retryForce'), exact: true }).count(), 0);
+      await shot(page, side, `${name.slice(1)}-checkout-confirm`, 'Fresh checkout confirmation: moving skills to trash requires another click', { dialog: true });
+      assert.equal(requests().length, 1, 'Opening checkout confirmation must not itself delete');
+      if (refusal === 'repo_status_failed') {
+        let first = true;
+        await page.route(`**/api/repos/${name}*`, route => {
+          if (route.request().method() !== 'DELETE' || new URL(route.request().url()).searchParams.has('recordOnly') || !first) return route.fallback();
+          first = false;
+          return route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'Synthetic CI git-status failure on restored checkout', error_code: refusal }) });
+        });
+      }
+      let response = await deleteClick(s);
+      if (refusal) {
+        assert.equal(response.status(), 409);
+        assert.equal((await response.json()).error_code, refusal);
+        const dialog = page.getByRole('dialog');
+        const warningKey = refusal === 'repo_dirty' ? 'dirty' : 'statusFailed';
+        await dialog.getByText(s.t(`dashboard.trackedRepos.uninstallConfirm.${warningKey}`, { name: name.slice(1) }), { exact: true }).waitFor();
+        assert.equal((await dialog.innerText()).includes('Nothing on disk is deleted'), false);
+        assert.ok(await row(page, name).isVisible());
+        assert.equal((await row(page, name).innerText()).includes(s.t('dashboard.trackedRepos.noCheckout')), false, 'Guard refresh must show the restored checkout');
+        await shot(page, side, `${name.slice(1)}-refusal`, refusal === 'repo_dirty'
+          ? 'Real dirty checkout refusal: explicit force confirmation required'
+          : 'Synthetic status failure on real restored checkout: explicit force confirmation', { dialog: true });
+        assert.equal(requests().length, 2, 'A dirty/status refusal must not automatically force removal');
+        assert.equal(await readFile(contentPath, 'utf8'), content);
+        assert.equal(await readFile(fixture.metadata, 'utf8'), metadata);
+        assert.equal(await readFile(fixture.ignore, 'utf8'), currentIgnore);
+        assert.equal((await s.trash()).some(item => item.name === name), false);
+        const retried = page.waitForResponse(r => r.request().method() === 'DELETE' && r.url().includes(`/api/repos/${name}`));
+        await caption(page, 'Explicitly confirm Retry with Force for this checkout');
+        await click(page, dialog.getByRole('button', { name: s.t('resources.uninstall.retryForce'), exact: true }));
+        response = await retried;
+        assert.equal(new URL(response.url()).searchParams.get('force'), 'true');
+        assertRepoIntent(response, false, true);
+      }
+      await success(s, name, response, true);
+      assert.equal(requests().length, refusal ? 3 : 2);
+      const trashed = (await s.trash()).find(item => item.name === name);
+      assert.equal(await readFile(path.join(trashed.path, 'sample/SKILL.md'), 'utf8'), content);
+      await shot(page, side, `${name.slice(1)}-result`, 'Actual checkout result: moved to trash, checkout toast, row gone');
+      await page.waitForTimeout(2000);
+      check(`after ${name}: real recordOnly restore guard preserves content/metadata/ignore/no-trash; fresh ordinary confirmation${refusal ? ' then explicit checkout force' : ''}; actual trash retains checkout bytes`);
+    }
+  }
+  // Existing flows are exercised through the actual controls on BOTH product pins.
+  for (const [name, dirty] of [['_clean', false], ['_dirty', true]]) {
+    await openConfirmation(s, name);
+    await shot(page, side, `${name.slice(1)}-confirm`, `${dirty ? 'Dirty' : 'Clean'} checkout: existing uninstall confirmation`, { dialog: true });
+    let response = await deleteClick(s);
+    if (dirty) {
+      assert.equal(response.status(), 409);
+      assert.equal((await response.json()).error_code, 'repo_dirty');
+      const retry = page.getByRole('dialog').getByRole('button', { name: s.t('resources.uninstall.retryForce'), exact: true });
+      await retry.waitFor();
+      await shot(page, side, 'dirty-refusal', 'Real dirty checkout: changes require explicit force confirmation', { dialog: true });
+      const result = page.waitForResponse(r => r.request().method() === 'DELETE' && r.url().includes('/api/repos/_dirty'));
+      await caption(page, 'Explicitly confirm Retry with Force for the dirty checkout');
+      await click(page, retry);
+      response = await result;
+      assert.equal(new URL(response.url()).searchParams.get('force'), 'true');
+      assertRepoIntent(response, false, true);
+    }
+    assert.equal(response.status(), 200);
+    assert.equal((await response.json()).movedToTrash, true);
+    await page.getByText(s.t('dashboard.toast.repoUninstalled', { name: name.slice(1) }), { exact: true }).waitFor();
+    await row(page, name).waitFor({ state: 'hidden' });
+    await shot(page, side, `${name.slice(1)}-result`, 'Checkout moved to trash: existing result and toast');
+    await page.waitForTimeout(2000);
+    check(`${side}: existing ${dirty ? 'dirty explicit-force' : 'clean force=false'} checkout flow`);
+  }
+  await unlinkFolders(s, side);
+  if (recorder) { const finish = recorder; recorder = undefined; await finish(); }
+  await s.close();
+}
+
+async function unlinkFolders(s, side) {
+  const { page, fixture } = s;
+  // Use the actual Resources route and its existing UnlinkFolderDialog owner.
+  if (recorder) await recorder.pause();
+  await click(page, page.getByRole('link', { name: s.t('layout.nav.skills'), exact: true }));
+  await page.getByRole('heading', { name: s.t('layout.nav.skills'), exact: true }).waitFor();
+  for (const link of fixture.links) await page.locator('.ss-gh').filter({ has: page.getByText(link.name, { exact: true }) }).waitFor();
+  await page.evaluate(() => document.fonts.ready);
+  await settleCapture(page, false);
+  await caption(page, 'Skills loaded: review linked folders before Unlink');
+  if (recorder) { await recorder.resume(); await page.waitForTimeout(1000); }
+  for (const link of fixture.links) {
+    const synthetic = link.name === 'unlink-warning';
+    const endpoint = `/api/source-links/${link.name}`;
+    const requests = () => s.requests.filter(request => new URL(request.url).pathname === endpoint);
+    const group = page.locator('.ss-gh').filter({ has: page.getByText(link.name, { exact: true }) });
+    await group.waitFor();
+    assert.equal(await readlink(path.join(fixture.source, link.name)), link.target);
+    assert.equal(await readFile(link.file, 'utf8'), link.content);
+    const metadata = await readFile(fixture.metadata, 'utf8');
+    const ignore = await readFile(fixture.ignore, 'utf8');
+    const resources = await s.context.request.get(`${s.url}/api/resources`);
+    assert.equal(resources.status(), 200);
+    assert.ok((await resources.json()).sourceLinks.some(item => item.name === link.name));
+    if (synthetic) {
+      await page.route(`**${endpoint}`, async route => {
+        if (route.request().method() !== 'DELETE') return route.fallback();
+        // Execute the real unlink once. Only its response warning is synthetic.
+        // This demonstrates client rendering, not a backend metadata fault or partial oplog.
+        const actual = await route.fetch();
+        assert.equal(actual.status(), 200);
+        const result = await actual.json();
+        assert.equal(result.success, true);
+        assert.equal(result.name, link.name);
+        await route.fulfill({ response: actual, json: {
+          ...result, warning: 'Unlinked, but could not update metadata: synthetic CI response warning',
+        } });
+      });
+    }
+    await caption(page, `Open ${link.name} Unlink confirmation; target folder stays`);
+    await click(page, group.getByRole('button', { name: s.t('sourceLinks.unlink'), exact: true }));
+    const dialog = page.getByRole('dialog', { name: s.t('sourceLinks.unlinkTitle', { name: link.name }), exact: true });
+    await dialog.waitFor();
+    for (const key of ['sourceLinks.unlinkMessage', 'sourceLinks.target', 'sourceLinks.unlinkSkills', 'sourceLinks.unlinkTrash']) {
+      await dialog.getByText(s.t(key), { exact: true }).waitFor();
+    }
+    await dialog.getByText(link.target, { exact: true }).waitFor();
+    assert.equal(requests().length, 0, 'Opening unlink confirmation must not send DELETE');
+    await shot(page, side, `${link.name}-confirm`, synthetic
+      ? 'Synthetic warning response fixture: actual Unlink confirmation'
+      : 'Healthy unlink: target stays; only the source link goes to trash', { dialog: true });
+    const pending = page.waitForResponse(response => response.request().method() === 'DELETE' && new URL(response.url()).pathname === endpoint);
+    await caption(page, `Confirm Unlink for ${link.name}; preserve the target folder`);
+    await click(page, dialog.getByRole('button', { name: s.t('sourceLinks.unlink'), exact: true }));
+    const response = await pending;
+    assert.equal(response.status(), 200);
+    assert.equal(new URL(response.url()).search, '', 'Unlink must not send force or recordOnly');
+    const result = await response.json();
+    assert.equal(result.success, true);
+    assert.equal(result.name, link.name);
+    assert.equal(Boolean(result.warning), synthetic);
+    await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    await group.waitFor({ state: 'hidden' });
+    const success = s.t('sourceLinks.unlinked', { name: link.name });
+    if (synthetic && side === 'after') {
+      await page.getByText(s.t('sourceLinks.metadataWarning'), { exact: true }).waitFor();
+      assert.equal(await page.getByText(success, { exact: true }).count(), 0, 'Partial warning must not claim full success');
+    } else {
+      await page.getByText(success, { exact: true }).waitFor();
+    }
+    assert.equal(await page.getByRole('button', { name: s.t('resources.uninstall.retryForce'), exact: true }).count(), 0);
+    await assert.rejects(lstat(path.join(fixture.source, link.name)), { code: 'ENOENT' });
+    const trashed = (await s.trash()).filter(item => item.name === link.name);
+    assert.equal(trashed.length, 1);
+    assert.ok((await lstat(trashed[0].path)).isSymbolicLink());
+    assert.equal(await readlink(trashed[0].path), link.target);
+    assert.equal(await readFile(link.file, 'utf8'), link.content);
+    assert.equal(await readFile(fixture.metadata, 'utf8'), metadata);
+    assert.equal(await readFile(fixture.ignore, 'utf8'), ignore);
+    const refreshed = await s.context.request.get(`${s.url}/api/resources`);
+    assert.equal(refreshed.status(), 200);
+    assert.equal((await refreshed.json()).sourceLinks.some(item => item.name === link.name), false);
+    await shot(page, side, `${link.name}-result`, synthetic
+      ? side === 'after' ? 'Synthetic metadata-warning response: dialog closes; warning shown; no retry'
+        : 'Before: synthetic warning response is ignored; actual UI shows success'
+      : 'Healthy unlink: actual success toast, refreshed list and preserved target');
+    await page.waitForTimeout(2000);
+    assert.equal(requests().length, 1, 'Completed unlink must not offer or automatically send a second DELETE');
+    check(`${side} ${link.name}: real link trashed once, target/metadata/ignore bytes preserved, dialog closed and list refreshed${synthetic ? '; warning response is synthetic client evidence only' : '; healthy success toast'}`);
+  }
+}
+
+async function localized(side) {
+  const long = '_dokumentation-und-automatisierung-fuer-das-entwicklungsteam';
+  const s = await session(side, 'narrow-de', narrowViewport, 'de', [...names, long]);
+  await shot(s.page, side, 'long-row', 'Deutsch · 1024 CSS px · synthetic long repository name', { group: 'narrow-de' });
+  if (side === 'after') {
+    await openConfirmation(s, long);
+    await shot(s.page, side, 'long-confirm', 'Deutsch · record-only confirmation with long repository name', { group: 'narrow-de', dialog: true });
+    const layout = await s.page.locator('.ss-dlg').evaluate(dialog => {
+      const r = dialog.getBoundingClientRect();
+      const body = dialog.querySelector('.db');
+      return { x: r.x, right: r.right, bottom: r.bottom, viewport: innerWidth, height: innerHeight, bodyWidth: body.clientWidth, textWidth: body.scrollWidth };
+    });
+    assert.ok(layout.x >= 0 && layout.right <= layout.viewport && layout.bottom <= layout.height);
+    assert.ok(layout.textWidth <= layout.bodyWidth + 1, 'Localized changed message must not overflow horizontally');
+    check('after: German long-name record confirmation fits measured 1024px viewport');
+  } else {
+    assert.equal((await s.overview()).trackedRepos.some(repo => repo.name === long), false);
+    await shot(s.page, side, 'long-confirm', 'Deutsch · before has no declaration control (same long-name fixture)', { group: 'narrow-de' });
+  }
+  await s.close();
+}
+
+try {
+  manifest.ciHead = command('git', ['-C', path.join(workspace, 'harness'), 'rev-parse', 'HEAD']).trim();
+  manifest.tools = { node: process.version, pnpm: command('pnpm', ['--version']).trim(), go: command('go', ['version']).trim(), ffmpeg: command('ffmpeg', ['-version']).split('\n')[0] };
+  assert.match(command('ffmpeg', ['-hide_banner', '-filters']), /\bdrawtext\b/, 'Installed ffmpeg must support caption rendering');
+  // Playwright --with-deps in the existing Ubuntu capture workflow installs fonts-liberation.
+  let fontSource;
+  let font;
+  for (const candidate of ['/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf']) {
+    try { font = await readFile(candidate); fontSource = candidate; break; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  assert.ok(font, 'Existing capture dependencies must provide Liberation Sans');
+  await writeFile(path.join(output, 'caption-font.ttf'), font);
+  manifest.presentation.font = { source: fontSource, file: 'caption-font.ttf', sha256: createHash('sha256').update(font).digest('hex'), size: 20 };
+  manifest.tools.playwright = JSON.parse(await readFile(new URL('./package.json', pathToFileURL(process.env.CAPTURE_PLAYWRIGHT)), 'utf8')).version;
+  manifest.sourceHashes = {};
+  for (const file of ['.github/workflows/pr880-hosted-ui.yml', 'scripts/ci-ui/capture.mjs', 'scripts/ci-ui/fixture.mjs', 'scripts/ci-ui/cleanup.mjs']) {
+    manifest.sourceHashes[file] = createHash('sha256').update(await readFile(path.join(workspace, 'harness', file))).digest('hex');
+  }
+  browser = await chromium.launch({ headless: true });
+  manifest.tools.chromium = browser.version();
+  await desktop('before');
+  await desktop('after');
+  await localized('before');
+  await localized('after');
+  const before = manifest.captures.filter(capture => capture.side === 'before');
+  const after = manifest.captures.filter(capture => capture.side === 'after');
+  assert.equal(before.length, after.length);
+  for (const capture of after) {
+    const match = before.find(item => item.group === capture.group && item.state === capture.state);
+    assert.ok(match, `Missing Before counterpart for ${capture.state}`);
+    assert.deepEqual(match.metrics.crop, capture.metrics.crop);
+    assert.deepEqual(match.metrics.viewport, capture.metrics.viewport);
+    assert.deepEqual(match.metrics.scroll, capture.metrics.scroll);
+  }
+  manifest.status = 'passed';
+} catch (error) {
+  manifest.status = 'failed';
+  manifest.error = error.stack;
+  process.exitCode = 1;
+} finally {
+  try {
+    if (recorder) await recorder();
+    if (activeContext) await activeContext.tracing.stop({ path: path.join(output, 'failed-trace.zip') });
+  } catch (error) { manifest.mediaCleanupError = error.stack; manifest.status = 'failed'; process.exitCode = 1; }
+  try { if (browser) await browser.close(); }
+  catch (error) { manifest.browserCleanupError = error.stack; manifest.status = 'failed'; process.exitCode = 1; }
+  try {
+    if (activeFixture) {
+      await writeFile(path.join(output, 'failed-backend.log'), activeFixture.log.join(''));
+      await activeFixture.cleanup();
+    }
+    await rm(stateRoot, { recursive: true, force: true });
+    manifest.fixtureCleanup = 'Owned foreground backend stopped; synthetic homes removed';
+  } catch (error) { manifest.fixtureCleanup = error.stack; manifest.status = 'failed'; process.exitCode = 1; }
+  const checksums = [];
+  for (const name of await readdir(output)) {
+    if (/\.(png|mp4|zip|log|json)$/.test(name)) checksums.push(`${createHash('sha256').update(await readFile(path.join(output, name))).digest('hex')}  ${name}`);
+  }
+  // manifest is written last; source identity and partial results survive failures.
+  await writeFile(path.join(output, 'manifest.json'), JSON.stringify(manifest, null, 2));
+  checksums.push(`${createHash('sha256').update(await readFile(path.join(output, 'manifest.json'))).digest('hex')}  manifest.json`);
+  await writeFile(path.join(output, 'SHA256SUMS'), checksums.join('\n') + '\n');
+  const pairs = manifest.captures.filter(capture => capture.side === 'after').map(capture => {
+    const before = manifest.captures.find(item => item.side === 'before' && item.state === capture.state && item.group === capture.group);
+    return `| ${capture.group} / ${capture.state} | ${before?.file ?? 'not captured'} | ${capture.file} |`;
+  });
+  await writeFile(path.join(output, 'index.md'), `# Hosted PR880 evidence\n\nStatus: ${manifest.status}. Human visual/frame review is still required.\n\n${manifest.provenance}\n\n${manifest.media}\n\nBefore: ${pins.before}\nAfter: ${pins.after}\nCI helper: ${manifest.ciHead}\n\nRecording: removal-sequence.mp4 (H.264).\n\nSynthetic intercepted errors: ${manifest.syntheticInterceptions.join('; ')}.\n\n| State | Before | After |\n| --- | --- | --- |\n${pairs.join('\n')}\n`);
+}

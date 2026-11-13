@@ -1,0 +1,245 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"skillshare/internal/config"
+	"skillshare/internal/hooks"
+	"skillshare/internal/mcp"
+	"skillshare/internal/plugin"
+	"skillshare/internal/ui"
+)
+
+// doctorPluginTimeout bounds the native plugin CLIs a plugin check runs.
+const doctorPluginTimeout = 30 * time.Second
+
+// checkNativeResources runs the MCP, hooks and plugin checks against the same config
+// and scope as their own commands. cfg is nil in project mode.
+func checkNativeResources(cfg *config.Config, projectRoot string, result *doctorResult) {
+	mcpService := &mcp.Service{ConfigPath: config.ConfigPath(), StateDir: config.StateDir(), ConfigDirs: mcp.ConfigDirsFromEnv()}
+	hooksService := &hooks.Service{ConfigPath: config.ConfigPath(), StateDir: config.StateDir(), ConfigDirs: hooks.ConfigDirsFromEnv()}
+	pluginService := &plugin.Service{ConfigPath: config.ConfigPath(), StateDir: config.StateDir()}
+	if projectRoot != "" {
+		projectConfig := config.ProjectConfigPath(projectRoot)
+		mcpService.ConfigPath, mcpService.ProjectRoot = projectConfig, projectRoot
+		hooksService.ConfigPath, hooksService.ProjectRoot = projectConfig, projectRoot
+		pluginService.ConfigPath, pluginService.ProjectRoot = projectConfig, projectRoot
+	} else {
+		hooksService.Accounts = hooksAccounts(cfg)
+		pluginService.Accounts = pluginAccounts(cfg)
+	}
+	ui.Section("MCP, hooks and plugins")
+	checkMCPServers(mcpService, result)
+	checkHooksEntries(hooksService, result)
+	checkPluginPackages(pluginService, result)
+}
+
+// addResourceCheck records one check whose status follows its worst finding.
+func addResourceCheck(result *doctorResult, name, label, ok string, errors, warnings []string) {
+	for range errors {
+		result.addError()
+	}
+	for range warnings {
+		result.addWarning()
+	}
+	details := append(append([]string{}, errors...), warnings...)
+	switch {
+	case len(errors) > 0:
+		result.addCheck(name, checkError, fmt.Sprintf("%s: %d error(s), %d warning(s)", label, len(errors), len(warnings)), details)
+	case len(warnings) > 0:
+		result.addCheck(name, checkWarning, fmt.Sprintf("%s: %d warning(s)", label, len(warnings)), details)
+	default:
+		result.addCheck(name, checkPass, ok, nil)
+	}
+}
+
+// printResourceFindings prints errors then warnings as rows; label names the
+// first row only.
+func printResourceFindings(label string, width int, errors, warnings []string) {
+	for _, e := range errors {
+		ui.Row(ui.MarkFail, label, e, width)
+		label = ""
+	}
+	for _, w := range warnings {
+		ui.Row(ui.MarkWarn, label, w, width)
+		label = ""
+	}
+}
+
+// checkMCPServers runs the static part of `mcp check`: no server is started and no
+// host is resolved, so doctor stays offline apart from its version check.
+func checkMCPServers(service *mcp.Service, result *doctorResult) {
+	report, err := service.Check(mcp.CheckOptions{SkipDNS: true, ClientVersion: version})
+	if err != nil {
+		ui.Row(ui.MarkFail, "MCP", err.Error(), doctorWidth)
+		addResourceCheck(result, "mcp", "MCP", "", []string{err.Error()}, nil)
+		return
+	}
+	if len(report.Servers) == 0 {
+		ui.Row(ui.MarkNone, "MCP", "no servers configured", doctorWidth)
+		result.addInfo("mcp", "No MCP servers configured")
+		return
+	}
+	var errors, warnings []string
+	for _, server := range report.Servers {
+		name := server.Name
+		if server.Project != "" {
+			name += " (project " + shortenPath(server.Project) + ")"
+		}
+		for _, f := range server.Findings {
+			line := name + ": " + f.Message
+			if f.Target != "" {
+				line = name + " → " + f.Target + ": " + f.Message
+			}
+			switch f.Level {
+			case "error":
+				errors = append(errors, line)
+			case "warning":
+				warnings = append(warnings, line)
+			}
+		}
+	}
+	ok := fmt.Sprintf("All %d MCP server(s) OK", len(report.Servers))
+	if len(errors)+len(warnings) == 0 {
+		ui.Row(ui.MarkOK, "MCP", "all "+plural(len(report.Servers), "server")+" OK", doctorWidth)
+	} else {
+		result.suggest("skillshare mcp check", "see the MCP details")
+	}
+	printResourceFindings("MCP", doctorWidth, errors, warnings)
+	addResourceCheck(result, "mcp", "MCP", ok, errors, warnings)
+}
+
+// checkHooksEntries reports what `hooks sync` would still change or refuse.
+func checkHooksEntries(service *hooks.Service, result *doctorResult) {
+	// Read the section first: with nothing configured there is no plan to check,
+	// so doctor skips the native file and Git reads a preview makes.
+	source, err := service.Source()
+	if err != nil {
+		ui.Row(ui.MarkFail, "Hooks", err.Error(), doctorWidth)
+		addResourceCheck(result, "hooks", "Hooks", "", []string{err.Error()}, nil)
+		return
+	}
+	if len(source.Entries) == 0 && len(source.Projects) == 0 {
+		ui.Row(ui.MarkNone, "Hooks", "none configured", doctorWidth)
+		result.addInfo("hooks", "No hooks configured")
+		return
+	}
+	var errors, warnings []string
+	syncable := false
+	if plan, err := service.Preview(); err != nil {
+		errors = append(errors, "sync preview failed: "+err.Error())
+	} else {
+		for _, c := range plan.Changes {
+			line := c.Name + " → " + c.Target
+			switch c.Action {
+			case "unchanged":
+			case "inactive":
+				// Sync cannot fix these: the message names what is missing, such as Git.
+				warnings = append(warnings, line+": inactive: "+c.Message)
+			case "conflict":
+				syncable = true
+				warnings = append(warnings, line+": conflict: "+c.Message)
+			default:
+				syncable = true
+				warnings = append(warnings, line+": not synced ("+c.Action+")")
+			}
+		}
+		warnings = append(warnings, plan.Warnings...)
+	}
+	ok := fmt.Sprintf("All %d hook(s) in sync", len(source.Entries))
+	if len(errors)+len(warnings) == 0 {
+		ui.Row(ui.MarkOK, "Hooks", "all "+plural(len(source.Entries), "hook")+" in sync", doctorWidth)
+	}
+	printResourceFindings("Hooks", doctorWidth, errors, warnings)
+	if syncable {
+		result.suggest("skillshare sync hooks", "sync the hooks")
+	}
+	addResourceCheck(result, "hooks", "Hooks", ok, errors, warnings)
+}
+
+// checkPluginPackages previews `plugin sync` without fetching any source. It only asks
+// each bound Agent's native CLI what is installed, so nothing runs when no package exists.
+func checkPluginPackages(service *plugin.Service, result *doctorResult) {
+	inv, err := service.Packages()
+	if err != nil {
+		ui.Row(ui.MarkFail, "Plugins", err.Error(), doctorWidth)
+		addResourceCheck(result, "plugins", "Plugins", "", []string{err.Error()}, nil)
+		return
+	}
+	if len(inv.Packages) == 0 {
+		ui.Row(ui.MarkNone, "Plugins", "none configured", doctorWidth)
+		result.addInfo("plugins", "No plugins configured")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), doctorPluginTimeout)
+	defer cancel()
+	sp := ui.StartSpinner("Checking plugins...")
+	plan, err := service.Preview(ctx, plugin.Request{Action: "sync"})
+	sp.Stop()
+	if err != nil {
+		ui.Row(ui.MarkFail, "Plugins", err.Error(), doctorWidth)
+		addResourceCheck(result, "plugins", "Plugins", "", []string{err.Error()}, nil)
+		return
+	}
+	var warnings []string
+	for _, c := range plan.Changes {
+		line := c.Name + " → " + c.Target
+		switch c.Action {
+		case "noop":
+			if c.Guidance {
+				warnings = append(warnings, line+": "+c.Message)
+			}
+		case "blocked":
+			warnings = append(warnings, line+": blocked: "+c.Message)
+		default:
+			warnings = append(warnings, line+": not synced ("+c.Action+"): "+c.Message)
+		}
+	}
+	ok := fmt.Sprintf("All %d plugin package(s) in sync", len(inv.Packages))
+	if len(warnings) == 0 {
+		ui.Row(ui.MarkOK, "Plugins", "all "+plural(len(inv.Packages), "package")+" in sync", doctorWidth)
+	} else {
+		result.suggest("skillshare sync plugins --dry-run", "see what plugin sync would change")
+	}
+	printResourceFindings("Plugins", doctorWidth, nil, warnings)
+	addResourceCheck(result, "plugins", "Plugins", ok, nil, warnings)
+}
+
+// extraTargetFindings checks one resolved extra target beyond reachability: links
+// that no longer resolve, and files that differ from the source.
+func extraTargetFindings(extra config.ExtraConfig, target config.ExtraTargetConfig, sourceDir, targetPath string) (errors, warnings []string) {
+	label := extra.Name + " → " + shortenPath(target.Path)
+	if extra.File == "" {
+		for _, name := range findBrokenSymlinks(targetPath) {
+			errors = append(errors, label+": broken symlink "+name)
+		}
+	}
+	// diff does not model flattened or transformed targets, so it cannot judge them.
+	if target.Flatten || target.Extension != "" {
+		return errors, warnings
+	}
+	if _, err := os.Stat(sourceDir); err != nil {
+		return errors, warnings
+	}
+	resolved := target
+	resolved.Path = targetPath
+	for _, d := range collectExtrasDiff([]config.ExtraConfig{{Name: extra.Name, File: extra.File, Targets: []config.ExtraTargetConfig{resolved}}}, func(config.ExtraConfig) string { return sourceDir }) {
+		if !d.synced && d.errMsg == "" && len(d.items) > 0 {
+			warnings = append(warnings, fmt.Sprintf("%s: %s out of sync (%s %s)", label, plural(len(d.items), "file"), d.items[0].file, d.items[0].reason))
+		}
+	}
+	return errors, warnings
+}
+
+// resolveDoctorExtraTarget makes an extra target path absolute, as sync does.
+func resolveDoctorExtraTarget(path string, isProject bool, projectRoot string) string {
+	p := config.ExpandPath(path)
+	if isProject && !filepath.IsAbs(p) {
+		p = filepath.Join(projectRoot, p)
+	}
+	return p
+}

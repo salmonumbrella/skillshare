@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
+	"skillshare/internal/config"
 	"skillshare/internal/install"
+	"skillshare/internal/sourcewalk"
+	ssync "skillshare/internal/sync"
 	"skillshare/internal/ui"
 	"skillshare/internal/utils"
 )
@@ -26,10 +28,8 @@ func cmdUpdateProject(args []string, root string) (*updateResult, error) {
 		opts.all = true
 	}
 
-	if !projectConfigExists(root) {
-		if err := performProjectInit(root, projectInitOptions{}); err != nil {
-			return nil, err
-		}
+	if err := ensureProjectConfig(root); err != nil {
+		return nil, err
 	}
 
 	runtime, err := loadProjectRuntime(root)
@@ -37,34 +37,49 @@ func cmdUpdateProject(args []string, root string) (*updateResult, error) {
 		return nil, err
 	}
 
-	sourcePath := runtime.sourcePath
+	sourcePath := utils.ResolveSymlink(runtime.sourcePath)
 	if opts.threshold == "" {
 		opts.threshold = runtime.config.Audit.BlockThreshold
 	}
 
-	ui.Header(ui.WithModeLabel("Updating"))
-	ui.StepStart("Source", sourcePath)
-
-	if opts.all {
-		uc := &updateContext{sourcePath: sourcePath, projectRoot: root, opts: opts}
-		return updateAllProjectSkills(uc)
+	// An update is what moves the lockfile forward.
+	if !opts.dryRun {
+		defer trackProjectLock(runtime)()
+		// Runs before the lockfile is written, which pins by the config's source.
+		before := install.LoadMetadataOrNew(runtime.sourcePath)
+		defer func() {
+			// The update may have saved the config through another copy (--prune).
+			if fresh, err := config.LoadProject(root); err == nil {
+				*runtime.config = *fresh
+			}
+			if err := config.FollowRepairedSources(root, runtime.config, before, install.LoadMetadataOrNew(runtime.sourcePath), parseOptsFromProjectConfig(runtime.config)); err != nil {
+				ui.Warning("Could not update the project config: %v", err)
+			}
+		}()
 	}
 
-	return cmdUpdateProjectBatch(sourcePath, opts, root)
+	if opts.all {
+		uc := &updateContext{sourcePath: sourcePath, projectRoot: root, opts: opts, parseOpts: parseOptsFromProjectConfig(runtime.config), follow: runtime.skillsWalk().Follow}
+		return updateAllProjectSkills(uc, runtime.skillsWalk())
+	}
+
+	return cmdUpdateProjectBatch(sourcePath, opts, root, parseOptsFromProjectConfig(runtime.config), runtime.skillsWalk().Follow)
 }
 
-func cmdUpdateProjectBatch(sourcePath string, opts *updateOptions, projectRoot string) (*updateResult, error) {
+func cmdUpdateProjectBatch(sourcePath string, opts *updateOptions, projectRoot string, pOpts install.ParseOptions, follow *sourcewalk.Follow) (*updateResult, error) {
 	// --- Resolve targets ---
 	var targets []updateTarget
 	seen := map[string]bool{}
 	var resolveWarnings []string
 
+	metaStore, _ := install.LoadMetadataWithMigration(sourcePath, "")
+
 	for _, name := range opts.names {
 		// Check group directory first (before repo/skill lookup,
 		// so "feature-radar" expands to all skills rather than
 		// matching a single nested "feature-radar/feature-radar").
-		if isGroupDir(name, sourcePath) {
-			groupMatches, groupErr := resolveGroupUpdatable(name, sourcePath)
+		if isGroupDir(name, sourcePath, metaStore) {
+			groupMatches, groupErr := resolveGroupUpdatable(name, sourcePath, sourcewalk.Options{Follow: follow})
 			if groupErr != nil {
 				resolveWarnings = append(resolveWarnings, fmt.Sprintf("%s: %v", name, groupErr))
 				continue
@@ -73,7 +88,7 @@ func cmdUpdateProjectBatch(sourcePath string, opts *updateOptions, projectRoot s
 				resolveWarnings = append(resolveWarnings, fmt.Sprintf("%s: no updatable skills in group", name))
 				continue
 			}
-			ui.Info("'%s' is a group — expanding to %d updatable skill(s)", name, len(groupMatches))
+			ui.Note(fmt.Sprintf("'%s' is a group — expanding to %s", name, plural(len(groupMatches), "updatable skill")))
 			for _, m := range groupMatches {
 				if !seen[m.path] {
 					seen[m.path] = true
@@ -83,17 +98,7 @@ func cmdUpdateProjectBatch(sourcePath string, opts *updateOptions, projectRoot s
 			continue
 		}
 
-		// Normalize _ prefix for tracked repos
-		repoName := name
-		if !strings.HasPrefix(repoName, "_") {
-			prefixed := filepath.Join(sourcePath, "_"+name)
-			if install.IsGitRepo(prefixed) {
-				repoName = "_" + name
-			}
-		}
-		repoPath := filepath.Join(sourcePath, repoName)
-
-		if install.IsGitRepo(repoPath) {
+		if repoName, repoPath := install.FindTrackedCheckoutUnlessSkill(sourcePath, name); repoPath != "" {
 			if !seen[repoPath] {
 				seen[repoPath] = true
 				targets = append(targets, updateTarget{name: repoName, path: repoPath, isRepo: true})
@@ -104,11 +109,11 @@ func cmdUpdateProjectBatch(sourcePath string, opts *updateOptions, projectRoot s
 		// Regular skill with metadata
 		skillPath := filepath.Join(sourcePath, name)
 		if info, err := os.Stat(skillPath); err == nil && info.IsDir() {
-			meta, metaErr := install.ReadMeta(skillPath)
-			if metaErr == nil && meta != nil && meta.Source != "" {
+			entry := metaStore.Get(name)
+			if entry != nil && entry.Source != "" {
 				if !seen[skillPath] {
 					seen[skillPath] = true
-					targets = append(targets, updateTarget{name: name, path: skillPath, isRepo: false, meta: meta})
+					targets = append(targets, updateTarget{name: name, path: skillPath, isRepo: false, meta: entry})
 				}
 				continue
 			}
@@ -120,7 +125,7 @@ func cmdUpdateProjectBatch(sourcePath string, opts *updateOptions, projectRoot s
 	}
 
 	for _, group := range opts.groups {
-		groupMatches, err := resolveGroupUpdatable(group, sourcePath)
+		groupMatches, err := resolveGroupUpdatable(group, sourcePath, sourcewalk.Options{Follow: follow})
 		if err != nil {
 			resolveWarnings = append(resolveWarnings, fmt.Sprintf("--group %s: %v", group, err))
 			continue
@@ -137,16 +142,6 @@ func cmdUpdateProjectBatch(sourcePath string, opts *updateOptions, projectRoot s
 		}
 	}
 
-	var repoCount, skillCount int
-	for _, t := range targets {
-		if t.isRepo {
-			repoCount++
-		} else {
-			skillCount++
-		}
-	}
-	ui.StepEnd("Items", fmt.Sprintf("%d tracked repo(s), %d skill(s)", repoCount, skillCount))
-
 	for _, w := range resolveWarnings {
 		ui.Warning("%s", w)
 	}
@@ -159,7 +154,7 @@ func cmdUpdateProjectBatch(sourcePath string, opts *updateOptions, projectRoot s
 	}
 
 	// --- Execute ---
-	uc := &updateContext{sourcePath: sourcePath, projectRoot: projectRoot, opts: opts}
+	uc := &updateContext{sourcePath: sourcePath, projectRoot: projectRoot, opts: opts, parseOpts: pOpts, follow: follow}
 
 	if len(targets) == 1 {
 		t := targets[0]
@@ -174,20 +169,17 @@ func cmdUpdateProjectBatch(sourcePath string, opts *updateOptions, projectRoot s
 	}
 
 	// Batch mode
-	if opts.dryRun {
-		ui.Warning("[dry-run] No changes will be made")
-	}
-
 	batchResult, batchErr := executeBatchUpdate(uc, targets)
 	return &batchResult, batchErr
 }
 
-func updateAllProjectSkills(uc *updateContext) (*updateResult, error) {
+func updateAllProjectSkills(uc *updateContext, walk sourcewalk.Options) (*updateResult, error) {
 	var targets []updateTarget
 
 	scanSpinner := ui.StartSpinner("Scanning skills...")
-	walkRoot := utils.ResolveSymlink(uc.sourcePath)
-	err := filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
+	walkRoot := uc.sourcePath
+	metaStore, _ := install.LoadMetadataWithMigration(uc.sourcePath, "")
+	err := sourcewalk.Walk(walkRoot, walk, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -201,23 +193,31 @@ func updateAllProjectSkills(uc *updateContext) (*updateResult, error) {
 			return filepath.SkipDir
 		}
 
-		// Tracked repo (_-prefixed)
-		if info.IsDir() && strings.HasPrefix(info.Name(), "_") {
-			if install.IsGitRepo(path) {
-				rel, _ := filepath.Rel(walkRoot, path)
-				targets = append(targets, updateTarget{name: rel, path: path, isRepo: true})
+		// Followed checkouts are skipped whatever their name: a root SKILL.md
+		// would otherwise schedule them as a regular update below.
+		if info.IsDir() {
+			if warning, skip := followedRepoSkipped(walk, walkRoot, path); skip {
+				if warning != "" {
+					ui.Warning("%s", warning)
+				}
 				return filepath.SkipDir
 			}
+		}
+
+		// Tracked repo (_-prefixed)
+		if info.IsDir() && install.IsTrackedCheckout(path) {
+			rel, _ := filepath.Rel(walkRoot, path)
+			targets = append(targets, updateTarget{name: rel, path: path, isRepo: true})
+			return filepath.SkipDir
 		}
 
 		// Regular skill with metadata
 		if !info.IsDir() && info.Name() == "SKILL.md" {
 			skillDir := filepath.Dir(path)
-			meta, metaErr := install.ReadMeta(skillDir)
-			if metaErr == nil && meta != nil && meta.Source != "" {
-				rel, _ := filepath.Rel(walkRoot, skillDir)
-				if rel != "." {
-					targets = append(targets, updateTarget{name: rel, path: skillDir, isRepo: false, meta: meta})
+			rel, _ := filepath.Rel(walkRoot, skillDir)
+			if rel != "." {
+				if entry := metaStore.Get(rel); entry != nil && entry.Source != "" {
+					targets = append(targets, updateTarget{name: rel, path: skillDir, isRepo: false, meta: entry})
 				}
 			}
 		}
@@ -227,16 +227,23 @@ func updateAllProjectSkills(uc *updateContext) (*updateResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan skills: %w", err)
 	}
+	for _, w := range ssync.SourceLinkWarnings(walk, false) {
+		ui.Warning("%s", w)
+	}
 
-	var repoCount, skillCount int
+	// Tracked repos declared in metadata but absent on disk (issue #212):
+	// surface them instead of silently ignoring (mirrors global --all).
+	existing := make(map[string]bool, len(targets))
 	for _, t := range targets {
-		if t.isRepo {
-			repoCount++
-		} else {
-			skillCount++
+		existing[t.name] = true
+	}
+	missingRepos, _ := install.GetMissingTrackedRepos(uc.sourcePath, walk)
+	for _, repo := range missingRepos {
+		if !existing[repo.Name] {
+			existing[repo.Name] = true
+			targets = append(targets, updateTarget{name: repo.Name, path: filepath.Join(uc.sourcePath, filepath.FromSlash(repo.Name)), isRepo: true})
 		}
 	}
-	ui.StepEnd("Items", fmt.Sprintf("%d tracked repo(s), %d skill(s)", repoCount, skillCount))
 
 	total := len(targets)
 	if total == 0 {
@@ -250,15 +257,16 @@ func updateAllProjectSkills(uc *updateContext) (*updateResult, error) {
 		var r updateResult
 		var updateErr error
 		if t.isRepo {
-			r, updateErr = updateTrackedRepo(uc, t.name)
+			if mr, missing := missingTrackedRepoResult(t); missing {
+				r = mr
+				displayMissingTrackedReposWarning(r.missingTrackedRepos)
+			} else {
+				r, updateErr = updateTrackedRepo(uc, t.name)
+			}
 		} else {
 			r, updateErr = updateRegularSkill(uc, t.name)
 		}
 		return &r, updateErr
-	}
-
-	if uc.opts.dryRun {
-		ui.Warning("[dry-run] No changes will be made")
 	}
 
 	batchResult, batchErr := executeBatchUpdate(uc, targets)

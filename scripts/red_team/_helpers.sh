@@ -49,6 +49,28 @@ $content
 SKILL_EOF
 }
 
+# Write or merge a skill entry into the centralized .metadata.json store.
+# Usage: write_store_meta <source_dir> <skill_name> <json_entry>
+# Example: write_store_meta "$SOURCE_DIR" "my-skill" '{"source":"test","file_hashes":{"SKILL.md":"sha256:abc"}}'
+write_store_meta() {
+  local source_dir="$1"
+  local skill_name="$2"
+  local entry_json="$3"
+  local store_path="$source_dir/.metadata.json"
+
+  if [ -f "$store_path" ]; then
+    # Merge into existing store
+    local tmp
+    tmp=$(jq --arg name "$skill_name" --argjson entry "$entry_json" \
+      '.entries[$name] = $entry' "$store_path")
+    echo "$tmp" > "$store_path"
+  else
+    # Create new store
+    jq -n --arg name "$skill_name" --argjson entry "$entry_json" \
+      '{version:1, entries:{($name): $entry}}' > "$store_path"
+  fi
+}
+
 # Run skillshare with isolated config.
 # -g is placed after the subcommand to force global mode,
 # preventing auto-detection of .skillshare/ in the working directory.
@@ -125,17 +147,36 @@ assert_finding() {
   fi
 }
 
-# Assert audit JSON output does NOT contain a finding with given pattern
-# Usage: assert_no_finding <label> <json_output> <pattern>
-assert_no_finding() {
+# Assert a successful audit has no findings matching a jq predicate.
+# Null findings is the CLI's valid representation of an empty findings slice.
+assert_no_findings_matching() {
   local label="$1"
   local json="$2"
-  local pattern="$3"
-  if echo "$json" | jq -e ".results[0].findings[] | select(.pattern == \"$pattern\")" >/dev/null 2>&1; then
-    fail "$label — should NOT have $pattern finding"
-  else
-    pass "$label"
+  local predicate="$3"
+  if [ "$SS_EXIT" -ne 0 ]; then
+    fail "$label — audit exited $SS_EXIT"
+    return
   fi
+  if ! jq -se '
+    length == 1 and (.[0] |
+      (.results | type == "array" and length > 0) and
+      (.results[0] | type == "object" and has("findings")) and
+      (.results[0].findings | . == null or type == "array"))
+  ' <<< "$json" >/dev/null 2>&1; then
+    fail "$label — invalid audit JSON or missing findings"
+    return
+  fi
+  if jq -e "[.results[0].findings[]? | select($predicate)] | length == 0" <<< "$json" >/dev/null 2>&1; then
+    pass "$label"
+  else
+    fail "$label — unexpected finding or invalid finding data"
+  fi
+}
+
+# Assert audit JSON output does NOT contain a finding with given pattern.
+# Usage: assert_no_finding <label> <json_output> <pattern>
+assert_no_finding() {
+  assert_no_findings_matching "$1" "$2" ".pattern == \"$3\""
 }
 
 # ── Git repo helpers ───────────────────────────────────────────────

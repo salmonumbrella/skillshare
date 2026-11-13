@@ -1,210 +1,173 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"skillshare/internal/audit"
 	"skillshare/internal/git"
 	"skillshare/internal/install"
 	"skillshare/internal/ui"
+	"skillshare/internal/update"
 )
 
-// auditScanFunc abstracts the audit scan call so the same gate logic
-// can be used for both global mode (audit.ScanSkill) and project mode
-// (audit.ScanSkillForProject with a captured projectRoot).
-type auditScanFunc func(repoPath string) (*audit.Result, error)
-
-// auditGateAfterPull scans the repo for security issues after a git pull.
-// If findings are detected at or above threshold:
-//   - TTY mode: prompts the user; on decline, resets to beforeHash.
-//   - Non-TTY mode: automatically resets to beforeHash and returns error.
-//
-// Returns the audit result (may be nil if skipped or on error) and any error.
-func auditGateAfterPull(repoPath, beforeHash string, skipAudit bool, threshold string, scanFn auditScanFunc) (*audit.Result, error) {
-	if skipAudit {
-		return nil, nil
-	}
-	normalizedThreshold, err := audit.NormalizeThreshold(threshold)
-	if err != nil {
-		normalizedThreshold = audit.DefaultThreshold()
-	}
-
-	result, err := scanFn(repoPath)
-	if err != nil {
-		// Scan error -> fail-closed across modes.
-		if beforeHash == "" {
-			return nil, fmt.Errorf("security audit failed: %v — rollback commit unavailable, update aborted and repository state is unknown: %w", err, audit.ErrBlocked)
+// runTrackedRepoUpdate updates one tracked repo and prints what the audit gate
+// found. On a terminal it asks whether to keep blocking findings. onReport,
+// when set, runs once with the result so far, before any audit output or
+// prompt, so the caller can print its own lines above them.
+func runTrackedRepoUpdate(uc *updateContext, repoPath string, onProgress func(string), onReport func(*update.TrackedRepoResult)) (*update.TrackedRepoResult, error) {
+	printed := false
+	printAudit := func(res *update.TrackedRepoResult) {
+		if printed {
+			return
 		}
-		if resetErr := git.ResetHard(repoPath, beforeHash); resetErr != nil {
-			return nil, fmt.Errorf("security audit failed: %v; WARNING: rollback also failed: %v — malicious content may remain: %w", err, resetErr, audit.ErrBlocked)
+		printed = true
+		if onReport != nil {
+			onReport(res)
 		}
-		return nil, fmt.Errorf("security audit failed: %v — rolled back (use --skip-audit to bypass): %w", err, audit.ErrBlocked)
-	}
-
-	if !result.HasSeverityAtOrAbove(normalizedThreshold) {
-		return result, nil
-	}
-
-	// Show findings
-	for _, f := range result.Findings {
-		if audit.SeverityRank(f.Severity) <= audit.SeverityRank(normalizedThreshold) {
-			ui.Warning("[%s] %s (%s:%d)", f.Severity, f.Message, f.File, f.Line)
+		if res.Audit == nil {
+			return
+		}
+		if res.AcceptedSkipped > 0 {
+			ui.Note(plural(res.AcceptedSkipped, "previously accepted finding") + " skipped")
+		}
+		for _, f := range res.Audit.Findings {
+			if !f.Acknowledged && audit.SeverityRank(f.Severity) <= audit.SeverityRank(res.Threshold) {
+				ui.Warning("[%s] %s (%s:%d)", f.Severity, f.ExplainedMessage(), f.File, f.Line)
+			}
 		}
 	}
 
+	opts := update.TrackedRepoOptions{
+		ParseOptions: uc.parseOpts,
+		SourceDir:    uc.sourcePath,
+		Force:        uc.opts.force,
+		DryRun:       uc.opts.dryRun,
+		SkipAudit:    uc.opts.skipAudit,
+		Threshold:    uc.opts.threshold,
+		ProjectRoot:  uc.projectRoot,
+		Follow:       uc.follow,
+		OnProgress:   onProgress,
+	}
+	declined := false
 	if ui.IsTTY() {
-		fmt.Printf("\n  Security findings at %s or above detected.\n", normalizedThreshold)
-		fmt.Printf("  Apply anyway? [y/N]: ")
-		reader := bufio.NewReader(os.Stdin)
-		answer, _ := reader.ReadString('\n')
-		answer = strings.TrimSpace(strings.ToLower(answer))
-		if answer == "y" || answer == "yes" {
-			return result, nil
+		opts.Confirm = func(res *update.TrackedRepoResult) (bool, error) {
+			printAudit(res)
+			fmt.Printf("\n  Security findings at %s or above detected.\n", res.Threshold)
+			apply, err := ui.ConfirmAction("Apply anyway?", false)
+			declined = err == nil && !apply
+			return apply, err
 		}
-		// User declined → rollback
-		if beforeHash == "" {
-			return result, fmt.Errorf("security audit failed — findings at/above %s detected, rollback commit unavailable and repository state is unknown: %w", normalizedThreshold, audit.ErrBlocked)
-		}
-		if err := git.ResetHard(repoPath, beforeHash); err != nil {
-			return result, fmt.Errorf("security audit failed — findings at/above %s detected; WARNING: rollback also failed: %v — malicious content may remain: %w", normalizedThreshold, err, audit.ErrBlocked)
-		}
-		ui.Info("Rolled back to %s", beforeHash[:12])
-		return result, fmt.Errorf("security audit failed — findings at/above %s detected — rolled back (use --skip-audit to bypass): %w", normalizedThreshold, audit.ErrBlocked)
 	}
 
-	// Non-interactive → fail-closed
-	if beforeHash == "" {
-		return result, fmt.Errorf("security audit failed — findings at/above %s detected, rollback commit unavailable and repository state is unknown: %w", normalizedThreshold, audit.ErrBlocked)
+	res, err := update.TrackedRepo(repoPath, opts)
+	printAudit(res)
+
+	if res.Overridden {
+		if uc.opts.force {
+			ui.Warning("Findings at/above %s; proceeding due to --force", res.Threshold)
+		}
+		if res.RecordErr != nil {
+			ui.Warning("Failed to record accepted findings: %v", res.RecordErr)
+		} else if res.Recorded > 0 {
+			ui.Note(fmt.Sprintf("Recorded %s; future updates won't block on them", plural(res.Recorded, "accepted finding")))
+		}
 	}
-	if err := git.ResetHard(repoPath, beforeHash); err != nil {
-		return result, fmt.Errorf("security audit failed — findings at/above %s detected; WARNING: rollback also failed: %v — malicious content may remain: %w", normalizedThreshold, err, audit.ErrBlocked)
+	var blocked *install.AuditGateError
+	if declined && errors.As(err, &blocked) && blocked.Rollback == install.CheckoutUnchanged {
+		ui.Note("Candidate rejected; checkout unchanged")
 	}
-	return result, fmt.Errorf("security audit failed — findings at/above %s detected — rolled back (use --skip-audit to bypass): %w", normalizedThreshold, audit.ErrBlocked)
+	var opErr *update.Error
+	if errors.As(err, &opErr) && opErr.Stage == update.StageStatus {
+		return res, &gitStatusError{err: opErr.Err}
+	}
+	return res, err
 }
 
 func updateTrackedRepo(uc *updateContext, repoName string) (updateResult, error) {
 	repoPath := filepath.Join(uc.sourcePath, repoName)
-	start := time.Now()
-
-	ui.StepContinue("Repo", repoName+" (tracked)")
-
 	startUpdate := time.Now()
-	// Check for uncommitted changes
-	spinner := ui.StartSpinner("Checking status...")
 
-	isDirty, _ := git.IsDirty(repoPath)
-	if isDirty {
-		spinner.Stop()
-		files, _ := git.GetDirtyFiles(repoPath)
-
-		if !uc.opts.force {
-			lines := []string{
-				"",
-				"Repository has uncommitted changes:",
-				"",
-			}
-			lines = append(lines, files...)
-			lines = append(lines, "", "Use --force to discard changes and update", "")
-
-			ui.WarningBox("Warning", lines...)
-			fmt.Println()
-			ui.ErrorMsg("Update aborted")
-			return updateResult{skipped: 1}, fmt.Errorf("uncommitted changes in repository")
-		}
-
-		ui.Warning("Discarding local changes (--force)")
-		if !uc.opts.dryRun {
-			if err := git.Restore(repoPath); err != nil {
-				return updateResult{skipped: 1}, fmt.Errorf("failed to discard changes: %w", err)
-			}
-		}
-		spinner = ui.StartSpinner("Fetching from origin...")
-	}
-
-	if uc.opts.dryRun {
-		spinner.Stop()
-		ui.Warning("[dry-run] Would run: git pull")
-		return updateResult{skipped: 1}, nil
-	}
-
-	spinner.Update("   Fetching from origin...")
+	spinner := ui.StartSpinner("Fetching " + repoName + "...")
 	var onProgress func(string)
 	if ui.IsTTY() {
 		onProgress = func(line string) {
-			spinner.Update("   " + line)
+			spinner.Update(line)
 		}
 	}
 
-	// Use ForcePull if --force to handle force push
-	var info *git.UpdateInfo
-	var err error
-	if uc.opts.force {
-		info, err = git.ForcePullWithProgress(repoPath, git.AuthEnvForRepo(repoPath), onProgress)
-	} else {
-		info, err = git.PullWithProgress(repoPath, git.AuthEnvForRepo(repoPath), onProgress)
-	}
-	if err != nil {
+	res, err := runTrackedRepoUpdate(uc, repoPath, onProgress, func(res *update.TrackedRepoResult) {
 		spinner.Stop()
-		ui.StepResult("error", fmt.Sprintf("Failed: %v", err), 0)
-		return updateResult{skipped: 1}, fmt.Errorf("git pull failed: %w", err)
-	}
-
-	if info.UpToDate {
-		spinner.Stop()
-		ui.StepResult("success", "Already up to date", time.Since(startUpdate))
-		return updateResult{skipped: 1}, nil
-	}
-
-	spinner.Stop()
-	ui.StepResult("success", fmt.Sprintf("%d commits, %d files updated", len(info.Commits), info.Stats.FilesChanged), time.Since(startUpdate))
-	fmt.Println()
-
-	// Show changes box
-	lines := []string{
-		"",
-		fmt.Sprintf("  Commits:  %d new", len(info.Commits)),
-		fmt.Sprintf("  Files:    %d changed (+%d / -%d)",
-			info.Stats.FilesChanged, info.Stats.Insertions, info.Stats.Deletions),
-		"",
-	}
-
-	// Show up to 5 commits
-	maxCommits := 5
-	for i, c := range info.Commits {
-		if i >= maxCommits {
-			lines = append(lines, fmt.Sprintf("  ... and %d more", len(info.Commits)-maxCommits))
-			break
+		if res.Discarded {
+			ui.Warning("Discarding local changes (--force)")
 		}
-		lines = append(lines, fmt.Sprintf("  %s  %s", c.Hash, truncateString(c.Message, 40)))
-	}
-	lines = append(lines, "")
+		info := res.Info
+		if info == nil || info.UpToDate {
+			return
+		}
+		printUpdateRow(ui.MarkOK, repoName, fmt.Sprintf("%s, %s changed (+%d −%d)",
+			plural(len(info.Commits), "commit"), plural(info.Stats.FilesChanged, "file"),
+			info.Stats.Insertions, info.Stats.Deletions), time.Since(startUpdate))
 
-	ui.Box("Changes", lines...)
+		printCommitNotes(info.Commits)
 
-	if uc.opts.diff {
-		renderDiffSummary(repoPath, info.BeforeHash, info.AfterHash)
-	}
-	fmt.Println()
+		if uc.opts.diff {
+			renderDiffSummary(res.Changes)
+		}
+	})
 
-	// Post-pull audit gate
-	scanFn := uc.auditScanFn()
-	if _, err := auditGateAfterPull(repoPath, info.BeforeHash, uc.opts.skipAudit, uc.opts.threshold, scanFn); err != nil {
+	var statusErr *gitStatusError
+	var opErr *update.Error
+	switch {
+	case errors.As(err, &statusErr):
+		printUpdateRow(ui.MarkFail, repoName, statusErr.Error(), 0)
+		return updateResult{skipped: 1}, statusErr
+	case errors.As(err, &opErr) && opErr.Stage == update.StageDiscard:
+		return updateResult{skipped: 1}, err
+	case errors.As(err, &opErr):
+		msg := opErr.Error()
+		if !uc.opts.force {
+			msg += " (try --force)"
+		}
+		printUpdateRow(ui.MarkFail, repoName, msg, 0)
+		return updateResult{skipped: 1}, err
+	case err != nil:
 		return updateResult{securityFailed: 1}, err
 	}
 
-	ui.SuccessMsg("Updated %s", repoName)
-	ui.StepResult("success", "Updated successfully", time.Since(start))
-	fmt.Println()
-	ui.SectionLabel("Next Steps")
-	ui.Info("Run 'skillshare sync' to distribute changes")
+	switch res.Status {
+	case update.StatusDirty:
+		files, _ := git.GetDirtyFiles(repoPath)
+		printUpdateRow(ui.MarkFail, repoName, "uncommitted changes", 0)
+		for _, f := range files {
+			ui.Note(f)
+		}
+		fmt.Println()
+		ui.Next("skillshare update "+repoName+" --force", "discard them and update")
+		return updateResult{skipped: 1}, fmt.Errorf("uncommitted changes in repository")
+	case update.StatusDryRun:
+		printUpdateRow(ui.MarkNone, repoName, "would run git pull", 0)
+		fmt.Println()
+		ui.DryRun()
+		return updateResult{skipped: 1}, nil
+	}
 
+	if res.MetadataErr != nil {
+		ui.Warning("Failed to refresh metadata for %s: %v", repoName, res.MetadataErr)
+	}
+	for _, w := range res.Warnings {
+		ui.Warning("%s", w)
+	}
+	if res.Status == update.StatusUpToDate {
+		printUpdateRow(ui.MarkOK, repoName, "already up to date", time.Since(startUpdate))
+		return updateResult{skipped: 1}, nil
+	}
+
+	ui.Next("skillshare sync", "link the changes into your targets")
 	return updateResult{updated: 1}, nil
 }
 
@@ -212,41 +175,64 @@ func updateRegularSkill(uc *updateContext, skillName string) (updateResult, erro
 	skillPath := filepath.Join(uc.sourcePath, skillName)
 
 	// Read metadata to get source
-	meta, err := install.ReadMeta(skillPath)
-	if err != nil {
-		return updateResult{skipped: 1}, fmt.Errorf("cannot read metadata for '%s': %w", skillName, err)
+	store, storeErr := install.LoadMetadataWithMigration(uc.sourcePath, "")
+	if storeErr != nil {
+		return updateResult{skipped: 1}, fmt.Errorf("cannot read metadata for '%s': %w", skillName, storeErr)
 	}
+	meta := store.GetByPath(skillName)
 	if meta == nil || meta.Source == "" {
 		return updateResult{skipped: 1}, fmt.Errorf("skill '%s' has no source metadata, cannot update", skillName)
 	}
 
-	ui.StepContinue("Skill", skillName)
-	ui.StepContinue("Source", meta.Source)
+	if !uc.opts.force && meta.LocallyModified(skillPath, uc.follow) {
+		if uc.opts.dryRun {
+			printUpdateRow(ui.MarkWarn, skillName, "would skip — "+modifiedSkillReason, 0)
+			fmt.Println()
+			ui.DryRun()
+			return updateResult{skipped: 1}, nil
+		}
+		// Only a skill named on purpose fails; --all and --group skip it as the batch path does.
+		if uc.opts.all || len(uc.opts.groups) > 0 {
+			printUpdateRow(ui.MarkWarn, skillName, modifiedSkillReason, 0)
+			ui.Next("skillshare check "+skillName+" --diff", "see the changes",
+				"skillshare update "+skillName+" --force", "discard them and reinstall")
+			return updateResult{skipped: 1}, nil
+		}
+		printUpdateRow(ui.MarkFail, skillName, modifiedSkillReason, 0)
+		ui.Next("skillshare check "+skillName+" --diff", "see the changes",
+			"skillshare update "+skillName+" --force", "discard them and reinstall")
+		return updateResult{skipped: 1}, fmt.Errorf("local changes in skill")
+	}
 
+	from := "from " + sourceLabel(meta.Source)
 	if uc.opts.dryRun {
-		ui.Warning("[dry-run] Would reinstall from: %s", meta.Source)
+		printUpdateRow(ui.MarkNone, skillName, "would reinstall "+from, 0)
+		fmt.Println()
+		ui.DryRun()
 		return updateResult{skipped: 1}, nil
 	}
 
 	startUpdate := time.Now()
 	// Parse source and reinstall
-	source, err := install.ParseSource(meta.Source)
+	source, err := install.RecordedSource(meta, uc.parseOpts)
 	if err != nil {
 		return updateResult{skipped: 1}, fmt.Errorf("invalid source in metadata: %w", err)
 	}
+	// Preserve branch from original install
+	source.ApplyRecordedBranch(meta.Branch)
 
 	// Snapshot before update for --diff
 	var beforeHashes map[string]string
 	if uc.opts.diff {
-		beforeHashes, _ = install.ComputeFileHashes(skillPath)
+		beforeHashes, _ = install.ComputeFileHashes(skillPath, uc.follow)
 	}
 
-	spinner := ui.StartSpinner("Updating...")
+	spinner := ui.StartSpinner("Updating " + skillName + "...")
 
 	installOpts := uc.makeInstallOpts()
 	if ui.IsTTY() {
 		installOpts.OnProgress = func(line string) {
-			spinner.Update("   " + line)
+			spinner.Update(line)
 		}
 	}
 
@@ -259,12 +245,11 @@ func updateRegularSkill(uc *updateContext, skillName string) (updateResult, erro
 			if uc.opts.prune {
 				if pruneErr := pruneSkill(skillPath, skillName, uc); pruneErr == nil {
 					pruneRegistry([]string{skillName}, uc)
-					ui.StepResult("warning", "Pruned — stale (deleted upstream)", 0)
+					printUpdateRow(ui.MarkWarn, skillName, "pruned — deleted upstream", 0)
 					return updateResult{pruned: 1}, nil
 				}
 			}
-			ui.StepResult("warning", "Stale (deleted upstream)", 0)
-			fmt.Println()
+			printUpdateRow(ui.MarkWarn, skillName, "stale — deleted upstream", 0)
 			displayStaleWarning([]string{skillName})
 			return updateResult{skipped: 1}, nil
 		}
@@ -273,23 +258,20 @@ func updateRegularSkill(uc *updateContext, skillName string) (updateResult, erro
 			return updateResult{securityFailed: 1}, err
 		}
 
-		ui.StepResult("error", fmt.Sprintf("Failed: %v", err), 0)
+		printUpdateRow(ui.MarkFail, skillName, err.Error(), 0)
 		return updateResult{skipped: 1}, fmt.Errorf("update failed: %w", err)
 	}
 
 	spinner.Stop()
-	ui.StepResult("success", "Updated successfully", time.Since(startUpdate))
-	fmt.Println()
-
+	printUpdateRow(ui.MarkOK, skillName, from, time.Since(startUpdate))
 	renderInstallWarningsWithResult("", result.Warnings, uc.opts.auditVerbose, result)
 
 	if uc.opts.diff {
-		afterHashes, _ := install.ComputeFileHashes(skillPath)
+		afterHashes, _ := install.ComputeFileHashes(skillPath, uc.follow)
 		renderHashDiffSummary(beforeHashes, afterHashes)
 	}
 
-	ui.SectionLabel("Next Steps")
-	ui.Info("Run 'skillshare sync' to distribute changes")
+	ui.Next("skillshare sync", "link the changes into your targets")
 
 	return updateResult{updated: 1}, nil
 }
@@ -298,51 +280,23 @@ func updateRegularSkill(uc *updateContext, skillName string) (updateResult, erro
 // Output is suppressed; caller handles display via progress bar.
 // Returns (updated, auditResult, error).
 func updateTrackedRepoQuick(uc *updateContext, repoPath string) (bool, *audit.Result, error) {
-	// Check for uncommitted changes
-	if isDirty, _ := git.IsDirty(repoPath); isDirty {
-		if !uc.opts.force {
-			return false, nil, nil
-		}
-		if !uc.opts.dryRun {
-			if err := git.Restore(repoPath); err != nil {
-				return false, nil, nil
-			}
-		}
-	}
-
-	if uc.opts.dryRun {
+	res, err := runTrackedRepoUpdate(uc, repoPath, nil, nil)
+	var opErr *update.Error
+	if errors.As(err, &opErr) {
+		// A failed discard or pull counts as skipped in a batch.
 		return false, nil, nil
-	}
-
-	var info *git.UpdateInfo
-	var err error
-	if uc.opts.force {
-		info, err = git.ForcePullWithProgress(repoPath, git.AuthEnvForRepo(repoPath), nil)
-	} else {
-		info, err = git.PullWithProgress(repoPath, git.AuthEnvForRepo(repoPath), nil)
 	}
 	if err != nil {
-		return false, nil, nil
+		return false, res.Audit, err
 	}
-
-	if info.UpToDate {
-		return false, nil, nil
-	}
-
-	// Post-pull audit gate
-	auditResult, auditErr := auditGateAfterPull(repoPath, info.BeforeHash, uc.opts.skipAudit, uc.opts.threshold, uc.auditScanFn())
-	if auditErr != nil {
-		return false, auditResult, auditErr
-	}
-
-	return true, auditResult, nil
+	return res.Status == update.StatusUpdated, res.Audit, nil
 }
 
 // updateSkillFromMeta updates a skill using its metadata in batch mode.
 // Output is suppressed; caller handles display via progress bar.
-// If cachedMeta is non-nil it is used directly; otherwise metadata is read from disk.
+// If cachedMeta is non-nil it is used directly; otherwise metadata is loaded from the store.
 // Returns (updated, installResult, error).
-func updateSkillFromMeta(uc *updateContext, skillPath string, cachedMeta *install.SkillMeta) (bool, *install.InstallResult, error) {
+func updateSkillFromMeta(uc *updateContext, skillPath string, cachedMeta *install.MetadataEntry) (bool, *install.InstallResult, error) {
 	if uc.opts.dryRun {
 		return false, nil, nil
 	}
@@ -353,17 +307,21 @@ func updateSkillFromMeta(uc *updateContext, skillPath string, cachedMeta *instal
 
 	meta := cachedMeta
 	if meta == nil {
-		var readErr error
-		meta, readErr = install.ReadMeta(skillPath)
-		if readErr != nil || meta == nil || meta.Source == "" {
+		store, _ := install.LoadMetadataWithMigration(uc.sourcePath, "")
+		// GetByPath handles both full-path keys and legacy basename+group keys.
+		if rel, relErr := filepath.Rel(uc.sourcePath, skillPath); relErr == nil {
+			meta = store.GetByPath(filepath.ToSlash(rel))
+		}
+		if meta == nil || meta.Source == "" {
 			return false, nil, nil
 		}
 	}
 
-	source, err := install.ParseSource(meta.Source)
+	source, err := install.RecordedSource(meta, uc.parseOpts)
 	if err != nil {
 		return false, nil, nil
 	}
+	source.ApplyRecordedBranch(meta.Branch)
 
 	result, err := install.Install(source, skillPath, uc.makeInstallOpts())
 	if err != nil {
@@ -373,18 +331,17 @@ func updateSkillFromMeta(uc *updateContext, skillPath string, cachedMeta *instal
 	return true, result, nil
 }
 
-// renderDiffSummary prints a file-level change summary for the given repo.
-func renderDiffSummary(repoPath, beforeHash, afterHash string) {
-	changes, err := git.GetChangedFiles(repoPath, beforeHash, afterHash)
-	if err != nil || len(changes) == 0 {
+// renderDiffSummary prints the candidate's file-level changes, before publication.
+func renderDiffSummary(changes []git.FileChange) {
+	if len(changes) == 0 {
 		return
 	}
 
-	maxFiles := 20
-	lines := []string{""}
+	ui.Section("Files changed")
+	const maxFiles = 20
 	for i, c := range changes {
 		if i >= maxFiles {
-			lines = append(lines, fmt.Sprintf("  ... and %d more file(s)", len(changes)-maxFiles))
+			ui.Note(fmt.Sprintf("… and %d more", len(changes)-maxFiles))
 			break
 		}
 		var marker string
@@ -403,11 +360,8 @@ func renderDiffSummary(repoPath, beforeHash, afterHash string) {
 		if c.OldPath != "" {
 			detail += fmt.Sprintf(" (from %s)", c.OldPath)
 		}
-		lines = append(lines, detail)
+		fmt.Println(detail)
 	}
-	lines = append(lines, "")
-
-	ui.Box("Files Changed", lines...)
 }
 
 // renderHashDiffSummary prints a file-level change summary by comparing
@@ -438,7 +392,7 @@ func renderHashDiffSummary(beforeHashes, afterHashes map[string]string) {
 	}
 
 	if len(changes) == 0 {
-		ui.Info("No file changes detected")
+		ui.Note("No file changes")
 		return
 	}
 
@@ -447,24 +401,45 @@ func renderHashDiffSummary(beforeHashes, afterHashes map[string]string) {
 		return changes[i].path < changes[j].path
 	})
 
-	maxFiles := 20
-	lines := []string{""}
+	ui.Section("Files changed")
+	const maxFiles = 20
 	for i, c := range changes {
 		if i >= maxFiles {
-			lines = append(lines, fmt.Sprintf("  ... and %d more file(s)", len(changes)-maxFiles))
+			ui.Note(fmt.Sprintf("… and %d more", len(changes)-maxFiles))
 			break
 		}
-		lines = append(lines, fmt.Sprintf("  %s %s", c.marker, c.path))
+		fmt.Printf("  %s %s\n", c.marker, c.path)
 	}
-	lines = append(lines, "")
+}
 
-	ui.Box("Files Changed", lines...)
+// printCommitNotes lists up to five pulled commits in dim text.
+func printCommitNotes(commits []git.CommitInfo) {
+	const maxCommits = 5
+	for i, c := range commits {
+		if i >= maxCommits {
+			ui.Note(fmt.Sprintf("… and %d more", len(commits)-maxCommits))
+			break
+		}
+		ui.Note(c.Hash + "  " + truncateString(c.Message, 60))
+	}
+}
+
+// printUpdateRow reports one skill or tracked repo: its name, a dim detail
+// and, when known, how long it took.
+func printUpdateRow(mark, name, detail string, took time.Duration) {
+	value := name
+	if detail != "" {
+		value += " " + ui.DimText("· "+detail)
+	}
+	value += ui.Took(took)
+	ui.Row(mark, "Update", value, ui.RowWidth("Update", "Audit"))
 }
 
 // isSecurityError returns true if the error originated from the audit gate.
-// All security-related errors wrap audit.ErrBlocked as a sentinel.
+// Security-related errors wrap audit.ErrBlocked, or install.ErrAuditScanFailed
+// when a reinstall's audit could not run.
 func isSecurityError(err error) bool {
-	return errors.Is(err, audit.ErrBlocked)
+	return errors.Is(err, audit.ErrBlocked) || errors.Is(err, install.ErrAuditScanFailed)
 }
 
 func truncateString(s string, maxLen int) string { return truncateStr(s, maxLen) }

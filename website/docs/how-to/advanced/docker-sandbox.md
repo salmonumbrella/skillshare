@@ -156,7 +156,7 @@ make playground-down
 |----------|-------------|-----------------|
 | Try skillshare without installing Go/Node | `docker run ghcr.io/runkids/skillshare` | Install Go + Node + pnpm, then build from source |
 | Run full test suite before opening a PR | `make test-docker` | Depend on local toolchain (Go version mismatch = flaky results) |
-| Frontend work without Go installed | `make dev-docker` + `cd ui && pnpm run dev` | Must install Go 1.25+ locally to run the API server |
+| Frontend work without Go installed | `make dev-docker` + `cd ui && pnpm run dev` | Must install Go 1.26+ locally to run the API server |
 | Demo skillshare to a colleague | `make playground` → Web UI on `:19420` | Walk them through a full local install |
 | Verify Linux behavior on Apple Silicon | `make docker-build` | Push to CI and wait |
 
@@ -166,7 +166,7 @@ make playground-down
 |----------|-------------|---------------|
 | New contributor onboarding | `make playground` — one command, ready to go | No more "install Go, set PATH, clone, build" setup guide |
 | Automated skill quality gate in CI | `docker run ghcr.io/.../skillshare-ci audit /skills` | Previously required installing Go + building from source in every workflow |
-| "Works on my machine" across contributors | Docker pins Go 1.25.5 + all dependencies | Different local Go versions causing test flakes |
+| "Works on my machine" across contributors | Docker pins Go 1.26.10 + all dependencies | Different local Go versions causing test flakes |
 | PR reviewer reproducing an issue | `./scripts/test_docker.sh --cmd "go test -run TestXxx ..."` | Must clone + full local setup to reproduce |
 
 ### Enterprise and self-hosted deployment
@@ -231,7 +231,7 @@ spec:
 
 ---
 
-## Dev Profile
+## Dev Profile {#dev-profile}
 
 Two ways to develop the frontend with Vite HMR:
 
@@ -310,10 +310,10 @@ make devc-status     # show container status
 
 The devcontainer reuses the same `docker/sandbox/Dockerfile` as the sandbox, so you get:
 
-- Go 1.25 toolchain
+- Go 1.26 toolchain
 - Node.js 24 + pnpm (bundled in the Docker image) — enables `make ui-dev` and `cd website && pnpm start` inside the container
 - VS Code extensions: Go, Tailwind CSS, ESLint, Prettier
-- Ports forwarded: `19420` (Web UI), `5173` (Vite HMR), `3000` (Docusaurus)
+- Ports forwarded: `45173` (Vite HMR), `49420` (Go API), `48888` (Docusaurus) — uncommon on purpose, so they do not clash with other projects on your host
 - Source code mounted at `/workspace`
 - **Pre-configured demo environment** — same as the interactive playground:
   - Shortcut commands in PATH (`ss`, `ui`, `docs`)
@@ -332,26 +332,26 @@ ss audit                  # run audit with custom rules
 cd ~/demo-project
 ss status                 # auto-detects project mode
 ss audit                  # project-level audit
-ui -p                     # switch API to project mode → http://localhost:5173
+ui -p                     # switch API to project mode → http://localhost:45173
 ```
 
 ### Frontend development
 
 | Port | Service | Command |
 |------|---------|---------|
-| `5173` | Vite (React UI + HMR) | `ui` or `ui -p` |
-| `19420` | Go API backend | started by `ui` / `ui -p` |
-| `3000` | Docusaurus | `docs` |
+| `45173` | Vite (React UI + HMR) | `ui` or `ui -p` |
+| `49420` | Go API backend | started by `ui` / `ui -p` |
+| `48888` | Docusaurus | `docs` |
 
 ```bash
-ui                        # global mode: API + Vite → http://localhost:5173
-ui -p                     # project mode: API + Vite → http://localhost:5173
+ui                        # global mode: API + Vite → http://localhost:45173
+ui -p                     # project mode: API + Vite → http://localhost:45173
 ui stop                   # stop API + Vite
-docs                      # documentation site → http://localhost:3000
+docs                      # documentation site → http://localhost:48888
 docs stop                 # stop Docusaurus
 ```
 
-`ui` starts both the Go API backend (port 19420, background) and Vite dev server (port 5173, HMR). Switching between `ui` and `ui -p` automatically restarts the API in the new mode. VS Code auto-forwards ports to your host browser.
+`ui` starts both the Go API backend (port 49420, background) and Vite dev server (port 45173, HMR). Switching between `ui` and `ui -p` automatically restarts the API in the new mode. VS Code auto-forwards ports to your host browser.
 
 ### Token configuration
 
@@ -405,7 +405,7 @@ Three Dockerfiles serve different purposes:
 |---|---|---|---|
 | **Image** | `ghcr.io/runkids/skillshare` | `ghcr.io/runkids/skillshare-ci` | Local build only |
 | **Dockerfile** | `docker/production/Dockerfile` | `docker/ci/Dockerfile` | `docker/sandbox/Dockerfile` |
-| **Base** | `debian:bookworm-slim` | `debian:bookworm-slim` | `golang:1.25.5-bookworm` |
+| **Base** | `debian:bookworm-slim` | `debian:bookworm-slim` | `golang:1.26.10-bookworm` |
 | **Includes** | git, curl, tini | git only | Go toolchain, gh, jq, air, delve, pre-built UI |
 | **Non-root** | Yes (UID 10001) | No | No |
 | **PID 1** | tini | default | default |
@@ -432,7 +432,7 @@ make docker-build-multiarch                # linux/amd64 + linux/arm64 (slow, fo
 
 `docker-build` only produces an image for your machine's architecture — an arm64 image from Apple Silicon won't run on x86 servers. Use `docker-build-multiarch` when pushing to a registry so any platform gets the right image automatically.
 
-The production image uses `tini` as PID 1, runs as a non-root user (UID 10001), includes a healthcheck, and auto-initialises config on first run. Default command: `skillshare ui -g --host 0.0.0.0 --no-open`.
+The production image uses `tini` as PID 1, runs as a non-root user (UID 10001), includes a healthcheck, and auto-initialises config on first run. Default command: `skillshare ui -g --host 0.0.0.0 --no-open`. To open it by a domain name rather than `localhost` or an IP address, set `SKILLSHARE_UI_TRUSTED_ORIGINS`; see [Reverse Proxy](/docs/reference/commands/ui#reverse-proxy).
 
 Published images are available on GHCR (pushed automatically on tag):
 

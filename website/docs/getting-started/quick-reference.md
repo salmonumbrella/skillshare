@@ -13,6 +13,8 @@ Command cheat sheet for skillshare.
 | `init` | First-time setup |
 | `install <source>` | Add a skill |
 | `uninstall <name>...` | Remove one or more skills |
+| `link <path>` | Link a folder of your own skills into the source |
+| `unlink <name>` | Remove a link from the source |
 | `list` | List all skills |
 | `search <query>` | Search for skills |
 | `sync` | Push to all targets |
@@ -28,6 +30,7 @@ Command cheat sheet for skillshare.
 | `check` | Check for skill updates |
 | `check --json` | Check for updates (JSON output) |
 | `upgrade` | Upgrade CLI and built-in skill |
+| `move <name>... <folder>` | Move installed skills or folders into another folder, keeping install records |
 | `hub list` | List configured skill hubs |
 | `hub add <url>` | Add a skill hub |
 
@@ -42,18 +45,74 @@ Command cheat sheet for skillshare.
 | `target remove <name>` | Remove target safely |
 | `diff [target]` | Show differences |
 
+## Extras Management
+
+| Command | Description |
+|---------|-------------|
+| `extras init <name> --target <path>` | Add an extras entry to config |
+| `extras init <name> --file <file> --target <path>` | Add an extra that syncs one file (`--as` renames it at targets) |
+| `extras list` | List configured extras with sync status |
+| `extras remove <name>` | Remove an extras entry from config |
+| `extras <name> --add-target <path>` | Add a target to an existing extras entry |
+| `extras <name> --remove-target <path>` | Remove a target (add `--prune` to delete synced files) |
+| `extras collect <name>` | Collect local files from extras target into source |
+
+## Agent Management
+
+| Command | Description |
+|---------|-------------|
+| `list agents` | List installed agents |
+| `install <source> --kind agent` | Install only agents from a repo |
+| `install <source> -a <name>` | Install specific agent(s) by name |
+| `uninstall --kind agent <name>` | Remove an agent |
+| `sync agents` | Sync only agents to targets |
+| `check agents` | Check agents for updates |
+| `audit agents` | Security scan agents |
+| `enable --kind agent <name>` | Re-enable a disabled agent |
+| `disable --kind agent <name>` | Disable an agent via `.agentignore` |
+
+## Plugin Management
+
+| Command | Description |
+|---------|-------------|
+| `plugin` | Open the interactive plugin manager |
+| `plugin list` | Show managed plugins and native installation state |
+| `plugin discover <source>` | Inspect a directory or Git repository |
+| `plugin add [source]` | Install a complete native plugin |
+| `plugin import [plugin@market] --from claude` | Adopt an existing native installation |
+| `plugin inspect <name>` | Inspect a managed package |
+| `plugin check [name]` | Check source changes without applying |
+| `plugin update [name \| --all] --target claude` | Update a supported target from a reviewed source |
+| `plugin enable [name] --target codex` | Select a target for the next sync |
+| `plugin disable [name] --target codex` | Deselect a target for the next sync |
+| `plugin remove [name]` | Uninstall managed bindings and remove definitions |
+| `sync plugins [name]` | Apply plugin sync selection; alias for `plugin sync` |
+
+Targets: Claude Code, Codex, Cursor, Antigravity (`agy`), Pi, and OpenCode.
+Project mode supports Claude, Antigravity, Pi, and OpenCode.
+
+Enable/disable only saves the selection. The next plugin sync installs selected
+bindings or uninstalls deselected bindings while retaining their definitions.
+Plugins are excluded from `sync --all`. Use `--dry-run --json` to preview mutations;
+use `--no-tui` with explicit inputs for automation. See [plugin](../reference/commands/plugin.md)
+for native client requirements and supported targets.
+
 ## Sync Operations
 
 | Command | Description |
 |---------|-------------|
 | `sync extras` | Sync non-skill resources (rules, commands, etc.) |
-| `sync --all` | Sync skills + extras together |
+| `sync mcp` | Sync MCP connection settings |
+| `hooks list` | List managed native hooks |
+| `sync hooks` | Sync native hooks without executing them |
+| `sync --all` | Sync skills + agents + extras + MCP + hooks (excludes plugins) |
 | `collect <target>` | Collect skills from target to source |
 | `collect --all` | Collect from all targets |
 | `backup [target]` | Create backup |
 | `backup --list` | List backups |
 | `restore <target>` | Restore from backup |
-| `push [-m "msg"]` | Push to git remote |
+| `commit [-m "msg"]` | Create a local git commit without pushing |
+| `push [-m "msg"] [--pull]` | Commit and push to git remote; `--pull` merges remote changes first, then syncs |
 | `pull` | Pull from git and sync |
 | `trash list` | List soft-deleted skills |
 | `trash restore <name>` | Restore a soft-deleted skill |
@@ -62,10 +121,15 @@ Command cheat sheet for skillshare.
 
 | Command | Description |
 |---------|-------------|
+| `analyze` | Analyze context window usage (interactive TUI) |
+| `analyze --filter <text>` | Filter skills by name/path substring |
+| `analyze --json` | Context usage as JSON |
 | `doctor` | Diagnose issues |
+| `doctor --json` | Diagnose issues (JSON output for CI) |
 | `log` | View operations and audit logs |
 | `ui` | Launch web dashboard on `localhost:19420` |
 | `ui -p` | Launch web dashboard in project mode |
+| `completion <shell> --install` | Install shell tab-completion (bash/zsh/fish/powershell/nushell) |
 | `version` | Show CLI version |
 | `make test-docker` | Run offline Docker sandbox tests |
 | `make playground` | Start playground + enter shell (one step) |
@@ -100,11 +164,17 @@ skillshare init --remote git@github.com:you/my-skills.git
 # Non-interactive (no prompts, auto-detect installed targets)
 skillshare init --remote git@github.com:you/my-skills.git --no-copy --all-targets --no-skill
 
+# Optional local checkpoint without pushing
+skillshare commit -m "Save local skill edits"
+
 # Machine A: push changes
 skillshare push -m "Add new skill"
 
 # Machine B: pull and sync
 skillshare pull
+
+# Editing on several machines: both ways in one command
+skillshare push --pull -m "Update skills"
 ```
 
 Optional later (only if you install additional AI CLIs after setup):
@@ -123,6 +193,13 @@ skillshare init --discover --select cursor --mode copy
 ```bash
 # Install team repo
 skillshare install github.com/team/skills --track
+
+# Install from specific branch (works with or without --track)
+skillshare install github.com/team/skills --branch develop --all
+skillshare install github.com/team/skills --track --branch develop
+
+# Pin to a tag or commit SHA (regular install only)
+skillshare install github.com/team/skills --branch v1.2.0 --all
 
 # Update from team
 skillshare update --all
@@ -145,9 +222,12 @@ make playground-down     # stop container
 | Path | Description |
 |------|-------------|
 | `~/.config/skillshare/config.yaml` | Configuration file |
-| `~/.config/skillshare/registry.yaml` | Installed skill registry (auto-managed) |
-| `~/.config/skillshare/skills/` | Source directory |
+| `~/.config/skillshare/skills/.metadata.json` | Installed skill metadata (auto-managed) |
+| `~/.config/skillshare/skills/` | Skill source directory |
+| `~/.config/skillshare/agents/` | Agent source directory |
+| `~/.config/skillshare/extras/<name>/` | Extras source directories |
 | `~/.local/state/skillshare/logs/` | Operation and audit logs |
+| `~/.local/state/skillshare/projects/` | Machine-local project registrations and locks |
 | `~/.local/share/skillshare/backups/` | Backup directory |
 
 ---

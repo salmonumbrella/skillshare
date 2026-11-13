@@ -1,22 +1,291 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/utils"
 )
 
-// TargetConfig holds configuration for a single target
+// ValidSyncModes lists all valid sync mode values.
+var ValidSyncModes = []string{"merge", "symlink", "copy"}
+
+// ValidTargetNamings lists all valid target naming values.
+var ValidTargetNamings = []string{"flat", "standard", "prefixed"}
+
+// ValidGitRoots lists all valid git_root scope keywords. Empty is also accepted
+// (meaning "skills"); see ValidGitRoot.
+var ValidGitRoots = []string{"skills", "agents", "extras", "root"}
+
+// IsValidSyncMode reports whether mode is a valid sync mode (or empty, meaning inherit).
+func IsValidSyncMode(mode string) bool {
+	if mode == "" {
+		return true // empty = inherit global default
+	}
+	return slices.Contains(ValidSyncModes, mode)
+}
+
+// IsValidTargetNaming reports whether naming is a valid target naming mode
+// (or empty, meaning inherit the global default).
+func IsValidTargetNaming(naming string) bool {
+	if naming == "" {
+		return true // empty = inherit global default
+	}
+	return slices.Contains(ValidTargetNamings, naming)
+}
+
+// EffectiveTargetNaming resolves the runtime target naming mode.
+// Empty values inherit the global default; the final fallback is "flat".
+func EffectiveTargetNaming(naming string) string {
+	if naming == "" {
+		return "flat"
+	}
+	return naming
+}
+
+// TargetNamingModeError reports a target naming the skills sync mode cannot
+// honour: prefixed rewrites name: in each copy, so it needs copy mode. mode is
+// the effective mode; empty counts as the merge default.
+func TargetNamingModeError(naming, mode string) error {
+	if mode == "" {
+		mode = "merge"
+	}
+	if EffectiveTargetNaming(naming) != "prefixed" || mode == "copy" {
+		return nil
+	}
+	return fmt.Errorf("target naming %q requires copy mode, but the target syncs in %q mode", "prefixed", mode)
+}
+
+// TargetNamingModeConfigError is TargetNamingModeError for a target as written in a
+// config file, with the fix. A managed project's target has projectRoot set: it cannot
+// be edited as a target, so its fix is in the project's settings.
+func TargetNamingModeConfigError(naming, mode, projectRoot string) error {
+	err := TargetNamingModeError(naming, mode)
+	if err == nil {
+		return nil
+	}
+	if projectRoot != "" {
+		return fmt.Errorf("%w; set mode: copy in the project's skills settings", err)
+	}
+	return fmt.Errorf("%w; set mode: copy on the target", err)
+}
+
+// NamingModeConfigError is TargetNamingModeConfigError for a target that syncs skills,
+// nil when skills are off. defaultMode is the mode a target without its own inherits.
+func (tc TargetConfig) NamingModeConfigError(defaultMode string) error {
+	sc := tc.SkillsConfig()
+	if !sc.IsEnabled() {
+		return nil
+	}
+	return TargetNamingModeConfigError(sc.TargetNaming, cmp.Or(sc.Mode, defaultMode), tc.projectRoot)
+}
+
+// NewTargetSkillsMode is the skills mode a new target is written with: copy when it
+// would otherwise inherit a naming its inherited mode cannot honour, else empty (inherit).
+func NewTargetSkillsMode(naming, mode string) string {
+	if TargetNamingModeError(naming, mode) != nil {
+		return "copy"
+	}
+	return ""
+}
+
+// ResourceTargetConfig holds per-resource-kind target configuration (skills, agents, etc.).
+type ResourceTargetConfig struct {
+	// SharedTargets are compatible writers to the same folder, resolved at runtime.
+	SharedTargets []SkillTargetIdentity `yaml:"-" json:"-"`
+	// Agent carries the enclosing account's identity during selection; it is not configuration.
+	Agent        string   `yaml:"-" json:"-"`
+	Path         string   `yaml:"path,omitempty"`
+	Mode         string   `yaml:"mode,omitempty"` // merge, symlink, or copy
+	TargetNaming string   `yaml:"target_naming,omitempty"`
+	Include      []string `yaml:"include,omitempty"`
+	Exclude      []string `yaml:"exclude,omitempty"`
+	// Extension transforms each agent file during sync (agents only; implies copy).
+	Extension string `yaml:"extension,omitempty"`
+	// Enabled set to false stops syncing skills to the target (skills only).
+	// The other fields are kept so switching it back restores them.
+	Enabled *bool `yaml:"enabled,omitempty"`
+}
+
+// IsEmpty reports whether all fields are zero-valued.
+func (r ResourceTargetConfig) IsEmpty() bool {
+	return r.Path == "" && r.Mode == "" && r.TargetNaming == "" && len(r.Include) == 0 && len(r.Exclude) == 0 && r.Extension == "" && r.Enabled == nil
+}
+
+// IsEnabled reports whether the resource is synced; an unset Enabled means true.
+func (r ResourceTargetConfig) IsEnabled() bool {
+	return r.Enabled == nil || *r.Enabled
+}
+
+// SetEnabled records enabled, leaving the field unset for the default (true).
+func (r *ResourceTargetConfig) SetEnabled(enabled bool) {
+	if enabled {
+		r.Enabled = nil
+		return
+	}
+	off := false
+	r.Enabled = &off
+}
+
+// withExtensionMode defaults an unset mode to copy when an extension is set,
+// so every reader of an agents config sees the mode sync actually uses.
+func (r ResourceTargetConfig) withExtensionMode() ResourceTargetConfig {
+	if r.Extension != "" && r.Mode == "" {
+		r.Mode = "copy"
+	}
+	return r
+}
+
+// TargetConfig holds configuration for a single target.
+// Legacy flat fields (Path/Mode/Include/Exclude) are kept for backward-compatible
+// YAML reading; migrateTargetConfigs moves them into Skills on load.
 type TargetConfig struct {
-	Path    string   `yaml:"path"`
-	Mode    string   `yaml:"mode,omitempty"` // merge, symlink, or copy
-	Include []string `yaml:"include,omitempty"`
-	Exclude []string `yaml:"exclude,omitempty"`
+	sharedSkillTargets []SkillTargetIdentity
+	Path               string   `yaml:"path,omitempty"`
+	Mode               string   `yaml:"mode,omitempty"` // merge, symlink, or copy
+	Include            []string `yaml:"include,omitempty"`
+	Exclude            []string `yaml:"exclude,omitempty"`
+
+	// Agent and ConfigDir make this target another config directory of a built-in Agent,
+	// such as a second account. Its paths are then the Agent's own, moved into ConfigDir.
+	Agent     string `yaml:"agent,omitempty"`
+	ConfigDir string `yaml:"config_dir,omitempty"`
+	// CLI replaces the Agent's executable for plugin commands, for a compatible CLI such
+	// as omo for Pi: a name found on PATH or an absolute path.
+	CLI string `yaml:"cli,omitempty"`
+
+	Skills *ResourceTargetConfig `yaml:"skills,omitempty"`
+	Agents *ResourceTargetConfig `yaml:"agents,omitempty"`
+
+	// Instructions names the instruction file the tool reads, for tools
+	// skillshare does not know or to override the built-in file.
+	Instructions *TargetInstructionsConfig `yaml:"instructions,omitempty"`
+
+	// Files are extra plain files the tool reads, relative to its file root
+	// (see TargetFileRoot), added by the user to those skillshare knows.
+	Files []string `yaml:"files,omitempty"`
+
+	defaultTargetNaming string `yaml:"-"`
+	// derivedSkills and derivedAgents are the paths filled in from config_dir or the environment.
+	derivedSkills, derivedAgents string `yaml:"-"`
+	// projectRoot marks a target expanded from projects; see expandProjects.
+	projectRoot string `yaml:"-"`
+}
+
+// TargetInstructionsConfig is a user-set instruction file of a target. Path is
+// absolute or ~/ in global mode and relative to the project root in project
+// mode. Import marks a tool that follows @path lines.
+type TargetInstructionsConfig struct {
+	Path   string `yaml:"path" json:"path"`
+	Import bool   `yaml:"import,omitempty" json:"import"`
+}
+
+// SkillsConfig returns the effective skills configuration.
+// If Skills sub-key is set, it is returned directly.
+// Otherwise the legacy flat fields are returned for backward compatibility.
+func (tc *TargetConfig) SkillsConfig() ResourceTargetConfig {
+	if tc.Skills != nil {
+		sc := *tc.Skills
+		sc.SharedTargets = tc.sharedSkillTargets
+		sc.Agent = tc.Agent
+		if sc.TargetNaming == "" {
+			sc.TargetNaming = tc.defaultTargetNaming
+		}
+		return sc
+	}
+	return ResourceTargetConfig{
+		SharedTargets: tc.sharedSkillTargets,
+		Agent:         tc.Agent,
+		Path:          tc.Path,
+		Mode:          tc.Mode,
+		TargetNaming:  tc.defaultTargetNaming,
+		Include:       tc.Include,
+		Exclude:       tc.Exclude,
+	}
+}
+
+// AgentsConfig returns the agents configuration, or an empty value if not set.
+func (tc *TargetConfig) AgentsConfig() ResourceTargetConfig {
+	if tc.Agents != nil {
+		return tc.Agents.withExtensionMode()
+	}
+	return ResourceTargetConfig{}
+}
+
+// EnsureSkills returns the Skills sub-key, creating it from legacy flat fields if nil.
+// Use this before writing to Skills fields.
+func (tc *TargetConfig) EnsureSkills() *ResourceTargetConfig {
+	if tc.Skills == nil {
+		sc := ResourceTargetConfig{
+			Path:    tc.Path,
+			Mode:    tc.Mode,
+			Include: tc.Include,
+			Exclude: tc.Exclude,
+		}
+		tc.Skills = &sc
+		tc.Path = ""
+		tc.Mode = ""
+		tc.Include = nil
+		tc.Exclude = nil
+	}
+	return tc.Skills
+}
+
+// EnsureAgents returns the Agents sub-key, creating it if nil.
+// Use this before writing to Agents fields.
+func (tc *TargetConfig) EnsureAgents() *ResourceTargetConfig {
+	if tc.Agents == nil {
+		tc.Agents = &ResourceTargetConfig{}
+	}
+	return tc.Agents
+}
+
+// migrateTargetConfigs moves legacy flat fields into skills: sub-key.
+// Returns true if any target was migrated.
+func migrateTargetConfigs(targets map[string]TargetConfig) bool {
+	migrated := false
+	for name, tc := range targets {
+		hasFlatFields := tc.Path != "" || tc.Mode != "" || len(tc.Include) > 0 || len(tc.Exclude) > 0
+		if !hasFlatFields {
+			continue
+		}
+		if tc.Skills == nil {
+			tc.Skills = &ResourceTargetConfig{
+				Path:    tc.Path,
+				Mode:    tc.Mode,
+				Include: tc.Include,
+				Exclude: tc.Exclude,
+			}
+		} else {
+			// Mixed format: merge flat fields into existing Skills (don't overwrite)
+			if tc.Skills.Path == "" && tc.Path != "" {
+				tc.Skills.Path = tc.Path
+			}
+			if tc.Skills.Mode == "" && tc.Mode != "" {
+				tc.Skills.Mode = tc.Mode
+			}
+			if len(tc.Skills.Include) == 0 && len(tc.Include) > 0 {
+				tc.Skills.Include = tc.Include
+			}
+			if len(tc.Skills.Exclude) == 0 && len(tc.Exclude) > 0 {
+				tc.Skills.Exclude = tc.Exclude
+			}
+		}
+		tc.Path = ""
+		tc.Mode = ""
+		tc.Include = nil
+		tc.Exclude = nil
+		targets[name] = tc
+		migrated = true
+	}
+	return migrated
 }
 
 // AuditConfig holds security audit policy settings.
@@ -30,6 +299,37 @@ type AuditConfig struct {
 // LogConfig holds log retention settings.
 type LogConfig struct {
 	MaxEntries *int `yaml:"max_entries,omitempty"` // nil = use default (1000), 0 = unlimited, >0 = limit
+}
+
+// BackupConfig holds the retention limits for target folder backups.
+type BackupConfig struct {
+	MaxCount  *int   `yaml:"max_count,omitempty"`   // nil = use default (10), 0 = unlimited, >0 = limit
+	MaxSizeMB *int64 `yaml:"max_size_mb,omitempty"` // nil = use default (500), 0 = unlimited, >0 = limit
+}
+
+// ContextBudgetConfig holds token budget warning thresholds.
+type ContextBudgetConfig struct {
+	WarnAlwaysLoadedTokens *int `yaml:"warn_always_loaded_tokens,omitempty"`
+	WarnOnDemandTokens     *int `yaml:"warn_on_demand_tokens,omitempty"`
+}
+
+const (
+	DefaultWarnAlwaysLoadedTokens = 10000
+	DefaultWarnOnDemandTokens     = 100000
+)
+
+func (c ContextBudgetConfig) AlwaysLoadedThreshold() int {
+	if c.WarnAlwaysLoadedTokens == nil {
+		return DefaultWarnAlwaysLoadedTokens
+	}
+	return *c.WarnAlwaysLoadedTokens
+}
+
+func (c ContextBudgetConfig) OnDemandThreshold() int {
+	if c.WarnOnDemandTokens == nil {
+		return DefaultWarnOnDemandTokens
+	}
+	return *c.WarnOnDemandTokens
 }
 
 // HubEntry represents a single saved hub source.
@@ -47,27 +347,262 @@ type HubConfig struct {
 
 // ExtraTargetConfig holds configuration for one target of an extra resource.
 type ExtraTargetConfig struct {
-	Path string `yaml:"path"`
-	Mode string `yaml:"mode,omitempty"` // merge (default), symlink, or copy
+	Path      string `yaml:"path"`
+	Mode      string `yaml:"mode,omitempty"`      // merge (default), symlink, copy, or import (single-file extras only)
+	Flatten   bool   `yaml:"flatten,omitempty"`   // flatten subdirectories into target root
+	Extension string `yaml:"extension,omitempty"` // transform script applied during sync (implies copy)
+	As        string `yaml:"as,omitempty"`        // target filename for a single-file extra (default: the extra's file)
+	// Include and Exclude select which source files sync to this target, as
+	// .gitignore-style patterns on the path inside the source (directory
+	// extras with merge or copy mode only).
+	Include []string `yaml:"include,omitempty"`
+	Exclude []string `yaml:"exclude,omitempty"`
 }
 
 // ExtraConfig holds configuration for a non-skill resource type (rules, commands, etc.).
 type ExtraConfig struct {
-	Name    string              `yaml:"name"`
+	Name   string `yaml:"name"`
+	Source string `yaml:"source,omitempty"`
+	// File makes this a single-file extra: a plain filename inside the
+	// resolved source directory, synced to <target path>/<as or file>.
+	File    string              `yaml:"file,omitempty"`
 	Targets []ExtraTargetConfig `yaml:"targets"`
+}
+
+// GlobalSources overrides default source directories for global resources.
+// New in v0.19.16 — mirrors ProjectSources for project mode.
+// When a field is set, it takes precedence over the corresponding legacy
+// top-level field (Source / AgentsSource / ExtrasSource). When all three are
+// empty, EffectiveSkillsSource / EffectiveAgentsSource / EffectiveExtrasSource
+// fall back to <BaseDir>/<type>/ defaults (or, for extras, the derivation
+// described in ExtrasParentDir).
+type GlobalSources struct {
+	MCP    string `yaml:"mcp,omitempty"`
+	Skills string `yaml:"skills,omitempty"`
+	Agents string `yaml:"agents,omitempty"`
+	Extras string `yaml:"extras,omitempty"`
 }
 
 // Config holds the application configuration
 type Config struct {
-	Source  string                  `yaml:"source"`
-	Mode    string                  `yaml:"mode,omitempty"` // default mode: merge
-	Targets map[string]TargetConfig `yaml:"targets"`
-	Extras  []ExtraConfig           `yaml:"extras,omitempty"`
-	Ignore  []string                `yaml:"ignore,omitempty"`
-	Audit   AuditConfig             `yaml:"audit,omitempty"`
-	Hub     HubConfig               `yaml:"hub,omitempty"`
-	Log     LogConfig               `yaml:"log,omitempty"`
-	TUI     *bool                   `yaml:"tui,omitempty"` // nil = default true
+	// legacySkills retains unmigrated embedded metadata during read-only edits.
+	// Ordinary Load removes this section through migrateSkillsToRegistry first.
+	legacySkills yaml.Node     `yaml:"-"`
+	Plugins      yaml.Node     `yaml:"plugins,omitempty"`
+	Hooks        yaml.Node     `yaml:"hooks,omitempty"`
+	MCP          *MCPConfig    `yaml:"mcp,omitempty"`
+	Source       string        `yaml:"source,omitempty"`
+	AgentsSource string        `yaml:"agents_source,omitempty"`
+	ExtrasSource string        `yaml:"extras_source,omitempty"`
+	Sources      GlobalSources `yaml:"sources,omitempty"`
+	// FollowSourceLinks treats directory links directly under the skills
+	// source as directories, one hop. Default false leaves them invisible.
+	FollowSourceLinks bool `yaml:"follow_source_links,omitempty"`
+	// GitRoot selects which directory the git integration (commit/push/pull)
+	// operates on. One of: "skills" (default), "agents", "extras", "root".
+	// "root" is BaseDir() and version-controls skills + agents + extras together.
+	// Empty is treated as "skills" for backward compatibility.
+	GitRoot      string                  `yaml:"git_root,omitempty"`
+	Mode         string                  `yaml:"mode,omitempty"` // default mode: merge
+	TargetNaming string                  `yaml:"target_naming,omitempty"`
+	Targets      map[string]TargetConfig `yaml:"targets"`
+	// Projects are project folders synced from this config, keyed by root as written.
+	Projects       map[string]ManagedProject `yaml:"projects,omitempty"`
+	projectOverlay *projectOverlay
+	Extras         []ExtraConfig       `yaml:"extras,omitempty"`
+	Ignore         []string            `yaml:"ignore,omitempty"`
+	Audit          AuditConfig         `yaml:"audit,omitempty"`
+	Hub            HubConfig           `yaml:"hub,omitempty"`
+	Log            LogConfig           `yaml:"log,omitempty"`
+	Backup         BackupConfig        `yaml:"backup,omitempty"`
+	Updates        UpdatesConfig       `yaml:"updates,omitempty"`
+	ContextBudget  ContextBudgetConfig `yaml:"context_budget,omitempty"`
+	TUI            *bool               `yaml:"tui,omitempty"` // nil = default true
+	GitLabHosts    []string            `yaml:"gitlab_hosts,omitempty"`
+	AzureHosts     []string            `yaml:"azure_hosts,omitempty"`
+	CNBHosts       []string            `yaml:"cnb_hosts,omitempty"`
+	GiteaHosts     []string            `yaml:"gitea_hosts,omitempty"`
+
+	// ProjectsStorage is where a new project is saved: "shared" (config.yaml,
+	// the default) or "machine-local" (this machine's project registry).
+	ProjectsStorage string `yaml:"projects_storage,omitempty"`
+
+	// PreserveTildeOnSave folds $HOME prefixes back to ~ when serializing the
+	// config to YAML. Useful when the config is shared via dotfiles across
+	// machines or users. The in-memory config is unaffected; Load() still
+	// expands ~ as usual.
+	PreserveTildeOnSave bool `yaml:"preserve_tilde_on_save,omitempty"`
+
+	// RegistryDir is the resolved directory for registry.yaml (cached SourceRoot result).
+	// Set during Load(), not serialized to YAML.
+	RegistryDir string `yaml:"-"`
+}
+
+// SkillsWalk returns a fresh traversal policy for one operation on the skills
+// source. With FollowSourceLinks off it follows nothing.
+func (c *Config) SkillsWalk() sourcewalk.Options {
+	return SkillsWalk(c.FollowSourceLinks, c.EffectiveSkillsSource(), c.Targets)
+}
+
+// SkillsWalk builds the skills source traversal policy for one operation. The
+// skills paths of enabled targets are passed so a link onto a target is skipped.
+func SkillsWalk(follow bool, source string, targets map[string]TargetConfig) sourcewalk.Options {
+	if !follow {
+		return sourcewalk.Options{}
+	}
+	return sourcewalk.Options{Follow: sourcewalk.NewFollow(source, SkillsTargetPaths(targets))}
+}
+
+// SkillsTargetPaths returns the skills paths of the enabled targets, which a
+// followed source link must not overlap.
+func SkillsTargetPaths(targets map[string]TargetConfig) []string {
+	var paths []string
+	for _, t := range targets {
+		if sc := t.SkillsConfig(); sc.IsEnabled() && sc.Path != "" {
+			paths = append(paths, ExpandPath(sc.Path))
+		}
+	}
+	return paths
+}
+
+// EffectiveSkillsSource returns the resolved skills source directory.
+// Priority: c.Sources.Skills (v0.19.16+) → c.Source (legacy) → <BaseDir>/skills.
+func (c *Config) EffectiveSkillsSource() string {
+	if c.Sources.Skills != "" {
+		return ExpandPath(c.Sources.Skills)
+	}
+	if c.Source != "" {
+		return ExpandPath(c.Source)
+	}
+	return filepath.Join(BaseDir(), "skills")
+}
+
+// EffectiveAgentsSource returns the resolved agents source directory.
+// Priority: c.Sources.Agents (v0.19.16+) → c.AgentsSource (legacy) → <BaseDir>/agents.
+func (c *Config) EffectiveAgentsSource() string {
+	if c.Sources.Agents != "" {
+		return ExpandPath(c.Sources.Agents)
+	}
+	if c.AgentsSource != "" {
+		return ExpandPath(c.AgentsSource)
+	}
+	return filepath.Join(BaseDir(), "agents")
+}
+
+// EffectiveExtrasSource returns the resolved extras parent directory.
+// Priority: c.Sources.Extras (v0.19.16+) → c.ExtrasSource (legacy) →
+// ExtrasParentDir(c.EffectiveSkillsSource()) (sibling of skills source).
+// The fallback preserves existing global-mode behavior where extras live in
+// the parent of the skills source directory.
+func (c *Config) EffectiveExtrasSource() string {
+	if c.Sources.Extras != "" {
+		return ExpandPath(c.Sources.Extras)
+	}
+	if c.ExtrasSource != "" {
+		return ExpandPath(c.ExtrasSource)
+	}
+	return ExtrasParentDir(c.EffectiveSkillsSource())
+}
+
+// ScopeDir resolves a git_root scope keyword to its directory. It is the single
+// source of truth for the scope→directory mapping; EffectiveGitRoot and the
+// CLI helpers all delegate here. Empty/"skills" maps to the skills source.
+func ScopeDir(c *Config, scope string) string {
+	switch scope {
+	case "root":
+		return BaseDir()
+	case "agents":
+		return c.EffectiveAgentsSource()
+	case "extras":
+		return c.EffectiveExtrasSource()
+	default: // "skills" or ""
+		return c.EffectiveSkillsSource()
+	}
+}
+
+// EffectiveGitRoot returns the directory the git integration (commit/push/pull)
+// operates on, based on the git_root scope keyword. Empty/"skills" preserves the
+// historical behavior of operating on the skills source.
+func (c *Config) EffectiveGitRoot() string {
+	return ScopeDir(c, c.GitRoot)
+}
+
+// gitDirExists reports whether dir contains a .git entry directly.
+func gitDirExists(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, ".git"))
+	return err == nil
+}
+
+// GitRootMismatch reports whether the git repository lives at a different scope
+// than configured: the configured git root has no .git, but another scope's
+// directory does. This happens when git_root is changed without re-initializing
+// git at the new directory. Returns the stray scope keyword and its directory.
+func (c *Config) GitRootMismatch() (scope, dir string, mismatch bool) {
+	root := c.EffectiveGitRoot()
+	if gitDirExists(root) {
+		return "", "", false
+	}
+	for _, s := range []string{"root", "skills", "agents", "extras"} {
+		d := ScopeDir(c, s)
+		if d == root {
+			continue
+		}
+		if gitDirExists(d) {
+			return s, d, true
+		}
+	}
+	return "", "", false
+}
+
+// ValidGitRoot reports whether s is an accepted git_root scope keyword.
+// Empty is accepted (means "skills").
+func ValidGitRoot(s string) bool {
+	if s == "" {
+		return true // empty = skills
+	}
+	return slices.Contains(ValidGitRoots, s)
+}
+
+// HasAgentTarget reports whether any configured target has an agents path,
+// either from the user's config agents: sub-key or from the built-in defaults.
+func (c *Config) HasAgentTarget() bool {
+	builtinAgents := DefaultAgentTargets()
+	for name, tc := range c.Targets {
+		// Check user config agents: sub-key
+		if ac := tc.AgentsConfig(); ac.Path != "" {
+			return true
+		}
+		// Check built-in defaults
+		if _, ok := builtinAgents[name]; ok {
+			return true
+		}
+		if _, ok := LookupGlobalAgentTarget(name); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// EffectiveGitLabHosts returns GitLabHosts merged with SKILLSHARE_GITLAB_HOSTS env var.
+// Use this instead of accessing GitLabHosts directly for runtime behavior;
+// GitLabHosts contains only config-file values and is safe to persist via Save().
+func (c *Config) EffectiveGitLabHosts() []string {
+	return mergeGitLabHostsFromEnv(c.GitLabHosts)
+}
+
+// EffectiveAzureHosts returns AzureHosts merged with SKILLSHARE_AZURE_HOSTS env var.
+func (c *Config) EffectiveAzureHosts() []string {
+	return mergeAzureHostsFromEnv(c.AzureHosts)
+}
+
+// EffectiveCNBHosts returns CNBHosts merged with SKILLSHARE_CNB_HOSTS env var.
+func (c *Config) EffectiveCNBHosts() []string {
+	return mergeCNBHostsFromEnv(c.CNBHosts)
+}
+
+// EffectiveGiteaHosts returns GiteaHosts merged with SKILLSHARE_GITEA_HOSTS env var.
+func (c *Config) EffectiveGiteaHosts() []string {
+	return mergeGiteaHostsFromEnv(c.GiteaHosts)
 }
 
 // IsTUIEnabled reports whether interactive TUI is enabled.
@@ -171,12 +706,57 @@ func ConfigPath() string {
 	return filepath.Join(BaseDir(), "config.yaml")
 }
 
+// LoadReadOnly reads the migrated config view without writing files or relocating
+// legacy state. On Windows a legacy config is read in place when needed.
+func LoadReadOnly() (*Config, error) {
+	return LoadReadOnlyPath(ReadOnlyConfigPath())
+}
+
+// LoadReadOnlyPath reads one exact global config without migrations on disk.
+func LoadReadOnlyPath(path string) (*Config, error) {
+	cfg, err := loadConfig(path, false)
+	if err != nil {
+		return nil, err
+	}
+	// Keep an old registry readable without moving it to the canonical source root.
+	if !fileExists(RegistryPath(cfg.RegistryDir)) && fileExists(RegistryPath(filepath.Dir(path))) {
+		cfg.RegistryDir = filepath.Dir(path)
+	}
+	return cfg, nil
+}
+
+// ReadOnlyConfigPath selects the config read in place, including Windows legacy fallback.
+func ReadOnlyConfigPath() string { return readOnlyConfigPath(runtime.GOOS) }
+
+func readOnlyConfigPath(goos string) string {
+	path := ConfigPath()
+	if goos != "windows" || os.Getenv("SKILLSHARE_CONFIG") != "" {
+		return path
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	legacy := filepath.Join(home, ".config", "skillshare", "config.yaml")
+	if fileExists(legacy) {
+		return legacy
+	}
+	return path
+}
+
 // Load reads the config from the default location
 func Load() (*Config, error) {
-	path := ConfigPath()
+	return loadConfig(ConfigPath(), true)
+}
 
-	// Migrate skills[] to registry.yaml (one-time, silent)
-	_ = migrateSkillsToRegistry(path)
+func loadConfig(path string, persist bool) (*Config, error) {
+	// Migrate skills[] to registry.yaml (one-time, silent).
+	if persist {
+		_ = migrateSkillsToRegistry(path)
+	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -186,28 +766,130 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
 
+	return decodeConfig(path, data, persist)
+}
+
+// decodeConfig shares normalization and expansion with prepared saves. Only a
+// normal Load persists the legacy migrations.
+func decodeConfig(path string, data []byte, persist bool) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
+
+	// Retain legacy metadata until an ordinary Load migrates it to the registry.
+	// Project candidates must not discard this raw section while loading in place.
+	var legacy struct {
+		Skills yaml.Node `yaml:"skills"`
+	}
+	if err := yaml.Unmarshal(data, &legacy); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+	cfg.legacySkills = legacy.Skills
 
 	threshold, err := normalizeAuditBlockThreshold(cfg.Audit.BlockThreshold)
 	if err != nil {
 		return nil, fmt.Errorf("invalid audit.block_threshold: %w", err)
 	}
 	cfg.Audit.BlockThreshold = threshold
+	if !slices.Contains([]string{"", ProjectsStorageShared, ProjectsStorageMachineLocal}, cfg.ProjectsStorage) {
+		return nil, fmt.Errorf("invalid projects_storage %q (valid: %s, %s)", cfg.ProjectsStorage, ProjectsStorageShared, ProjectsStorageMachineLocal)
+	}
+
+	// Validate and normalize gitlab_hosts (config file only; env var merged at read time)
+	hosts, err := normalizeGitLabHosts(cfg.GitLabHosts)
+	if err != nil {
+		return nil, err
+	}
+	cfg.GitLabHosts = hosts
+
+	// Validate and normalize azure_hosts
+	azureHosts, err := normalizeAzureHosts(cfg.AzureHosts)
+	if err != nil {
+		return nil, err
+	}
+	cfg.AzureHosts = azureHosts
+
+	// Validate and normalize cnb_hosts
+	cnbHosts, err := normalizeCNBHosts(cfg.CNBHosts)
+	if err != nil {
+		return nil, err
+	}
+	cfg.CNBHosts = cnbHosts
+
+	// Validate and normalize gitea_hosts
+	giteaHosts, err := normalizeGiteaHosts(cfg.GiteaHosts)
+	if err != nil {
+		return nil, err
+	}
+	cfg.GiteaHosts = giteaHosts
+
+	// Migrate legacy flat target fields in memory, persisting only for ordinary Load.
+	if migrateTargetConfigs(cfg.Targets) && persist {
+		if migrated, err := marshalConfig(&cfg, schemaComment, data); err == nil {
+			// Write a symlinked config's target so the link survives.
+			dest := utils.ResolveSymlink(path)
+			tmpPath := dest + ".tmp"
+			if writeErr := os.WriteFile(tmpPath, migrated, 0644); writeErr == nil {
+				os.Rename(tmpPath, dest)
+			}
+		}
+	}
 
 	// Expand ~ in paths
 	cfg.Source = expandPath(cfg.Source)
+	cfg.AgentsSource = expandPath(cfg.AgentsSource)
+	cfg.ExtrasSource = expandPath(cfg.ExtrasSource)
+	cfg.Sources.Skills = expandPath(cfg.Sources.Skills)
+	cfg.Sources.Agents = expandPath(cfg.Sources.Agents)
+	cfg.Sources.Extras = expandPath(cfg.Sources.Extras)
+	defaults := cfg.DefaultTargets()
 	for name, target := range cfg.Targets {
-		target.Path = expandPath(target.Path)
+		target.defaultTargetNaming = cfg.TargetNaming
+		if target.Skills != nil {
+			target.Skills.Path = expandPath(target.Skills.Path)
+		}
+		if target.Agents != nil {
+			target.Agents.Path = expandPath(target.Agents.Path)
+		}
+		// Fallback to built-in default path for known targets without explicit path
+		if target.SkillsConfig().Path == "" {
+			if def, ok := defaults[name]; ok {
+				target.EnsureSkills().Path = expandPath(def.Path)
+				// Keep omitted OMP paths and environment defaults derived across saves.
+				if name == "omp" || targetConfigHome(name, runtime.GOOS) != "" {
+					target.derivedSkills = target.SkillsConfig().Path
+				}
+			}
+		}
 		cfg.Targets[name] = target
 	}
 
+	if err := cfg.expandAgentConfigDirs(); err != nil {
+		return nil, err
+	}
+	if err := cfg.loadLocalProjects(path, data); err != nil {
+		return nil, err
+	}
+	if err := cfg.expandProjects(); err != nil {
+		return nil, err
+	}
+	cfg.Targets = WithSharedSkillsTargets(cfg.Targets, cfg.Mode)
 	// Expand ~ in extras paths
 	for i, extra := range cfg.Extras {
+		cfg.Extras[i].Source = expandPath(extra.Source)
 		for j, et := range extra.Targets {
 			cfg.Extras[i].Targets[j].Path = expandPath(et.Path)
+		}
+	}
+
+	// Cache SourceRoot so callers don't re-walk .git/ on every LoadRegistry call.
+	// Use EffectiveSkillsSource so configs using the new sources.skills field
+	// (without a legacy source: top-level) still resolve a registry root.
+	if skillsDir := cfg.EffectiveSkillsSource(); skillsDir != "" {
+		cfg.RegistryDir = SourceRoot(skillsDir)
+		if persist {
+			MigrateRegistryToSource(filepath.Dir(path), cfg.RegistryDir)
 		}
 	}
 
@@ -224,18 +906,91 @@ func (c *Config) Save() error {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
-	data, err := yaml.Marshal(c)
+	// fork patch: fold $HOME prefixes back to ~ so serialized paths are
+	// machine-agnostic (dotfiles-friendly). Opt-in via preserve_tilde_on_save.
+	// The in-memory config is left untouched; we marshal a shallow copy with
+	// folded path fields.
+	payload := c.withoutProjectTargets()
+	if c.PreserveTildeOnSave {
+		payload = payload.cloneForSave()
+	}
+	data, err := marshalConfigFile(path, payload, schemaComment)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
-
-	data = append(schemaComment, data...)
 
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("failed to write config: %w", err)
 	}
 
 	return nil
+}
+
+// cloneForSave returns a shallow copy of c with all path fields folded back to
+// ~ form via utils.FoldHomePathWith. Slices and maps that contain path fields
+// are re-allocated to avoid mutating the live config. The user home directory
+// is resolved once and passed to FoldHomePathWith to avoid repeated syscalls.
+//
+// Keep this in sync with the expandPath() calls in Load().
+func (c *Config) cloneForSave() *Config {
+	out := *c
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		// Cannot fold without a home directory; serialize as-is.
+		return &out
+	}
+
+	fold := func(p string) string { return utils.FoldHomePathWith(p, home) }
+
+	out.Source = fold(out.Source)
+	out.AgentsSource = fold(out.AgentsSource)
+	out.ExtrasSource = fold(out.ExtrasSource)
+	out.Sources.Skills = fold(out.Sources.Skills)
+	out.Sources.Agents = fold(out.Sources.Agents)
+	out.Sources.Extras = fold(out.Sources.Extras)
+
+	if len(c.Targets) > 0 {
+		out.Targets = make(map[string]TargetConfig, len(c.Targets))
+		for name, tc := range c.Targets {
+			tc.Path = fold(tc.Path)
+			tc.ConfigDir = fold(tc.ConfigDir)
+			tc.CLI = fold(tc.CLI)
+			if tc.Skills != nil {
+				skills := *tc.Skills
+				skills.Path = fold(skills.Path)
+				tc.Skills = &skills
+			}
+			if tc.Agents != nil {
+				agents := *tc.Agents
+				agents.Path = fold(agents.Path)
+				tc.Agents = &agents
+			}
+			out.Targets[name] = tc
+		}
+	}
+
+	if len(c.Extras) > 0 {
+		out.Extras = make([]ExtraConfig, len(c.Extras))
+		for i, extra := range c.Extras {
+			extra.Source = fold(extra.Source)
+			if len(extra.Targets) > 0 {
+				targets := make([]ExtraTargetConfig, len(extra.Targets))
+				for j, et := range extra.Targets {
+					et.Path = fold(et.Path)
+					targets[j] = et
+				}
+				extra.Targets = targets
+			}
+			out.Extras[i] = extra
+		}
+	}
+
+	return &out
+}
+
+// ExpandPath expands ~ to home directory.
+func ExpandPath(path string) string {
+	return expandPath(path)
 }
 
 // expandPath expands ~ to home directory
@@ -291,12 +1046,105 @@ func migrateSkillsToRegistry(configPath string) error {
 		return nil
 	}
 	delete(raw, "skills")
-	cleaned, err := yaml.Marshal(raw)
+	cleaned, err := marshalConfig(raw, schemaComment, data)
 	if err != nil {
 		return nil
 	}
-	cleaned = append(schemaComment, cleaned...)
 	return os.WriteFile(configPath, cleaned, 0644)
+}
+
+// isValidHostname reports whether h is a bare hostname
+// (no scheme, path, port, or empty after trim).
+func isValidHostname(h string) bool {
+	return h != "" &&
+		!strings.Contains(h, "://") &&
+		!strings.Contains(h, "/") &&
+		!strings.Contains(h, ":")
+}
+
+// normalizeHostList validates and normalizes host list entries.
+// fieldName is used in error messages (e.g. "gitlab_hosts", "azure_hosts").
+// Rejects entries containing "://", "/", ":", or empty after trim.
+// Returns lowercased, trimmed hostnames.
+func normalizeHostList(hosts []string, fieldName string) ([]string, error) {
+	if len(hosts) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		h = strings.TrimSpace(h)
+		if !isValidHostname(h) {
+			if h == "" {
+				return nil, fmt.Errorf("%s: empty entry", fieldName)
+			}
+			if strings.Contains(h, "://") {
+				return nil, fmt.Errorf("%s: entry %q must be a hostname, not a URL (remove scheme)", fieldName, h)
+			}
+			if strings.Contains(h, "/") {
+				return nil, fmt.Errorf("%s: entry %q must be a hostname without path", fieldName, h)
+			}
+			return nil, fmt.Errorf("%s: entry %q must be a hostname without port", fieldName, h)
+		}
+		out = append(out, strings.ToLower(h))
+	}
+	return out, nil
+}
+
+func normalizeGitLabHosts(hosts []string) ([]string, error) {
+	return normalizeHostList(hosts, "gitlab_hosts")
+}
+
+func normalizeAzureHosts(hosts []string) ([]string, error) {
+	return normalizeHostList(hosts, "azure_hosts")
+}
+
+func normalizeCNBHosts(hosts []string) ([]string, error) {
+	return normalizeHostList(hosts, "cnb_hosts")
+}
+
+func normalizeGiteaHosts(hosts []string) ([]string, error) {
+	return normalizeHostList(hosts, "gitea_hosts")
+}
+
+// mergeHostsFromEnv merges comma-separated env var entries with config file hosts.
+// Invalid entries in the env var are silently skipped.
+func mergeHostsFromEnv(configHosts []string, envKey string) []string {
+	envVal := os.Getenv(envKey)
+	if envVal == "" {
+		return configHosts
+	}
+	seen := make(map[string]bool, len(configHosts))
+	for _, h := range configHosts {
+		seen[h] = true
+	}
+	merged := append([]string(nil), configHosts...)
+	for _, raw := range strings.Split(envVal, ",") {
+		h := strings.ToLower(strings.TrimSpace(raw))
+		if !isValidHostname(h) {
+			continue
+		}
+		if !seen[h] {
+			seen[h] = true
+			merged = append(merged, h)
+		}
+	}
+	return merged
+}
+
+func mergeGitLabHostsFromEnv(configHosts []string) []string {
+	return mergeHostsFromEnv(configHosts, "SKILLSHARE_GITLAB_HOSTS")
+}
+
+func mergeAzureHostsFromEnv(configHosts []string) []string {
+	return mergeHostsFromEnv(configHosts, "SKILLSHARE_AZURE_HOSTS")
+}
+
+func mergeCNBHostsFromEnv(configHosts []string) []string {
+	return mergeHostsFromEnv(configHosts, "SKILLSHARE_CNB_HOSTS")
+}
+
+func mergeGiteaHostsFromEnv(configHosts []string) []string {
+	return mergeHostsFromEnv(configHosts, "SKILLSHARE_GITEA_HOSTS")
 }
 
 func normalizeAuditBlockThreshold(v string) (string, error) {

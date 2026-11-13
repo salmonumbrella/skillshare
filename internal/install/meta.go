@@ -8,15 +8,17 @@ import (
 	"strings"
 	"time"
 
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/utils"
 )
 
 // MetaFileName is the name of the skillshare metadata file stored in each skill directory.
 const MetaFileName = ".skillshare-meta.json"
 
-// SkillMeta contains metadata about an installed skill
+// SkillMeta contains metadata about an installed skill or agent
 type SkillMeta struct {
 	Source      string            `json:"source"`                // Original source input
+	Kind        string            `json:"kind,omitempty"`        // "skill" (default/empty) or "agent"
 	Type        string            `json:"type"`                  // Source type (github, local, etc.)
 	InstalledAt time.Time         `json:"installed_at"`          // Installation timestamp
 	RepoURL     string            `json:"repo_url,omitempty"`    // Git repo URL (for git sources)
@@ -24,9 +26,21 @@ type SkillMeta struct {
 	Version     string            `json:"version,omitempty"`     // Git commit hash or version
 	TreeHash    string            `json:"tree_hash,omitempty"`   // Git tree SHA of Subdir
 	FileHashes  map[string]string `json:"file_hashes,omitempty"` // sha256:<hex> per file
+	Branch      string            `json:"branch,omitempty"`      // Git branch (when non-default)
+	Commit      string            `json:"commit,omitempty"`      // Full commit SHA, what the lockfile records
+	Layout      string            `json:"layout,omitempty"`      // Files a local install copied
 }
 
-// WriteMeta saves metadata to the skill directory
+// EffectiveKind returns "skill" if Kind is empty, otherwise the Kind value.
+func (m *SkillMeta) EffectiveKind() string {
+	if m.Kind == "" {
+		return "skill"
+	}
+	return m.Kind
+}
+
+// Deprecated: WriteMeta writes per-skill sidecar files.
+// New code should use MetadataStore.Set() + MetadataStore.Save() instead.
 func WriteMeta(skillPath string, meta *SkillMeta) error {
 	metaPath := filepath.Join(skillPath, MetaFileName)
 
@@ -42,7 +56,8 @@ func WriteMeta(skillPath string, meta *SkillMeta) error {
 	return nil
 }
 
-// ReadMeta loads metadata from the skill directory
+// Deprecated: ReadMeta reads per-skill sidecar files.
+// New code should use LoadMetadata() + MetadataStore.Get() instead.
 func ReadMeta(skillPath string) (*SkillMeta, error) {
 	metaPath := filepath.Join(skillPath, MetaFileName)
 
@@ -62,7 +77,8 @@ func ReadMeta(skillPath string) (*SkillMeta, error) {
 	return &meta, nil
 }
 
-// HasMeta checks if a skill directory has metadata
+// Deprecated: HasMeta checks for per-skill sidecar files.
+// New code should use MetadataStore.Has() instead.
 func HasMeta(skillPath string) bool {
 	metaPath := filepath.Join(skillPath, MetaFileName)
 	_, err := os.Stat(metaPath)
@@ -71,7 +87,15 @@ func HasMeta(skillPath string) bool {
 
 // ComputeFileHashes walks skillPath and returns a map of relative file paths
 // to their "sha256:<hex>" digests. It skips .skillshare-meta.json and .git/.
-func ComputeFileHashes(skillPath string) (map[string]string, error) {
+// Directory symlinks are skipped; file symlinks hash their target content.
+// With a follow policy, a linked operation root is resolved before walking;
+// keys remain relative to the logical skill root.
+func ComputeFileHashes(skillPath string, follow ...*sourcewalk.Follow) (map[string]string, error) {
+	if len(follow) > 0 {
+		if resolved, ok := follow[0].Resolve(skillPath); ok {
+			skillPath = resolved
+		}
+	}
 	hashes := make(map[string]string)
 
 	err := filepath.Walk(skillPath, func(path string, info os.FileInfo, walkErr error) error {
@@ -86,6 +110,20 @@ func ComputeFileHashes(skillPath string) (map[string]string, error) {
 		}
 		if info.Name() == MetaFileName {
 			return nil
+		}
+		if info.Name() == MetadataFileName {
+			return nil
+		}
+		// File managers write these into folders they open; not skill content (#743).
+		if utils.IsOSMetadataFile(info.Name()) {
+			return nil
+		}
+		if utils.IsLinkMode(path, info.Mode()) {
+			// Walk does not follow symlinks, but FileHashFormatted does.
+			// Leave stat failures to hashing so they retain the existing error path.
+			if target, err := os.Stat(path); err == nil && target.IsDir() {
+				return nil
+			}
 		}
 
 		rel, relErr := filepath.Rel(skillPath, path)
@@ -107,12 +145,15 @@ func ComputeFileHashes(skillPath string) (map[string]string, error) {
 	return hashes, nil
 }
 
-// NewMetaFromSource creates a SkillMeta from a Source
+// Deprecated: NewMetaFromSource creates a SkillMeta from a Source.
+// New code should use MetadataStore.SetFromSource() instead.
 func NewMetaFromSource(source *Source) *SkillMeta {
 	meta := &SkillMeta{
 		Source:      source.Raw,
 		Type:        source.MetaType(),
 		InstalledAt: time.Now(),
+		Branch:      source.Branch,
+		Commit:      source.Commit,
 	}
 
 	if source.IsGit() {
@@ -124,4 +165,19 @@ func NewMetaFromSource(source *Source) *SkillMeta {
 	}
 
 	return meta
+}
+
+// Deprecated: RefreshMetaHashes recomputes per-skill sidecar hashes.
+// New code should use MetadataStore.RefreshHashes() instead.
+func RefreshMetaHashes(skillPath string) {
+	meta, err := ReadMeta(skillPath)
+	if err != nil || meta == nil || meta.FileHashes == nil {
+		return
+	}
+	hashes, err := ComputeFileHashes(skillPath)
+	if err != nil {
+		return
+	}
+	meta.FileHashes = hashes
+	_ = WriteMeta(skillPath, meta)
 }

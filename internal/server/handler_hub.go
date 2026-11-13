@@ -2,18 +2,17 @@ package server
 
 import (
 	"net/http"
-	"path/filepath"
 
 	"skillshare/internal/hub"
 )
 
 func (s *Server) handleHubIndex(w http.ResponseWriter, r *http.Request) {
-	sourcePath := s.cfg.Source
-	if s.IsProjectMode() {
-		sourcePath = filepath.Join(s.projectRoot, ".skillshare", "skills")
-	}
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
+	sourcePath := s.skillsSource()
+	s.mu.RUnlock()
 
-	idx, err := hub.BuildIndex(sourcePath, false, false)
+	idx, err := hub.BuildIndex(sourcePath, false, false, s.skillsWalk())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

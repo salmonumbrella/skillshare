@@ -1,5 +1,5 @@
 ---
-sidebar_position: 6
+sidebar_position: 7
 ---
 
 # Project Skills
@@ -20,7 +20,7 @@ Use project skills when your team needs repo-specific AI instructions (coding st
 | **Project tooling** | CI/CD deployment knowledge, testing patterns, migration scripts specific to this repo |
 | **Onboarding acceleration** | "How does auth work here?" — the AI already knows, from committed project skills |
 | **Open source projects** | Maintainers commit `.skillshare/` so contributors get project-specific AI context on clone |
-| **Community skill curation** | A repo's `registry.yaml` serves as a curated skill list — anyone can `install -p` to get the same setup |
+| **Community skill curation** | A repo's `config.yaml` `skills:` section serves as a curated skill list — anyone can `install -p` to get the same setup |
 
 ---
 
@@ -78,6 +78,8 @@ skillshare sync -g       # Force global mode
 | **Git integration** | Optional (`push`/`pull`) | Skills committed directly to project repo |
 | **Scope** | All projects on machine | Single repository |
 
+Add personal project folders with [`skillshare project add`](/docs/reference/commands/project) or the dashboard’s **Projects** page. They are saved under [`projects`](/docs/reference/targets/configuration#projects) in the global config, or on this machine only when you choose. Each folder gets its own skills and agents with one sync, without a repository config. MCP and hooks keep their own declarations in the global config. See [where projects are saved](/docs/reference/commands/project#local-registrations) and [Many Projects, One Config](/docs/how-to/recipes/many-projects-one-config#scenario).
+
 ---
 
 ## `.skillshare/` Directory Structure
@@ -85,19 +87,21 @@ skillshare sync -g       # Force global mode
 ```
 <project-root>/
 ├── .skillshare/
-│   ├── config.yaml              # Targets + settings
-│   ├── registry.yaml            # Remote skills list (auto-managed)
-│   ├── .gitignore               # Ignores logs/ and cloned remote/tracked skill dirs
+│   ├── config.yaml              # Targets + settings (incl. extras)
+│   ├── skills.lock.json         # Commit each remote skill is pinned to (auto-managed, commit it)
+│   ├── skills/.metadata.json     # Runtime metadata (hashes, timestamps — auto-managed, gitignored)
+│   ├── .gitignore               # Ignores logs/, trash/, backups/, .metadata.json, and cloned remote/tracked skill dirs
+│   ├── extras/                  # Extras source directories
+│   │   └── rules/               # e.g. extras init rules --target .claude/rules -p
+│   │       └── coding.md
 │   └── skills/
 │       ├── my-local-skill/      # Created manually or via `skillshare new`
 │       │   └── SKILL.md
 │       ├── remote-skill/        # Installed via `skillshare install -p`
-│       │   ├── SKILL.md
-│       │   └── .skillshare-meta.json
+│       │   └── SKILL.md
 │       ├── tools/               # Category folder (via --into tools)
 │       │   └── pdf/             # Installed via `skillshare install ... --into tools -p`
-│       │       ├── SKILL.md
-│       │       └── .skillshare-meta.json
+│       │       └── SKILL.md
 │       └── _team-skills/        # Installed via `skillshare install --track -p`
 │           ├── .git/            # Git history preserved
 │           ├── frontend/ui/
@@ -113,6 +117,47 @@ skillshare sync -g       # Force global mode
     └── skills/
         └── (same symlink structure as .claude/skills/)
 ```
+
+Symlinks in project mode use **relative paths** (e.g., `../../.skillshare/skills/...`). This makes the project directory portable — rename it, move it, or clone it on another machine and all symlinks continue to work. Global mode uses absolute paths since source and targets are in separate filesystem locations.
+
+---
+
+## Visible Project Directory {#visible-project-directory}
+
+Repositories that treat skills as reviewable content rather than tool state can use a visible `skillshare/` directory instead of the hidden `.skillshare/`:
+
+```bash
+skillshare init -p --visible
+```
+
+```
+<project-root>/
+├── skillshare/
+│   ├── config.yaml
+│   ├── skills/
+│   └── agents/
+└── src/
+```
+
+Everything else is identical — `config.yaml`, `skills/`, `agents/`, `extras/`, and the operational `trash/`, `backups/` and `logs/` directories all live inside whichever project directory is in use.
+
+Detection checks `.skillshare/config.yaml` first and `skillshare/config.yaml` second, so:
+
+- Existing projects are unaffected.
+- If both directories exist, `.skillshare/` wins.
+- To move an existing project, run `mv .skillshare skillshare`, then `skillshare sync -p` to repair target symlinks that still point to the old directory. If your `sources` settings explicitly reference `.skillshare/`, update those paths in `config.yaml` before syncing.
+
+`init -p` without `--visible` continues to create `.skillshare/`.
+
+:::note
+The global config directory is also called `skillshare` (`~/.config/skillshare/`). Only a `skillshare/` directory inside a project root is treated as a project.
+:::
+
+### Missing config
+
+Project commands initialize a project automatically when there isn't one yet, and a [shared skills repo](/docs/how-to/recipes/centralized-skills-repo) using `--config local` regenerates its gitignored `config.yaml` the same way.
+
+They stop short of one case: if the project directory already holds skills or agents but its `config.yaml` is missing, re-initializing would write an empty config and drop every configured target. Those commands report the problem instead, so you can restore `config.yaml` from version control or run `skillshare init -p` deliberately.
 
 ---
 
@@ -136,25 +181,104 @@ targets:
 - **Short**: Just the target name (e.g., `claude`). Uses known default path, merge mode.
 - **Long**: Object with `name`, optional `path`, optional `mode` (`merge`, `copy`, or `symlink`), and optional `include`/`exclude` filters. Supports relative paths (resolved from project root) and `~` expansion.
 
-Remote skill installations are tracked in a separate file, `.skillshare/registry.yaml`:
+Remote skill dependencies are declared in `config.yaml` under `skills:`:
 
 ```yaml
-# .skillshare/registry.yaml (auto-managed by install/uninstall)
+targets:
+  - claude
+  - cursor
+
 skills:
-  - name: pdf-skill
+  - name: pdf
     source: anthropic/skills/pdf
   - name: _team-skills
     source: github.com/team/skills
-    tracked: true                  # Tracked repo: cloned with git history
+    tracked: true
+  - name: review
+    source: github.com/team/skills/code-review
+    group: frontend
 ```
 
-**Skills** list tracks remote installations only. Local skills don't need entries here.
+**Skills** list declares remote installations only. Local skills don't need entries here.
 
 - `tracked: true`: Installed with `--track` (git repo with `.git/` preserved). When someone runs `skillshare install -p`, tracked skills are cloned with full git history so `skillshare update` works correctly.
+- `group`: Subdirectory path (corresponds to `--into` during install).
+
+Runtime metadata (install timestamps, file hashes, commit SHAs) is stored separately in `.skillshare/skills/.metadata.json` — this file is auto-managed and gitignored. A project that committed it before this rule existed should run `git rm --cached .skillshare/skills/.metadata.json` once to stop tracking it.
 
 :::tip Portable Skill Manifest
-`config.yaml` and `registry.yaml` together form a portable skill manifest in both global and project mode. In a project, commit them to git and anyone can run `skillshare install -p && skillshare sync`. For global mode, copy both files to a new machine and run `skillshare install && skillshare sync`. This works for teams, open source contributors, community templates, and dotfiles across machines.
+`config.yaml` is the declarative skill manifest. In a project, commit it to git and anyone can run `skillshare install -p && skillshare sync`. For global mode, `.metadata.json` serves as the manifest since global config doesn't need to be shared via git.
 :::
+
+### Lockfile {#lockfile}
+
+`config.yaml` says what a skill follows, such as a repo's default branch. `.skillshare/skills.lock.json` records which commit that was when someone last installed or updated it. Commit both, and everyone who runs `skillshare install -p` gets the same content, even after the upstream repo has moved on.
+
+```json
+{
+  "version": 1,
+  "skills": {
+    "pdf": {
+      "source": "github.com/anthropics/skills/skills/pdf",
+      "commit": "8f14e45fceea167a5a36dedd4bea2543ce848564",
+      "tree_hash": "f88c87101780018cfabdd229d5d92abedd6f640e"
+    }
+  }
+}
+```
+
+The file is written for you. You never edit it:
+
+| Command | Effect on the lockfile |
+|---------|------------------------|
+| `skillshare install <source> -p` | Pins the new skill to the commit it was installed from |
+| `skillshare install -p` | Installs every skill at its pinned commit. A skill that is already installed at another commit is moved to the pinned one |
+| `skillshare update <name> -p` | Moves the skill to the latest commit and rewrites its pin, so the change shows up in code review |
+| `skillshare uninstall <name> -p` | Removes the pin |
+
+Tracked repos are pinned too. They are reset to the pinned commit but stay on their branch, so `skillshare update` can still pull. A pin is ignored once the skill's `source` in `config.yaml` no longer matches it. Local-path sources have no commit and are not pinned.
+
+A pin only moves when you move the skill, with `update` or a forced reinstall. If a teammate's pin is newer than your copy, other commands leave the pin alone until `skillshare install -p` brings your copy up to it. `install -p` does not move a tracked repo that has uncommitted changes; commit or discard them first.
+
+Skills installed with an earlier skillshare version have no recorded commit. They are pinned the next time they are updated or reinstalled.
+
+The lockfile is different from `--branch <sha>`: that flag pins a skill permanently, and `update` reinstalls the same revision. With the lockfile the skill keeps following its branch, and only an explicit `update` moves it.
+
+---
+
+## Custom Source Directories {#custom-source-directories}
+
+By default, project mode reads skills, agents, and extras from `.skillshare/skills/`, `.skillshare/agents/`, and `.skillshare/extras/`. Override these paths with the optional `sources` map when you want to keep skill content alongside other project documentation:
+
+```yaml
+sources:
+  skills: ./docs/skills
+  agents: ./docs/agents
+  extras: ./docs/extras
+targets:
+  - claude
+```
+
+Each key is optional — omitting a key falls back to the default `.skillshare/<type>/` path. Paths are resolved relative to the project root, and absolute paths (including `~`) work too.
+
+**Common layouts:**
+
+```yaml
+# Co-locate skill content with existing project docs
+sources:
+  skills: ./docs/skills
+
+# Keep agents in an AI-focused subdirectory
+sources:
+  agents: ./ai/agents
+```
+
+**Constraints:**
+
+- **No alias with target paths.** `skillshare sync -p` rejects configs where a source resolves to the same directory as a target (or one contains the other). This prevents `sync --force` from wiping the configured source. For example, `sources.skills: .claude/skills` combined with a `claude` target is rejected with an `overlaps` error.
+- **External paths skip gitignore management.** When a source resolves outside the project root (an absolute path elsewhere on disk), skillshare does not add entries to the project's `.gitignore`. Manage ignore rules in the source directory yourself if needed.
+- **Operational dirs stay in the project directory.** Trash, backups, and operation logs always live under the active project directory (`.skillshare/`, or `skillshare/` — see below) regardless of `sources` settings.
+- **`init -p` always seeds `{skills,agents}/` in the project directory.** Custom sources take effect only after you edit `config.yaml`.
 
 ---
 
@@ -167,10 +291,11 @@ Project mode has some intentional limitations:
 | Merge sync mode | ✓ | Default, per-skill symlinks |
 | Copy sync mode | ✓ | Per-target via `skillshare target <name> --mode copy -p` |
 | Symlink sync mode | ✓ | Per-target via `skillshare target <name> --mode symlink -p` |
-| `--track` repos | ✓ | Cloned to `.skillshare/skills/_repo/`, added to `.gitignore` (`logs/` is also ignored by default) |
+| `--track` repos | ✓ | Cloned to `.skillshare/skills/_repo/`, added to `.gitignore` (`logs/`, `trash/`, `backups/`, and the `.metadata.json` files are also ignored by default) |
 | `--discover` | ✓ | Detect and add new targets to existing project config |
 | `push` / `pull` | ✗ | Use git directly on the project repo |
 | `collect` | ✓ | Collect local skills from project targets to `.skillshare/skills/` |
+| `extras` | ✓ | Extras sync, init, list, remove, collect — all support `-p` |
 | `backup` / `restore` | ✗ | Not needed (project targets are reproducible) |
 
 ---

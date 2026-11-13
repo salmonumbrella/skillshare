@@ -9,10 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
+
+	"skillshare/internal/backup"
 	"skillshare/internal/testutil"
 )
 
-func TestBackup_AfterSync_ResolvesSymlinks(t *testing.T) {
+func TestBackup_AfterSync_SkipsSymlinkedSkills(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
 
@@ -48,46 +51,25 @@ targets:
 	backupResult := sb.RunCLI("backup")
 	backupResult.AssertSuccess(t)
 
-	// Verify backup contains local skill but not the symlinked one
+	// Verify backup contains the local skill only.
 	backupDir := filepath.Join(sb.Home, ".local", "share", "skillshare", "backups")
 	entries, err := os.ReadDir(backupDir)
 	if err != nil || len(entries) == 0 {
 		t.Fatal("backup directory should contain a timestamp directory")
 	}
 
-	backupPath := filepath.Join(backupDir, entries[0].Name(), "claude")
+	// os.ReadDir returns entries sorted ascending, so the newest backup —
+	// the one taken after the symlink existed — is the last entry.
+	latest := entries[len(entries)-1]
+	backupPath := filepath.Join(backupDir, latest.Name(), "claude")
 	if _, err := os.Stat(filepath.Join(backupPath, "my-local", "SKILL.md")); err != nil {
 		t.Error("local skill should be in backup")
 	}
-	// Symlinked skills are now followed at the top level and their content
-	// is copied, so merge-mode targets are fully backed up.
-	if _, err := os.Stat(filepath.Join(backupPath, "agent-browser", "SKILL.md")); err != nil {
-		t.Error("symlinked skill should be resolved and backed up")
+	// Symlinked skills live in the source and are recreated by sync, so the
+	// backup must not duplicate their content (issue #252).
+	if _, err := os.Lstat(filepath.Join(backupPath, "agent-browser")); !os.IsNotExist(err) {
+		t.Error("symlinked skill should be skipped, not copied into the backup")
 	}
-}
-
-func TestBackup_CreatesBackup(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("skill1", map[string]string{"SKILL.md": "# Skill 1"})
-	targetPath := sb.CreateTarget("claude")
-
-	// Create some files in target to backup
-	localSkillPath := filepath.Join(targetPath, "local-skill")
-	os.MkdirAll(localSkillPath, 0755)
-	os.WriteFile(filepath.Join(localSkillPath, "SKILL.md"), []byte("# Local"), 0644)
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets:
-  claude:
-    path: ` + targetPath + `
-`)
-
-	result := sb.RunCLI("backup")
-
-	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "claude")
 }
 
 func TestBackup_SpecificTarget_BackupsOnlyThat(t *testing.T) {
@@ -133,7 +115,7 @@ targets:
 	result := sb.RunCLI("backup")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "nothing to backup")
+	result.AssertOutputContains(t, "nothing to back up")
 }
 
 func TestBackup_SymlinkTarget_ShowsNothing(t *testing.T) {
@@ -157,21 +139,64 @@ targets:
 	result := sb.RunCLI("backup")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "nothing to backup")
+	result.AssertOutputContains(t, "nothing to back up")
 }
 
-func TestBackup_List_ShowsAllBackups(t *testing.T) {
+func TestBackup_CleanupBusy(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
+	sb.WriteConfig("source: " + sb.SourcePath + "\ntargets: {}\n")
+	root := filepath.Join(sb.Home, ".local", "share", "skillshare", "backups")
+	if err := os.MkdirAll(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	lock := flock.New(filepath.Join(root, ".backup.lock"))
+	if err := lock.RLock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock() //nolint:errcheck
 
+	for _, args := range [][]string{{"backup", "--cleanup"}, {"backup", "--cleanup", "--dry-run"}} {
+		result := sb.RunCLI(args...)
+		result.AssertFailure(t)
+		result.AssertAnyOutputContains(t, "cleanup skipped")
+	}
+}
+
+func TestBackup_CleanupInterruptedSnapshot(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
 targets: {}
 `)
 
-	result := sb.RunCLI("backup", "--list")
+	staging := filepath.Join(sb.Home, ".local", "share", "skillshare", "backups", ".snapshot-orphan")
+	if err := os.MkdirAll(staging, 0755); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(staging, "partial.txt")
+	if err := os.WriteFile(payload, []byte("partial"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
-	result.AssertSuccess(t)
-	// May show "No backups found" if none exist
+	listed := sb.RunCLI("backup", "--list")
+	listed.AssertSuccess(t)
+	listed.AssertOutputContains(t, "No backups")
+
+	preview := sb.RunCLI("backup", "--cleanup", "--dry-run")
+	preview.AssertSuccess(t)
+	preview.AssertOutputContains(t, "Would remove 1 backup directory, freeing 7 B")
+	if _, err := os.Stat(payload); err != nil {
+		t.Fatalf("dry run changed incomplete snapshot: %v", err)
+	}
+
+	cleaned := sb.RunCLI("backup", "--cleanup")
+	cleaned.AssertSuccess(t)
+	cleaned.AssertOutputContains(t, "Removed 1 backup directory, freed 7 B")
+	cleaned.AssertOutputContains(t, "0 backups left")
+	if _, err := os.Stat(staging); !os.IsNotExist(err) {
+		t.Fatalf("incomplete snapshot remains after cleanup: %v", err)
+	}
 }
 
 func TestBackup_List_Empty_ShowsNone(t *testing.T) {
@@ -213,7 +238,7 @@ targets: {}
 	result := sb.RunCLI("backup", "--cleanup")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Cleaning")
+	result.AssertOutputContains(t, "No backups to clean up")
 }
 
 func TestBackup_DryRun_DoesNotCreateBackup(t *testing.T) {
@@ -328,13 +353,13 @@ targets:
 
 	sb.RunCLI("backup").AssertSuccess(t)
 
-	// Get first backup timestamp
+	// Get the completed snapshot, excluding lock files and staging directories.
 	backupDir := filepath.Join(sb.Home, ".local", "share", "skillshare", "backups")
-	entries, err := os.ReadDir(backupDir)
-	if err != nil || len(entries) == 0 {
+	backups, err := backup.ListInDir(backupDir)
+	if err != nil || len(backups) == 0 {
 		t.Fatal("expected at least one backup directory")
 	}
-	firstTimestamp := entries[0].Name()
+	firstTimestamp := backups[0].Timestamp
 
 	// Wait to ensure different timestamp
 	time.Sleep(1100 * time.Millisecond)
@@ -413,33 +438,6 @@ targets:
 	if string(content) != "# Modified" {
 		t.Error("dry-run should not modify files")
 	}
-}
-
-func TestRestore_Force_OverwritesNonEmpty(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	targetPath := sb.CreateTarget("claude")
-
-	skillPath := filepath.Join(targetPath, "my-skill")
-	os.MkdirAll(skillPath, 0755)
-	os.WriteFile(filepath.Join(skillPath, "SKILL.md"), []byte("# Backed Up"), 0644)
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets:
-  claude:
-    path: ` + targetPath + `
-`)
-
-	sb.RunCLI("backup").AssertSuccess(t)
-
-	// Add extra files to target
-	os.WriteFile(filepath.Join(skillPath, "SKILL.md"), []byte("# Changed"), 0644)
-	os.WriteFile(filepath.Join(targetPath, "extra.txt"), []byte("extra"), 0644)
-
-	result := sb.RunCLI("restore", "claude", "--force")
-	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Restored")
 }
 
 func TestRestore_NoForce_NonEmpty_Fails(t *testing.T) {

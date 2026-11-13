@@ -3,38 +3,39 @@ package main
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"skillshare/internal/install"
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/utils"
 )
 
 type updateTarget struct {
-	name   string             // relative path from source dir (display name)
-	path   string             // absolute path on disk
-	isRepo bool               // true for tracked repos (_-prefixed git repos)
-	meta   *install.SkillMeta // cached metadata; nil for tracked repos
+	name   string                 // relative path from source dir (display name)
+	path   string                 // absolute path on disk
+	isRepo bool                   // true for tracked repos (_-prefixed git repos)
+	meta   *install.MetadataEntry // cached metadata; nil for tracked repos
 }
 
 // resolveByBasename searches nested skills and tracked repos by their
 // directory basename. Returns an error when zero or multiple matches found.
-func resolveByBasename(sourceDir, name string) (updateTarget, error) {
+func resolveByBasename(sourceDir, name string, walks ...sourcewalk.Options) (updateTarget, error) {
+	name = path.Clean(filepath.ToSlash(name)) // "team/" names the same item as "team"
 	var matches []updateTarget
 
 	// Search tracked repos
-	repos, _ := install.GetTrackedRepos(sourceDir)
-	for _, r := range repos {
-		if filepath.Base(r) == "_"+name || filepath.Base(r) == name {
-			matches = append(matches, updateTarget{name: r, path: filepath.Join(sourceDir, r), isRepo: true})
-		}
+	repos, _ := install.GetTrackedRepos(sourceDir, walks...)
+	for _, r := range install.MatchTrackedRepos(repos, name) {
+		matches = append(matches, updateTarget{name: r, path: filepath.Join(sourceDir, r), isRepo: true})
 	}
 
 	// Search updatable skills
 	skills, _ := install.GetUpdatableSkills(sourceDir)
 	for _, s := range skills {
-		if filepath.Base(s) == name {
+		if s == name || filepath.Base(s) == name {
 			matches = append(matches, updateTarget{name: s, path: filepath.Join(sourceDir, s), isRepo: false})
 		}
 	}
@@ -58,10 +59,10 @@ func resolveByBasename(sourceDir, name string) (updateTarget, error) {
 // resolveByGlob searches tracked repos and updatable skills whose basenames
 // match the given glob pattern (e.g. "core-*", "_team-?"). Returns all matches
 // sorted by name.
-func resolveByGlob(sourceDir, pattern string) ([]updateTarget, error) {
+func resolveByGlob(sourceDir, pattern string, walks ...sourcewalk.Options) ([]updateTarget, error) {
 	var matches []updateTarget
 
-	repos, _ := install.GetTrackedRepos(sourceDir)
+	repos, _ := install.GetTrackedRepos(sourceDir, walks...)
 	for _, r := range repos {
 		if matchGlob(pattern, filepath.Base(r)) {
 			matches = append(matches, updateTarget{name: r, path: filepath.Join(sourceDir, r), isRepo: true})
@@ -81,7 +82,7 @@ func resolveByGlob(sourceDir, pattern string) ([]updateTarget, error) {
 
 // resolveGroupUpdatable finds all updatable items (tracked repos or skills with
 // metadata) under a group directory. Local skills without metadata are skipped.
-func resolveGroupUpdatable(group, sourceDir string) ([]updateTarget, error) {
+func resolveGroupUpdatable(group, sourceDir string, walks ...sourcewalk.Options) ([]updateTarget, error) {
 	group = strings.TrimSuffix(group, "/")
 	groupPath := filepath.Join(sourceDir, group)
 
@@ -90,14 +91,14 @@ func resolveGroupUpdatable(group, sourceDir string) ([]updateTarget, error) {
 		return nil, fmt.Errorf("group '%s' not found in source", group)
 	}
 
-	walkRoot := utils.ResolveSymlink(groupPath)
-	resolvedSourceDir := utils.ResolveSymlink(sourceDir)
-
-	// Guard: walkRoot must be inside resolvedSourceDir to prevent
-	// symlinked groups from reaching outside the source tree.
-	if srcRel, err := filepath.Rel(resolvedSourceDir, walkRoot); err != nil || strings.HasPrefix(srcRel, "..") {
+	walkRoot, logicalRoot, err := resolveGroupWalk(groupPath, sourceDir, walks)
+	if err != nil {
 		return nil, fmt.Errorf("group '%s' resolves outside source directory", group)
 	}
+	resolvedSourceDir := utils.ResolveSymlink(sourceDir)
+
+	// Load store once before walk (not per iteration)
+	store, _ := install.LoadMetadata(resolvedSourceDir)
 
 	var matches []updateTarget
 	if walkErr := filepath.Walk(walkRoot, func(path string, fi os.FileInfo, err error) error {
@@ -111,20 +112,26 @@ func resolveGroupUpdatable(group, sourceDir string) ([]updateTarget, error) {
 			return filepath.SkipDir
 		}
 
-		rel, relErr := filepath.Rel(resolvedSourceDir, path)
+		tail, err := filepath.Rel(walkRoot, path)
+		if err != nil {
+			return err
+		}
+		logicalPath := filepath.Join(logicalRoot, tail)
+
+		rel, relErr := filepath.Rel(resolvedSourceDir, logicalPath)
 		if relErr != nil || rel == "." || strings.HasPrefix(rel, "..") {
 			return nil
 		}
 
-		// Tracked repo (has .git)
-		if install.IsGitRepo(path) {
-			matches = append(matches, updateTarget{name: rel, path: path, isRepo: true})
+		// Tracked repo (_-prefixed checkout)
+		if install.IsTrackedCheckout(path) {
+			matches = append(matches, updateTarget{name: rel, path: logicalPath, isRepo: true})
 			return filepath.SkipDir
 		}
 
-		// Skill with metadata (has .skillshare-meta.json)
-		if meta, metaErr := install.ReadMeta(path); metaErr == nil && meta != nil && meta.Source != "" {
-			matches = append(matches, updateTarget{name: rel, path: path, isRepo: false, meta: meta})
+		// Skill with metadata (centralized store)
+		if entry := store.GetByPath(rel); entry != nil && entry.Source != "" {
+			matches = append(matches, updateTarget{name: rel, path: logicalPath, isRepo: false, meta: entry})
 			return filepath.SkipDir
 		}
 
@@ -139,18 +146,18 @@ func resolveGroupUpdatable(group, sourceDir string) ([]updateTarget, error) {
 // isGroupDir checks if a name corresponds to a group directory (a container
 // for other skills). Returns false for tracked repos, skills with metadata,
 // and directories that are themselves a skill (have SKILL.md).
-func isGroupDir(name, sourceDir string) bool {
+func isGroupDir(name, sourceDir string, store *install.MetadataStore) bool {
 	path := filepath.Join(sourceDir, name)
 	info, err := os.Stat(path)
 	if err != nil || !info.IsDir() {
 		return false
 	}
 	// Not a tracked repo
-	if install.IsGitRepo(path) {
+	if install.IsTrackedCheckout(path) {
 		return false
 	}
 	// Not a skill with metadata
-	if meta, metaErr := install.ReadMeta(path); metaErr == nil && meta != nil && meta.Source != "" {
+	if entry := store.Get(name); entry != nil && entry.Source != "" {
 		return false
 	}
 	// Not a skill directory (has SKILL.md)
@@ -158,4 +165,20 @@ func isGroupDir(name, sourceDir string) bool {
 		return false
 	}
 	return true
+}
+
+// resolveGroupWalk permits an external group only when the operation's policy
+// validates that first-level source link. Nested group links retain the guard.
+func resolveGroupWalk(groupPath, sourceDir string, walks []sourcewalk.Options) (physical, logical string, err error) {
+	physical = utils.ResolveSymlink(groupPath)
+	source := utils.ResolveSymlink(sourceDir)
+	if len(walks) > 0 && utils.PathsEqual(utils.ResolveSymlink(filepath.Dir(groupPath)), source) {
+		if resolved, ok := walks[0].Follow.Resolve(groupPath); ok {
+			return resolved, filepath.Join(source, filepath.Base(groupPath)), nil
+		}
+	}
+	if rel, relErr := filepath.Rel(source, physical); relErr != nil || strings.HasPrefix(rel, "..") {
+		return "", "", fmt.Errorf("group resolves outside source directory")
+	}
+	return physical, physical, nil
 }

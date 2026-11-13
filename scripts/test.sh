@@ -78,8 +78,8 @@ cd "$PROJECT_ROOT"
 if [[ "$RUN_INT" == true ]]; then
     echo -e "${YELLOW}Building binary...${NC}"
     make build
-    export SKILLSHARE_TEST_BINARY="$PROJECT_ROOT/bin/skillshare"
-    echo -e "${GREEN}✓ Binary built: bin/skillshare${NC}"
+    export SKILLSHARE_TEST_BINARY="${SKILLSHARE_TEST_BINARY:-$PROJECT_ROOT/bin/skillshare}"
+    echo -e "${GREEN}✓ Binary built: ${SKILLSHARE_TEST_BINARY}${NC}"
     echo ""
 fi
 
@@ -92,7 +92,7 @@ fi
 # Run unit tests
 if [[ "$RUN_UNIT" == true ]]; then
     echo -e "${YELLOW}Running unit tests...${NC}"
-    go test $VERBOSE $COVER_FLAG ./internal/...
+    go test $VERBOSE $COVER_FLAG ./cmd/... ./internal/...
     echo ""
 fi
 

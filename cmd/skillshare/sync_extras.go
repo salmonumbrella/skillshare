@@ -79,7 +79,16 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 	if _, _, err := config.ValidateConfigForSync(cfg); err != nil {
 		return err
 	}
-	if len(cfg.Extras) == 0 {
+	sharedRun, err := sync.BeginSharedExtras(cfg, dryRun)
+	if err != nil {
+		if jsonOutput {
+			return writeJSONError(err)
+		}
+		return err
+	}
+	totals := extrasSyncTotals{width: extrasRowWidth(cfg.Extras)}
+	jsonEntries := sharedDetachEntries(sharedRun.Detach(config.ExpandPath), jsonOutput, &totals)
+	if len(cfg.Extras) == 0 && sharedRun == nil {
 		// Clean up empty extras directory
 		removeEmptyDir(config.ExtrasParentDir(cfg.EffectiveSkillsSource()))
 
@@ -105,9 +114,17 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 	configDir := filepath.Dir(cfg.EffectiveSkillsSource())
 
 	// Auto-migrate legacy extras directories (flat → extras/<name>/)
-	if warnings := config.MigrateExtrasDir(configDir, cfg.Extras); len(warnings) > 0 {
-		for _, w := range warnings {
-			ui.Warning(w)
+	localExtras := make([]config.ExtraConfig, 0, len(cfg.Extras))
+	for _, extra := range cfg.Extras {
+		if cfg.CheckExtraWritable(extra.Name) == nil {
+			localExtras = append(localExtras, extra)
+		}
+	}
+	if !dryRun || !cfg.SharedEnabled() {
+		if warnings := config.MigrateExtrasDir(configDir, localExtras); len(warnings) > 0 {
+			for _, w := range warnings {
+				ui.Warning(w)
+			}
 		}
 	}
 
@@ -120,9 +137,6 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 		}
 	}
 
-	totals := extrasSyncTotals{width: extrasRowWidth(cfg.Extras)}
-	var jsonEntries []syncExtrasJSONEntry
-
 	if !jsonOutput {
 		ui.Section("Extras")
 	}
@@ -130,6 +144,7 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 	opts := sync.ExtraRunOptions{
 		DryRun:      dryRun,
 		Force:       force,
+		Protected:   sharedRun.Protected(),
 		ResolvePath: config.ExpandPath,
 		ResolveExtension: func(ext string) (*sync.ExtensionSpec, error) {
 			return resolveExtension(ext, globalExtensionsDir())
@@ -141,6 +156,7 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 		extraSource := config.ResolveExtrasSourceDir(extra, cfg.EffectiveExtrasSource(), cfg.EffectiveSkillsSource())
 
 		run := sync.RunExtraTargets(extra, extraSource, opts)
+		sharedRun.Record(extra, extraSource, run, nil)
 		if run.SourceMissing {
 			printMissingExtraSource(extra.Name, extraSource, jsonOutput)
 			if jsonOutput {
@@ -157,6 +173,12 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 		jsonEntries = append(jsonEntries, jsonEntry)
 	}
 
+	if err := sharedRun.Save(); err != nil {
+		if jsonOutput {
+			return writeJSONError(err)
+		}
+		return err
+	}
 	// Oplog
 	status := "ok"
 	if totals.errors > 0 {
@@ -164,6 +186,7 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 	}
 	e := oplog.NewEntry("sync-extras", status, time.Since(start))
 	e.Args = map[string]any{
+		"detached": totals.detached, "kept": totals.kept, "detach_errors": totals.detachErrors,
 		"extras_count": len(cfg.Extras),
 		"synced":       totals.synced,
 		"skipped":      totals.skipped,
@@ -354,7 +377,11 @@ func syncVerb(mode string) string {
 // plus an error counting failures as `sync extras` does.
 // Used by sync --all --json to merge extras into the skills JSON output.
 // agentTargetPaths is used to skip extras "agents" targets that overlap with the agents sync system.
-func runExtrasSyncEntries(extras []config.ExtraConfig, sourceFunc func(config.ExtraConfig) string, dryRun, force bool, projectRoot string, agentTargetPaths map[string]bool) ([]syncExtrasJSONEntry, error) {
+func runExtrasSyncEntries(extras []config.ExtraConfig, sourceFunc func(config.ExtraConfig) string, dryRun, force bool, projectRoot string, agentTargetPaths map[string]bool, sessions ...*sync.SharedExtrasRun) ([]syncExtrasJSONEntry, error) {
+	var session *sync.SharedExtrasRun
+	if len(sessions) > 0 {
+		session = sessions[0]
+	}
 	// Resolve the per-target transform extension so --all --json applies
 	// it like a normal sync instead of copying files verbatim.
 	extDir := globalExtensionsDir()
@@ -364,6 +391,7 @@ func runExtrasSyncEntries(extras []config.ExtraConfig, sourceFunc func(config.Ex
 		resolvePath = func(path string) string { return resolveProjectPath(projectRoot, path) }
 	}
 	opts := sync.ExtraRunOptions{
+		Protected:   session.Protected(),
 		DryRun:      dryRun,
 		Force:       force,
 		ProjectRoot: projectRoot,
@@ -378,7 +406,9 @@ func runExtrasSyncEntries(extras []config.ExtraConfig, sourceFunc func(config.Ex
 	entries := make([]syncExtrasJSONEntry, 0, len(extras))
 	for _, extra := range extras {
 		entry := syncExtrasJSONEntry{Name: extra.Name}
-		run := sync.RunExtraTargets(extra, sourceFunc(extra), opts)
+		sourceDir := sourceFunc(extra)
+		run := sync.RunExtraTargets(extra, sourceDir, opts)
+		session.Record(extra, sourceDir, run, nil)
 		if run.SourceMissing {
 			entry.Targets = []syncExtrasJSONTarget{}
 		}
@@ -406,6 +436,7 @@ func printMissingExtraSource(name, sourceDir string, jsonOutput bool) {
 
 // extrasSyncTotals accumulates target outcomes for the summary and oplog.
 type extrasSyncTotals struct {
+	detached, kept, detachErrors             int
 	synced, skipped, pruned, errors, targets int
 	width                                    int // label width of the printed rows
 }

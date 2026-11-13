@@ -48,3 +48,11 @@ func (s *Server) checkSharedExtraChanges(planned []config.ExtraConfig) error {
 	}
 	return nil
 }
+
+func (s *Server) sharedStatusPayload() *config.SharedStatus {
+	if s.IsProjectMode() || !s.cfg.SharedEnabled() {
+		return nil
+	}
+	status := s.cfg.SharedStatus()
+	return &status
+}

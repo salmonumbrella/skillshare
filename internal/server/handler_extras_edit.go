@@ -142,7 +142,13 @@ func (s *Server) handleExtrasEditTarget(w http.ResponseWriter, r *http.Request) 
 		oldMode := syncpkg.ExtraTargetMode(old.Mode, extra.File != "")
 		var errs []string
 		resp["pruned"], _, errs = syncpkg.ClearExtraTarget(extra.File, sourceDir, oldPath, old.As, oldMode, nil)
-		results := s.syncExtras(name, false, false)
+		results, syncErr := s.syncExtras(name, false, false)
+		if syncErr != nil {
+			if !writeSharedError(w, syncErr) {
+				writeError(w, http.StatusInternalServerError, syncErr.Error())
+			}
+			return
+		}
 		resp["extras"] = results
 		if len(errs) > 0 {
 			resp["prune_errors"] = errs
@@ -279,7 +285,13 @@ func (s *Server) handleExtrasEdit(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{"success": true, "name": next.Name}
 	status, msg := "ok", ""
 	if relink {
-		results := s.syncExtras(next.Name, false, false)
+		results, syncErr := s.syncExtras(next.Name, false, false)
+		if syncErr != nil {
+			if !writeSharedError(w, syncErr) {
+				writeError(w, http.StatusInternalServerError, syncErr.Error())
+			}
+			return
+		}
 		resp["extras"] = results
 		status, _ = extrasSyncStatus(results)
 	}

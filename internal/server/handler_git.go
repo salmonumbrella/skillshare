@@ -13,21 +13,22 @@ import (
 )
 
 type gitStatusResponse struct {
-	GitInstalled   bool     `json:"gitInstalled"`
-	IsRepo         bool     `json:"isRepo"`
-	HasRemote      bool     `json:"hasRemote"`
-	Branch         string   `json:"branch"`
-	IsDirty        bool     `json:"isDirty"`
-	Files          []string `json:"files"`
-	SourceDir      string   `json:"sourceDir"`
-	Scope          string   `json:"scope"`
-	ScopeMismatch  bool     `json:"scopeMismatch"`
-	MismatchScope  string   `json:"mismatchScope,omitempty"`
-	MismatchDir    string   `json:"mismatchDir,omitempty"`
-	RemoteURL      string   `json:"remoteURL,omitempty"`
-	HeadHash       string   `json:"headHash,omitempty"`
-	HeadMessage    string   `json:"headMessage,omitempty"`
-	TrackingBranch string   `json:"trackingBranch,omitempty"`
+	Shared         *config.SharedStatus `json:"shared,omitempty"`
+	GitInstalled   bool                 `json:"gitInstalled"`
+	IsRepo         bool                 `json:"isRepo"`
+	HasRemote      bool                 `json:"hasRemote"`
+	Branch         string               `json:"branch"`
+	IsDirty        bool                 `json:"isDirty"`
+	Files          []string             `json:"files"`
+	SourceDir      string               `json:"sourceDir"`
+	Scope          string               `json:"scope"`
+	ScopeMismatch  bool                 `json:"scopeMismatch"`
+	MismatchScope  string               `json:"mismatchScope,omitempty"`
+	MismatchDir    string               `json:"mismatchDir,omitempty"`
+	RemoteURL      string               `json:"remoteURL,omitempty"`
+	HeadHash       string               `json:"headHash,omitempty"`
+	HeadMessage    string               `json:"headMessage,omitempty"`
+	TrackingBranch string               `json:"trackingBranch,omitempty"`
 	// Ahead counts commits no remote-tracking branch has yet, i.e. what a push uploads.
 	Ahead int `json:"ahead"`
 	// Behind counts upstream commits HEAD lacks as of the last fetch, i.e. what a pull brings in.
@@ -48,6 +49,7 @@ func (s *Server) handleGitStatus(w http.ResponseWriter, r *http.Request) {
 		s.mu.RUnlock()
 		return
 	}
+	shared := s.sharedStatusPayload()
 	scope := s.cfg.GitRoot
 	mScope, mDir, mismatch := s.cfg.GitRootMismatch()
 	s.mu.RUnlock()
@@ -55,6 +57,7 @@ func (s *Server) handleGitStatus(w http.ResponseWriter, r *http.Request) {
 		scope = "skills"
 	}
 	resp := gitStatusResponse{
+		Shared:        shared,
 		GitInstalled:  git.IsInstalled(),
 		SourceDir:     src,
 		Scope:         scope,
@@ -699,15 +702,16 @@ func (s *Server) handleAbsorbNested(w http.ResponseWriter, r *http.Request) {
 }
 
 type pullResponse struct {
-	Success     bool               `json:"success"`
-	UpToDate    bool               `json:"upToDate"`
-	Commits     []git.CommitInfo   `json:"commits"`
-	Stats       git.DiffStats      `json:"stats"`
-	SyncResults []syncTargetResult `json:"syncResults"`
-	DryRun      bool               `json:"dryRun"`
-	Message     string             `json:"message,omitempty"`
-	Warnings    []string           `json:"warnings,omitempty"`
-	Unmatched   []unmatchedInclude `json:"unmatched,omitempty"`
+	Shared      *config.SharedStatus `json:"shared,omitempty"`
+	Success     bool                 `json:"success"`
+	UpToDate    bool                 `json:"upToDate"`
+	Commits     []git.CommitInfo     `json:"commits"`
+	Stats       git.DiffStats        `json:"stats"`
+	SyncResults []syncTargetResult   `json:"syncResults"`
+	DryRun      bool                 `json:"dryRun"`
+	Message     string               `json:"message,omitempty"`
+	Warnings    []string             `json:"warnings,omitempty"`
+	Unmatched   []unmatchedInclude   `json:"unmatched,omitempty"`
 }
 
 // handlePull pulls changes and syncs to targets
@@ -825,8 +829,13 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.reloadConfig(); err != nil {
+		writeError(w, http.StatusInternalServerError, "reload after pull: "+err.Error())
+		return
+	}
 	resp := pullResponse{
 		Success:     true,
+		Shared:      s.sharedStatusPayload(),
 		UpToDate:    info.UpToDate,
 		Commits:     info.Commits,
 		Stats:       info.Stats,
@@ -839,10 +848,18 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 		resp.Warnings = append(resp.Warnings, "The remote tracks config.yaml; kept this machine's copy. Push to remove it from the remote.")
 	}
 
+	if err := s.cfg.RecordSharedPointer(src, false); err != nil {
+		resp.Warnings = append(resp.Warnings, err.Error())
+	}
 	// Sync what the pulled scope holds, as the CLI does. Skills always sync
 	// from the skills source, whatever directory git_root points at.
 	syncPulledExtras := func() {
-		for _, extra := range s.syncExtras("", false, false) {
+		extras, syncErr := s.syncExtras("", false, false)
+		if syncErr != nil {
+			resp.Warnings = append(resp.Warnings, syncErr.Error())
+			return
+		}
+		for _, extra := range extras {
 			for _, msg := range extra.Warnings {
 				resp.Warnings = append(resp.Warnings, fmt.Sprintf("extras %s: %s", extra.Name, msg))
 			}
@@ -859,7 +876,7 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	switch scope := s.cfg.GitRoot; {
-	case info.UpToDate && !body.AlwaysSync:
+	case info.UpToDate && !body.AlwaysSync && !s.cfg.SharedEnabled():
 	case scope == "extras":
 		syncPulledExtras()
 	default:
@@ -879,7 +896,7 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 				resp.Warnings = append(resp.Warnings, fmt.Sprintf("Skill path overlap across %d target(s) — see Health Check for details", out.pathOverlap))
 			}
 		}
-		if scope == "root" {
+		if scope == "root" || s.cfg.SharedEnabled() {
 			syncPulledExtras()
 		}
 	}

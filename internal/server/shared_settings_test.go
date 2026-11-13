@@ -149,3 +149,78 @@ func TestSharedPublicationAPIRefusesBeforeStaging(t *testing.T) {
 		}
 	}
 }
+
+func TestSharedExtrasAPILastRemoval(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	shared := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
+	source := filepath.Join(sb.Root, "rules")
+	target := filepath.Join(sb.Root, "placed")
+	sb.WriteFile(filepath.Join(source, "fixture.md"), "managed\n")
+	sb.WriteFile(shared, fmt.Sprintf("version: 1\nextras: [{name: rules,source: %q,targets: [{path: %q,mode: copy}]}]\n", filepath.ToSlash(source), filepath.ToSlash(target)))
+	sb.WriteConfig("source: " + filepath.ToSlash(sb.SourcePath) + "\nshared: {path: ./team.yaml}\ntargets: {}\n")
+	cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, "127.0.0.1:0", "", "")
+	for _, remove := range []bool{false, true} {
+		if remove {
+			sb.WriteFile(shared, "version: 1\n")
+			if err := s.reloadConfig(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		rr := httptest.NewRecorder()
+		s.handleExtrasSync(rr, httptest.NewRequest(http.MethodPost, "/api/extras/sync", strings.NewReader(`{}`)))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("sync=%d %s", rr.Code, rr.Body.String())
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(target, "fixture.md")); !os.IsNotExist(err) {
+		t.Fatal("API left last placement")
+	}
+}
+
+func TestSharedPullAPIReloadsAndDetachesLastExtra(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.WriteConfig("source: " + filepath.ToSlash(sb.SourcePath) + "\ngit_root: root\nshared: {path: ./team.yaml}\ntargets: {}\n")
+	base := t.TempDir()
+	remote := testutil.SetupBareRemoteRepo(t, base)
+	testutil.SeedRemoteBranch(t, base, remote, "main", map[string]string{
+		".gitignore":              "config.yaml\n",
+		"team.yaml":               "version: 1\nextras: [{name: rules,source: ./extras/rules,targets: [{path: ~/placed,mode: copy}]}]\n",
+		"extras/rules/fixture.md": "from remote\n",
+	})
+	root := filepath.Dir(sb.ConfigPath)
+	testutil.RunGit(t, root, "init")
+	testutil.ConfigureGitUser(t, root)
+	testutil.RunGit(t, root, "remote", "add", "origin", remote)
+	cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(cfg, "127.0.0.1:0", "", "")
+	pull := func() {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		s.handlePull(rr, httptest.NewRequest(http.MethodPost, "/api/git/pull", strings.NewReader(`{}`)))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("pull=%d %s", rr.Code, rr.Body.String())
+		}
+	}
+	pull()
+	if sb.ReadFile(filepath.Join(sb.Home, "placed", "fixture.md")) != "from remote\n" {
+		t.Fatal("dashboard pull used stale declarations")
+	}
+	seed := filepath.Join(base, "seed-main")
+	sb.WriteFile(filepath.Join(seed, "team.yaml"), "version: 1\n")
+	testutil.RunGit(t, seed, "add", "team.yaml")
+	testutil.RunGit(t, seed, "commit", "-m", "remove last declaration")
+	testutil.RunGit(t, seed, "push")
+	pull()
+	if _, err := os.Lstat(filepath.Join(sb.Home, "placed", "fixture.md")); !os.IsNotExist(err) {
+		t.Fatal("dashboard pull did not detach")
+	}
+}

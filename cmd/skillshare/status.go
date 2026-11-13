@@ -26,14 +26,15 @@ import (
 
 // statusJSONOutput is the JSON representation for status --json output.
 type statusJSONOutput struct {
-	Source       statusJSONSource   `json:"source"`
-	SkillCount   int                `json:"skill_count"`
-	VariantCount int                `json:"variant_count"`
-	TrackedRepos []statusJSONRepo   `json:"tracked_repos"`
-	Targets      []statusJSONTarget `json:"targets"`
-	Agents       *statusJSONAgents  `json:"agents,omitempty"`
-	Audit        statusJSONAudit    `json:"audit"`
-	Version      string             `json:"version"`
+	Shared       *config.SharedStatus `json:"shared,omitempty"`
+	Source       statusJSONSource     `json:"source"`
+	SkillCount   int                  `json:"skill_count"`
+	VariantCount int                  `json:"variant_count"`
+	TrackedRepos []statusJSONRepo     `json:"tracked_repos"`
+	Targets      []statusJSONTarget   `json:"targets"`
+	Agents       *statusJSONAgents    `json:"agents,omitempty"`
+	Audit        statusJSONAudit      `json:"audit"`
+	Version      string               `json:"version"`
 }
 
 type statusJSONSource struct {
@@ -144,6 +145,7 @@ func cmdStatus(args []string) error {
 			})
 		}
 
+		printSharedStatus(cfg)
 		printAuditStatus(cfg.Audit)
 		checkSkillVersion(cfg)
 		return nil
@@ -151,6 +153,7 @@ func cmdStatus(args []string) error {
 
 	// JSON mode
 	output := statusJSONOutput{
+		Shared:  sharedStatusPayload(cfg),
 		Version: version,
 	}
 

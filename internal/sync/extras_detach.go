@@ -34,7 +34,7 @@ func BeginSharedExtras(cfg *config.Config, dryRun bool) (*SharedExtrasRun, error
 	path := cfg.SharedStatus().Path
 	state, err := config.LoadSharedState(config.ConfigPath(), cfg.EffectiveGitRoot(), filepath.Dir(path))
 	if err != nil {
-		return nil, err
+		return nil, &config.SharedError{Code: config.SharedUnavailable, Path: path, Cause: err}
 	}
 	state.RecordPointer(path)
 	return &SharedExtrasRun{cfg: cfg, state: state, dryRun: dryRun, protected: map[string]bool{}}, nil
@@ -50,7 +50,10 @@ func (r *SharedExtrasRun) Save() error {
 	if r == nil || r.dryRun {
 		return nil
 	}
-	return r.state.Save()
+	if err := r.state.Save(); err != nil {
+		return &config.SharedError{Code: config.SharedUnavailable, Path: r.cfg.SharedStatus().Path, Cause: err}
+	}
+	return nil
 }
 
 func placedOutput(file string, target config.SharedPlacedTarget) string {

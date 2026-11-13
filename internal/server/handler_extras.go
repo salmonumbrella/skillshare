@@ -623,8 +623,14 @@ func (s *Server) handleExtrasSync(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	results := s.syncExtras(body.Name, body.DryRun, body.Force)
+	results, syncErr := s.syncExtras(body.Name, body.DryRun, body.Force)
 	s.mu.RUnlock()
+	if syncErr != nil {
+		if !writeSharedError(w, syncErr) {
+			writeError(w, http.StatusInternalServerError, syncErr.Error())
+		}
+		return
+	}
 
 	if body.Name != "" && len(results) == 0 {
 		writeError(w, http.StatusNotFound, "extra not found: "+body.Name)
@@ -678,12 +684,16 @@ func extrasSyncStatus(results []extraSyncResult) (string, int) {
 
 // syncExtras syncs every extra (or only the one named) into its targets.
 // Per-target failures are reported in the results. Callers must hold s.mu.
-func (s *Server) syncExtras(name string, dryRun, force bool) []extraSyncResult {
+func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult, error) {
+	var session *syncpkg.SharedExtrasRun
 	if !s.IsProjectMode() {
-		if err := s.cfg.CheckSharedApply(); err != nil {
-			return []extraSyncResult{{Name: name, Targets: []extraTargetSyncResult{{Error: err.Error()}}}}
+		var err error
+		session, err = syncpkg.BeginSharedExtras(s.cfg, dryRun)
+		if err != nil {
+			return nil, err
 		}
 	}
+
 	projectRoot := s.projectRoot
 	source := s.cfg.EffectiveSkillsSource()
 	extrasSource := s.cfg.EffectiveExtrasSource()
@@ -693,6 +703,7 @@ func (s *Server) syncExtras(name string, dryRun, force bool) []extraSyncResult {
 	}
 
 	opts := syncpkg.ExtraRunOptions{
+		Protected:        session.Protected(),
 		DryRun:           dryRun,
 		Force:            force,
 		ProjectRoot:      projectRoot,
@@ -707,6 +718,19 @@ func (s *Server) syncExtras(name string, dryRun, force bool) []extraSyncResult {
 	}
 
 	results := make([]extraSyncResult, 0)
+	var detachErr error
+	if name == "" {
+		for _, detached := range session.Detach(opts.ResolvePath) {
+			if len(detached.Errors) > 0 {
+				detachErr = fmt.Errorf("shared extras detach failed: %s", strings.Join(detached.Errors, "; "))
+			}
+			target := extraTargetSyncResult{Target: detached.Target, Pruned: detached.Removed, Errors: detached.Errors, Warnings: []string{}}
+			for _, path := range detached.Kept {
+				target.Warnings = append(target.Warnings, "kept: edited by you: "+path)
+			}
+			results = append(results, extraSyncResult{Name: detached.Name, Targets: []extraTargetSyncResult{target}})
+		}
+	}
 
 	for _, extra := range s.extrasConfig() {
 		if name != "" && extra.Name != name {
@@ -720,6 +744,7 @@ func (s *Server) syncExtras(name string, dryRun, force bool) []extraSyncResult {
 		}
 
 		run := syncpkg.RunExtraTargets(extra, sourceDir, opts)
+		session.Record(extra, sourceDir, run, nil)
 		result := extraSyncResult{
 			Name:    extra.Name,
 			Targets: make([]extraTargetSyncResult, 0, len(extra.Targets)),
@@ -762,7 +787,7 @@ func (s *Server) syncExtras(name string, dryRun, force bool) []extraSyncResult {
 		results = append(results, result)
 	}
 
-	return results
+	return results, errors.Join(detachErr, session.Save())
 }
 
 // extrasAgentTargetPaths returns the agents sync target paths for

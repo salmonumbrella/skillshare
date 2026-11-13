@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -34,6 +35,8 @@ type syncLogStats struct {
 
 // syncJSONOutput is the JSON representation for sync --json output.
 type syncJSONOutput struct {
+	Error         string                 `json:"error,omitempty"`
+	ErrorCode     string                 `json:"error_code,omitempty"`
 	Targets       int                    `json:"targets"`
 	Linked        int                    `json:"linked"`
 	Local         int                    `json:"local"`
@@ -482,20 +485,9 @@ func cmdSync(args []string) error {
 		if analyzeErr == nil && len(analyzeEntries) > 0 {
 			ctxCost = buildContextCostJSON(analyzeEntries, cfg.ContextBudget)
 		}
-		if hasAll && cfg.CheckSharedApply() != nil {
-			if syncErr == nil {
-				syncErr = cfg.CheckSharedApply()
-			}
-			return syncOutputJSON(results, dryRun, start, ignoreStats, syncErr, ctxCost, mcpResult, hooksResult, linkWarnings)
-		}
-		if hasAll && len(cfg.Extras) > 0 {
-			agentPaths := collectAgentTargetPathsGlobal(cfg)
-			extrasEntries, extrasErr := runExtrasSyncEntries(cfg.Extras, func(extra config.ExtraConfig) string {
-				return config.ResolveExtrasSourceDir(extra, cfg.EffectiveExtrasSource(), cfg.EffectiveSkillsSource())
-			}, dryRun, force, "", agentPaths)
-			if syncErr == nil {
-				syncErr = extrasErr
-			}
+		if hasAll && (len(cfg.Extras) > 0 || cfg.SharedEnabled()) {
+			extrasEntries, extrasErr := runGlobalExtrasSyncEntries(cfg, dryRun, force, collectAgentTargetPathsGlobal(cfg))
+			syncErr = errors.Join(syncErr, extrasErr)
 			return syncOutputJSON(results, dryRun, start, ignoreStats, syncErr, ctxCost, mcpResult, hooksResult, linkWarnings, extrasEntries)
 		}
 		return syncOutputJSON(results, dryRun, start, ignoreStats, syncErr, ctxCost, mcpResult, hooksResult, linkWarnings)
@@ -679,6 +671,13 @@ func syncOutputJSON(results []syncTargetResult, dryRun bool, start time.Time, iS
 	output.IgnoredSkills = ignoredSkills
 	if len(extras) > 0 && extras[0] != nil {
 		output.Extras = extras[0]
+	}
+	if syncErr != nil {
+		output.Error = syncErr.Error()
+		var shared *config.SharedError
+		if errors.As(syncErr, &shared) {
+			output.ErrorCode = shared.Code
+		}
 	}
 	output.ContextCost = ctxCost
 	output.MCP = mcpResult

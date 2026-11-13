@@ -21,6 +21,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	// Keep endpoint usable even when config is temporarily invalid.
 	s.mu.Lock()
 	_ = s.reloadConfig()
+	shared := s.sharedStatusPayload()
 	cfgObj := any(s.cfg)
 	if s.IsProjectMode() {
 		cfgObj = s.projectCfg
@@ -33,10 +34,14 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, map[string]any{
+	payload := map[string]any{
 		"config": cfgObj,
 		"raw":    string(raw),
-	})
+	}
+	if shared != nil {
+		payload["shared"] = shared
+	}
+	writeJSON(w, payload)
 }
 
 var syncModes = []string{"merge", "copy", "symlink"}

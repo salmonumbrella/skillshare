@@ -172,18 +172,27 @@ func integrateRemote(source string, force, keepConfig bool, spinner *ui.Spinner,
 // extras are skipped when none are configured so sync does not print its
 // setup guide. The config is read again because the pull may have changed it.
 func syncPulledScope(cfg *config.Config) error {
-	if pulled, err := config.Load(); err == nil {
-		cfg.Extras = pulled.Extras
+	pulled, err := config.Load()
+	if err != nil {
+		return err
 	}
-	for _, args := range pulledScopeSyncArgs(cfg.GitRoot) {
-		if args[0] == "extras" && len(cfg.Extras) == 0 {
-			continue
-		}
-		if err := cmdSync(args); err != nil {
-			return err
-		}
+	cfg = pulled
+	sharedErr := cfg.CheckSharedApply()
+	pointerErr := cfg.RecordSharedPointer(cfg.EffectiveGitRoot(), false)
+	argsList := pulledScopeSyncArgs(cfg.GitRoot)
+	if cfg.SharedEnabled() && cfg.GitRoot != "root" && cfg.GitRoot != "extras" {
+		argsList = append(argsList, []string{"extras", "--global"})
 	}
-	return nil
+	var syncErr error
+	for _, args := range argsList {
+		if args[0] == "extras" {
+			if sharedErr != nil || pointerErr != nil || len(cfg.Extras) == 0 && !cfg.SharedEnabled() {
+				continue
+			}
+		}
+		syncErr = errors.Join(syncErr, cmdSync(args))
+	}
+	return errors.Join(sharedErr, pointerErr, syncErr)
 }
 
 // pulledScopeSyncArgs returns the `sync` invocations that cover a git root

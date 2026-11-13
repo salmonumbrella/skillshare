@@ -1038,12 +1038,15 @@ func (m extrasListTUIModel) projectRoot() string {
 }
 
 func (m extrasListTUIModel) doSync(name, targetPath string) (string, error) {
+	var session *sync.SharedExtrasRun
 	if m.projCfg == nil {
 		cfg, err := config.Load()
 		if err != nil {
 			return "", err
 		}
-		if err := cfg.CheckSharedApply(); err != nil {
+		m.cfg = cfg
+		session, err = sync.BeginSharedExtras(cfg, false)
+		if err != nil {
 			return "", err
 		}
 	}
@@ -1051,39 +1054,42 @@ func (m extrasListTUIModel) doSync(name, targetPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
+	selected := *extra
+	selected.Targets = targets
 	sourceDir := m.sourceFunc(*extra)
-	projectRoot := m.projectRoot()
-	synced := 0
-	for _, t := range targets {
-		mode := sync.EffectiveMode(t.Mode)
-		resolved := config.ExpandPath(t.Path)
-		// Resolve the per-target transform extension so the TUI sync applies
-		// it instead of copying files verbatim.
-		var spec *sync.ExtensionSpec
-		if t.Extension != "" {
-			effMode, modeErr := validateExtensionMode(t.Mode)
-			if modeErr != nil {
-				return "", fmt.Errorf("sync %s: %w", t.Path, modeErr)
-			}
-			mode = effMode
-			extDir := globalExtensionsDir()
-			if projectRoot != "" {
-				extDir = projectExtensionsDir(projectRoot)
-			}
-			var specErr error
-			spec, specErr = resolveExtension(t.Extension, extDir)
-			if specErr != nil {
-				return "", fmt.Errorf("sync %s: %w", t.Path, specErr)
-			}
-		}
-		_, err := sync.SyncExtraTarget(*extra, t, sourceDir, resolved, mode, spec, sync.ExtraSyncOptions{ProjectRoot: projectRoot})
-		if err != nil {
-			return "", fmt.Errorf("sync %s: %w", t.Path, err)
-		}
-		synced++
+	if m.projCfg == nil {
+		sourceDir = config.ResolveExtrasSourceDir(*extra, m.cfg.EffectiveExtrasSource(), m.cfg.EffectiveSkillsSource())
 	}
-	return fmt.Sprintf("✓ Synced %q to %d target(s)", name, synced), nil
+	projectRoot := m.projectRoot()
+	extDir := globalExtensionsDir()
+	if projectRoot != "" {
+		extDir = projectExtensionsDir(projectRoot)
+	}
+	run := sync.RunExtraTargets(selected, sourceDir, sync.ExtraRunOptions{ResolvePath: func(path string) string {
+		return canonicalExtraTargetPath(map[bool]runMode{true: modeProject, false: modeGlobal}[projectRoot != ""], projectRoot, path)
+	}, ProjectRoot: projectRoot, Protected: session.Protected(), ResolveExtension: func(ext string) (*sync.ExtensionSpec, error) { return resolveExtension(ext, extDir) }})
+	if run.SourceMissing {
+		return "", fmt.Errorf("extras source directory does not exist: %s", sourceDir)
+	}
+	for _, tr := range run.Targets {
+		if tr.ModeErr != nil {
+			return "", tr.ModeErr
+		}
+		if tr.ExtensionErr != nil {
+			return "", tr.ExtensionErr
+		}
+		if tr.Err != nil {
+			return "", tr.Err
+		}
+		if tr.Result != nil && len(tr.Result.Errors) > 0 {
+			return "", fmt.Errorf("%s", strings.Join(tr.Result.Errors, "; "))
+		}
+	}
+	session.Record(selected, sourceDir, run, nil)
+	if err := session.Save(); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("✓ Synced %q to %d target(s)", name, len(run.Targets)), nil
 }
 
 func (m extrasListTUIModel) doCollect(name, targetPath string) (string, error) {

@@ -163,6 +163,7 @@ func cmdDoctorGlobal(jsonMode bool) error {
 	}
 
 	runDoctorChecks(cfg, result, false)
+	checkSharedFile(cfg, result)
 	checkExtras(cfg.Extras, result, false, cfg.EffectiveSkillsSource(), cfg.EffectiveExtrasSource(), "", "", func() error { return cfg.ValidateExtras() })
 	checkNativeResources(cfg, "", result)
 	ui.Section("Storage")

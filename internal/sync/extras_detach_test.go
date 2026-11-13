@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -276,6 +277,9 @@ func TestSharedMergeReplacedLinkVanishedSourceProtectsForce(t *testing.T) {
 }
 
 func TestSharedFailedDetachRetainedAndRetried(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission regression; Windows token verification pending")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("root bypasses fixture permissions")
 	}
@@ -373,7 +377,7 @@ func TestProtectedExtensionOutputSkipsBeforeExecution(t *testing.T) {
 	if err := os.WriteFile(output, []byte("user edit"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	result, err := SyncExtraTarget(config.ExtraConfig{}, config.ExtraTargetConfig{}, source, target, "copy", &ExtensionSpec{OutputExt: ".txt"}, ExtraSyncOptions{Force: true, Protected: map[string]bool{output: true}})
+	result, err := SyncExtraTarget(config.ExtraConfig{}, config.ExtraTargetConfig{}, source, target, "copy", &ExtensionSpec{OutputExt: "txt"}, ExtraSyncOptions{Force: true, Protected: map[string]bool{output: true}})
 	if err != nil || result.Skipped != 1 || len(result.Errors) != 0 {
 		t.Fatalf("protected transform=%+v %v", result, err)
 	}

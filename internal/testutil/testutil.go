@@ -349,10 +349,13 @@ func (sb *Sandbox) ListDir(path string) []string {
 
 // IsolateNativeClients replaces inherited client overrides before any service runs.
 func (sb *Sandbox) IsolateNativeClients() {
+	// Synthetic HOME already isolates defaults. These overrides change Claude's
+	// file layout and make Pi and OMP share one directory, so scrub inherited ones.
+	sb.SetEnv("CLAUDE_CONFIG_DIR", "")
+	sb.SetEnv("PI_CODING_AGENT_DIR", "")
 	for key, dir := range map[string]string{
-		"CLAUDE_CONFIG_DIR": ".claude", "CODEX_HOME": ".codex",
+		"CODEX_HOME":   ".codex",
 		"COPILOT_HOME": ".copilot", "OPENCODE_CONFIG_DIR": ".config/opencode",
-		"PI_CODING_AGENT_DIR": ".pi/agent",
 	} {
 		sb.SetEnv(key, filepath.Join(sb.Home, filepath.FromSlash(dir)))
 	}

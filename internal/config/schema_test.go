@@ -486,17 +486,24 @@ func TestSchema_SharedPointerIsStrict(t *testing.T) {
 		t.Fatal(err)
 	}
 	var schema struct {
-		Properties map[string]struct {
-			AdditionalProperties bool                       `json:"additionalProperties"`
-			Required             []string                   `json:"required"`
-			Properties           map[string]json.RawMessage `json:"properties"`
-		} `json:"properties"`
+		Properties map[string]json.RawMessage `json:"properties"`
 	}
 	if err := json.Unmarshal(data, &schema); err != nil {
 		t.Fatal(err)
 	}
-	shared, ok := schema.Properties["shared"]
-	if !ok || shared.AdditionalProperties || !slices.Contains(shared.Required, "path") || len(shared.Properties) != 2 {
+	var shared struct {
+		AdditionalProperties bool                       `json:"additionalProperties"`
+		Required             []string                   `json:"required"`
+		Properties           map[string]json.RawMessage `json:"properties"`
+	}
+	raw, ok := schema.Properties["shared"]
+	if !ok {
+		t.Fatal("shared pointer schema missing")
+	}
+	if err := json.Unmarshal(raw, &shared); err != nil {
+		t.Fatal(err)
+	}
+	if shared.AdditionalProperties || !slices.Contains(shared.Required, "path") || len(shared.Properties) != 2 {
 		t.Fatal("shared pointer schema must require path and allow only path/skip")
 	}
 }

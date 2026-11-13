@@ -42,6 +42,8 @@ func TestSharedExtrasTwoMachinePullAndRepair(t *testing.T) {
 	testutil.RunGit(t, remote, "symbolic-ref", "HEAD", "refs/heads/"+branch)
 	testutil.RunGit(t, bRoot, "init")
 	testutil.ConfigureGitUser(t, bRoot)
+	testutil.RunGit(t, bRoot, "add", ".gitignore")
+	testutil.RunGit(t, bRoot, "commit", "-m", "fixture local root scaffold")
 	testutil.RunGit(t, bRoot, "remote", "add", "origin", remote)
 	activate(b)
 	b.RunCLI("pull").AssertSuccess(t)

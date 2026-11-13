@@ -118,6 +118,24 @@ func TestSharedPointerStrictAndFolded(t *testing.T) {
 	}
 }
 
+func TestSharedPointerSavePortableSpelling(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	for _, path := range []string{filepath.Join(sb.Home, "team.yaml"), filepath.ToSlash(filepath.Join(sb.Home, "team.yaml")), "~/team.yaml", "./team.yaml"} {
+		payload := &Config{Shared: &SharedPointer{Path: path}}
+		if err := sharedSavePayload(payload); err != nil {
+			t.Fatal(err)
+		}
+		want := "~/team.yaml"
+		if path == "./team.yaml" {
+			want = path
+		}
+		if payload.Shared.Path != want {
+			t.Fatalf("pointer %q saved as %q, want %q", path, payload.Shared.Path, want)
+		}
+	}
+}
+
 func TestSharedExtraPathTable(t *testing.T) {
 	want := []string{"source", "targets[].path", "targets[].extension"}
 	if !reflect.DeepEqual(sharedExtraPaths, want) {

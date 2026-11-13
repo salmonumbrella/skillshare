@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 
 	"skillshare/internal/sharedfile"
@@ -38,7 +39,7 @@ func sharedSavePayload(payload *Config) error {
 	if payload.Shared != nil {
 		pointer := *payload.Shared
 		if home, err := os.UserHomeDir(); err == nil {
-			pointer.Path = utils.FoldHomePathWith(pointer.Path, home)
+			pointer.Path = filepath.ToSlash(utils.FoldHomePathWith(filepath.FromSlash(pointer.Path), filepath.FromSlash(home)))
 		}
 		payload.Shared = &pointer
 	}

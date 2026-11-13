@@ -1,7 +1,7 @@
 // Hosted CI only. No inherited account, native-client, Git or product config.
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { cp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export const pins = {
@@ -95,7 +95,9 @@ export async function makeFixture(root, app, binary, names) {
     serverDone = new Promise(resolve => server.once('exit', resolve));
     server.on('error', error => { spawnError = error; });
     const startTime = (await readFile(`/proc/${server.pid}/stat`, 'utf8')).split(') ').pop().split(' ')[19];
-    await writeFile(path.join(root, 'server.json'), JSON.stringify({ pid: server.pid, binary, cwd: home, startTime }));
+    const recordTemp = path.join(root, 'server.json.tmp');
+    await writeFile(recordTemp, JSON.stringify({ pid: server.pid, binary, cwd: home, startTime }));
+    await rename(recordTemp, path.join(root, 'server.json'));
     server.stdout.on('data', data => log.push(data.toString()));
     server.stderr.on('data', data => log.push(data.toString()));
     const url = `http://127.0.0.1:${port}`;

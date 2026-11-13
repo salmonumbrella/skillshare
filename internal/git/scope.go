@@ -245,36 +245,16 @@ func (e *UnpushedConfigHistoryError) Error() string {
 // diffs check new resolutions without treating config inherited from upstream
 // as a new local change. The check never changes the index, worktree, or refs.
 func CheckUnpushedConfigHistory(dir string, opts install.ParseOptions) error {
-	head := gitenv.Command("rev-parse", "--verify", "--quiet", "HEAD")
-	head.Dir = dir
-	if err := head.Run(); err != nil {
-		var exit *exec.ExitError
-		if errors.As(err, &exit) && exit.ExitCode() == 1 {
-			return nil // no commits yet
-		}
+	args, stdin, rejected, err := unpushedRange(dir, opts)
+	if err != nil {
 		return fmt.Errorf("check config.yaml history: %w", err)
 	}
-	remote, branch := pushTarget(dir)
-	// Replacement refs change what log reads but not what push uploads.
-	args := []string{"--no-replace-objects", "log", "--format=%x00%h", "--full-history", "--root",
-		"-c", "--diff-filter=AMT", "--no-renames", "--no-show-signature", "--raw"}
-	cmd := gitenv.Command()
-	live, rejected, ok := liveRemoteCommits(dir, remote, branch, opts)
 	if rejected {
 		return nil
 	}
-	if ok {
-		args = append(args, "--stdin")
-		// "^<id>" lines, not "--not": git before 2.42 rejects options on stdin.
-		var revs strings.Builder
-		revs.WriteString("HEAD\n")
-		for _, id := range live {
-			revs.WriteString("^" + id + "\n")
-		}
-		cmd.Stdin = strings.NewReader(revs.String())
-	} else {
-		args = append(args, "HEAD", "--not", "--remotes="+remote)
-	}
+	args = append([]string{"--no-replace-objects", "log", "--format=%x00%h", "--full-history", "--root", "-c", "--diff-filter=AMT", "--no-renames", "--no-show-signature", "--raw"}, args...)
+	cmd := gitenv.Command()
+	cmd.Stdin = strings.NewReader(stdin)
 	cmd.Args = append(cmd.Args, append(args, "--", ":(top,literal)config.yaml")...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
@@ -301,6 +281,34 @@ func CheckUnpushedConfigHistory(dir string, opts install.ParseOptions) error {
 		return histErr
 	}
 	return nil
+}
+
+// unpushedRange selects exactly the objects PushArgs would upload, sharing the
+// existing live-remote reachability and replacement-ref policy with both guards.
+func unpushedRange(dir string, opts install.ParseOptions) (args []string, stdin string, rejected bool, err error) {
+	head := gitenv.Command("rev-parse", "--verify", "--quiet", "HEAD")
+	head.Dir = dir
+	if err := head.Run(); err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 {
+			return nil, "", true, nil
+		}
+		return nil, "", false, err
+	}
+	remote, branch := pushTarget(dir)
+	live, rejected, ok := liveRemoteCommits(dir, remote, branch, opts)
+	if rejected {
+		return nil, "", true, nil
+	}
+	if ok {
+		var revs strings.Builder
+		revs.WriteString("HEAD\n")
+		for _, id := range live {
+			revs.WriteString("^" + id + "\n")
+		}
+		return []string{"--stdin"}, revs.String(), false, nil
+	}
+	return []string{"HEAD", "--not", "--remotes=" + remote}, "", false, nil
 }
 
 // liveRemoteCommits returns the objects that the refs of every push URL of

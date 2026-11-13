@@ -386,6 +386,18 @@ func (s *Server) handleGitCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.cfg.CheckSharedWorktree(src); err != nil {
+		if !writeSharedError(w, err) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	if err := s.cfg.RecordSharedPointer(src, body.DryRun); err != nil {
+		if !writeSharedError(w, err) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
 	if s.rootScopeGuard(w, src, body.DryRun) {
 		return
 	}
@@ -472,6 +484,18 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.cfg.CheckSharedWorktree(src); err != nil {
+		if !writeSharedError(w, err) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	if err := s.cfg.RecordSharedPointer(src, body.DryRun); err != nil {
+		if !writeSharedError(w, err) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
 	if s.rootScopeGuard(w, src, body.DryRun) {
 		return
 	}
@@ -554,6 +578,12 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 // rootConfigHistoryGuard checks before staging and again before uploading, so
 // neither existing local commits nor newly created ones can publish config.yaml.
 func (s *Server) rootConfigHistoryGuard(w http.ResponseWriter, src string) bool {
+	if err := s.cfg.CheckSharedOutgoing(src, s.parseOpts()); err != nil {
+		if !writeSharedError(w, err) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return true
+	}
 	if s.cfg.GitRoot != "root" {
 		return false
 	}

@@ -104,3 +104,48 @@ func TestSharedLocalOverrideRemainsWritable(t *testing.T) {
 		t.Fatal("override changed shared file")
 	}
 }
+
+func TestSharedPublicationAPIRefusesBeforeStaging(t *testing.T) {
+	for _, scope := range []string{"skills", "agents", "extras", "root"} {
+		for _, push := range []bool{false, true} {
+			t.Run(scope+fmt.Sprint(push), func(t *testing.T) {
+				sb := testutil.NewSandbox(t)
+				defer sb.Cleanup()
+				shared := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
+				sb.WriteFile(shared, "version: 1\n")
+				sb.WriteConfig("source: " + filepath.ToSlash(sb.SourcePath) + "\nshared: {path: ./team.yaml}\ngit_root: " + scope + "\ntargets: {}\n")
+				cfg, err := config.LoadReadOnlyPath(sb.ConfigPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				dir := cfg.EffectiveGitRoot()
+				sb.WriteFile(filepath.Join(dir, "fixture.txt"), "fixture")
+				testutil.RunGit(t, dir, "init")
+				testutil.ConfigureGitUser(t, dir)
+				testutil.RunGit(t, dir, "add", "-A")
+				testutil.RunGit(t, dir, "commit", "-m", "initial fixture")
+				testutil.RunGit(t, dir, "remote", "add", "origin", filepath.Join(sb.Root, "remote.git"))
+				sb.WriteFile(shared, "version: 2\n")
+				cfg, err = config.LoadReadOnlyPath(sb.ConfigPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				s := New(cfg, "127.0.0.1:0", "", "")
+				before := testutil.RunGit(t, dir, "diff", "--cached", "--raw")
+				rr := httptest.NewRecorder()
+				r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
+				if push {
+					s.handlePush(rr, r)
+				} else {
+					s.handleGitCommit(rr, r)
+				}
+				if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), config.SharedUnavailable) {
+					t.Fatalf("response=%d %s", rr.Code, rr.Body.String())
+				}
+				if testutil.RunGit(t, dir, "diff", "--cached", "--raw") != before {
+					t.Fatal("API staged before refusal")
+				}
+			})
+		}
+	}
+}

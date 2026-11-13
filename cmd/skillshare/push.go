@@ -250,6 +250,14 @@ func cmdPush(args []string) (err error) {
 	if err := checkGitRepo(source, spinner); err != nil {
 		return err
 	}
+	if err := guardSharedWorktree(cfg, source, opts.dryRun); err != nil {
+		spinner.Fail("Cannot safely publish shared settings")
+		return err
+	}
+	if err := guardSharedOutgoing(cfg, source, parseOptsFromConfig(cfg)); err != nil {
+		spinner.Fail("Cannot safely publish shared history")
+		return err
+	}
 	if cfg.GitRoot == "root" {
 		if err := gitops.CheckUnpushedConfigHistory(source, parseOptsFromConfig(cfg)); err != nil {
 			spinner.Fail("Cannot safely push config.yaml history")
@@ -330,6 +338,17 @@ func cmdPush(args []string) (err error) {
 			ui.Row(ui.MarkOK, "Pull", pullSummary(info)+ui.Took(time.Since(pullStart)), width)
 			printCommitNotes(info.Commits)
 		}
+		if latest, loadErr := config.Load(); loadErr != nil {
+			return loadErr
+		} else {
+			cfg = latest
+		}
+		if err := guardSharedWorktree(cfg, source, opts.dryRun); err != nil {
+			return err
+		}
+		if err := guardSharedOutgoing(cfg, source, parseOptsFromConfig(cfg)); err != nil {
+			return err
+		}
 		// The pull may have brought in a remote-tracked config.yaml after the
 		// safety sweep ran; untrack it again so this push removes it remotely.
 		if cfg.GitRoot == "root" {
@@ -348,6 +367,18 @@ func cmdPush(args []string) (err error) {
 				ui.Note("Kept on disk; it holds machine-specific paths")
 			}
 		}
+	}
+
+	if latest, loadErr := config.Load(); loadErr != nil {
+		return loadErr
+	} else {
+		cfg = latest
+	}
+	if err := guardSharedWorktree(cfg, source, opts.dryRun); err != nil {
+		return err
+	}
+	if err := guardSharedOutgoing(cfg, source, parseOptsFromConfig(cfg)); err != nil {
+		return err
 	}
 
 	if cfg.GitRoot == "root" {

@@ -49,6 +49,10 @@ func cmdCommit(args []string) error {
 	if err := checkGitWorktree(source, spinner); err != nil {
 		return err
 	}
+	if err := guardSharedWorktree(cfg, source, opts.dryRun); err != nil {
+		spinner.Fail("Cannot safely publish shared settings")
+		return err
+	}
 
 	sweep := rootScopeSafetySweep(cfg, source, opts.dryRun)
 	if sweep.hasNotice() {

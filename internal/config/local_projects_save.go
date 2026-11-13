@@ -146,7 +146,7 @@ func PrepareProjectLayers(path string, cfg *Config, edit func(*ProjectLayers) er
 		next := *cfg
 		next.projectOverlay = nil
 		next.Projects = layers.Shared
-		if sharedBytes, err = serializeConfig(path, &next); err != nil {
+		if sharedBytes, err = serializeConfigSnapshot(&next, o.sharedRaw); err != nil {
 			c.Err = err
 			return c, err
 		}
@@ -179,6 +179,10 @@ func PrepareProjectLayers(path string, cfg *Config, edit func(*ProjectLayers) er
 		return local, nil
 	}
 	c = &SaveCandidate{Bytes: sharedBytes, Expanded: &next, path: path, check: o.check}
+	if err := c.prepareSharedHistory(o.sharedRaw); err != nil {
+		c.Err = err
+		return c, err
+	}
 	if localChanged {
 		// After config.yaml is replaced, the registry write expects the new bytes.
 		after := *o

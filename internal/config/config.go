@@ -921,12 +921,24 @@ func (c *Config) Save() error {
 	if c.PreserveTildeOnSave {
 		payload = payload.cloneForSave()
 	}
-	data, err := marshalConfigFile(path, payload, schemaComment)
+	previous, err := readConfigSnapshot(path)
+	if err != nil {
+		return err
+	}
+	data, err := marshalConfig(payload, schemaComment, previous)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
+	candidate := &SaveCandidate{path: path, Bytes: data, Expanded: c}
+	if err := candidate.prepareSharedHistory(previous); err != nil {
+		return err
+	}
+	if candidate.before != nil {
+		return candidate.Write()
+	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 	if err := os.WriteFile(path, data, 0644); err != nil {

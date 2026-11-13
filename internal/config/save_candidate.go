@@ -20,14 +20,17 @@ type SaveCandidate struct {
 	path     string
 	private  bool
 	check    func() error
-	// then is written after this candidate; noop marks a candidate whose
-	// files already hold Bytes, so Write does nothing.
-	then *SaveCandidate
-	noop bool
+	// before persists pointer history first; then persists the project registry
+	// afterwards. noop suppresses only this candidate's own file write.
+	before *SaveCandidate
+	then   *SaveCandidate
+	noop   bool
 }
 
 // Changed reports whether Write would change any file.
-func (c *SaveCandidate) Changed() bool { return !c.noop }
+func (c *SaveCandidate) Changed() bool {
+	return !c.noop || c.before != nil && c.before.Changed() || c.then != nil && c.then.Changed()
+}
 
 // PrepareSave runs Save's serializer without changing the caller or filesystem.
 // Existing comments, anchors and aliases participate in the effective result, so
@@ -38,17 +41,33 @@ func PrepareSave(path string, next *Config) (*SaveCandidate, error) {
 		c.Err = fmt.Errorf("cannot prepare a nil config")
 		return c, c.Err
 	}
-	data, err := serializeConfig(path, next)
+	previous, err := readConfigSnapshot(path)
+	if err != nil {
+		c.Err = err
+		return c, err
+	}
+	data, err := serializeConfigSnapshot(next, previous)
 	if err != nil {
 		c.Err = err
 		return c, c.Err
 	}
 	c.Bytes = data
 	c.Expanded, c.Err = decodeConfig(path, data, false)
+	if c.Err == nil {
+		c.Err = c.prepareSharedHistory(previous)
+	}
 	return c, c.Err
 }
 
 func serializeConfig(path string, next *Config) ([]byte, error) {
+	previous, err := readConfigSnapshot(path)
+	if err != nil {
+		return nil, err
+	}
+	return serializeConfigSnapshot(next, previous)
+}
+
+func serializeConfigSnapshot(next *Config, previous []byte) ([]byte, error) {
 	payload := next.withoutProjectTargets()
 	if err := sharedSavePayload(payload); err != nil {
 		return nil, err
@@ -64,15 +83,25 @@ func serializeConfig(path string, next *Config) ([]byte, error) {
 			Skills yaml.Node `yaml:"skills,omitempty"`
 		}{(*plain)(payload), payload.legacySkills}
 	}
-	data, err := marshalConfigFile(path, value, schemaComment)
+	data, err := marshalConfig(value, schemaComment, previous)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal config: %w", err)
 	}
 	return data, nil
 }
 
-// Check refuses a stale local-project snapshot before any detach or write.
+// Check refuses stale config, project or shared-state snapshots before a write.
 func (c *SaveCandidate) Check() error {
+	if err := c.checkOwn(); err != nil {
+		return err
+	}
+	if c.before != nil {
+		return c.before.Check()
+	}
+	return nil
+}
+
+func (c *SaveCandidate) checkOwn() error {
 	if c.Err != nil {
 		return c.Err
 	}
@@ -85,14 +114,21 @@ func (c *SaveCandidate) Check() error {
 // Write atomically persists the already prepared Bytes without serializing again.
 // Resolving the destination keeps a symlinked config linked to its shared file.
 func (c *SaveCandidate) Write() error {
-	if c.noop {
-		return c.Check()
-	}
-	if err := c.write(); err != nil {
+	if err := c.Check(); err != nil {
 		return err
 	}
+	if c.before != nil {
+		if err := c.before.Write(); err != nil {
+			return fmt.Errorf("before saving %s: %w", c.path, err)
+		}
+	}
+	if !c.noop {
+		if err := c.write(); err != nil {
+			return err
+		}
+	}
 	if c.then != nil {
-		if err := c.then.write(); err != nil {
+		if err := c.then.Write(); err != nil {
 			return fmt.Errorf("saved %s, but not %s: %w", c.path, c.then.path, err)
 		}
 	}
@@ -100,7 +136,7 @@ func (c *SaveCandidate) Write() error {
 }
 
 func (c *SaveCandidate) write() error {
-	if err := c.Check(); err != nil {
+	if err := c.checkOwn(); err != nil {
 		return err
 	}
 	dest, err := utils.ConfigWritePath(c.path, false)
@@ -141,7 +177,7 @@ func (c *SaveCandidate) write() error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("failed to close config: %w", err)
 	}
-	if err := c.Check(); err != nil {
+	if err := c.checkOwn(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp.Name(), dest); err != nil {

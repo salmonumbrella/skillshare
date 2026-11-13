@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"maps"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -16,7 +17,7 @@ func TestSharedSaveProperty(t *testing.T) {
 	for _, fold := range []bool{false, true} {
 		for _, operation := range []string{"save", "prepare", "projects", "updates"} {
 			t.Run(fmt.Sprint(fold, "/", operation), func(t *testing.T) {
-				sb, _ := sharedFixture(t, "extras: [{name: local, targets: []}]\n", "version: 1\nextras: [{name: rules, source: extras/rules, targets: [{path: ~/rules}]}]\n")
+				sb, _ := sharedFixture(t, fmt.Sprintf("preserve_tilde_on_save: %v\nextras: [{name: local, targets: []}]\n", fold), "version: 1\nextras: [{name: rules, source: extras/rules, targets: [{path: ~/rules}]}]\n")
 				sharedPath := filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml")
 				original := sha256.Sum256([]byte(sb.ReadFile(sharedPath)))
 				random := rand.New(rand.NewSource(42))
@@ -35,6 +36,14 @@ func TestSharedSaveProperty(t *testing.T) {
 					local := *cfg
 					local.sharedLayer = nil
 					local.Extras = append([]ExtraConfig(nil), cfg.Extras[1:]...)
+					if operation == "projects" {
+						local.Projects = maps.Clone(cfg.sharedProjectDeclarations())
+						if local.Projects == nil {
+							local.Projects = map[string]ManagedProject{}
+						}
+						local.Projects[filepath.Join(sb.Root, fmt.Sprintf("app-%d", i))] = ManagedProject{Targets: []string{"claude"}, Skills: &ResourceTargetConfig{}}
+						local.projectOverlay = nil
+					}
 					payload := local.withoutProjectTargets()
 					if fold {
 						payload = payload.cloneForSave()
@@ -78,10 +87,8 @@ func TestSharedSaveProperty(t *testing.T) {
 					if len(stored.Extras) != 1 || stored.Extras[0].Name != "local" {
 						t.Fatal("shared declarations leaked")
 					}
-					if operation == "save" || operation == "prepare" {
-						if !bytes.Equal(got, want) {
-							t.Fatalf("base bytes differ:\n%s\nwant:\n%s", got, want)
-						}
+					if !bytes.Equal(got, want) {
+						t.Fatalf("base bytes differ:\n%s\nwant:\n%s", got, want)
 					}
 					raw, err := os.ReadFile(sharedPath)
 					if err != nil || sha256.Sum256(raw) != original {

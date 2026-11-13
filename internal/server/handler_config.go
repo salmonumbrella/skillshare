@@ -204,9 +204,21 @@ func (s *Server) handlePutConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := os.WriteFile(path, []byte(body.Raw), 0644); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to write config: "+err.Error())
-		return
+	if s.IsProjectMode() {
+		if err := os.WriteFile(path, []byte(body.Raw), 0644); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to write config: "+err.Error())
+			return
+		}
+	} else {
+		// Preserve the lexical config path for relative shared pointers and state identity.
+		candidate, err := config.PrepareRawConfigSave(s.configPath(), []byte(body.Raw))
+		if err == nil {
+			err = candidate.Write()
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to write config: "+err.Error())
+			return
+		}
 	}
 
 	if err := s.reloadConfig(); err != nil {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -98,10 +99,10 @@ func Check(path string, data []byte) (*Document, *Unavailable) {
 			continue
 		}
 		reason := UnknownKey
-		if strings.Contains(later, " "+k.Value+" ") {
+		if slices.Contains(strings.Fields(later), k.Value) {
 			reason = NewerSection
 		}
-		if strings.Contains(machine, " "+k.Value+" ") {
+		if slices.Contains(strings.Fields(machine), k.Value) {
 			reason = MachineKey
 		}
 		return fail(reason, Finding{Line: k.Line, Column: k.Column, Key: k.Value})
@@ -143,7 +144,7 @@ func unknownField(n *yaml.Node, allowed string) *fieldFailure {
 	}
 	for i := 0; i < len(n.Content); i += 2 {
 		k, v := n.Content[i], n.Content[i+1]
-		if !strings.Contains(allowed, " "+k.Value+" ") {
+		if !slices.Contains(strings.Fields(allowed), k.Value) {
 			return &fieldFailure{UnknownKey, Finding{Line: k.Line, Column: k.Column, Key: k.Value}}
 		}
 		valid := v.Kind == yaml.ScalarNode && v.Tag == "!!str"

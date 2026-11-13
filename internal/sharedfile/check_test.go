@@ -23,6 +23,7 @@ func TestCheckReasons(t *testing.T) {
 		{"machine", "version: 1\nsources: {}", MachineKey},
 		{"unknown", "version: 1\ncolour: blue", UnknownKey},
 		{"nested", "version: 1\nextras: [{name: rules, remote: somewhere}]", UnknownKey},
+		{"combined key", "version: 1\nextras: [{name: rules, name source: ignored}]", UnknownKey},
 		{"target key", "version: 1\nextras: [{name: rules, targets: [{path: rules, colour: blue}]}]", UnknownKey},
 		{"list", "[one, two]", Parse},
 		{"empty", "", Parse},

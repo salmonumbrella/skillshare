@@ -2,6 +2,8 @@ package config
 
 import (
 	"bytes"
+	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -9,7 +11,10 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/gofrs/flock"
 	"gopkg.in/yaml.v3"
 	"skillshare/internal/sharedfile"
 	"skillshare/internal/utils"
@@ -28,15 +33,34 @@ type SharedReceipt struct {
 	Targets []SharedPlacedTarget `yaml:"targets,omitempty"`
 }
 type SharedPlacement struct {
-	Name        string        `yaml:"name"`
-	Declaration yaml.Node     `yaml:"declaration"`
-	Receipt     SharedReceipt `yaml:"receipt"`
+	Name           string        `yaml:"name"`
+	Declaration    yaml.Node     `yaml:"declaration"`
+	DeclarationDir string        `yaml:"declaration_dir,omitempty"`
+	Receipt        SharedReceipt `yaml:"receipt"`
+}
+
+// SharedExtraIntent is one native output awaiting its durable receipt. It holds
+// identities and native bookkeeping facts, never output or source content.
+type SharedExtraIntent struct {
+	Placement      SharedPlacement     `yaml:"placement"`
+	Relative       string              `yaml:"relative,omitempty"`
+	Effects        []SharedExtraEffect `yaml:"effects"`
+	Parents        map[string]string   `yaml:"parents,omitempty"`
+	MetadataBefore map[string]string   `yaml:"metadata_before,omitempty"`
+	MetadataAfter  map[string]string   `yaml:"metadata_after,omitempty"`
+	Fallback       bool                `yaml:"fallback,omitempty"`
+}
+type SharedExtraEffect struct {
+	Path   string `yaml:"path"`
+	Before string `yaml:"before"`
+	After  string `yaml:"after"`
 }
 type SharedState struct {
-	Version  int               `yaml:"version"`
-	Pointer  string            `yaml:"pointer,omitempty"`
-	Pointers []string          `yaml:"pointers,omitempty"`
-	Extras   []SharedPlacement `yaml:"extras,omitempty"`
+	Version  int                `yaml:"version"`
+	Pointer  string             `yaml:"pointer,omitempty"`
+	Pointers []string           `yaml:"pointers,omitempty"`
+	Extras   []SharedPlacement  `yaml:"extras,omitempty"`
+	Pending  *SharedExtraIntent `yaml:"pending,omitempty"`
 }
 type SharedStateFile struct {
 	State      SharedState
@@ -44,7 +68,89 @@ type SharedStateFile struct {
 	configPath string
 	roots      []string
 	raw        []byte
+	guard      *sharedWriteGuard
+	writeFault func() error
 }
+
+type sharedWriteGuard struct {
+	file           *SharedStateFile
+	leased, closed bool
+}
+
+func (g *sharedWriteGuard) acquire(ctx context.Context) (func(), error) {
+	if g.closed {
+		return nil, fmt.Errorf("shared state lease is closed")
+	}
+	if g.leased {
+		return func() {}, nil
+	}
+	f := g.file
+	if err := f.safePath(); err != nil {
+		return nil, err
+	}
+	if _, err := readSharedState(f.path); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(f.path), 0700); err != nil {
+		return nil, err
+	}
+	lockPath := strings.TrimSuffix(f.path, ".yaml") + ".lock"
+	if info, err := os.Lstat(lockPath); err == nil && !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("shared state lock must be a regular file")
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	lock := flock.New(lockPath, flock.SetPermissions(0600))
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ok, err := lock.TryLockContext(ctx, 50*time.Millisecond)
+	if err != nil || !ok {
+		_ = lock.Close()
+		if err == nil {
+			err = ctx.Err()
+		}
+		return nil, fmt.Errorf("shared state lock: %w", err)
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { _ = lock.Close() }) }
+	if err := f.safePath(); err != nil {
+		release()
+		return nil, err
+	}
+	if _, err := readSharedState(f.path); err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
+}
+
+// BeginSharedStateWrite leases one resolved config identity, then reloads it.
+// Read-only loads and candidate preparation do not acquire this lease.
+func BeginSharedStateWrite(ctx context.Context, configPath, gitRoot, sharedDir string) (*SharedStateFile, func(), error) {
+	f, err := LoadSharedState(configPath, gitRoot, sharedDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	release, err := f.guard.acquire(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	next, err := LoadSharedState(configPath, gitRoot, sharedDir)
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	if !utils.PathsEqual(next.path, f.path) {
+		release()
+		return nil, nil, fmt.Errorf("shared state identity changed; retry")
+	}
+	next.guard.leased = true
+	var once sync.Once
+	return next, func() { once.Do(func() { next.guard.closed = true; release() }) }, nil
+}
+
+// SetWriteFaultForTest injects a fault into this file's saves only.
+func (f *SharedStateFile) SetWriteFaultForTest(fault func() error) { f.writeFault = fault }
 
 func SharedStatePath(configPath string) (string, error) {
 	return sharedStatePath(configPath, runtime.GOOS)
@@ -64,6 +170,7 @@ func LoadSharedState(configPath, gitRoot, sharedDir string) (*SharedStateFile, e
 		return nil, err
 	}
 	f := &SharedStateFile{path: path, configPath: configPath, roots: []string{gitRoot, sharedDir}}
+	f.guard = &sharedWriteGuard{file: f}
 	if err := f.safePath(); err != nil {
 		return nil, err
 	}
@@ -148,9 +255,54 @@ func decodeSharedState(raw []byte) (SharedState, error) {
 	if state.Version != 1 {
 		return state, fmt.Errorf("unsupported machine-local shared state version")
 	}
-	for _, placement := range state.Extras {
+	placements := slices.Clone(state.Extras)
+	if p := state.Pending; p != nil {
+		placements = append(placements, p.Placement)
+		if len(p.Placement.Receipt.Targets) != 1 || p.Placement.DeclarationDir == "" || len(p.Effects) < 1 || len(p.Effects) > 2 {
+			return state, fmt.Errorf("invalid shared placement intent")
+		}
+		target := p.Placement.Receipt.Targets[0]
+		rel := filepath.FromSlash(p.Relative)
+		if !filepath.IsAbs(target.Path) || p.Relative != "" && (filepath.IsAbs(rel) || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+			return state, fmt.Errorf("invalid shared intent output")
+		}
+		output := target.Path
+		if p.Placement.Receipt.File != "" {
+			name := target.As
+			if name == "" {
+				name = p.Placement.Receipt.File
+			}
+			output = filepath.Join(output, name)
+		} else {
+			output = filepath.Join(output, rel)
+		}
+		if !utils.PathsEqual(p.Effects[0].Path, output) || !filepath.IsAbs(p.Placement.Receipt.Source) {
+			return state, fmt.Errorf("invalid shared intent destination")
+		}
+		for _, effect := range p.Effects {
+			if !filepath.IsAbs(effect.Path) || !sharedFingerprintValid(effect.Before) || !sharedFingerprintValid(effect.After) || effect.After == "absent" || effect.After == "directory" {
+				return state, fmt.Errorf("invalid shared intent fingerprint")
+			}
+		}
+		for path, fingerprint := range p.Parents {
+			if !filepath.IsAbs(path) || !sharedFingerprintValid(fingerprint) {
+				return state, fmt.Errorf("invalid shared intent parent")
+			}
+		}
+		for _, metadata := range []map[string]string{p.MetadataBefore, p.MetadataAfter} {
+			for name, fingerprint := range metadata {
+				if !slices.Contains([]string{"created", "restore", "restore-link", "restore-junction", "written", "import-base"}, name) || !sharedFingerprintValid(fingerprint) {
+					return state, fmt.Errorf("invalid shared intent metadata")
+				}
+			}
+		}
+	}
+	for _, placement := range placements {
 		if ValidateExtraName(placement.Name) != nil {
 			return state, fmt.Errorf("invalid shared placement name")
+		}
+		if placement.DeclarationDir != "" && !filepath.IsAbs(placement.DeclarationDir) {
+			return state, fmt.Errorf("invalid shared declaration directory")
 		}
 		// Reuse the portable validator so raw declaration nodes cannot hide unknown
 		// fields, aliases or invalid extras shapes inside a machine-local snapshot.
@@ -174,6 +326,20 @@ func decodeSharedState(raw []byte) (SharedState, error) {
 	return state, nil
 }
 
+func sharedFingerprintValid(value string) bool {
+	if value == "absent" || value == "directory" {
+		return true
+	}
+	if strings.HasPrefix(value, "link:") {
+		return len(value) > 5 && !strings.ContainsRune(value, 0)
+	}
+	if strings.HasPrefix(value, "file:") && len(value) == 69 {
+		_, err := hex.DecodeString(value[5:])
+		return err == nil
+	}
+	return false
+}
+
 func (f *SharedStateFile) RecordPointer(resolved string) {
 	if resolved != "" && !slices.Contains(f.State.Pointers, resolved) {
 		f.State.Pointers = append(f.State.Pointers, resolved)
@@ -190,6 +356,11 @@ func (f *SharedStateFile) stateCandidate() (*SaveCandidate, error) {
 	for i := range state.Extras {
 		state.Extras[i].Declaration = withoutSharedComments(state.Extras[i].Declaration)
 	}
+	if state.Pending != nil {
+		pending := *state.Pending
+		pending.Placement.Declaration = withoutSharedComments(pending.Placement.Declaration)
+		state.Pending = &pending
+	}
 	data, err := yaml.Marshal(state)
 	if err != nil {
 		return nil, fmt.Errorf("cannot encode machine-local shared state")
@@ -197,7 +368,8 @@ func (f *SharedStateFile) stateCandidate() (*SaveCandidate, error) {
 	if _, err := decodeSharedState(data); err != nil {
 		return nil, err
 	}
-	c := &SaveCandidate{path: f.path, Bytes: data, private: true}
+	c := &SaveCandidate{path: f.path, Bytes: data, private: true, guard: f.guard}
+	observed := bytes.Clone(f.raw)
 	c.check = func() error {
 		if err := f.safePath(); err != nil {
 			return err
@@ -206,7 +378,7 @@ func (f *SharedStateFile) stateCandidate() (*SaveCandidate, error) {
 		if err != nil {
 			return err
 		}
-		if (raw == nil) != (f.raw == nil) || !bytes.Equal(raw, f.raw) {
+		if (raw == nil) != (observed == nil) || !bytes.Equal(raw, observed) {
 			return fmt.Errorf("machine-local shared state changed; retry the command")
 		}
 		return nil
@@ -226,6 +398,11 @@ func withoutSharedComments(n yaml.Node) yaml.Node {
 	return n
 }
 func (f *SharedStateFile) Save() error {
+	if f.writeFault != nil {
+		if err := f.writeFault(); err != nil {
+			return err
+		}
+	}
 	candidate, err := f.stateCandidate()
 	if err != nil {
 		return err

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -92,9 +93,19 @@ func (c *Config) RecordSharedPointer(gitDir string, dryRun bool) error {
 	if !c.SharedEnabled() {
 		return nil
 	}
-	state, err := c.sharedStateForGit(gitDir)
+	var state *SharedStateFile
+	var err error
+	if dryRun {
+		state, err = c.sharedStateForGit(gitDir)
+	} else {
+		var release func()
+		state, release, err = BeginSharedStateWrite(context.Background(), ConfigPath(), gitDir, filepath.Dir(c.SharedStatus().Path))
+		if err == nil {
+			defer release()
+		}
+	}
 	if err != nil {
-		return err
+		return &SharedError{Code: SharedPublication, Path: c.SharedStatus().Path, Cause: err}
 	}
 	state.RecordPointer(c.SharedStatus().Path)
 	if dryRun {

@@ -2,16 +2,148 @@ package config
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 	"skillshare/internal/testutil"
 )
+
+func fixtureSharedIntent(t *testing.T, sb *testutil.Sandbox) *SharedExtraIntent {
+	t.Helper()
+	target := filepath.Join(sb.Home, "native")
+	return &SharedExtraIntent{Placement: SharedPlacement{
+		Name: "fromEnv", Declaration: fixtureDeclaration(t), DeclarationDir: filepath.Dir(sb.ConfigPath),
+		Receipt: SharedReceipt{Source: filepath.Join(sb.Home, "rules"), Targets: []SharedPlacedTarget{{Path: target, Mode: "copy"}}},
+	}, Relative: "guide.md", Effects: []SharedExtraEffect{{Path: filepath.Join(target, "guide.md"), Before: "absent", After: "file:" + strings.Repeat("a", 64)}}}
+}
+
+func TestSharedStateLeaseSerializesAndReleases(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.WriteConfig("targets: {}\n")
+	first, release, err := BeginSharedStateWrite(context.Background(), sb.ConfigPath, sb.SourcePath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, unlock, err := BeginSharedStateWrite(ctx, sb.ConfigPath, sb.SourcePath, ""); err == nil {
+		unlock()
+		t.Fatal("competing lease succeeded")
+	}
+	// A different config identity is independent while the first is leased.
+	_, otherRelease, err := BeginSharedStateWrite(context.Background(), filepath.Join(sb.Root, "other.yaml"), sb.SourcePath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRelease()
+	first.State.Pending = fixtureSharedIntent(t, sb)
+	if err := first.Save(); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	release()
+	if err := first.Save(); err == nil {
+		t.Fatal("closed lease allowed a write")
+	}
+	next, closeNext, err := BeginSharedStateWrite(context.Background(), sb.ConfigPath, sb.SourcePath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeNext()
+	if next.State.Pending == nil {
+		t.Fatal("leased reload lost pending receipt")
+	}
+	path, _ := SharedStatePath(sb.ConfigPath)
+	if _, err := os.Stat(strings.TrimSuffix(path, ".yaml") + ".lock"); err != nil {
+		t.Fatal("stable lock inode missing", err)
+	}
+}
+
+func TestSharedStateLeaseAliasAndStaleCandidates(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.WriteConfig("targets: {}\n")
+	stale, err := LoadSharedState(sb.ConfigPath, sb.SourcePath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := stale.stateCandidate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	leased, release, err := BeginSharedStateWrite(context.Background(), sb.ConfigPath, sb.SourcePath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	alias := filepath.Join(sb.Root, "alias.yaml")
+	if err := os.Symlink(sb.ConfigPath, alias); err != nil {
+		t.Skip("file links unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	if _, unlock, err := BeginSharedStateWrite(ctx, alias, sb.SourcePath, ""); !errors.Is(err, context.DeadlineExceeded) {
+		if err == nil {
+			unlock()
+		}
+		t.Fatalf("alias did not contend: %v", err)
+	}
+	leased.RecordPointer(filepath.Join(sb.Root, "team.yaml"))
+	if err := leased.Save(); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if err := stale.Save(); err == nil {
+		t.Fatal("stale direct save overwrote state")
+	}
+	if err := candidate.Write(); err == nil {
+		t.Fatal("prepared bytes silently refreshed")
+	}
+}
+
+func TestSharedIntentStrictOptionalFields(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	p := fixtureSharedIntent(t, sb)
+	state := SharedState{Version: 1, Pending: p}
+	raw, err := yaml.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodeSharedState(raw); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("managed content")) {
+		t.Fatal("payload in private intent")
+	}
+	for _, corrupt := range []func(*SharedExtraIntent){
+		func(p *SharedExtraIntent) { p.Relative = "../escape" },
+		func(p *SharedExtraIntent) { p.Effects[0].Path = filepath.Join(sb.Root, "elsewhere") },
+		func(p *SharedExtraIntent) { p.Effects[0].After = "file:invalid" },
+		func(p *SharedExtraIntent) { p.Placement.DeclarationDir = "relative" },
+		func(p *SharedExtraIntent) { p.MetadataAfter = map[string]string{"unrecognized": "absent"} },
+	} {
+		bad := fixtureSharedIntent(t, sb)
+		corrupt(bad)
+		data, err := yaml.Marshal(SharedState{Version: 1, Pending: bad})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := decodeSharedState(data); err == nil {
+			t.Fatalf("invalid intent accepted: %s", data)
+		}
+	}
+}
 
 func fixtureDeclaration(t *testing.T) yaml.Node {
 	t.Helper()

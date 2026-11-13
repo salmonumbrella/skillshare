@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"os"
@@ -25,6 +26,7 @@ type SaveCandidate struct {
 	before *SaveCandidate
 	then   *SaveCandidate
 	noop   bool
+	guard  *sharedWriteGuard
 }
 
 // Changed reports whether Write would change any file.
@@ -114,11 +116,43 @@ func (c *SaveCandidate) checkOwn() error {
 // Write atomically persists the already prepared Bytes without serializing again.
 // Resolving the destination keeps a symlinked config linked to its shared file.
 func (c *SaveCandidate) Write() error {
+	guard, err := c.writeGuard(nil)
+	if err != nil {
+		return err
+	}
+	if guard != nil {
+		release, err := guard.acquire(context.Background())
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
+	return c.writeChain()
+}
+
+func (c *SaveCandidate) writeGuard(found *sharedWriteGuard) (*sharedWriteGuard, error) {
+	if c == nil {
+		return found, nil
+	}
+	if c.guard != nil {
+		if found != nil && found != c.guard {
+			return nil, fmt.Errorf("incompatible shared state write guards")
+		}
+		found = c.guard
+	}
+	var err error
+	if found, err = c.before.writeGuard(found); err != nil {
+		return nil, err
+	}
+	return c.then.writeGuard(found)
+}
+
+func (c *SaveCandidate) writeChain() error {
 	if err := c.Check(); err != nil {
 		return err
 	}
 	if c.before != nil {
-		if err := c.before.Write(); err != nil {
+		if err := c.before.writeChain(); err != nil {
 			return fmt.Errorf("before saving %s: %w", c.path, err)
 		}
 	}
@@ -128,7 +162,7 @@ func (c *SaveCandidate) Write() error {
 		}
 	}
 	if c.then != nil {
-		if err := c.then.Write(); err != nil {
+		if err := c.then.writeChain(); err != nil {
 			return fmt.Errorf("saved %s, but not %s: %w", c.path, c.then.path, err)
 		}
 	}

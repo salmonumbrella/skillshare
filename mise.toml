@@ -1,6 +1,6 @@
 [tools]
-go = "1.25.5"
-pnpm = "10.28.0"
+go = "1.26.10"
+pnpm = "12.6.0"
 
 [tasks.help]
 description = "Show common development tasks"
@@ -22,6 +22,11 @@ echo "  mise run devc:down      # stop devcontainer"
 echo "  mise run devc:restart   # restart devcontainer"
 echo "  mise run devc:reset     # full reset (remove volumes)"
 echo "  mise run devc:status    # show devcontainer status"
+echo "  mise run verify         # host verify env: real AI CLIs, throwaway config"
+echo "  mise run verify:shell   # enter the verify env shell"
+echo "  mise run verify:down    # stop the verify dashboard"
+echo "  mise run verify:status  # show verify env paths and state"
+echo "  mise run verify:reset   # delete the throwaway HOME"
 echo "  mise run lint           # go vet"
 echo "  mise run fmt            # format Go files"
 echo "  mise run check          # fmt:check + lint + test"
@@ -40,7 +45,10 @@ echo "  docker compose -f docker-compose.sandbox.yml --profile dev up -d  # star
 
 [tasks.build]
 description = "Build the skillshare binary"
-run = "mkdir -p bin && go build -o bin/skillshare ./cmd/skillshare"
+run = """
+BINARY="${SKILLSHARE_BINARY:-bin/skillshare}"
+mkdir -p "$(dirname "$BINARY")" && go build -o "$BINARY" ./cmd/skillshare
+"""
 
 [tasks."build:meta"]
 description = "Build with version metadata"
@@ -53,7 +61,7 @@ run = "./scripts/build-windows.sh ${1:-}"
 [tasks.run]
 description = "Run skillshare help using the local binary"
 depends = ["build"]
-run = "./bin/skillshare --help"
+run = "${SKILLSHARE_BINARY:-./bin/skillshare} --help"
 
 [tasks.test]
 description = "Run unit and integration tests"
@@ -117,6 +125,26 @@ run = "./scripts/devc.sh reset"
 [tasks."devc:status"]
 description = "Show devcontainer status"
 run = "./scripts/devc.sh status"
+
+[tasks.verify]
+description = "Host verify env: real AI CLIs, throwaway config"
+run = "./scripts/verify.sh up"
+
+[tasks."verify:shell"]
+description = "Enter the verify env shell"
+run = "./scripts/verify.sh shell"
+
+[tasks."verify:down"]
+description = "Stop the verify dashboard"
+run = "./scripts/verify.sh down"
+
+[tasks."verify:status"]
+description = "Show verify env paths and state"
+run = "./scripts/verify.sh status"
+
+[tasks."verify:reset"]
+description = "Delete the throwaway HOME"
+run = "./scripts/verify.sh reset"
 
 [tasks."dev:docker"]
 description = "Go API in Docker + auto-rebuild (pair with: cd ui && pnpm run dev)"

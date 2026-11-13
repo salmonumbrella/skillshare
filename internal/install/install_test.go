@@ -1,14 +1,79 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
+
+func TestDiscoverSkills_RepoAgentsSkills(t *testing.T) {
+	orig := TargetDotDirs
+	TargetDotDirs = map[string]bool{".agents": true, ".claude": true}
+	defer func() { TargetDotDirs = orig }()
+
+	tests := []struct {
+		name   string
+		skills []string
+		ignore string
+		want   []string
+	}{
+		{
+			name:   "only .agents/skills",
+			skills: []string{".agents/skills/one", ".agents/skills/two", ".agents/other/no", ".agents/skills/one/.claude/skills/no"},
+			want:   []string{".agents/skills/one", ".agents/skills/two"},
+		},
+		{
+			name:   "skills and .agents/skills copies",
+			skills: []string{"skills/x", ".agents/skills/x"},
+			want:   []string{"skills/x"},
+		},
+		{
+			name:   ".agents/skills skill ignored",
+			skills: []string{".agents/skills/one", ".agents/skills/two"},
+			ignore: ".agents/skills/two\n",
+			want:   []string{".agents/skills/one"},
+		},
+		{
+			name:   "authored skills ignored",
+			skills: []string{"skills/x", ".agents/skills/x"},
+			ignore: "skills/x\n",
+			want:   nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := t.TempDir()
+			for _, p := range tt.skills {
+				dir := filepath.Join(repo, p)
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("# Skill"), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.ignore != "" {
+				if err := os.WriteFile(filepath.Join(repo, ".skillignore"), []byte(tt.ignore), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var got []string
+			for _, skill := range discoverSkills(repo, true) {
+				got = append(got, skill.Path)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("discoverSkills() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestDiscoverSkills_RootOnly(t *testing.T) {
 	// Setup: repo with SKILL.md at root only
@@ -77,6 +142,123 @@ func TestDiscoverSkills_RootAndChildren(t *testing.T) {
 	}
 }
 
+func TestDiscoverLocal_ExplicitSkillTarget_ReturnsOnlyRootSkill(t *testing.T) {
+	repoPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoPath, "SKILL.md"), []byte("---\nname: root\n---\n# Root"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	childDir := filepath.Join(repoPath, "skills", "child-skill")
+	if err := os.MkdirAll(childDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(childDir, "SKILL.md"), []byte("---\nname: child\n---\n# Child"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	agentsDir := filepath.Join(repoPath, "agents")
+	if err := os.MkdirAll(agentsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsDir, "helper.md"), []byte("# helper"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	discovery, err := DiscoverLocal(&Source{
+		Type:          SourceTypeLocalPath,
+		Raw:           repoPath + "/SKILL.md",
+		Path:          repoPath,
+		Name:          "root",
+		ExplicitSkill: true,
+	})
+	if err != nil {
+		t.Fatalf("DiscoverLocal() error = %v", err)
+	}
+
+	if len(discovery.Skills) != 1 {
+		t.Fatalf("expected explicit skill target to return 1 skill, got %d: %+v", len(discovery.Skills), discovery.Skills)
+	}
+	if discovery.Skills[0].Path != "." {
+		t.Fatalf("expected explicit skill target to keep root skill, got path %q", discovery.Skills[0].Path)
+	}
+	if len(discovery.Agents) != 0 {
+		t.Fatalf("expected explicit skill target to ignore agents, got %d", len(discovery.Agents))
+	}
+}
+
+// Regression: UI discover endpoint defers CleanupDiscovery; for local sources
+// RepoPath is the user's directory and must not be removed.
+func TestCleanupDiscovery_PreservesLocalSource(t *testing.T) {
+	repoPath := t.TempDir()
+	skillFile := filepath.Join(repoPath, "SKILL.md")
+	if err := os.WriteFile(skillFile, []byte("---\nname: keep-me\n---\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	discovery, err := DiscoverLocal(&Source{
+		Type: SourceTypeLocalPath,
+		Raw:  repoPath,
+		Path: repoPath,
+		Name: filepath.Base(repoPath),
+	})
+	if err != nil {
+		t.Fatalf("DiscoverLocal: %v", err)
+	}
+	if discovery.RepoPath != repoPath {
+		t.Fatalf("RepoPath = %q, want %q", discovery.RepoPath, repoPath)
+	}
+
+	CleanupDiscovery(discovery)
+
+	if _, err := os.Stat(skillFile); err != nil {
+		t.Fatalf("local source was removed after CleanupDiscovery: %v", err)
+	}
+}
+
+func TestCleanupDiscovery_SkipsWhenSourceNil(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "keep.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	CleanupDiscovery(&DiscoveryResult{RepoPath: dir, Source: nil})
+	if _, err := os.Stat(file); err != nil {
+		t.Fatalf("directory was removed when Source was nil: %v", err)
+	}
+}
+
+func TestCleanupDiscovery_LogsRemoveFailure(t *testing.T) {
+	var logs bytes.Buffer
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(oldLogger) })
+
+	oldRemove := removeTempRepoPath
+	removeTempRepoPath = func(path string) error {
+		if path != "/tmp/skillshare-discover-test" {
+			t.Fatalf("remove path = %q, want %q", path, "/tmp/skillshare-discover-test")
+		}
+		return errors.New("cleanup denied")
+	}
+	t.Cleanup(func() { removeTempRepoPath = oldRemove })
+
+	CleanupDiscovery(&DiscoveryResult{
+		RepoPath: "/tmp/skillshare-discover-test",
+		Source:   &Source{Type: SourceTypeGitHTTPS},
+	})
+
+	got := logs.String()
+	for _, want := range []string{
+		"failed to clean up temp repo",
+		`path=/tmp/skillshare-discover-test`,
+		`error="cleanup denied"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("log output %q does not contain %q", got, want)
+		}
+	}
+}
+
 func TestDiscoverSkills_ChildrenOnly(t *testing.T) {
 	// Setup: orchestrator repo with no root SKILL.md, only children
 	repoPath := t.TempDir()
@@ -120,10 +302,53 @@ func TestDiscoverSkills_SkipsGitDir(t *testing.T) {
 	}
 }
 
-func TestDiscoverSkills_FindsHiddenDirs(t *testing.T) {
+func TestDiscoverSkills_SkipsTargetDotDirs(t *testing.T) {
+	// Simulate target dotdirs being set (as main.go does at startup)
+	origDirs := TargetDotDirs
+	TargetDotDirs = map[string]bool{".claude": true, ".cursor": true, ".skillshare": true}
+	defer func() { TargetDotDirs = origDirs }()
+
+	repoPath := t.TempDir()
+
+	// Create source skills (should be found)
+	for _, name := range []string{"adapt", "polish"} {
+		dir := filepath.Join(repoPath, "source", "skills", name)
+		os.MkdirAll(dir, 0755)
+		os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: "+name+"\n---"), 0644)
+	}
+
+	// Create target directory copies (should be skipped)
+	for _, name := range []string{"adapt", "polish"} {
+		dir := filepath.Join(repoPath, ".claude", "skills", name)
+		os.MkdirAll(dir, 0755)
+		os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: "+name+"\n---"), 0644)
+	}
+
+	// Create .skillshare dir (should also be skipped)
+	os.MkdirAll(filepath.Join(repoPath, ".skillshare"), 0755)
+	os.WriteFile(filepath.Join(repoPath, ".skillshare", "config.yaml"), []byte(""), 0644)
+
+	skills := discoverSkills(repoPath, false)
+	if len(skills) != 2 {
+		t.Fatalf("expected 2 skills (source only), got %d: %v", len(skills), skills)
+	}
+	for _, s := range skills {
+		if strings.HasPrefix(s.Path, ".claude") {
+			t.Errorf("found target dir skill that should have been skipped: %s", s.Path)
+		}
+	}
+}
+
+func TestDiscoverSkills_FindsNonTargetHiddenDirs(t *testing.T) {
+	// Simulate target dotdirs being set
+	origDirs := TargetDotDirs
+	TargetDotDirs = map[string]bool{".claude": true, ".cursor": true}
+	defer func() { TargetDotDirs = origDirs }()
+
 	repoPath := t.TempDir()
 
 	// Create hidden dirs with skills (like openai/skills .curated/, .system/)
+	// These are NOT target dirs and should be discovered.
 	for _, name := range []string{".curated", ".system"} {
 		dir := filepath.Join(repoPath, name, "skill-a")
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -143,9 +368,49 @@ func TestDiscoverSkills_FindsHiddenDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Create .claude target dir (should be skipped)
+	dir := filepath.Join(repoPath, ".claude", "skills", "my-skill")
+	os.MkdirAll(dir, 0755)
+	os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: my-skill\n---"), 0644)
+
 	skills := discoverSkills(repoPath, false)
 	if len(skills) != 2 {
-		t.Fatalf("expected 2 skills from hidden dirs, got %d: %v", len(skills), skills)
+		t.Fatalf("expected 2 skills from non-target hidden dirs, got %d: %v", len(skills), skills)
+	}
+}
+
+func TestDiscover_ScansExplicitlyRequestedDotDirRoot(t *testing.T) {
+	origDirs := TargetDotDirs
+	TargetDotDirs = map[string]bool{".claude": true, ".cursor": true, ".skillshare": true}
+	defer func() { TargetDotDirs = origDirs }()
+
+	repoPath := t.TempDir()
+	dotDir := filepath.Join(repoPath, ".claude")
+
+	skillDir := filepath.Join(dotDir, "skills", "my-skill")
+	if err := os.MkdirAll(skillDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: my-skill\n---"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dotDir, "reviewer.md"), []byte("---\nname: reviewer\n---"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Walking the repo root must still skip the dot-dir.
+	if skills := discoverSkills(repoPath, false); len(skills) != 0 {
+		t.Fatalf("expected repo-root walk to skip .claude, got %d: %v", len(skills), skills)
+	}
+
+	// Walking the dot-dir itself is an explicit request and must resolve.
+	skills := discoverSkills(dotDir, false)
+	if len(skills) != 1 || skills[0].Path != "skills/my-skill" {
+		t.Fatalf("expected skills/my-skill from explicit .claude root, got %v", skills)
+	}
+	agents := scanAgentDir(dotDir, dotDir)
+	if len(agents) != 1 || agents[0].Name != "reviewer" {
+		t.Fatalf("expected reviewer agent from explicit .claude root, got %v", agents)
 	}
 }
 
@@ -313,6 +578,12 @@ func TestWrapGitError(t *testing.T) {
 			wantSubstr: "repository not found",
 		},
 		{
+			name:       "ssh publickey denied — suggests ssh -T",
+			stderr:     "git@git.company.com: Permission denied (publickey).\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+			err:        errors.New("exit status 128"),
+			wantSubstr: "Permission denied (publickey).\n       check your SSH key: ssh -T git@git.company.com",
+		},
+		{
 			name:       "empty stderr falls back to err",
 			stderr:     "",
 			err:        errors.New("exit status 1"),
@@ -324,9 +595,99 @@ func TestWrapGitError(t *testing.T) {
 			for k, v := range tt.envVars {
 				t.Setenv(k, v)
 			}
-			got := wrapGitError(tt.stderr, tt.err, tt.tokenAuth)
+			got := WrapGitError(tt.stderr, tt.err, tt.tokenAuth)
 			if !strings.Contains(got.Error(), tt.wantSubstr) {
-				t.Errorf("wrapGitError() = %q, want substring %q", got.Error(), tt.wantSubstr)
+				t.Errorf("WrapGitError() = %q, want substring %q", got.Error(), tt.wantSubstr)
+			}
+		})
+	}
+}
+
+func TestExtractGitFatal(t *testing.T) {
+	tests := []struct {
+		name   string
+		stderr string
+		want   string
+	}{
+		{
+			name:   "fatal line only",
+			stderr: "fatal: repository not found",
+			want:   "repository not found",
+		},
+		{
+			name: "divergent branches with hints",
+			stderr: "hint: You have divergent branches and need to specify how to reconcile them.\n" +
+				"hint: You can do so by running one of the following commands:\n" +
+				"hint:\n" +
+				"hint:   git config pull.rebase false  # merge\n" +
+				"hint:   git config pull.rebase true   # rebase\n" +
+				"fatal: Need to specify how to reconcile divergent branches.",
+			want: "Need to specify how to reconcile divergent branches.",
+		},
+		{
+			name: "merge refusal keeps the listed files",
+			stderr: "error: Your local changes to the following files would be overwritten by merge:\n" +
+				"\tREADME.md\n\tSKILL.md\n" +
+				"Please commit your changes or stash them before you merge.\nAborting",
+			want: "Your local changes to the following files would be overwritten by merge: README.md, SKILL.md",
+		},
+		{
+			name:   "error prefix",
+			stderr: "error: cannot pull with rebase",
+			want:   "cannot pull with rebase",
+		},
+		{
+			name: "generic push error preserves earlier diagnostics",
+			stderr: "pre-push hook rejected branch\n" +
+				"error: failed to push some refs to 'https://github.com/org/repo.git'",
+			want: "pre-push hook rejected branch; error: failed to push some refs to 'https://github.com/org/repo.git'",
+		},
+		{
+			name:   "ssh publickey denied keeps reason",
+			stderr: "Cloning into '/tmp/x'...\ngit@git.company.com: Permission denied (publickey).\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+			want:   "Could not read from remote repository — git@git.company.com: Permission denied (publickey).",
+		},
+		{
+			name:   "ssh host key verification keeps reason",
+			stderr: "Host key verification failed.\r\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+			want:   "Could not read from remote repository — Host key verification failed.",
+		},
+		{
+			name:   "ssh unresolved hostname keeps reason",
+			stderr: "ssh: Could not resolve hostname git.company.com: Name or service not known\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+			want:   "Could not read from remote repository — ssh: Could not resolve hostname git.company.com: Name or service not known",
+		},
+		{
+			name:   "ssh connection refused skips known-hosts warning",
+			stderr: "ssh: connect to host git.company.com port 22: Connection refused\nwarning: unrelated\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+			want:   "Could not read from remote repository — ssh: connect to host git.company.com port 22: Connection refused",
+		},
+		{
+			name:   "ssh connection timed out keeps reason",
+			stderr: "ssh: connect to host git.company.com port 22: Operation timed out\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.\n",
+			want:   "Could not read from remote repository — ssh: connect to host git.company.com port 22: Operation timed out",
+		},
+		{
+			name:   "remote read failure without reason unchanged",
+			stderr: "fatal: Could not read from remote repository.",
+			want:   "Could not read from remote repository.",
+		},
+		{
+			name:   "no fatal or hint prefix",
+			stderr: "some other git output",
+			want:   "some other git output",
+		},
+		{
+			name:   "empty string",
+			stderr: "",
+			want:   "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractGitFatal(tt.stderr)
+			if got != tt.want {
+				t.Errorf("extractGitFatal() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -368,8 +729,8 @@ func TestUpdateTrackedRepo_BeforeHashFailure_FailsClosed(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when rollback commit cannot be determined")
 	}
-	if !strings.Contains(err.Error(), "failed to determine rollback commit before update") {
-		t.Fatalf("expected rollback commit error, got: %v", err)
+	if !strings.Contains(err.Error(), "cannot determine candidate base commit") {
+		t.Fatalf("expected candidate base commit error, got: %v", err)
 	}
 }
 

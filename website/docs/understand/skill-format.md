@@ -105,9 +105,20 @@ Tags are also searchable — `skillshare search workflow --hub ...` matches skil
 
 Restrict which targets this skill syncs to. When omitted, the skill syncs to **all** targets.
 
+Supports two placement styles — under `metadata:` (recommended) or at the top level:
+
 ```yaml
+# Recommended: under metadata
+metadata:
+  targets: [claude, cursor]
+
+# Legacy: top-level (still fully supported)
 targets: [claude, cursor]
 ```
+
+:::info Priority rule
+If both are present, `metadata.targets` takes priority over the top-level `targets`. This lets you migrate gradually — adding `metadata:` won't conflict with a leftover top-level field.
+:::
 
 | Value | Behavior |
 |-------|----------|
@@ -125,14 +136,35 @@ targets: [claude, cursor]
 ---
 name: claude-prompts
 description: Prompt patterns for Claude Code
-targets: [claude]
+metadata:
+  targets: [claude]
 ---
 
 # Claude Prompts
 ...
 ```
 
-This skill will only appear in Claude Code's skills directory, even if you have Cursor, Codex, and other targets configured.
+This skill will only appear in Claude Code's skills directory, even if you have Pi, Codex, and other targets configured.
+
+### `pattern`
+
+The structural design pattern used by this skill. Generated automatically by `skillshare new -P <pattern>`.
+
+```yaml
+pattern: reviewer
+```
+
+Available patterns: `tool-wrapper`, `generator`, `reviewer`, `inversion`, `pipeline`. See [Skill Design Patterns](/docs/understand/philosophy/skill-design-patterns) for details on each.
+
+### `category`
+
+The use-case category for this skill. Set interactively during `skillshare new` or omitted entirely.
+
+```yaml
+category: quality
+```
+
+Available categories: `library`, `verification`, `data`, `automation`, `scaffold`, `quality`, `cicd`, `runbook`, `infra`.
 
 ### `license`
 
@@ -151,9 +183,28 @@ This is purely informational — it does not block installation. Common values: 
 
 ---
 
-## Custom Metadata
+## The `metadata` Block
 
-You can add any custom fields:
+The `metadata:` block is a structured YAML object for deployment and behavioral fields. This aligns with the [Agent Skills ecosystem convention](https://developers.googleblog.com/en/5-agent-skill-design-patterns-every-adk-developer-should-know/) used across 30+ AI CLI tools.
+
+```yaml
+---
+name: my-skill
+description: My custom skill
+metadata:
+  targets: [claude]
+  pattern: reviewer
+  domain: python
+---
+```
+
+Currently, `targets` is the only `metadata` field that skillshare processes. Other fields (like `pattern`, `domain`, `interaction`) are preserved in the frontmatter but not used by skillshare — they may be consumed by other tools in the ecosystem.
+
+For backward compatibility, skillshare also reads a top-level `targets` field. If both are present, `metadata.targets` takes precedence.
+
+## Custom Fields
+
+You can add any custom top-level fields:
 
 ```yaml
 ---
@@ -164,7 +215,7 @@ version: 1.0.0
 ---
 ```
 
-Custom fields are stored in the frontmatter but not used by skillshare itself.
+Custom top-level fields are stored in the frontmatter but not used by skillshare itself.
 
 ---
 
@@ -212,23 +263,31 @@ Response: "The function looks correct but could benefit from type hints..."
 
 ---
 
-## Skill Metadata File
+## Centralized Metadata
 
-When you install a skill, skillshare creates a `.skillshare-meta.json` file:
+When you install a skill, skillshare records its metadata in `.metadata.json` (centralized for all skills):
 
 ```json
 {
-  "source": "anthropics/skills/skills/pdf",
-  "type": "github",
-  "installed_at": "2026-01-20T15:30:00Z",
-  "repo_url": "https://github.com/anthropics/skills.git",
-  "subdir": "skills/pdf",
-  "version": "abc1234"
+  "version": 1,
+  "entries": {
+    "pdf": {
+      "source": "anthropics/skills/skills/pdf",
+      "type": "github-subdir",
+      "installed_at": "2026-01-20T15:30:00Z",
+      "repo_url": "https://github.com/anthropics/skills.git",
+      "subdir": "skills/pdf",
+      "version": "abc1234"
+    }
+  }
 }
 ```
 
+Each skill entry includes:
+
 | Field | Description |
 |-------|-------------|
+| Entry key | Skill path relative to the source directory (for example `pdf` or `frontend/react-skill`) |
 | `source` | Original install source input |
 | `type` | Source type (`github`, `local`, etc.) |
 | `installed_at` | Installation timestamp |

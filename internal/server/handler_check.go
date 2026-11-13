@@ -1,13 +1,13 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"path/filepath"
-	"strings"
 
 	"skillshare/internal/check"
-	"skillshare/internal/git"
 	"skillshare/internal/install"
+	"skillshare/internal/sourcewalk"
 )
 
 type repoCheckResult struct {
@@ -23,158 +23,80 @@ type skillCheckResult struct {
 	Version     string `json:"version"`
 	Status      string `json:"status"`
 	InstalledAt string `json:"installed_at,omitempty"`
+	Kind        string `json:"kind,omitempty"`
+	Message     string `json:"message,omitempty"`
+}
+
+// planSkillCheck plans the update check of every installed skill outside a
+// followed checkout. It takes s.mu.RLock, so the caller must not hold s.mu.
+func (s *Server) planSkillCheck(sourceDir, projectRoot string, walk sourcewalk.Options) *check.Resolution {
+	names, _ := install.GetUpdatableSkills(sourceDir)
+	var skills []check.Skill
+	for _, name := range names {
+		if followedCheckout(filepath.Join(sourceDir, name), walk.Follow) != "" {
+			continue
+		}
+		skills = append(skills, check.Skill{Name: name, Entry: s.skillEntry(name), Dir: filepath.Join(sourceDir, name), Follow: walk.Follow})
+	}
+	return check.Plan(skills, projectRoot)
+}
+
+// dashboardSkillResults converts resolved statuses to the dashboard payload,
+// which is narrower than the CLI's: a skill without a remote carries only its
+// name, status and message.
+func dashboardSkillResults(results []check.SkillResult) []skillCheckResult {
+	out := make([]skillCheckResult, 0, len(results))
+	for _, r := range results {
+		if r.Local {
+			out = append(out, skillCheckResult{Name: r.Name, Status: r.Status, Message: r.Message})
+			continue
+		}
+		out = append(out, skillCheckResult{
+			Name:        r.Name,
+			Source:      r.Source,
+			Version:     r.Version,
+			Status:      r.Status,
+			InstalledAt: r.InstalledAt,
+			Message:     r.Message,
+		})
+	}
+	return out
+}
+
+// checkTrackedRepo checks one tracked repo with the same logic as the CLI:
+// auth-aware fetch and a reported dirty-check error.
+func checkTrackedRepo(name, repoPath string, parseOpts install.ParseOptions) repoCheckResult {
+	out := check.ParallelCheckRepos([]check.RepoCheckInput{{Name: name, RepoPath: repoPath, ParseOptions: parseOpts}}, nil)[0]
+	return repoCheckResult{Name: out.Name, Status: out.Status, Behind: out.Behind, Message: out.Message}
 }
 
 func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
-	sourceDir := s.cfg.Source
-	if s.IsProjectMode() {
-		sourceDir = filepath.Join(s.projectRoot, ".skillshare", "skills")
-	}
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
+	sourceDir := s.skillsSource()
+	projectRoot := s.projectRoot
+	walk := s.skillsWalk()
+	parseOpts := s.parseOpts()
+	s.mu.RUnlock()
 
-	repos, _ := install.GetTrackedRepos(sourceDir)
-	skills, _ := install.GetUpdatableSkills(sourceDir)
+	repos, linked := dashboardRepos(sourceDir, walk)
+	plan := s.planSkillCheck(sourceDir, projectRoot, walk)
 
 	var repoResults []repoCheckResult
 	for _, repo := range repos {
-		repoPath := filepath.Join(sourceDir, repo)
-		result := repoCheckResult{Name: repo}
-
-		if isDirty, _ := git.IsDirty(repoPath); isDirty {
-			result.Status = "dirty"
-			result.Message = "has uncommitted changes"
-		} else if behind, err := git.GetBehindCount(repoPath); err != nil {
-			result.Status = "error"
-			result.Message = err.Error()
-		} else if behind == 0 {
-			result.Status = "up_to_date"
-		} else {
-			result.Status = "behind"
-			result.Behind = behind
-		}
-
-		repoResults = append(repoResults, result)
+		repoResults = append(repoResults, checkTrackedRepo(repo, filepath.Join(sourceDir, repo), parseOpts))
 	}
 
-	// Group skills by repo URL for efficient checking
-	type skillWithMeta struct {
-		name string
-		meta *install.SkillMeta
-	}
-	urlGroups := make(map[string][]skillWithMeta)
-	var localResults []skillCheckResult
-
-	for _, skill := range skills {
-		skillPath := filepath.Join(sourceDir, skill)
-		meta, err := install.ReadMeta(skillPath)
-		if err != nil || meta == nil || meta.RepoURL == "" {
-			localResults = append(localResults, skillCheckResult{
-				Name:   skill,
-				Status: "local",
-			})
-			continue
-		}
-		urlGroups[meta.RepoURL] = append(urlGroups[meta.RepoURL], skillWithMeta{
-			name: skill,
-			meta: meta,
-		})
-	}
-
-	skillResults := append([]skillCheckResult{}, localResults...)
-
-	for url, group := range urlGroups {
-		// Get remote HEAD hash
-		remoteHash, err := git.GetRemoteHeadHash(url)
-
-		if err != nil {
-			for _, sw := range group {
-				r := skillCheckResult{
-					Name:    sw.name,
-					Source:  sw.meta.Source,
-					Version: sw.meta.Version,
-					Status:  "error",
-				}
-				if !sw.meta.InstalledAt.IsZero() {
-					r.InstalledAt = sw.meta.InstalledAt.Format("2006-01-02")
-				}
-				skillResults = append(skillResults, r)
-			}
-			continue
-		}
-
-		// Fast path: check if all skills match by commit hash
-		allMatch := true
-		for _, sw := range group {
-			if sw.meta.Version != remoteHash {
-				allMatch = false
-				break
-			}
-		}
-		if allMatch {
-			for _, sw := range group {
-				r := skillCheckResult{
-					Name:    sw.name,
-					Source:  sw.meta.Source,
-					Version: sw.meta.Version,
-					Status:  "up_to_date",
-				}
-				if !sw.meta.InstalledAt.IsZero() {
-					r.InstalledAt = sw.meta.InstalledAt.Format("2006-01-02")
-				}
-				skillResults = append(skillResults, r)
-			}
-			continue
-		}
-
-		// Slow path: HEAD moved — try tree hash comparison
-		var hasTreeHash bool
-		for _, sw := range group {
-			if sw.meta.TreeHash != "" && sw.meta.Subdir != "" {
-				hasTreeHash = true
-				break
-			}
-		}
-
-		var remoteTreeHashes map[string]string
-		if hasTreeHash {
-			remoteTreeHashes = check.FetchRemoteTreeHashes(url)
-		}
-
-		for _, sw := range group {
-			r := skillCheckResult{
-				Name:    sw.name,
-				Source:  sw.meta.Source,
-				Version: sw.meta.Version,
-			}
-			if !sw.meta.InstalledAt.IsZero() {
-				r.InstalledAt = sw.meta.InstalledAt.Format("2006-01-02")
-			}
-
-			if sw.meta.Version == remoteHash {
-				r.Status = "up_to_date"
-			} else if sw.meta.TreeHash != "" && sw.meta.Subdir != "" && remoteTreeHashes != nil {
-				normalizedSubdir := strings.TrimPrefix(sw.meta.Subdir, "/")
-				if rh, ok := remoteTreeHashes[normalizedSubdir]; ok && sw.meta.TreeHash == rh {
-					r.Status = "up_to_date"
-				} else {
-					r.Status = "update_available"
-				}
-			} else {
-				r.Status = "update_available"
-			}
-
-			skillResults = append(skillResults, r)
-		}
-	}
+	// Without a context the check runs to completion, so the error is always nil.
+	resolved, _ := plan.Run(context.Background(), check.Options{ParseOptions: parseOpts})
+	skillResults := dashboardSkillResults(resolved)
 
 	if repoResults == nil {
 		repoResults = []repoCheckResult{}
 	}
-	if skillResults == nil {
-		skillResults = []skillCheckResult{}
-	}
-
 	writeJSON(w, map[string]any{
 		"tracked_repos": repoResults,
+		"linked_repos":  linked,
 		"skills":        skillResults,
 	})
 }

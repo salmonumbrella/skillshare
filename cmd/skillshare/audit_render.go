@@ -2,12 +2,16 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
 	"skillshare/internal/audit"
+	"skillshare/internal/sourcewalk"
+	"skillshare/internal/theme"
 	"skillshare/internal/ui"
+	"skillshare/internal/utils"
 )
 
 // riskColor maps a risk label to an ANSI color, aligned with formatSeverity.
@@ -18,232 +22,328 @@ func riskColor(label string) string {
 	return ui.Dim
 }
 
+// auditTUIContext carries info needed to scan the "other" kind for TUI tab switching.
+type auditTUIContext struct {
+	kind             resourceKindFilter
+	sourcePath       string // skills source (always)
+	skillsWalk       sourcewalk.Options
+	agentsSourcePath string // agents source (always)
+	projectRoot      string
+	threshold        string
+	registry         *audit.Registry
+	mode             string
+	minSeverity      string
+	markAccepted     func(*audit.Result)
+}
+
 // presentAuditResults handles the common output path for audit scans:
-// prints per-skill list only when TUI is unavailable, always prints summary,
-// and launches TUI when conditions are met.
-func presentAuditResults(results []*audit.Result, elapsed []time.Duration, scanOutputs []audit.ScanOutput, summary auditRunSummary, jsonOutput bool, opts auditOptions, headerMinWidth int) error {
+// prints per-skill rows only when TUI is unavailable, always prints the
+// summary, and launches TUI when conditions are met.
+func presentAuditResults(results []*audit.Result, elapsed []time.Duration, scanOutputs []audit.ScanOutput, summary auditRunSummary, jsonOutput bool, opts auditOptions, took time.Duration, tuiCtx *auditTUIContext) error {
 	useTUI := !jsonOutput && shouldLaunchTUI(opts.NoTUI, nil) && len(results) > 1
 
 	if !jsonOutput {
+		kind := kindSkills
+		if tuiCtx != nil {
+			kind = tuiCtx.kind
+		}
+		flagged, blockedFlagged := "", false
 		if !useTUI {
 			// In batch mode (multiple results), only show skills with findings
 			// to avoid flooding the terminal. Use --quiet=false explicitly or
 			// single-skill mode to see clean results.
 			suppressClean := len(results) > 1
+			var shown []*audit.Result
+			var shownElapsed []time.Duration
 			for i, r := range results {
-				if len(r.Findings) > 0 || (!opts.Quiet && !suppressClean) {
-					printSkillResultLine(i+1, len(results), r, elapsed[i])
+				if !audit.HiddenByFloor(r, opts.MinSeverity) && (len(r.Findings) > 0 || (!opts.Quiet && !suppressClean)) {
+					shown = append(shown, r)
+					shownElapsed = append(shownElapsed, elapsed[i])
 				}
 			}
-			fmt.Println()
+			names := make([]string, len(shown))
+			// Point Next at the first blocked skill, else the first with findings.
+			for i, r := range shown {
+				names[i] = r.SkillName
+				if r.SkillName == audit.CrossSkillResultName || len(r.Findings) == 0 {
+					continue
+				}
+				if flagged == "" || (r.IsBlocked && !blockedFlagged) {
+					flagged, blockedFlagged = r.SkillName, r.IsBlocked
+				}
+			}
+			width := ui.RowWidth(names...)
+			for i, r := range shown {
+				printSkillResultLine(r, shownElapsed[i], width)
+			}
+			if len(shown) > 0 {
+				fmt.Println()
+			}
 		}
-		summaryLines := buildAuditSummaryLines(summary)
-		printAuditSummary(summary, summaryLines, headerMinWidth)
+		printAuditSummary(summary, kind)
+		printAuditDisplayCounts(results, opts.MinSeverity)
+		fmt.Println()
+		printAuditDone(summary, kind, "", took)
+		if flagged != "" {
+			ui.Next("skillshare audit "+flagged, "see its findings")
+		}
 	}
 
 	if useTUI {
-		return runAuditTUI(results, scanOutputs, summary)
+		// The warnings printed before the TUI are hidden while it is open.
+		summary.addSourceLinkWarnings(opts.skillsWalk)
+		if tuiCtx != nil {
+			tuiCtx.minSeverity = opts.MinSeverity
+			return launchAuditTUIWithTabs(results, scanOutputs, summary, tuiCtx)
+		}
+		return runAuditTUI(results, scanOutputs, summary, nil, nil, auditRunSummary{}, auditTabSkills, opts.MinSeverity)
 	}
 	return nil
 }
 
-// printSkillResultLine prints a single-line result for a skill during batch scan.
-func printSkillResultLine(index, total int, result *audit.Result, elapsed time.Duration) {
-	prefix := fmt.Sprintf("[%d/%d]", index, total)
-	name := result.SkillName
-	showTime := elapsed >= time.Second
-	timeStr := fmt.Sprintf("%.1fs", elapsed.Seconds())
-
-	if len(result.Findings) == 0 {
-		if ui.IsTTY() {
-			if showTime {
-				fmt.Printf("%s %s✓%s %s %s%s%s\n", prefix, ui.Green, ui.Reset, name, ui.Dim, timeStr, ui.Reset)
-			} else {
-				fmt.Printf("%s %s✓%s %s\n", prefix, ui.Green, ui.Reset, name)
-			}
-		} else {
-			if showTime {
-				fmt.Printf("%s ✓ %s %s\n", prefix, name, timeStr)
-			} else {
-				fmt.Printf("%s ✓ %s\n", prefix, name)
-			}
-		}
-		return
-	}
-
-	color := riskColor(result.RiskLabel)
-	symbol := "!"
-	if result.IsBlocked {
-		symbol = "✗"
-	}
-	maxSeverity := result.MaxSeverity()
-	if maxSeverity == "" {
-		maxSeverity = "NONE"
-	}
-	riskText := fmt.Sprintf("AGG %s %d/100, max %s", strings.ToUpper(result.RiskLabel), result.RiskScore, maxSeverity)
-
-	if ui.IsTTY() {
-		if showTime {
-			fmt.Printf("%s %s%s%s %s  %s(%s)%s  %s%s%s\n", prefix, color, symbol, ui.Reset, name, color, riskText, ui.Reset, ui.Dim, timeStr, ui.Reset)
-		} else {
-			fmt.Printf("%s %s%s%s %s  %s(%s)%s\n", prefix, color, symbol, ui.Reset, name, color, riskText, ui.Reset)
-		}
-	} else {
-		if showTime {
-			fmt.Printf("%s %s %s  (%s)  %s\n", prefix, symbol, name, riskText, timeStr)
-		} else {
-			fmt.Printf("%s %s %s  (%s)\n", prefix, symbol, name, riskText)
-		}
-	}
-}
-
-// printSkillResult prints detailed results for a single-skill audit.
-func printSkillResult(result *audit.Result, elapsed time.Duration) {
-	if len(result.Findings) == 0 {
-		ui.Success("No issues found in %s (%.1fs)", result.SkillName, elapsed.Seconds())
-		return
-	}
-
-	for _, f := range result.Findings {
-		sevLabel := formatSeverity(f.Severity)
-		loc := fmt.Sprintf("%s:%d", f.File, f.Line)
-		if ui.IsTTY() {
-			fmt.Printf("  %s: %s (%s)\n", sevLabel, f.Message, loc)
-			if meta := findingMetaCLI(f); meta != "" {
-				fmt.Printf("  %s[%s]%s\n", ui.Dim, meta, ui.Reset)
-			}
-			fmt.Printf("  %s\"%s\"%s\n\n", ui.Dim, f.Snippet, ui.Reset)
-		} else {
-			fmt.Printf("  %s: %s (%s)\n", f.Severity, f.Message, loc)
-			if meta := findingMetaCLI(f); meta != "" {
-				fmt.Printf("  [%s]\n", meta)
-			}
-			fmt.Printf("  \"%s\"\n\n", f.Snippet)
-		}
-	}
-
-	color := riskColor(result.RiskLabel)
-	threshold := result.Threshold
-	if threshold == "" {
-		threshold = audit.DefaultThreshold()
-	}
-	maxSeverity := result.MaxSeverity()
-	if maxSeverity == "" {
-		maxSeverity = "NONE"
-	}
-	decision := "ALLOW"
-	compare := "<"
-	if result.IsBlocked {
-		decision = "BLOCK"
-		compare = ">="
-	}
-	if ui.IsTTY() {
-		fmt.Printf("%s→%s Aggregate risk: %s%s (%d/100)%s\n", ui.Cyan, ui.Reset, color, strings.ToUpper(result.RiskLabel), result.RiskScore, ui.Reset)
-		fmt.Printf("%s→%s Auditable: %.0f%%\n", ui.Cyan, ui.Reset, result.Analyzability*100)
-		if !result.TierProfile.IsEmpty() {
-			fmt.Printf("%s→%s Commands: %s\n", ui.Cyan, ui.Reset, result.TierProfile.String())
-		}
-		fmt.Printf("%s→%s Block decision: %s (max severity %s %s threshold %s)\n", ui.Cyan, ui.Reset, decision, maxSeverity, compare, threshold)
-	} else {
-		fmt.Printf("→ Aggregate risk: %s (%d/100)\n", strings.ToUpper(result.RiskLabel), result.RiskScore)
-		fmt.Printf("→ Auditable: %.0f%%\n", result.Analyzability*100)
-		if !result.TierProfile.IsEmpty() {
-			fmt.Printf("→ Commands: %s\n", result.TierProfile.String())
-		}
-		fmt.Printf("→ Block decision: %s (max severity %s %s threshold %s)\n", decision, maxSeverity, compare, threshold)
-	}
-}
-
-// buildAuditSummaryLines builds the summary box lines (without printing).
-func buildAuditSummaryLines(summary auditRunSummary) []string {
-	var lines []string
-	maxSeverity := summary.MaxSeverity
-	if maxSeverity == "" {
-		maxSeverity = "NONE"
-	}
-	// -- Policy settings --
-	lines = append(lines, fmt.Sprintf("  Block:     severity >= %s", ui.Colorize(ui.SeverityColor(summary.Threshold), summary.Threshold)))
-	lines = append(lines, fmt.Sprintf("  Policy:    %s", formatPolicyLine(summary.PolicyProfile, summary.PolicyDedupe, summary.PolicyAnalyzers)))
-	lines = append(lines, fmt.Sprintf("  Max sev:   %s", ui.Colorize(ui.SeverityColor(maxSeverity), maxSeverity)))
-
-	// -- Result counts --
-	lines = append(lines, "")
-	lines = append(lines, fmt.Sprintf("  Scanned:   %d skill(s)", summary.Scanned))
-	lines = append(lines, fmt.Sprintf("  Passed:    %d", summary.Passed))
-	if summary.Warning > 0 {
-		lines = append(lines, fmt.Sprintf("  Warning:   %s", ui.Colorize(ui.Yellow, fmt.Sprintf("%d", summary.Warning))))
-	} else {
-		lines = append(lines, fmt.Sprintf("  Warning:   %d", summary.Warning))
-	}
-	if summary.Failed > 0 {
-		lines = append(lines, fmt.Sprintf("  Failed:    %s", ui.Colorize(ui.Red, fmt.Sprintf("%d", summary.Failed))))
-	} else {
-		lines = append(lines, fmt.Sprintf("  Failed:    %d", summary.Failed))
-	}
-
-	// -- Severity & threat breakdown --
-	lines = append(lines, "")
-	lines = append(lines, fmt.Sprintf("  Severity:  c/h/m/l/i = %s/%s/%s/%s/%s",
-		colorizeNonZero(summary.Critical, ui.SeverityColor("CRITICAL")),
-		colorizeNonZero(summary.High, ui.SeverityColor("HIGH")),
-		colorizeNonZero(summary.Medium, ui.SeverityColor("MEDIUM")),
-		colorizeNonZero(summary.Low, ui.SeverityColor("LOW")),
-		colorizeNonZero(summary.Info, ui.SeverityColor("INFO"))))
-	if ui.IsTTY() {
-		if threatsLine := formatCategoryBreakdownCLI(summary.ByCategory); threatsLine != "" {
-			lines = append(lines, fmt.Sprintf("  Threats:   %s", threatsLine))
-		}
-	} else {
-		if threatsLine := formatCategoryBreakdown(summary.ByCategory, false); threatsLine != "" {
-			lines = append(lines, fmt.Sprintf("  Threats:   %s", threatsLine))
-		}
-	}
-
-	// -- Aggregate risk --
-	lines = append(lines, "")
-	riskLabel := strings.ToUpper(summary.RiskLabel)
-	riskText := fmt.Sprintf("%s (%d/100)", riskLabel, summary.RiskScore)
-	lines = append(lines, fmt.Sprintf("  Aggregate: %s", ui.Colorize(riskColor(summary.RiskLabel), riskText)))
-	lines = append(lines, fmt.Sprintf("  Auditable: %.0f%% avg", summary.AvgAnalyzability*100))
-
-	// -- Note --
-	lines = append(lines, "")
-	lines = append(lines, "  Note:      Failed uses severity gate; aggregate is informational")
-	if summary.ScanErrors > 0 {
-		lines = append(lines, fmt.Sprintf("  Scan errs: %d", summary.ScanErrors))
-	}
-	return lines
-}
-
-// auditSummaryNoteLine is the longest fixed-content line in the summary box.
-const auditSummaryNoteLine = "  Note:      Failed uses severity gate; aggregate is informational"
-
-// auditHeaderMinWidth computes a minimum content width for the header box,
-// ensuring it is at least as wide as the summary box's fixed-content lines.
-func auditHeaderMinWidth(subtitle string) int {
-	minW := len(auditSummaryNoteLine)
-	for _, line := range strings.Split(subtitle, "\n") {
-		if w := ui.DisplayWidth(line); w > minW {
-			minW = w
-		}
-	}
-	return minW
-}
-
-// printAuditSummary prints the summary box with a shared minimum width.
-func printAuditSummary(_ auditRunSummary, lines []string, minWidth int) {
-	ui.BoxWithMinWidth("Summary", minWidth, lines...)
+// printAuditHeader names what the audit scans and the rules it applies.
+func printAuditHeader(mode, path, threshold, policyLine string) {
+	fmt.Println(theme.Primary().Bold(true).Render("Audit") + "  " + utils.FoldHomePath(path))
+	ui.Note(fmt.Sprintf("%s · blocks at %s · policy %s", mode, threshold, policyLine))
 	fmt.Println()
 }
 
-// colorizeNonZero returns a colored number string when n > 0, gray otherwise.
-func colorizeNonZero(n int, color string) string {
-	s := fmt.Sprintf("%d", n)
-	if n == 0 {
-		return ui.Colorize(ui.Dim, s)
+func launchAuditTUIWithTabs(results []*audit.Result, scanOutputs []audit.ScanOutput, summary auditRunSummary, ctx *auditTUIContext) error {
+	initialTab := auditTabSkills
+	if ctx.kind == kindAgents {
+		initialTab = auditTabAgents
 	}
-	return ui.Colorize(color, s)
+
+	// Scan the "other" kind for the second tab.
+	var otherResults []*audit.Result
+	var otherOutputs []audit.ScanOutput
+	var otherSummary auditRunSummary
+	otherScanErrors := 0
+
+	otherKindFilter := kindAgents
+	otherSource := ctx.agentsSourcePath
+	if ctx.kind == kindAgents {
+		otherKindFilter = kindSkills
+		otherSource = ctx.sourcePath
+	}
+
+	if otherSource != "" {
+		otherPaths, err := discoverForKind(otherKindFilter, otherSource, ctx.skillsWalk)
+		otherInputs := toInputsForKind(otherKindFilter, otherPaths)
+		if err != nil {
+			otherScanErrors++
+		}
+		if err == nil && len(otherPaths) > 0 {
+			otherScanResults := audit.ParallelScan(otherInputs, ctx.projectRoot, nil, ctx.registry, ctx.skillsWalk.Follow)
+			for i := range otherPaths {
+				if i < len(otherScanResults) {
+					sr := otherScanResults[i]
+					if sr.Err != nil {
+						otherScanErrors++
+						continue
+					}
+					sr.Result.Threshold = ctx.threshold
+					ctx.markAccepted(sr.Result)
+					sr.Result.IsBlocked = sr.Result.HasSeverityAtOrAbove(ctx.threshold)
+					sr.Result.Kind = otherKindFilter.SingularNoun()
+					if rel, relErr := filepath.Rel(otherSource, sr.Result.ScanTarget); relErr == nil {
+						sr.Result.SkillName = rel
+					}
+					otherResults = append(otherResults, sr.Result)
+					otherOutputs = append(otherOutputs, sr)
+				}
+			}
+			otherSummary = summarizeAuditResults(len(otherPaths), otherResults, ctx.threshold)
+			otherSummary.Mode = ctx.mode
+		}
+	}
+
+	otherSummary.ScanErrors = otherScanErrors
+	if otherKindFilter == kindSkills {
+		otherSummary.addSourceLinkWarnings(ctx.skillsWalk)
+	}
+
+	// Filter out synthetic _cross-skill result — it's not a real resource.
+	var filteredResults []*audit.Result
+	var filteredOutputs []audit.ScanOutput
+	for i, r := range results {
+		if r.SkillName != audit.CrossSkillResultName {
+			filteredResults = append(filteredResults, r)
+			if i < len(scanOutputs) {
+				filteredOutputs = append(filteredOutputs, scanOutputs[i])
+			}
+		}
+	}
+
+	// Arrange into skills vs agents.
+	var skillResults, agentResults []*audit.Result
+	var skillOutputs, agentOutputs []audit.ScanOutput
+	var skillSummary, agentSummary auditRunSummary
+
+	if ctx.kind == kindAgents {
+		agentResults, agentOutputs, agentSummary = filteredResults, filteredOutputs, summary
+		skillResults, skillOutputs, skillSummary = otherResults, otherOutputs, otherSummary
+	} else {
+		skillResults, skillOutputs, skillSummary = filteredResults, filteredOutputs, summary
+		agentResults, agentOutputs, agentSummary = otherResults, otherOutputs, otherSummary
+	}
+
+	return runAuditTUI(skillResults, skillOutputs, skillSummary, agentResults, agentOutputs, agentSummary, initialTab, ctx.minSeverity)
 }
+
+// printSkillResultLine prints a one-row result for a skill during batch scan.
+func printSkillResultLine(result *audit.Result, elapsed time.Duration, width int) {
+	took := ""
+	if elapsed >= time.Second {
+		took = ui.DimText(fmt.Sprintf(" · %.1fs", elapsed.Seconds()))
+	}
+	if len(result.Findings) == 0 {
+		ui.Row(ui.MarkOK, result.SkillName, took, width)
+		return
+	}
+	mark := ui.MarkWarn
+	if result.IsBlocked {
+		mark = ui.MarkFail
+	}
+	maxSeverity := result.MaxSeverity()
+	if maxSeverity == "" {
+		maxSeverity = "NONE"
+	}
+	value := formatSeverity(maxSeverity) + ui.DimText(fmt.Sprintf(" · risk %d/100", result.RiskScore)) + took
+	ui.Row(mark, result.SkillName, value, width)
+}
+
+// printSkillResult prints the findings of a single-skill audit, then its
+// risk, and closes with whether the skill is blocked.
+func printSkillResult(result *audit.Result, kind resourceKindFilter, elapsed time.Duration, floor string) {
+	printAuditDisplayCounts([]*audit.Result{result}, floor)
+	if len(result.Findings) == 0 {
+		printAuditCoverage(result.BinaryFiles, result.SkippedFiles, result.OversizedFiles, ui.RowWidth("Skipped"))
+		printAuditDone(auditRunSummary{Passed: 1, Threshold: result.Threshold}, kind, result.SkillName, elapsed)
+		return
+	}
+
+	for _, f := range audit.DisplayFindings(result.Findings, floor) {
+		pad := strings.Repeat(" ", max(0, len("CRITICAL")-len(f.Severity)))
+		fmt.Printf("%s%s  %s  %s\n", formatSeverity(f.Severity), pad, f.Message, ui.DimText(fmt.Sprintf("%s:%d", f.File, f.Line)))
+		if meta := findingMetaCLI(f); meta != "" {
+			ui.Note(meta)
+		}
+		ui.Note(fmt.Sprintf("%q", f.Snippet))
+		if note := audit.SeverityContextNote(f.SeverityContext); note != "" {
+			ui.Note(note)
+		}
+		if f.Acknowledged {
+			ui.Note(acceptedFindingNote)
+		}
+		fmt.Println()
+	}
+
+	labels := []string{"Risk", "Auditable"}
+	if !result.TierProfile.IsEmpty() {
+		labels = append(labels, "Commands")
+	}
+	width := ui.RowWidth(labels...)
+	ui.Row(ui.MarkNone, "Risk", ui.Colorize(riskColor(result.RiskLabel), fmt.Sprintf("%s %d/100", strings.ToUpper(result.RiskLabel), result.RiskScore)), width)
+	ui.Row(ui.MarkNone, "Auditable", fmt.Sprintf("%.0f%%", result.Analyzability*100), width)
+	printAuditCoverage(result.BinaryFiles, result.SkippedFiles, result.OversizedFiles, width)
+	if !result.TierProfile.IsEmpty() {
+		ui.Row(ui.MarkNone, "Commands", result.TierProfile.String(), width)
+	}
+
+	_, _, _, _, _, accepted := result.CountOpenBySeverity()
+	summary := auditRunSummary{Threshold: result.Threshold, Accepted: accepted}
+	if result.IsBlocked {
+		summary.Failed = 1
+	} else {
+		summary.Warning = 1
+	}
+	fmt.Println()
+	printAuditDone(summary, kind, result.SkillName, elapsed)
+}
+
+// printAuditSummary prints the counts, severities, threats and aggregate
+// risk of a batch scan. Zero counts are left out.
+func printAuditSummary(summary auditRunSummary, kind resourceKindFilter) {
+	// The audit header already leaves a blank line above.
+	fmt.Println(theme.Primary().Bold(true).Render("Summary"))
+	width := ui.RowWidth("Scanned", "Severity", "Scan errors")
+	ui.Row(ui.MarkNone, "Scanned", fmt.Sprintf("%d %s", summary.Scanned, kind.Noun(summary.Scanned)), width)
+	for _, c := range []struct {
+		mark, label string
+		n           int
+	}{
+		{ui.MarkOK, "Passed", summary.Passed},
+		{ui.MarkWarn, "Warning", summary.Warning},
+		{ui.MarkFail, "Failed", summary.Failed},
+		{ui.MarkFail, "Scan errors", summary.ScanErrors},
+	} {
+		if c.n > 0 {
+			ui.Row(c.mark, c.label, fmt.Sprintf("%d", c.n), width)
+		}
+	}
+	var severities []string
+	for _, s := range []struct {
+		label string
+		n     int
+	}{
+		{"CRITICAL", summary.Critical},
+		{"HIGH", summary.High},
+		{"MEDIUM", summary.Medium},
+		{"LOW", summary.Low},
+		{"INFO", summary.Info},
+	} {
+		if s.n > 0 {
+			severities = append(severities, ui.Colorize(ui.SeverityColor(s.label), fmt.Sprintf("%d %s", s.n, strings.ToLower(s.label))))
+		}
+	}
+	if len(severities) > 0 {
+		ui.Row(ui.MarkNone, "Severity", strings.Join(severities, ", "), width)
+	}
+	if summary.Accepted > 0 {
+		ui.Row(ui.MarkNone, "Accepted", plural(summary.Accepted, "finding")+ui.DimText(" · accepted earlier with --force"), width)
+	}
+	if threats := formatCategoryBreakdown(summary.ByCategory, false); threats != "" {
+		ui.Row(ui.MarkNone, "Threats", threats, width)
+	}
+	risk := ui.Colorize(riskColor(summary.RiskLabel), fmt.Sprintf("%s %d/100", strings.ToUpper(summary.RiskLabel), summary.RiskScore))
+	ui.Row(ui.MarkNone, "Risk", risk+ui.DimText(fmt.Sprintf(" · %.0f%% auditable", summary.AvgAnalyzability*100)), width)
+	printAuditCoverage(summary.BinaryFiles, summary.SkippedFiles, summary.OversizedFiles, width)
+}
+
+// printAuditDone closes an audit: blocked when a finding reaches the
+// threshold, a warning when findings stay below it, clean otherwise. name
+// is set for a single-skill audit.
+func printAuditDone(summary auditRunSummary, kind resourceKindFilter, name string, took time.Duration) {
+	scanned := plural(summary.Scanned, kind.SingularNoun())
+	if name != "" {
+		scanned = name
+	}
+	switch {
+	case summary.Failed > 0:
+		text := fmt.Sprintf("%s blocked: findings at %s or above", scanned, summary.Threshold)
+		if name == "" {
+			text = fmt.Sprintf("Blocked %d of %s: findings at %s or above", summary.Failed, scanned, summary.Threshold)
+		}
+		ui.Done(ui.MarkFail, text, took)
+		ui.Note("The risk score is informational; only the severity blocks")
+	case summary.Warning > 0:
+		below := "below " + summary.Threshold
+		if summary.Accepted > 0 {
+			below += " or accepted"
+		}
+		text := fmt.Sprintf("%s has findings %s", scanned, below)
+		if name == "" {
+			text = fmt.Sprintf("%d of %s with findings %s", summary.Warning, scanned, below)
+		}
+		ui.Done(ui.MarkWarn, text, took)
+	default:
+		ui.Done(ui.MarkOK, "No issues found in "+scanned, took)
+	}
+}
+
+// acceptedFindingNote marks a finding --respect-accepted no longer fails.
+const acceptedFindingNote = "accepted earlier with --force"
 
 // formatSeverity returns an ANSI-colored uppercase severity label.
 func formatSeverity(sev string) string {
@@ -313,39 +413,6 @@ func formatCategoryBreakdown(cats map[string]int, compact bool) string {
 	return strings.Join(parts, " ")
 }
 
-// formatCategoryBreakdownCLI formats a category count map as
-// "cat:N cat:N ..." for CLI summary box output. High-count categories
-// (>50) are bold white; the rest are dim. Returns "" if empty.
-func formatCategoryBreakdownCLI(cats map[string]int) string {
-	if len(cats) == 0 {
-		return ""
-	}
-	type catCount struct {
-		name  string
-		count int
-	}
-	sorted := make([]catCount, 0, len(cats))
-	for name, count := range cats {
-		sorted = append(sorted, catCount{name, count})
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].count != sorted[j].count {
-			return sorted[i].count > sorted[j].count
-		}
-		return sorted[i].name < sorted[j].name
-	})
-
-	parts := make([]string, len(sorted))
-	for i, cc := range sorted {
-		if cc.count > 50 {
-			parts[i] = fmt.Sprintf("%s%s%s:%d%s", ui.Bold, ui.White, cc.name, cc.count, ui.Reset)
-		} else {
-			parts[i] = fmt.Sprintf("%s%s:%d%s", ui.Dim, cc.name, cc.count, ui.Reset)
-		}
-	}
-	return strings.Join(parts, " ")
-}
-
 // formatCategoryBreakdownTUI formats a category count map as lipgloss-styled
 // "cat:N cat:N ..." using dim/emphasis (no per-category colors).
 // Uses compact short names. Returns "" if the map is empty.
@@ -375,62 +442,73 @@ func formatCategoryBreakdownTUI(cats map[string]int) string {
 			label = short
 		}
 		if cc.count > 50 {
-			parts[i] = tc.Emphasis.Bold(true).Render(label+":") + tc.Emphasis.Bold(true).Render(fmt.Sprintf("%d", cc.count))
+			parts[i] = theme.Primary().Bold(true).Render(label+":") + theme.Primary().Bold(true).Render(fmt.Sprintf("%d", cc.count))
 		} else {
-			parts[i] = tc.Dim.Render(label+":"+fmt.Sprintf("%d", cc.count))
+			parts[i] = theme.Dim().Render(label + ":" + fmt.Sprintf("%d", cc.count))
 		}
 	}
 	return strings.Join(parts, " ")
 }
 
 func printAuditHelp() {
-	fmt.Println(`Usage: skillshare audit [name...] [options]
-       skillshare audit --group <group> [options]
-       skillshare audit <path> [options]
+	printHelp("skillshare audit [agents] [name...] [options]\n       skillshare audit --group <group> [options]\n       skillshare audit <path> [options]", "Scan installed skills (or a specific skill/path) for security threats.\n\nIf no names or groups are specified, all installed skills are scanned.\nBlock decisions use severity threshold; aggregate risk score is reported separately.",
+		helpGroup{title: "Arguments", rows: []helpRow{
+			{"name...", "Skill name(s) to scan (optional)"},
+			{"path", "Existing file/directory path to scan (optional)"},
+		}},
+		helpGroup{title: "Options", rows: []helpRow{
+			{"-G, --group <name>", "Scan all skills in a group (repeatable)"},
+			{"-p, --project", "Use project-level skills"},
+			{"-g, --global", "Use global skills"},
+			{"-T, --threshold <t>", "Block by severity at/above: critical|high|medium|low|info\n(also supports c|h|m|l|i)"},
+			{"--min-severity <level>", "Display findings at/above: critical|high|medium|low|info\nDoes not change scores, gates, JSON or SARIF"},
+			{"--respect-accepted", "Do not fail on findings accepted earlier with --force\n(install/update); they are shown as accepted"},
+			{"--profile <p>", "Audit profile preset: default, strict, permissive"},
+			{"--dedupe <mode>", "Dedup mode: legacy, global (default)"},
+			{"--analyzer <id>", "Only run specified analyzer (repeatable)\nIDs: static, dataflow, tier, integrity, structure, cross-skill"},
+			{"--format <f>", "Output format: text (default), json, sarif, markdown"},
+			{"--json", "Output JSON (deprecated: use --format json)"},
+			{"-q, --quiet", "Only show skills with findings + summary (skip clean ✓ lines)"},
+			{"-y, --yes", "Skip large-audit confirmation prompt"},
+			{"--no-tui", "Disable interactive TUI, use plain text output"},
+			{"--init-rules", "Create a starter audit-rules.yaml"},
+		}},
+		helpGroup{title: "Commands", rows: []helpRow{
+			{"rules", "Browse, enable/disable rules (see: audit rules --help)"},
+		}},
+		helpExamples(
+			helpRow{"skillshare audit", "Scan all installed skills"},
+			helpRow{"skillshare audit react-patterns", "Scan a specific skill"},
+			helpRow{"skillshare audit a b c", "Scan multiple skills"},
+			helpRow{"skillshare audit --group frontend", "Scan all skills in frontend/"},
+			helpRow{"skillshare audit x -G backend", "Mix names and groups"},
+			helpRow{"skillshare audit ./skills/my-skill", "Scan a directory path"},
+			helpRow{"skillshare audit ./skills/foo/SKILL.md", "Scan a single file"},
+			helpRow{"skillshare audit --threshold high", "Block on HIGH+ findings"},
+			helpRow{"skillshare audit -T h", "Same, with shorthand alias"},
+			helpRow{"skillshare audit --respect-accepted", "Gate on findings not yet accepted"},
+			helpRow{"skillshare audit --format json", "Output machine-readable JSON"},
+			helpRow{"skillshare audit --format sarif", "Output SARIF 2.1.0 for GitHub Code Scanning"},
+			helpRow{"skillshare audit --format markdown", "Output Markdown report (for GitHub Issues/PRs)"},
+			helpRow{"skillshare audit --json", "Same as --format json (deprecated)"},
+			helpRow{"skillshare audit -p --init-rules", "Create project custom rules file"},
+			helpRow{"skillshare audit agents", "Scan agents only"},
+		),
+	)
+}
 
-Scan installed skills (or a specific skill/path) for security threats.
+// printAuditCoverage reports files that did not receive full text analysis.
+func printAuditCoverage(binary, skipped, oversized, width int) {
+	if skipped > 0 {
+		ui.Row(ui.MarkNone, "Skipped", fmt.Sprintf("%s (%d binary, %d oversized)", plural(skipped, "file"), binary, oversized), width)
+	}
+}
 
-If no names or groups are specified, all installed skills are scanned.
-Block decisions use severity threshold; aggregate risk score is reported separately.
-
-Arguments:
-  name...              Skill name(s) to scan (optional)
-  path                 Existing file/directory path to scan (optional)
-
-Options:
-  --group, -G <name>   Scan all skills in a group (repeatable)
-  -p, --project        Use project-level skills
-  -g, --global         Use global skills
-  --threshold, -T <t>  Block by severity at/above: critical|high|medium|low|info
-                       (also supports c|h|m|l|i)
-  --profile <p>        Audit profile preset: default, strict, permissive
-  --dedupe <mode>      Dedup mode: legacy, global (default)
-  --analyzer <id>      Only run specified analyzer (repeatable)
-                       IDs: static, dataflow, tier, integrity, structure, cross-skill
-  --format <f>         Output format: text (default), json, sarif, markdown
-  --json               Output JSON (deprecated: use --format json)
-  --quiet, -q          Only show skills with findings + summary (skip clean ✓ lines)
-  --yes, -y            Skip large-audit confirmation prompt
-  --no-tui             Disable interactive TUI, use plain text output
-  --init-rules         Create a starter audit-rules.yaml
-  -h, --help           Show this help
-
-Subcommands:
-  rules                Browse, enable/disable rules (see: audit rules --help)
-
-Examples:
-  skillshare audit                           # Scan all installed skills
-  skillshare audit react-patterns            # Scan a specific skill
-  skillshare audit a b c                     # Scan multiple skills
-  skillshare audit --group frontend          # Scan all skills in frontend/
-  skillshare audit x -G backend              # Mix names and groups
-  skillshare audit ./skills/my-skill         # Scan a directory path
-  skillshare audit ./skills/foo/SKILL.md     # Scan a single file
-  skillshare audit --threshold high          # Block on HIGH+ findings
-  skillshare audit -T h                      # Same, with shorthand alias
-  skillshare audit --format json              # Output machine-readable JSON
-  skillshare audit --format sarif            # Output SARIF 2.1.0 for GitHub Code Scanning
-  skillshare audit --format markdown         # Output Markdown report (for GitHub Issues/PRs)
-  skillshare audit --json                    # Same as --format json (deprecated)
-  skillshare audit -p --init-rules           # Create project custom rules file`)
+// printAuditDisplayCounts makes even an all-hidden report explicit.
+func printAuditDisplayCounts(results []*audit.Result, floor string) {
+	if floor == "" {
+		return
+	}
+	visible, hidden := audit.DisplayCounts(results, floor)
+	ui.Note(fmt.Sprintf("Findings: %d visible, %d hidden (minimum %s)", visible, hidden, floor))
 }

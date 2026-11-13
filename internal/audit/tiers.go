@@ -289,26 +289,7 @@ func DetectCommandTiers(content []byte) TierProfile {
 // DetectCommandTiersInMarkdown scans only fenced code blocks within Markdown content.
 func DetectCommandTiersInMarkdown(content []byte) TierProfile {
 	var profile TierProfile
-	text := string(content)
-	inCodeFence := false
-	fenceMarker := ""
-
-	for line := range strings.SplitSeq(text, "\n") {
-		if marker, ok := detectFenceMarker(line); ok {
-			if !inCodeFence {
-				inCodeFence = true
-				fenceMarker = marker
-			} else if marker == fenceMarker {
-				inCodeFence = false
-				fenceMarker = ""
-			}
-			continue
-		}
-		if !inCodeFence {
-			continue
-		}
-		classifyLineCommands(line, &profile)
-	}
+	scanFileUnifiedMarkdown(string(content), "", nil, &profile, false, false)
 	return profile
 }
 
@@ -355,4 +336,22 @@ func TierCombinationFindings(p TierProfile) []Finding {
 	}
 
 	return findings
+}
+
+// filterDisabledFindings drops findings whose RuleID is disabled (enabled: false
+// in audit-rules.yaml). Synthetic findings (tier/cross-skill) are generated
+// programmatically rather than compiled from the rule list, so they must honour
+// the disabled set here instead of being filtered at rule-compile time.
+func filterDisabledFindings(findings []Finding, disabled map[string]bool) []Finding {
+	if len(disabled) == 0 {
+		return findings
+	}
+	kept := findings[:0]
+	for _, f := range findings {
+		if disabled[f.RuleID] {
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return kept
 }

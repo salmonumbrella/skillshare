@@ -34,6 +34,8 @@ func TestSearchBatchGroupedInstall_MetadataSourceParseRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	initGitRepo(t, repoPath)
+	// The sources below pin -/tree/main/, so the branch must exist.
+	run(t, repoPath, "git", "branch", "-M", "main")
 
 	// Route GitLab clone URL to the local test repo so the test remains offline.
 	configureGitURLRewriteOrSkip(t, sb.Home, repoPath, "https://gitlab.com/team/monorepo.git")
@@ -79,19 +81,20 @@ func TestSearchBatchGroupedInstall_MetadataSourceParseRoundTrip(t *testing.T) {
 		}
 	}
 
+	store, storeErr := install.LoadMetadata(sb.SourcePath)
+	if storeErr != nil {
+		t.Fatalf("load metadata: %v", storeErr)
+	}
+
 	for _, name := range []string{"alpha-skill", "beta-skill"} {
-		skillPath := filepath.Join(sb.SourcePath, name)
-		meta, err := install.ReadMeta(skillPath)
-		if err != nil {
-			t.Fatalf("read meta for %s: %v", name, err)
-		}
-		if meta == nil {
+		entry := store.Get(name)
+		if entry == nil {
 			t.Fatalf("meta missing for %s", name)
 		}
 
-		parsed, err := install.ParseSource(meta.Source)
+		parsed, err := install.ParseSource(entry.Source)
 		if err != nil {
-			t.Fatalf("meta source for %s is not parseable: %q (%v)", name, meta.Source, err)
+			t.Fatalf("meta source for %s is not parseable: %q (%v)", name, entry.Source, err)
 		}
 		if parsed.CloneURL != "https://gitlab.com/team/monorepo.git" {
 			t.Fatalf("unexpected clone URL for %s: got %q", name, parsed.CloneURL)
@@ -99,7 +102,7 @@ func TestSearchBatchGroupedInstall_MetadataSourceParseRoundTrip(t *testing.T) {
 
 		wantSubdir := "skills/" + name
 		if parsed.Subdir != wantSubdir {
-			t.Fatalf("unexpected subdir for %s: got %q, want %q (source=%q)", name, parsed.Subdir, wantSubdir, meta.Source)
+			t.Fatalf("unexpected subdir for %s: got %q, want %q (source=%q)", name, parsed.Subdir, wantSubdir, entry.Source)
 		}
 	}
 }

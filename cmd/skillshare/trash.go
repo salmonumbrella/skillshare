@@ -3,13 +3,19 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"skillshare/internal/config"
+	"skillshare/internal/install"
 	"skillshare/internal/oplog"
+	"skillshare/internal/sourcewalk"
+	"skillshare/internal/theme"
 	"skillshare/internal/trash"
 	"skillshare/internal/ui"
+	"skillshare/internal/uninstall"
+	"skillshare/internal/utils"
 )
 
 func cmdTrash(args []string) error {
@@ -23,17 +29,14 @@ func cmdTrash(args []string) error {
 		return fmt.Errorf("cannot determine working directory: %w", err)
 	}
 
-	if mode == modeAuto {
-		if projectConfigExists(cwd) {
-			mode = modeProject
-		} else {
-			mode = modeGlobal
-		}
-	}
+	mode = resolveAutoMode(mode, cwd)
 
 	applyModeLabel(mode)
 
-	if len(rest) == 0 {
+	// Extract kind filter (e.g. "skillshare trash agents list" or "--all").
+	kind, rest := parseKindArgWithAll(rest)
+
+	if len(rest) == 0 || wantsHelp(rest) {
 		printTrashHelp()
 		return nil
 	}
@@ -54,13 +57,22 @@ func cmdTrash(args []string) error {
 
 	switch sub {
 	case "list", "ls":
-		return trashList(mode, cwd, noTUI)
+		return trashList(mode, cwd, noTUI, kind)
 	case "restore":
-		return trashRestore(mode, cwd, filteredArgs)
+		return trashRestore(mode, cwd, filteredArgs, kind)
 	case "delete", "rm":
-		return trashDelete(mode, cwd, filteredArgs)
+		return trashDelete(mode, cwd, filteredArgs, kind)
 	case "empty":
-		return trashEmpty(mode, cwd)
+		force := false
+		for _, arg := range filteredArgs {
+			switch arg {
+			case "--force", "-f":
+				force = true
+			default:
+				return fmt.Errorf("unknown option for trash empty: %s", arg)
+			}
+		}
+		return trashEmpty(mode, cwd, kind, force)
 	case "--help", "-h", "help":
 		printTrashHelp()
 		return nil
@@ -70,47 +82,91 @@ func cmdTrash(args []string) error {
 	}
 }
 
-func trashList(mode runMode, cwd string, noTUI bool) error {
-	trashBase := resolveTrashBase(mode, cwd)
-	items := trash.List(trashBase)
-
-	if len(items) == 0 {
-		ui.Info("Trash is empty")
-		return nil
-	}
-
-	// TUI dispatch: TTY + items + TUI enabled
+func trashList(mode runMode, cwd string, noTUI bool, kind resourceKindFilter) error {
+	// TUI path: merge skill + agent trash when kind includes both
 	if shouldLaunchTUI(noTUI, nil) {
+		var items []trash.TrashEntry
+
+		if kind.IncludesSkills() {
+			skillBase := resolveTrashBase(mode, cwd, kindSkills)
+			for _, e := range trash.List(skillBase) {
+				e.Kind = "skill"
+				items = append(items, e)
+			}
+		}
+		if kind.IncludesAgents() {
+			agentBase := resolveTrashBase(mode, cwd, kindAgents)
+			for _, e := range trash.List(agentBase) {
+				e.Kind = "agent"
+				items = append(items, e)
+			}
+		}
+
+		if len(items) == 0 {
+			ui.Done(ui.MarkNone, "Trash is empty", 0)
+			return nil
+		}
+
+		// Sort merged list by date (newest first)
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].Date.After(items[j].Date)
+		})
+
 		modeLabel := "global"
 		if mode == modeProject {
 			modeLabel = "project"
 		}
+		skillTrashBase := resolveTrashBase(mode, cwd, kindSkills)
+		agentTrashBase := resolveTrashBase(mode, cwd, kindAgents)
 		cfgPath := resolveTrashCfgPath(mode, cwd)
-		destDir, err := resolveSourceDir(mode, cwd)
+		destDir, err := resolveSourceDir(mode, cwd, kindSkills)
 		if err != nil {
 			return err
 		}
-		return runTrashTUI(items, trashBase, destDir, cfgPath, modeLabel)
+		agentDestDir, err := resolveSourceDir(mode, cwd, kindAgents)
+		if err != nil {
+			return err
+		}
+		follow, err := resolveTrashFollow(mode, cwd)
+		if err != nil {
+			return err
+		}
+		return runTrashTUI(items, skillTrashBase, agentTrashBase, destDir, agentDestDir, cfgPath, modeLabel, follow,
+			func() error { return reconcileRestoredSkills(mode, cwd) })
 	}
 
-	// Plain text output (--no-tui or non-TTY)
-	ui.Header("Trash")
+	// Plain text path (unchanged) — list single kind
+	trashBase := resolveTrashBase(mode, cwd, kind)
+	items := trash.List(trashBase)
+
+	if len(items) == 0 {
+		ui.Done(ui.MarkNone, "Trash is empty", 0)
+		return nil
+	}
+
+	names := make([]string, len(items))
+	for i, item := range items {
+		names[i] = item.Name
+	}
+	width := ui.RowWidth(names...)
+	fmt.Println(theme.Primary().Bold(true).Render("Trash"))
 	for _, item := range items {
-		age := time.Since(item.Date)
-		ageStr := formatAge(age)
-		sizeStr := formatBytes(item.Size)
-		ui.Info("  %s  (%s, %s ago)", item.Name, sizeStr, ageStr)
+		value := formatBytes(item.Size) + ui.DimText(" · "+timeAgo(item.Date))
+		if item.LinkTarget != "" {
+			value = "link → " + utils.FoldHomePath(item.LinkTarget) + ui.DimText(" · "+timeAgo(item.Date))
+		}
+		ui.Row(ui.MarkNone, item.Name, value, width)
 	}
 
 	totalSize := trash.TotalSize(trashBase)
 	fmt.Println()
-	ui.Info("%d item(s), %s total", len(items), formatBytes(totalSize))
-	ui.Info("Items are automatically cleaned up after 7 days")
+	ui.Done(ui.MarkNone, fmt.Sprintf("%s, %s", plural(len(items), "item"), formatBytes(totalSize)), 0)
+	ui.Note("Each item is removed for good 7 days after it was trashed")
 
 	return nil
 }
 
-func trashRestore(mode runMode, cwd string, args []string) error {
+func trashRestore(mode runMode, cwd string, args []string, kind resourceKindFilter) error {
 	start := time.Now()
 
 	var name string
@@ -136,7 +192,7 @@ func trashRestore(mode runMode, cwd string, args []string) error {
 
 	cfgPath := resolveTrashCfgPath(mode, cwd)
 
-	trashBase := resolveTrashBase(mode, cwd)
+	trashBase := resolveTrashBase(mode, cwd, kind)
 	entry := trash.FindByName(trashBase, name)
 	if entry == nil {
 		cmdErr := fmt.Errorf("'%s' not found in trash", name)
@@ -144,28 +200,45 @@ func trashRestore(mode runMode, cwd string, args []string) error {
 		return cmdErr
 	}
 
-	destDir, err := resolveSourceDir(mode, cwd)
+	destDir, err := resolveSourceDir(mode, cwd, kind)
 	if err != nil {
 		logTrashOp(cfgPath, "restore", 0, name, start, err)
 		return err
 	}
 
-	if err := trash.Restore(entry, destDir); err != nil {
-		logTrashOp(cfgPath, "restore", 0, name, start, err)
-		return err
+	if kind == kindAgents {
+		if err := uninstall.RestoreAgent(entry, destDir, nil); err != nil {
+			logTrashOp(cfgPath, "restore", 0, name, start, err)
+			return err
+		}
+	} else {
+		follow, err := resolveTrashFollow(mode, cwd)
+		if err != nil {
+			logTrashOp(cfgPath, "restore", 0, name, start, err)
+			return err
+		}
+		if err := uninstall.Restore(entry, destDir, follow, nil); err != nil {
+			logTrashOp(cfgPath, "restore", 0, name, start, err)
+			return err
+		}
+		if err := reconcileRestoredSkills(mode, cwd); err != nil {
+			logTrashOp(cfgPath, "restore", 0, name, start, err)
+			return err
+		}
 	}
 
-	ui.Success("Restored: %s", name)
-	age := time.Since(entry.Date)
-	ui.Info("Trashed %s ago, now back in %s", formatAge(age), destDir)
-	ui.SectionLabel("Next Steps")
-	ui.Info("Run 'skillshare sync' to update targets")
+	ui.Row(ui.MarkOK, "Restore", name+ui.DimText(" → "+utils.FoldHomePath(destDir)+" · trashed "+timeAgo(entry.Date)), ui.RowWidth("Restore"))
+	syncHint := "skillshare sync"
+	if kind == kindAgents {
+		syncHint = "skillshare sync agents"
+	}
+	ui.Next(syncHint, "link it into your targets again")
 
 	logTrashOp(cfgPath, "restore", 1, name, start, nil)
 	return nil
 }
 
-func trashDelete(mode runMode, cwd string, args []string) error {
+func trashDelete(mode runMode, cwd string, args []string, kind resourceKindFilter) error {
 	var name string
 	for _, arg := range args {
 		switch {
@@ -187,45 +260,47 @@ func trashDelete(mode runMode, cwd string, args []string) error {
 		return fmt.Errorf("skill name is required")
 	}
 
-	trashBase := resolveTrashBase(mode, cwd)
+	trashBase := resolveTrashBase(mode, cwd, kind)
 	entry := trash.FindByName(trashBase, name)
 	if entry == nil {
 		return fmt.Errorf("'%s' not found in trash", name)
 	}
 
-	if err := os.RemoveAll(entry.Path); err != nil {
+	if err := trash.Delete(entry.Path); err != nil {
 		return fmt.Errorf("failed to delete '%s': %w", name, err)
 	}
 
-	ui.Success("Permanently deleted: %s", name)
+	ui.Done(ui.MarkOK, "Permanently deleted "+name, 0)
 	return nil
 }
 
-func trashEmpty(mode runMode, cwd string) error {
+func trashEmpty(mode runMode, cwd string, kind resourceKindFilter, force bool) error {
 	start := time.Now()
 	cfgPath := resolveTrashCfgPath(mode, cwd)
 
-	trashBase := resolveTrashBase(mode, cwd)
+	trashBase := resolveTrashBase(mode, cwd, kind)
 	items := trash.List(trashBase)
 
 	if len(items) == 0 {
-		ui.Info("Trash is already empty")
+		ui.Done(ui.MarkNone, "Trash is already empty", 0)
 		return nil
 	}
 
-	ui.Warning("This will permanently delete %d item(s) from trash", len(items))
-	fmt.Print("Continue? [y/N]: ")
-	var input string
-	fmt.Scanln(&input)
-	input = strings.ToLower(strings.TrimSpace(input))
-	if input != "y" && input != "yes" {
-		ui.Info("Cancelled")
-		return nil
+	if !force {
+		ui.Warning("This will permanently delete %s from trash", plural(len(items), "item"))
+		ok, err := ui.ConfirmAction("Continue?", false)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			ui.Cancelled("deleted")
+			return nil
+		}
 	}
 
 	removed := 0
 	for _, item := range items {
-		if err := os.RemoveAll(item.Path); err != nil {
+		if err := trash.Delete(item.Path); err != nil {
 			cmdErr := fmt.Errorf("failed to delete '%s': %w", item.Name, err)
 			logTrashOp(cfgPath, "empty", removed, "", start, cmdErr)
 			return cmdErr
@@ -233,34 +308,84 @@ func trashEmpty(mode runMode, cwd string) error {
 		removed++
 	}
 
-	ui.Success("Emptied trash: %d item(s) permanently deleted", removed)
+	ui.Done(ui.MarkOK, fmt.Sprintf("Emptied trash: %s permanently deleted", plural(removed, "item")), time.Since(start))
 	logTrashOp(cfgPath, "empty", removed, "", start, nil)
 	return nil
 }
 
-func resolveTrashBase(mode runMode, cwd string) string {
+func resolveTrashBase(mode runMode, cwd string, kind resourceKindFilter) string {
+	if kind == kindAgents {
+		if mode == modeProject {
+			return trash.ProjectAgentTrashDir(cwd)
+		}
+		return trash.AgentTrashDir()
+	}
 	if mode == modeProject {
 		return trash.ProjectTrashDir(cwd)
 	}
 	return trash.TrashDir()
 }
 
-func resolveSourceDir(mode runMode, cwd string) (string, error) {
+// reconcileRestoredSkills puts restored project skills back in the project
+// config, lockfile and .gitignore, which uninstall dropped. Global mode keeps
+// them only in the metadata that restore already put back.
+func reconcileRestoredSkills(mode runMode, cwd string) error {
+	if mode != modeProject {
+		return nil
+	}
+	cfg, err := config.LoadProject(cwd)
+	if err != nil {
+		return fmt.Errorf("failed to load project config: %w", err)
+	}
+	source := cfg.EffectiveSkillsSource(cwd)
+	store, err := install.LoadMetadata(source)
+	if err != nil {
+		return err
+	}
+	return config.ReconcileProjectSkills(cwd, cfg, store, source)
+}
+
+func resolveTrashFollow(mode runMode, cwd string) (*sourcewalk.Follow, error) {
 	if mode == modeProject {
-		return fmt.Sprintf("%s/.skillshare/skills", cwd), nil
+		cfg, err := config.LoadProject(cwd)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load project config: %w", err)
+		}
+		return projectSkillsWalk(cwd, cfg).Follow, nil
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config: %w", err)
+	}
+	return cfg.SkillsWalk().Follow, nil
+}
+
+func resolveSourceDir(mode runMode, cwd string, kind resourceKindFilter) (string, error) {
+	if mode == modeProject {
+		projCfg, err := config.LoadProject(cwd)
+		if err != nil {
+			return "", fmt.Errorf("failed to load project config: %w", err)
+		}
+		if kind == kindAgents {
+			return projCfg.EffectiveAgentsSource(cwd), nil
+		}
+		return projCfg.EffectiveSkillsSource(cwd), nil
+	}
+	if kind == kindAgents {
+		cfg, err := config.Load()
+		if err != nil {
+			return "", fmt.Errorf("failed to load config: %w", err)
+		}
+		return cfg.EffectiveAgentsSource(), nil
 	}
 	cfg, err := config.Load()
 	if err != nil {
 		return "", fmt.Errorf("failed to load config: %w", err)
 	}
-	return cfg.Source, nil
+	return cfg.EffectiveSkillsSource(), nil
 }
 
 // formatAge is an alias for the shared formatDurationShort.
-func formatAge(d time.Duration) string {
-	return formatDurationShort(d)
-}
-
 func resolveTrashCfgPath(mode runMode, cwd string) string {
 	if mode == modeProject {
 		return config.ProjectConfigPath(cwd)
@@ -285,27 +410,31 @@ func logTrashOp(cfgPath string, action string, count int, name string, start tim
 }
 
 func printTrashHelp() {
-	fmt.Println(`Usage: skillshare trash <command> [options]
-
-Manage uninstalled skills in the trash.
-
-Commands:
-  list, ls              List trashed skills (interactive TUI in TTY)
-  restore <name>        Restore most recent trashed version to source
-  delete, rm <name>     Permanently delete a single item from trash
-  empty                 Permanently delete all items from trash
-
-Options:
-  --no-tui              Disable interactive TUI, use plain text output
-  --project, -p         Use project-level trash
-  --global, -g          Use global trash
-  --help, -h            Show this help
-
-Examples:
-  skillshare trash list                    # Interactive TUI (in TTY)
-  skillshare trash list --no-tui           # Plain text output
-  skillshare trash restore my-skill        # Restore from trash
-  skillshare trash restore my-skill -p     # Restore in project mode
-  skillshare trash delete my-skill         # Permanently delete from trash
-  skillshare trash empty                   # Empty the trash`)
+	printHelp("skillshare trash [agents] <command> [options]", "Manage uninstalled skills in the trash.",
+		helpGroup{title: "Commands", rows: []helpRow{
+			{"list, ls", "List trashed skills (interactive TUI in TTY)"},
+			{"restore <name>", "Restore most recent trashed version to source"},
+			{"delete, rm <name>", "Permanently delete a single item from trash"},
+			{"empty", "Permanently delete all items from trash"},
+		}},
+		helpGroup{title: "Options", rows: []helpRow{
+			{"-f, --force", "empty: skip the confirmation"},
+			{"--all", "Include both skills and agents"},
+			{"--no-tui", "Disable interactive TUI, use plain text output"},
+			{"-p, --project", "Use project-level trash"},
+			{"-g, --global", "Use global trash"},
+		}},
+		helpExamples(
+			helpRow{"skillshare trash list", "Interactive TUI (in TTY)"},
+			helpRow{"skillshare trash list --no-tui", "Plain text output"},
+			helpRow{"skillshare trash restore my-skill", "Restore from trash"},
+			helpRow{"skillshare trash restore my-skill -p", "Restore in project mode"},
+			helpRow{"skillshare trash delete my-skill", "Permanently delete from trash"},
+			helpRow{"skillshare trash empty", "Empty the trash"},
+			helpRow{"skillshare trash empty --force", "Empty without asking (scripts)"},
+			helpRow{"skillshare trash agents list", "List trashed agents"},
+			helpRow{"skillshare trash agents restore tutor", "Restore an agent from trash"},
+			helpRow{"skillshare trash --all list", "List trashed skills + agents"},
+		),
+	)
 }

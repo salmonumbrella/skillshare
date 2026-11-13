@@ -1,0 +1,74 @@
+{
+  "link.title.Learn": {
+    "message": "学习",
+    "description": "The title of the footer links column with title=Learn in the footer"
+  },
+  "link.title.How-To": {
+    "message": "操作指南",
+    "description": "The title of the footer links column with title=How-To in the footer"
+  },
+  "link.title.Reference": {
+    "message": "参考",
+    "description": "The title of the footer links column with title=Reference in the footer"
+  },
+  "link.title.Community": {
+    "message": "社区",
+    "description": "The title of the footer links column with title=Community in the footer"
+  },
+  "link.item.label.Getting Started": {
+    "message": "快速开始",
+    "description": "The label of footer link with label=Getting Started linking to /docs/getting-started"
+  },
+  "link.item.label.FAQ": {
+    "message": "常见问题",
+    "description": "The label of footer link with label=FAQ linking to /docs/troubleshooting/faq"
+  },
+  "link.item.label.Daily Workflow": {
+    "message": "日常工作流",
+    "description": "The label of footer link with label=Daily Workflow linking to /docs/how-to/daily-tasks/daily-workflow"
+  },
+  "link.item.label.Team Sharing": {
+    "message": "团队共享",
+    "description": "The label of footer link with label=Team Sharing linking to /docs/how-to/sharing/organization-sharing"
+  },
+  "link.item.label.Backup & Restore": {
+    "message": "备份与恢复",
+    "description": "The label of footer link with label=Backup & Restore linking to /docs/how-to/daily-tasks/backup-restore"
+  },
+  "link.item.label.Commands": {
+    "message": "命令",
+    "description": "The label of footer link with label=Commands linking to /docs/reference/commands"
+  },
+  "link.item.label.Targets": {
+    "message": "Targets",
+    "description": "The label of footer link with label=Targets linking to /docs/reference/targets"
+  },
+  "link.item.label.Environment Variables": {
+    "message": "环境变量",
+    "description": "The label of footer link with label=Environment Variables linking to /docs/reference/appendix/environment-variables"
+  },
+  "link.item.label.Troubleshooting": {
+    "message": "故障排查",
+    "description": "The label of footer link with label=Troubleshooting linking to /docs/troubleshooting"
+  },
+  "link.item.label.GitHub": {
+    "message": "GitHub",
+    "description": "The label of footer link with label=GitHub linking to https://github.com/runkids/skillshare"
+  },
+  "link.item.label.Issues": {
+    "message": "Issues",
+    "description": "The label of footer link with label=Issues linking to https://github.com/runkids/skillshare/issues"
+  },
+  "link.item.label.Discussions": {
+    "message": "Discussions",
+    "description": "The label of footer link with label=Discussions linking to https://github.com/runkids/skillshare/discussions"
+  },
+  "link.item.label.Blog": {
+    "message": "Blog",
+    "description": "The label of footer link with label=Blog linking to /blog"
+  },
+  "copyright": {
+    "message": "MIT License · Built with Docusaurus",
+    "description": "The footer copyright"
+  }
+}

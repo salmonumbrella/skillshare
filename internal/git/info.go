@@ -2,28 +2,33 @@ package git
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
+	"skillshare/internal/gitenv"
 	"skillshare/internal/install"
 )
 
 // DiffStats holds git diff statistics
 type DiffStats struct {
-	FilesChanged int
-	Insertions   int
-	Deletions    int
+	FilesChanged int `json:"filesChanged"`
+	Insertions   int `json:"insertions"`
+	Deletions    int `json:"deletions"`
 }
 
 // CommitInfo holds a single commit info
 type CommitInfo struct {
-	Hash    string
-	Message string
+	Hash    string `json:"hash"`
+	Message string `json:"message"`
 }
 
 // UpdateInfo holds info about changes from an update
@@ -40,7 +45,7 @@ var ErrNoRemoteBranches = errors.New("no remote branches found")
 
 // GetCurrentHash returns the current HEAD hash (short)
 func GetCurrentHash(repoPath string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--short", "HEAD")
+	cmd := gitenv.Command("rev-parse", "--short", "HEAD")
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -51,7 +56,7 @@ func GetCurrentHash(repoPath string) (string, error) {
 
 // GetCurrentFullHash returns the current HEAD hash (full 40-char).
 func GetCurrentFullHash(repoPath string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd := gitenv.Command("rev-parse", "HEAD")
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -62,7 +67,7 @@ func GetCurrentFullHash(repoPath string) (string, error) {
 
 // ResetHard resets the working tree to the given revision.
 func ResetHard(repoPath, rev string) error {
-	cmd := exec.Command("git", "reset", "--hard", rev)
+	cmd := gitenv.Command("reset", "--hard", rev)
 	cmd.Dir = repoPath
 	return cmd.Run()
 }
@@ -74,17 +79,17 @@ func Fetch(repoPath string) error {
 
 // FetchWithEnv runs git fetch with additional environment variables.
 func FetchWithEnv(repoPath string, extraEnv []string) error {
-	cmd := exec.Command("git", "fetch")
+	cmd := gitenv.Command("fetch")
 	cmd.Dir = repoPath
 	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
+		cmd.Env = append(cmd.Env, extraEnv...)
 	}
 	return cmd.Run()
 }
 
 // GetCommitsBetween returns commits between two refs
 func GetCommitsBetween(repoPath, from, to string) ([]CommitInfo, error) {
-	cmd := exec.Command("git", "-c", "color.ui=false", "log", "--oneline", from+".."+to)
+	cmd := gitenv.Command("-c", "color.ui=false", "log", "--oneline", from+".."+to)
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -110,7 +115,7 @@ func GetCommitsBetween(repoPath, from, to string) ([]CommitInfo, error) {
 
 // GetDiffStats returns diff statistics between two refs
 func GetDiffStats(repoPath, from, to string) (DiffStats, error) {
-	cmd := exec.Command("git", "diff", "--shortstat", from+".."+to)
+	cmd := gitenv.Command("diff", "--shortstat", from+".."+to)
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -157,14 +162,21 @@ func extractNumber(s string) int {
 }
 
 func runGitWithProgress(repoPath string, args []string, extraEnv []string, onProgress func(string)) error {
-	cmd := exec.Command("git", args...)
+	cmd := gitenv.Command(args...)
 	cmd.Dir = repoPath
 	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
+		cmd.Env = append(cmd.Env, extraEnv...)
 	}
 
+	tokenAuth := install.UsedTokenAuth(extraEnv)
+
 	if onProgress == nil {
-		return cmd.Run()
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			return install.WrapGitError(stderr.String(), err, tokenAuth)
+		}
+		return nil
 	}
 
 	stderrPipe, err := cmd.StderrPipe()
@@ -175,10 +187,20 @@ func runGitWithProgress(repoPath string, args []string, extraEnv []string, onPro
 		return err
 	}
 
-	if err := streamGitProgress(stderrPipe, onProgress); err != nil {
-		return err
+	var allStderr strings.Builder
+	captureProgress := func(line string) {
+		allStderr.WriteString(line)
+		allStderr.WriteByte('\n')
+		onProgress(line)
 	}
-	return cmd.Wait()
+	if scanErr := streamGitProgress(stderrPipe, captureProgress); scanErr != nil {
+		_ = cmd.Wait()
+		return scanErr
+	}
+	if err := cmd.Wait(); err != nil {
+		return install.WrapGitError(allStderr.String(), err, tokenAuth)
+	}
+	return nil
 }
 
 func streamGitProgress(stderr io.Reader, onProgress func(string)) error {
@@ -207,19 +229,18 @@ func scanGitProgress(data []byte, atEOF bool) (advance int, token []byte, err er
 	return 0, nil, nil
 }
 
-// Pull runs git pull and returns update info (quiet mode)
-func Pull(repoPath string) (*UpdateInfo, error) {
-	return PullWithEnv(repoPath, nil)
-}
-
 // PullWithAuth runs git pull with token auth env inferred from origin remote.
-func PullWithAuth(repoPath string) (*UpdateInfo, error) {
-	return PullWithEnv(repoPath, AuthEnvForRepo(repoPath))
+func PullWithAuth(repoPath string, opts install.ParseOptions) (*UpdateInfo, error) {
+	return PullWithEnv(repoPath, AuthEnvForRepo(repoPath, opts))
 }
 
 // PullWithProgress runs git pull and optionally streams progress lines to
 // onProgress when non-nil.
 func PullWithProgress(repoPath string, extraEnv []string, onProgress func(string)) (*UpdateInfo, error) {
+	return pullWithResolution(repoPath, extraEnv, onProgress, nil)
+}
+
+func pullWithResolution(repoPath string, extraEnv []string, onProgress func(string), resolution *PullResolution) (*UpdateInfo, error) {
 	info := &UpdateInfo{}
 
 	beforeHash, err := GetCurrentFullHash(repoPath)
@@ -227,13 +248,33 @@ func PullWithProgress(repoPath string, extraEnv []string, onProgress func(string
 		return nil, err
 	}
 	info.BeforeHash = beforeHash
+	restoreCheckout := install.GitCheckoutRecovery(repoPath, "@{upstream}")
 
-	args := []string{"pull", "--quiet"}
+	// Merge explicitly: without pull.rebase/pull.ff configured, git refuses to
+	// reconcile a branch that both this machine and the remote moved.
+	args := []string{"pull", "--no-rebase", "--ff", "--no-edit", "--quiet"}
 	if onProgress != nil {
-		args = []string{"pull", "--progress"}
+		args[len(args)-1] = "--progress"
 	}
 	if err := runGitWithProgress(repoPath, args, extraEnv, onProgress); err != nil {
-		return nil, err
+		conflicts := conflictedFiles(repoPath)
+		var conflictErr error
+		if len(conflicts) > 0 {
+			conflictErr = resolvePullConflicts(repoPath, conflicts, resolution)
+		}
+		if len(conflicts) == 0 || conflictErr != nil {
+			// A conflicted merge would leave markers that a later commit-all picks up.
+			abort := gitenv.Command("merge", "--abort")
+			abort.Dir = repoPath
+			abort.Run() // best-effort; fails harmlessly when no merge started
+			if after, _ := GetCurrentFullHash(repoPath); after == beforeHash {
+				restoreCheckout()
+			}
+			if len(conflicts) > 0 {
+				return nil, conflictErr
+			}
+			return nil, err
+		}
 	}
 
 	afterHash, err := GetCurrentFullHash(repoPath)
@@ -256,6 +297,52 @@ func PullWithProgress(repoPath string, extraEnv []string, onProgress func(string
 	return info, nil
 }
 
+// conflictedFiles lists the paths an in-progress merge left unmerged.
+func conflictedFiles(dir string) []string {
+	cmd := gitenv.Command("diff", "--name-only", "--diff-filter=U", "-z")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+}
+
+// resolveMetadataConflicts concludes a merge whose only conflicts are
+// .metadata.json files, merging them per entry (see install.MergeMetadata).
+// Both machines rewriting the shared file is the common case, not a real clash.
+func resolveMetadataConflicts(dir string, conflicts []string) error {
+	stage := func(n int, path string) []byte {
+		cmd := gitenv.Command("show", fmt.Sprintf(":%d:%s", n, path))
+		cmd.Dir = dir
+		out, _ := cmd.Output() // a missing stage (file absent on that side) reads as empty
+		return out
+	}
+	for _, path := range conflicts {
+		if filepath.Base(path) != install.MetadataFileName {
+			return fmt.Errorf("%s is not metadata", path)
+		}
+		merged, err := install.MergeMetadata(stage(1, path), stage(2, path), stage(3, path))
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, path), merged, 0644); err != nil {
+			return err
+		}
+		add := gitenv.Command("add", "--", path)
+		add.Dir = dir
+		if err := add.Run(); err != nil {
+			return err
+		}
+	}
+	commit := gitenv.Command("commit", "--no-edit")
+	commit.Dir = dir
+	return commit.Run()
+}
+
 // PullWithEnv runs git pull and returns update info (quiet mode) with
 // additional environment variables.
 func PullWithEnv(repoPath string, extraEnv []string) (*UpdateInfo, error) {
@@ -275,7 +362,7 @@ type FileChange struct {
 // Uses NUL-delimited output (-z) for safe handling of special filenames.
 func GetChangedFiles(repoPath, from, to string) ([]FileChange, error) {
 	// Get name-status with NUL delimiter
-	statusCmd := exec.Command("git", "diff", "--name-status", "-z", "-M", from+".."+to)
+	statusCmd := gitenv.Command("diff", "--name-status", "-z", "-M", from+".."+to)
 	statusCmd.Dir = repoPath
 	statusOut, err := statusCmd.Output()
 	if err != nil {
@@ -283,7 +370,7 @@ func GetChangedFiles(repoPath, from, to string) ([]FileChange, error) {
 	}
 
 	// Get numstat with NUL delimiter
-	numCmd := exec.Command("git", "diff", "--numstat", "-z", "-M", from+".."+to)
+	numCmd := gitenv.Command("diff", "--numstat", "-z", "-M", from+".."+to)
 	numCmd.Dir = repoPath
 	numOut, err := numCmd.Output()
 	if err != nil {
@@ -384,10 +471,14 @@ func GetChangedFiles(repoPath, from, to string) ([]FileChange, error) {
 
 // IsDirty checks if repo has uncommitted changes
 func IsDirty(repoPath string) (bool, error) {
-	cmd := exec.Command("git", "status", "--porcelain")
+	cmd := gitenv.Command("status", "--porcelain")
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && len(exitErr.Stderr) > 0 {
+			return false, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(exitErr.Stderr)))
+		}
 		return false, err
 	}
 	return strings.TrimSpace(string(out)) != "", nil
@@ -395,7 +486,7 @@ func IsDirty(repoPath string) (bool, error) {
 
 // GetDirtyFiles returns list of modified files
 func GetDirtyFiles(repoPath string) ([]string, error) {
-	cmd := exec.Command("git", "-c", "color.status=false", "status", "--short")
+	cmd := gitenv.Command("-c", "color.status=false", "status", "--short")
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -414,21 +505,29 @@ func GetDirtyFiles(repoPath string) ([]string, error) {
 
 // Restore discards all local changes
 func Restore(repoPath string) error {
-	cmd := exec.Command("git", "restore", ".")
+	cmd := gitenv.Command("restore", ".")
 	cmd.Dir = repoPath
 	return cmd.Run()
 }
 
 // IsRepo checks if the directory is a git repository
 func IsRepo(dir string) bool {
-	cmd := exec.Command("git", "rev-parse", "--git-dir")
+	cmd := gitenv.Command("rev-parse", "--git-dir")
 	cmd.Dir = dir
 	return cmd.Run() == nil
 }
 
+// IsInstalled reports whether the git executable is available on PATH. Every
+// other helper shells out to git, so callers can use this to surface a clear
+// "git is not installed" message instead of a raw exec error.
+func IsInstalled() bool {
+	_, err := exec.LookPath("git")
+	return err == nil
+}
+
 // HasRemote checks if the repo has at least one remote configured
 func HasRemote(dir string) bool {
-	cmd := exec.Command("git", "remote")
+	cmd := gitenv.Command("remote")
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
@@ -438,15 +537,18 @@ func HasRemote(dir string) bool {
 }
 
 // StageAll stages all changes (git add -A)
-func StageAll(dir string) error {
-	cmd := exec.Command("git", "add", "-A")
+func StageAll(dir, skills, operation string, warn func(string)) error {
+	for _, warning := range SourceLinkWarnings(dir, skills, operation) {
+		warn(warning)
+	}
+	cmd := gitenv.Command("add", "-A")
 	cmd.Dir = dir
 	return cmd.Run()
 }
 
 // Commit creates a commit with the given message
 func Commit(dir, msg string) error {
-	cmd := exec.Command("git", "commit", "-m", msg)
+	cmd := gitenv.Command("commit", "-m", msg)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -455,35 +557,195 @@ func Commit(dir, msg string) error {
 	return nil
 }
 
-// PushRemote pushes to the default remote
-func PushRemote(dir string) error {
-	return PushRemoteWithEnv(dir, nil)
-}
-
 // PushRemoteWithAuth pushes to the default remote with token auth env inferred
 // from origin remote.
-func PushRemoteWithAuth(dir string) error {
-	return PushRemoteWithEnv(dir, AuthEnvForRepo(dir))
+func PushRemoteWithAuth(dir string, opts install.ParseOptions) error {
+	return PushRemoteWithEnv(dir, AuthEnvForRepo(dir, opts))
 }
 
 // PushRemoteWithEnv pushes to the default remote with additional environment
-// variables.
+// variables, setting upstream on the first push (see PushArgs). Error output is
+// sanitized of credential values via WrapGitError.
 func PushRemoteWithEnv(dir string, extraEnv []string) error {
-	cmd := exec.Command("git", "push")
+	cmd := gitenv.Command(PushArgs(dir, extraEnv)...)
 	cmd.Dir = dir
-	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
-	}
-	out, err := cmd.CombinedOutput()
+	cmd.Env = append(append(cmd.Env, "LC_ALL=C"), extraEnv...)
+
+	var outBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &outBuf
+
+	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("git push failed: %s", strings.TrimSpace(string(out)))
+		wrapped := install.WrapGitError(outBuf.String(), err, install.UsedTokenAuth(extraEnv))
+		out := outBuf.String()
+		if strings.Contains(out, "[rejected]") && (strings.Contains(out, "fetch first") || strings.Contains(out, "non-fast-forward")) {
+			return fmt.Errorf("%w: %v", ErrPushRejected, wrapped)
+		}
+		return wrapped
 	}
 	return nil
 }
 
+// ErrPushRejected reports that the remote has commits this repository lacks,
+// so the push needs a pull first.
+var ErrPushRejected = errors.New("remote has commits this machine does not have; pull first, then push")
+
+// PushArgs returns the git push arguments for dir. The first push sets
+// upstream, targeting origin's default branch when it is named differently
+// from the local branch (origin is fetched to find it). Later pushes name a
+// upstream remote and branch explicitly, so push.default and remote.pushDefault
+// cannot send other branches or another remote than CheckUnpushedConfigHistory
+// checked.
+func PushArgs(dir string, extraEnv []string) []string {
+	local, err := GetCurrentBranch(dir)
+	if err != nil {
+		local = "main"
+	}
+	if !HasUpstream(dir) {
+		fetch := gitenv.Command("fetch", "origin")
+		fetch.Dir = dir
+		fetch.Env = append(fetch.Env, extraEnv...)
+		if fetch.Run() == nil {
+			if remote, err := GetRemoteDefaultBranch(dir); err == nil && remote != local {
+				return []string{"push", "-u", "origin", local + ":" + remote}
+			}
+		}
+		return []string{"push", "-u", "origin", local}
+	}
+	if remote, branch, ok := upstreamRef(dir, local); ok {
+		return []string{"push", remote, "HEAD:" + branch}
+	}
+	return []string{"push"}
+}
+
+// upstreamRef returns the remote and branch that local tracks. It reads the
+// branch config rather than splitting "remote/branch", so a remote or branch
+// name containing "/" stays intact.
+func upstreamRef(dir, local string) (remote, branch string, ok bool) {
+	get := func(key string) string {
+		cmd := gitenv.Command("config", "--get", "branch."+local+"."+key)
+		cmd.Dir = dir
+		out, _ := cmd.Output()
+		return strings.TrimSpace(string(out))
+	}
+	remote = get("remote")
+	branch = strings.TrimPrefix(get("merge"), "refs/heads/")
+	return remote, branch, remote != "" && branch != ""
+}
+
+// pushTarget returns where PushArgs sends HEAD: the upstream remote and
+// branch, or origin with an empty branch when @{u} does not resolve (the first
+// push, where PushArgs picks the branch after fetching).
+func pushTarget(dir string) (remote, branch string) {
+	if local, err := GetCurrentBranch(dir); err == nil && HasUpstream(dir) {
+		if remote, branch, ok := upstreamRef(dir, local); ok {
+			return remote, branch
+		}
+	}
+	return "origin", ""
+}
+
+// AheadCount returns how many commits on HEAD are not on any remote-tracking
+// branch, which is what a push would upload. It returns 0 when unknown, e.g.
+// before the first commit.
+func AheadCount(dir string) int {
+	cmd := gitenv.Command("rev-list", "--count", "HEAD", "--not", "--remotes")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(string(out)))
+	return n
+}
+
+// BehindCount returns how many upstream commits HEAD lacks, as of the last
+// fetch. It returns 0 when unknown, e.g. without an upstream.
+func BehindCount(dir string) int {
+	cmd := gitenv.Command("rev-list", "--count", "HEAD..@{u}")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(string(out)))
+	return n
+}
+
+// ErrMergeFailed reports that merging origin's history during a first pull
+// failed, usually on a conflict. The merge has been aborted.
+var ErrMergeFailed = errors.New("merging remote history failed")
+
+// ErrRemoteTracksConfig reports that the remote repository tracks config.yaml,
+// which would overwrite or corrupt machine-local configuration at root scope.
+var ErrRemoteTracksConfig = errors.New("remote tracks config.yaml")
+
+// FirstPull attaches a branch without upstream tracking to origin's default
+// branch. Local content is kept by merging the remote history (it may be
+// unrelated); with force, or with nothing local, the branch is reset to the
+// remote instead. Returns ErrNoRemoteBranches while origin is still empty.
+func FirstPull(dir string, force bool, opts install.ParseOptions) (*UpdateInfo, error) {
+	authEnv := AuthEnvForRepo(dir, opts)
+	fetch := gitenv.Command("fetch", "origin")
+	fetch.Dir = dir
+	fetch.Env = append(append(fetch.Env, "LC_ALL=C"), authEnv...)
+	if out, err := fetch.CombinedOutput(); err != nil {
+		return nil, install.WrapGitError(string(out), err, install.UsedTokenAuth(authEnv))
+	}
+
+	branch, err := GetRemoteDefaultBranch(dir)
+	if err != nil {
+		return nil, err
+	}
+	hasLocal, err := HasLocalContent(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	info := &UpdateInfo{}
+	info.BeforeHash, _ = GetCurrentFullHash(dir) // empty before the first commit
+	remote := "origin/" + branch
+	if RemoteTracksConfig(dir, remote) && HasLocalRootConfig(dir) {
+		return nil, fmt.Errorf("%w at %s: remote tracks machine-specific config.yaml", ErrRemoteTracksConfig, remote)
+	}
+	if hasLocal && !force {
+		merge := gitenv.Command("-c", "merge.ff=false", "merge", "--allow-unrelated-histories", "--no-edit", remote)
+		merge.Dir = dir
+		if out, err := merge.CombinedOutput(); err != nil {
+			abort := gitenv.Command("merge", "--abort")
+			abort.Dir = dir
+			abort.Run() // best-effort cleanup
+			return nil, fmt.Errorf("%w with %s: %s", ErrMergeFailed, remote, strings.TrimSpace(string(out)))
+		}
+	} else {
+		reset := gitenv.Command("reset", "--hard", remote)
+		reset.Dir = dir
+		if out, err := reset.CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("reset to %s failed: %s", remote, strings.TrimSpace(string(out)))
+		}
+	}
+
+	local, _ := GetCurrentBranch(dir)
+	if local == "" {
+		local = "main"
+	}
+	track := gitenv.Command("branch", "--set-upstream-to="+remote, local)
+	track.Dir = dir
+	track.Run() // best-effort
+
+	info.AfterHash, _ = GetCurrentFullHash(dir)
+	info.UpToDate = info.BeforeHash == info.AfterHash
+	if info.BeforeHash != "" && !info.UpToDate {
+		info.Commits, _ = GetCommitsBetween(dir, info.BeforeHash, info.AfterHash)
+		info.Stats, _ = GetDiffStats(dir, info.BeforeHash, info.AfterHash)
+	}
+	return info, nil
+}
+
 // GetStatus returns git status --porcelain output
 func GetStatus(dir string) (string, error) {
-	cmd := exec.Command("git", "status", "--porcelain")
+	cmd := gitenv.Command("status", "--porcelain")
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
@@ -494,14 +756,14 @@ func GetStatus(dir string) (string, error) {
 
 // HasUpstream checks if the current branch has upstream tracking configured.
 func HasUpstream(dir string) bool {
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	cmd := gitenv.Command("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	cmd.Dir = dir
 	return cmd.Run() == nil
 }
 
 // GetCurrentBranch returns the current branch name
 func GetCurrentBranch(repoPath string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	cmd := gitenv.Command("rev-parse", "--abbrev-ref", "HEAD")
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -516,7 +778,7 @@ func GetCurrentBranch(repoPath string) (string, error) {
 //  2. common branch names (main, master)
 //  3. first discovered refs/remotes/origin/* branch
 func GetRemoteDefaultBranch(repoPath string) (string, error) {
-	cmd := exec.Command("git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+	cmd := gitenv.Command("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
 	cmd.Dir = repoPath
 	if out, err := cmd.Output(); err == nil {
 		branch := strings.TrimSpace(string(out))
@@ -527,14 +789,14 @@ func GetRemoteDefaultBranch(repoPath string) (string, error) {
 	}
 
 	for _, branch := range []string{"main", "master"} {
-		checkCmd := exec.Command("git", "rev-parse", "--verify", "refs/remotes/origin/"+branch)
+		checkCmd := gitenv.Command("rev-parse", "--verify", "refs/remotes/origin/"+branch)
 		checkCmd.Dir = repoPath
 		if err := checkCmd.Run(); err == nil {
 			return branch, nil
 		}
 	}
 
-	listCmd := exec.Command("git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin")
+	listCmd := gitenv.Command("for-each-ref", "--format=%(refname:short)", "refs/remotes/origin")
 	listCmd.Dir = repoPath
 	out, err := listCmd.Output()
 	if err != nil {
@@ -556,7 +818,7 @@ func GetRemoteDefaultBranch(repoPath string) (string, error) {
 
 // HasRemoteSkillDirs reports whether origin/<remoteBranch> has at least one top-level directory.
 func HasRemoteSkillDirs(repoPath, remoteBranch string) (bool, error) {
-	lsCmd := exec.Command("git", "ls-tree", "-d", "--name-only", "origin/"+remoteBranch)
+	lsCmd := gitenv.Command("ls-tree", "-d", "--name-only", "origin/"+remoteBranch)
 	lsCmd.Dir = repoPath
 	lsOut, err := lsCmd.Output()
 	if err != nil {
@@ -565,14 +827,30 @@ func HasRemoteSkillDirs(repoPath, remoteBranch string) (bool, error) {
 	return strings.TrimSpace(string(lsOut)) != "", nil
 }
 
-// HasLocalSkillDirs reports whether the repo root has at least one directory besides .git.
-func HasLocalSkillDirs(repoPath string) (bool, error) {
+// HasLocalContent reports whether the repo root has a directory besides .git,
+// or any tracked or non-ignored file besides the scaffold .gitignore. Files
+// count because agents and extras repos keep their content as root-level
+// files; ignored files (.DS_Store) do not. Directories always count, so a
+// root-scope repo (skills/, agents/) keeps merging rather than resetting.
+func HasLocalContent(repoPath string) (bool, error) {
 	entries, err := os.ReadDir(repoPath)
 	if err != nil {
 		return false, err
 	}
 	for _, e := range entries {
 		if e.IsDir() && e.Name() != ".git" {
+			return true, nil
+		}
+	}
+
+	cmd := gitenv.Command("ls-files", "-z", "--cached", "--others", "--exclude-standard")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("list local files: %w", err)
+	}
+	for _, path := range strings.Split(string(out), "\x00") {
+		if path != "" && path != ".gitignore" {
 			return true, nil
 		}
 	}
@@ -586,8 +864,8 @@ func GetBehindCount(repoPath string) (int, error) {
 
 // GetBehindCountWithAuth fetches from origin and returns how many commits local
 // is behind, injecting HTTPS token auth based on origin remote when available.
-func GetBehindCountWithAuth(repoPath string) (int, error) {
-	return GetBehindCountWithEnv(repoPath, AuthEnvForRepo(repoPath))
+func GetBehindCountWithAuth(repoPath string, opts install.ParseOptions) (int, error) {
+	return GetBehindCountWithEnv(repoPath, AuthEnvForRepo(repoPath, opts))
 }
 
 // GetBehindCountWithEnv is like GetBehindCount but with additional env vars.
@@ -599,7 +877,7 @@ func GetBehindCountWithEnv(repoPath string, extraEnv []string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	cmd := exec.Command("git", "rev-list", "--count", "HEAD..origin/"+branch)
+	cmd := gitenv.Command("rev-list", "--count", "HEAD..origin/"+branch)
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -616,40 +894,125 @@ func GetRemoteHeadHash(repoURL string) (string, error) {
 
 // GetRemoteHeadHashWithAuth returns remote HEAD hash with HTTPS token auth
 // injection when token env vars are available.
-func GetRemoteHeadHashWithAuth(repoURL string) (string, error) {
-	return GetRemoteHeadHashWithEnv(repoURL, install.AuthEnvForURL(repoURL))
+func GetRemoteHeadHashWithAuth(repoURL string, opts install.ParseOptions) (string, error) {
+	return GetRemoteHeadHashWithEnv(repoURL, install.AuthEnvForURL(repoURL, opts))
 }
+
+// remoteHashTimeout bounds lightweight remote probes used by check/status flows.
+var remoteHashTimeout = 15 * time.Second
 
 // GetRemoteHeadHashWithEnv is like GetRemoteHeadHash but with additional env vars.
 func GetRemoteHeadHashWithEnv(repoURL string, extraEnv []string) (string, error) {
-	cmd := exec.Command("git", "ls-remote", repoURL, "HEAD")
-	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
-	}
-	out, err := cmd.Output()
+	out, err := runRemoteLsRemote([]string{repoURL, "HEAD"}, extraEnv)
 	if err != nil {
 		return "", err
 	}
-	// Format: "a1b2c3d4e5f6...\tHEAD\n"
-	parts := strings.Fields(strings.TrimSpace(string(out)))
-	if len(parts) == 0 {
-		return "", fmt.Errorf("no HEAD ref found")
-	}
-	hash := parts[0]
-	if len(hash) > 7 {
-		hash = hash[:7]
-	}
-	return hash, nil
+	return parseRemoteHash(out, "")
 }
 
-// ForcePull fetches and resets to origin (handles force push)
-func ForcePull(repoPath string) (*UpdateInfo, error) {
-	return ForcePullWithEnv(repoPath, nil)
+// GetRemoteRefHash returns the hash of a specific branch on a remote repo.
+// If branch is empty, returns HEAD hash (same as GetRemoteHeadHash).
+// The returned hash is truncated to 7 characters.
+func GetRemoteRefHash(repoURL, branch string) (string, error) {
+	return GetRemoteRefHashWithEnv(repoURL, branch, nil)
+}
+
+// GetRemoteRefHashWithAuth returns the remote ref hash with HTTPS token auth.
+func GetRemoteRefHashWithAuth(repoURL, branch string, opts install.ParseOptions) (string, error) {
+	return GetRemoteRefHashWithEnv(repoURL, branch, install.AuthEnvForURL(repoURL, opts))
+}
+
+// GetRemoteRefHashWithEnv returns the hash of a specific ref (branch, tag, or
+// commit SHA) on a remote repo. A pinned SHA never moves, so a full SHA is
+// returned without a network round-trip; an abbreviated hex ref is looked up
+// first, since it may also be a branch or tag name.
+func GetRemoteRefHashWithEnv(repoURL, branch string, extraEnv []string) (string, error) {
+	if len(branch) == 40 && install.IsCommitSHA(branch) {
+		return abbrevHash(branch), nil
+	}
+	args := []string{repoURL, "HEAD"}
+	if branch != "" {
+		// refs/tags/<name>^{} is the peeled commit of an annotated tag.
+		args = []string{repoURL, "refs/heads/" + branch, "refs/tags/" + branch, "refs/tags/" + branch + "^{}"}
+	}
+
+	out, err := runRemoteLsRemote(args, extraEnv)
+	if err != nil {
+		return "", err
+	}
+
+	hash, err := parseRemoteHash(out, branch)
+	if err != nil && install.IsCommitSHA(branch) {
+		return abbrevHash(branch), nil
+	}
+	return hash, err
+}
+
+func runRemoteLsRemote(args []string, extraEnv []string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), remoteHashTimeout)
+	defer cancel()
+
+	cmd := gitenv.CommandContext(ctx, append([]string{"ls-remote"}, args...)...)
+	cmd.Env = append(cmd.Env,
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=",
+		"SSH_ASKPASS=",
+	)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(cmd.Env, extraEnv...)
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("git ls-remote timed out after %s", remoteHashTimeout)
+	}
+	if err != nil {
+		return "", install.WrapGitError(stderr.String(), err, install.UsedTokenAuth(extraEnv))
+	}
+	return string(out), nil
+}
+
+// parseRemoteHash picks the commit from ls-remote output: a branch wins over a
+// same-named tag, and an annotated tag's peeled commit wins over the tag object.
+func parseRemoteHash(out, branch string) (string, error) {
+	var hash string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		ref := ""
+		if len(fields) > 1 {
+			ref = fields[1]
+		}
+		switch {
+		case strings.HasPrefix(ref, "refs/heads/"):
+			return abbrevHash(fields[0]), nil
+		case strings.HasSuffix(ref, "^{}"), hash == "":
+			hash = fields[0]
+		}
+	}
+	if hash == "" {
+		if branch != "" {
+			return "", fmt.Errorf("remote ref %q not found", branch)
+		}
+		return "", fmt.Errorf("no HEAD ref found")
+	}
+	return abbrevHash(hash), nil
+}
+
+func abbrevHash(hash string) string {
+	if len(hash) > 7 {
+		return hash[:7]
+	}
+	return hash
 }
 
 // ForcePullWithAuth runs force-pull flow with token auth env inferred from origin remote.
-func ForcePullWithAuth(repoPath string) (*UpdateInfo, error) {
-	return ForcePullWithEnv(repoPath, AuthEnvForRepo(repoPath))
+func ForcePullWithAuth(repoPath string, opts install.ParseOptions) (*UpdateInfo, error) {
+	return ForcePullWithEnv(repoPath, AuthEnvForRepo(repoPath, opts))
 }
 
 // ForcePullWithProgress runs fetch+hard-reset and optionally streams fetch
@@ -678,7 +1041,7 @@ func ForcePullWithProgress(repoPath string, extraEnv []string, onProgress func(s
 		return nil, err
 	}
 
-	cmd := exec.Command("git", "reset", "--hard", "origin/"+branch)
+	cmd := gitenv.Command("reset", "--hard", "origin/"+branch)
 	cmd.Dir = repoPath
 	if err := cmd.Run(); err != nil {
 		return nil, err
@@ -710,16 +1073,155 @@ func ForcePullWithEnv(repoPath string, extraEnv []string) (*UpdateInfo, error) {
 }
 
 // AuthEnvForRepo returns HTTPS token auth env vars for the repo's origin remote.
-func AuthEnvForRepo(repoPath string) []string {
-	return install.AuthEnvForURL(getRemoteURL(repoPath))
+func AuthEnvForRepo(repoPath string, opts install.ParseOptions) []string {
+	url, _ := GetRemoteURL(repoPath)
+	return install.AuthEnvForURL(url, opts)
 }
 
-func getRemoteURL(repoPath string) string {
-	cmd := exec.Command("git", "remote", "get-url", "origin")
+// GetRemoteURL returns the fetch URL for the "origin" remote.
+func GetRemoteURL(repoPath string) (string, error) {
+	cmd := gitenv.Command("remote", "get-url", "origin")
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return strings.TrimSpace(string(out))
+	return strings.TrimSpace(string(out)), nil
+}
+
+// validRemoteArg rejects values that git could parse as an option flag. A
+// remote URL beginning with "-" enables argv flag smuggling (e.g. "--upload-pack=…"),
+// so reject it; a legitimate remote URL never starts with a dash.
+func validRemoteArg(url string) error {
+	if url == "" {
+		return fmt.Errorf("empty remote URL")
+	}
+	if strings.HasPrefix(url, "-") {
+		return fmt.Errorf("invalid remote URL %q: must not start with '-'", url)
+	}
+	return nil
+}
+
+// SetRemoteURL updates the fetch/push URL for the "origin" remote.
+func SetRemoteURL(repoPath, newURL string) error {
+	if err := validRemoteArg(newURL); err != nil {
+		return err
+	}
+	cmd := gitenv.Command("remote", "set-url", "--", "origin", newURL)
+	cmd.Dir = repoPath
+	return cmd.Run()
+}
+
+// SetOrAddRemote points the "origin" remote at url: it updates the URL when
+// origin already exists and adds the remote otherwise. ("git remote set-url"
+// fails when origin is absent and "git remote add" fails when it exists, so the
+// correct command depends on the current state.)
+func SetOrAddRemote(repoPath, url string) error {
+	if err := validRemoteArg(url); err != nil {
+		return err
+	}
+	if _, err := GetRemoteURL(repoPath); err == nil {
+		return SetRemoteURL(repoPath, url)
+	}
+	cmd := gitenv.Command("remote", "add", "--", "origin", url)
+	cmd.Dir = repoPath
+	return cmd.Run()
+}
+
+// GetHeadMessage returns the subject line of the HEAD commit.
+func GetHeadMessage(repoPath string) (string, error) {
+	cmd := gitenv.Command("log", "-1", "--format=%s")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// ListLocalBranches returns local branch names sorted alphabetically.
+func ListLocalBranches(repoPath string) ([]string, error) {
+	cmd := gitenv.Command("branch", "--format=%(refname:short)")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var branches []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if b := strings.TrimSpace(line); b != "" {
+			branches = append(branches, b)
+		}
+	}
+	return branches, nil
+}
+
+// ListRemoteBranches returns remote-only branch names (stripping "origin/" prefix).
+// Branches that already exist locally are excluded.
+func ListRemoteBranches(repoPath string) ([]string, error) {
+	cmd := gitenv.Command("branch", "-r", "--format=%(refname:short)")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	locals, _ := ListLocalBranches(repoPath)
+	localSet := make(map[string]struct{}, len(locals))
+	for _, l := range locals {
+		localSet[l] = struct{}{}
+	}
+
+	var branches []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		ref := strings.TrimSpace(line)
+		if ref == "" || ref == "origin/HEAD" || strings.Contains(ref, "->") {
+			continue
+		}
+		name := strings.TrimPrefix(ref, "origin/")
+		if _, exists := localSet[name]; exists {
+			continue
+		}
+		branches = append(branches, name)
+	}
+	return branches, nil
+}
+
+// Checkout switches to the given branch. If the branch exists only on
+// the remote, a new local tracking branch is created automatically.
+func Checkout(repoPath, branch string) error {
+	// Check if local branch exists
+	check := gitenv.Command("rev-parse", "--verify", "refs/heads/"+branch)
+	check.Dir = repoPath
+	if check.Run() == nil {
+		// Local branch exists — simple checkout
+		cmd := gitenv.Command("checkout", branch)
+		cmd.Dir = repoPath
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("git checkout failed: %s", strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+
+	// Try remote tracking branch
+	cmd := gitenv.Command("checkout", "-b", branch, "origin/"+branch)
+	cmd.Dir = repoPath
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git checkout failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// GetTrackingBranch returns the upstream tracking branch (e.g. "origin/main").
+// Returns empty string (no error) if no upstream is set.
+func GetTrackingBranch(repoPath string) (string, error) {
+	cmd := gitenv.Command("rev-parse", "--abbrev-ref", "@{upstream}")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	if err != nil {
+		return "", nil
+	}
+	return strings.TrimSpace(string(out)), nil
 }

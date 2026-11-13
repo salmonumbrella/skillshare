@@ -7,10 +7,12 @@ import (
 // filterQuery holds the parsed result of a structured filter string.
 // All fields are lowercased for case-insensitive matching.
 type filterQuery struct {
-	TypeTag  string // "tracked", "remote", "local" (empty = any)
-	GroupTag string // substring match against group segment
-	RepoTag  string // substring match against RepoName
-	FreeText string // remaining text after removing known tags
+	TypeTag   string // "tracked", "remote", "local" (empty = any)
+	GroupTag  string // substring match against group segment
+	RepoTag   string // substring match against RepoName
+	KindTag   string // "skill" or "agent" (empty = any)
+	StatusTag string // "enabled" or "disabled" (empty = any)
+	FreeText  string // remaining text after removing known tags
 }
 
 // parseFilterQuery tokenizes the raw filter string and extracts known tags.
@@ -33,6 +35,16 @@ func parseFilterQuery(raw string) filterQuery {
 		if val, ok := cutTag(lower, "r:", "repo:"); ok {
 			q.RepoTag = val
 			continue
+		}
+		if val, ok := cutTag(lower, "k:", "kind:"); ok {
+			q.KindTag = normalizeKindValue(val)
+			continue
+		}
+		if val, ok := cutTag(lower, "s:", "status:"); ok {
+			if status := normalizeStatusValue(val); status != "" {
+				q.StatusTag = status
+				continue
+			}
 		}
 
 		freeTokens = append(freeTokens, strings.ToLower(token))
@@ -69,6 +81,33 @@ func normalizeTypeValue(val string) string {
 	}
 }
 
+// normalizeStatusValue canonicalizes the status filter value.
+// Returns "" for unrecognized values so the token falls back to free text.
+// The primary UI for status filtering is the `s` key (cycles the status chip);
+// this token exists for combining status with other tags (e.g. t:tracked s:disabled).
+func normalizeStatusValue(val string) string {
+	switch val {
+	case "enabled":
+		return "enabled"
+	case "disabled":
+		return "disabled"
+	default:
+		return ""
+	}
+}
+
+// normalizeKindValue maps plural forms to canonical kind names.
+func normalizeKindValue(val string) string {
+	switch val {
+	case "agent", "agents":
+		return "agent"
+	case "skill", "skills":
+		return "skill"
+	default:
+		return val
+	}
+}
+
 // matchSkillItem returns true if the skill item matches all non-empty conditions in the query (AND logic).
 func matchSkillItem(item skillItem, q filterQuery) bool {
 	e := item.entry
@@ -93,6 +132,23 @@ func matchSkillItem(item skillItem, q filterQuery) bool {
 	if q.RepoTag != "" {
 		repo := strings.ToLower(e.RepoName)
 		if !strings.Contains(repo, q.RepoTag) {
+			return false
+		}
+	}
+
+	// Kind tag — exact match on skill kind
+	if q.KindTag != "" && e.Kind != q.KindTag {
+		return false
+	}
+
+	// Status tag — exact match on enabled/disabled state
+	switch q.StatusTag {
+	case "disabled":
+		if !e.Disabled {
+			return false
+		}
+	case "enabled":
+		if e.Disabled {
 			return false
 		}
 	}
@@ -131,13 +187,31 @@ func skillGroup(e skillEntry) string {
 	}
 
 	if e.RepoName != "" {
-		// Tracked: first segment is repo dir, second is group
-		if len(parts) >= 3 {
-			return parts[1]
+		// Tracked: the group is the first segment below the repo root, which
+		// --into can place deeper than the first segment (org/_team).
+		rest, below := strings.CutPrefix(e.RelPath, e.RepoName+"/")
+		group, _, nested := strings.Cut(rest, "/")
+		if !below || !nested {
+			return ""
 		}
-		return ""
+		return group
 	}
 
 	// Non-tracked: first segment is group
 	return parts[0]
+}
+
+// skillTopGroup returns the top-level visual grouping key for the list TUI.
+// Tracked entries (including nested agents in deep repo subdirs) group by
+// their tracked repo root. Non-tracked nested entries group by their first
+// path segment (e.g. local "mma/foo" → "mma"). Flat root-level entries
+// return "" which renders as the "standalone" bucket.
+func skillTopGroup(e skillEntry) string {
+	if e.RepoName != "" {
+		return e.RepoName
+	}
+	if i := strings.Index(e.RelPath, "/"); i > 0 {
+		return e.RelPath[:i]
+	}
+	return ""
 }

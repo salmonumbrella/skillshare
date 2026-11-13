@@ -4,18 +4,40 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"skillshare/internal/audit"
+	"skillshare/internal/gitenv"
 )
 
 func handleUpdate(source *Source, destPath string, result *InstallResult, opts InstallOptions) (*InstallResult, error) {
 	result.SkillPath = destPath
 
-	// For git repos without subdir, try git pull
-	if source.IsGit() && !source.HasSubdir() && IsGitRepo(destPath) {
+	// For git repos without subdir, use git pull for true single-skill repo
+	// installs. Legacy installs of repo-root orchestrators (root SKILL.md plus
+	// child skills) used to be full repository clones; migrate those through the
+	// discovery installer so the root skill becomes SKILL.md-only.
+	if source.IsGit() && !source.HasSubdir() && IsGitRepo(destPath) && checkoutOnBranch(destPath, source.Branch) {
+		if hasDescendantSkillFile(destPath) {
+			migrated, err := updateRepoRootOrchestrator(source, destPath, result, opts)
+			if migrated || err != nil {
+				return result, err
+			}
+		}
+
 		if opts.DryRun {
 			result.Action = "would update (git pull)"
 			return result, nil
+		}
+
+		unlock, err := LockCheckout(destPath)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+
+		if err := checkFollowedCheckoutClean(destPath, opts); err != nil {
+			return nil, err
 		}
 
 		threshold, err := audit.NormalizeThreshold(opts.AuditThreshold)
@@ -33,7 +55,13 @@ func handleUpdate(source *Source, destPath string, result *InstallResult, opts I
 			return nil, fmt.Errorf("failed to determine rollback commit before update (aborting for safety): empty commit hash")
 		}
 
-		if err := gitPull(destPath, opts.OnProgress); err != nil {
+		// update --force discards local edits, which a pull refuses to merge over. A
+		// followed checkout is the user's own clone and must be clean, so it keeps pulling.
+		pull := gitPull
+		if _, followed := opts.SourceFollow.Resolve(destPath); opts.Reinstall && !followed {
+			pull = gitForcePull
+		}
+		if err := pull(destPath, source.authEnv(), opts.OnProgress); err != nil {
 			return nil, fmt.Errorf("failed to update: %w", err)
 		}
 
@@ -41,30 +69,37 @@ func handleUpdate(source *Source, destPath string, result *InstallResult, opts I
 		if !opts.SkipAudit {
 			afterHash, _ := getGitFullHash(destPath)
 			if afterHash != beforeHash {
-				scanResult, err := auditGateFailClosed(destPath, beforeHash, threshold, opts.AuditProjectRoot)
+				scanResult, err := auditGateFailClosed(opts.SourceDir, destPath, beforeHash, threshold, opts.AuditProjectRoot, opts.AuditOverride, opts.SourceFollow)
 				if err != nil {
 					return nil, err
 				}
 				result.AuditRiskScore = scanResult.RiskScore
 				result.AuditRiskLabel = scanResult.RiskLabel
+				if opts.AuditOverride {
+					result.Warnings = append(result.Warnings, recordAcceptedWarning(opts.SourceDir, destPath, scanResult, threshold)...)
+				}
 			}
 		} else {
 			result.AuditSkipped = true
 		}
 
-		// Update metadata timestamp and file hashes
+		// Update centralized metadata timestamp and file hashes.
 		meta, _ := ReadMeta(destPath)
-		if meta != nil {
-			if hash, err := getGitCommit(destPath); err == nil {
-				meta.Version = hash
-			}
-			if meta.Subdir != "" {
-				meta.TreeHash = getSubdirTreeHash(destPath, meta.Subdir)
-			}
-			if hashes, hashErr := ComputeFileHashes(destPath); hashErr == nil {
-				meta.FileHashes = hashes
-			}
-			WriteMeta(destPath, meta)
+		if meta == nil {
+			meta = NewMetaFromSource(source)
+		}
+		if hash, err := getGitCommit(destPath); err == nil {
+			meta.Version = hash
+		}
+		meta.Commit, _ = getGitFullHash(destPath)
+		if meta.Subdir != "" {
+			meta.TreeHash = getSubdirTreeHash(destPath, meta.Subdir)
+		}
+		if hashes, hashErr := ComputeFileHashes(destPath, opts.SourceFollow); hashErr == nil {
+			meta.FileHashes = hashes
+		}
+		if err := WriteMetaToStore(opts.SourceDir, destPath, meta); err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("failed to write metadata: %v", err))
 		}
 
 		result.Action = "updated"
@@ -90,21 +125,30 @@ func handleUpdate(source *Source, destPath string, result *InstallResult, opts I
 
 	// Install to temp location first.
 	// Force is NOT set: tempDest is fresh, so no overwrite needed.
-	// This lets auditInstalledSkill properly gate on findings at/above threshold,
-	// consistent with auditGateAfterPull for tracked repos.
+	// AuditOverride is forwarded so --force can still override the audit gate
+	// without granting overwrite semantics.
 	innerResult, err := Install(source, tempDest, InstallOptions{
 		Name:             opts.Name,
 		Force:            false,
+		AuditOverride:    opts.AuditOverride,
 		DryRun:           false,
 		Update:           false,
 		OnProgress:       opts.OnProgress,
 		SkipAudit:        opts.SkipAudit,
 		AuditThreshold:   opts.AuditThreshold,
 		AuditProjectRoot: opts.AuditProjectRoot,
+		AuditAcceptRoot:  opts.SourceDir,
+		AuditAcceptPath:  destPath,
+		skillFileOnly:    isSkillFileOnlyLocalInstall(source, destPath, opts.SourceDir),
 	})
 	if err != nil {
 		// Installation failed - original skill is preserved
 		return nil, err
+	}
+	// A branch or upstream commit that dropped SKILL.md would replace a skill
+	// with a plain folder.
+	if skillFileExists(destPath) && !skillFileExists(tempDest) {
+		return nil, fmt.Errorf("the new version has no SKILL.md; kept the installed skill")
 	}
 
 	// Propagate audit results and warnings from inner install
@@ -116,18 +160,151 @@ func handleUpdate(source *Source, destPath string, result *InstallResult, opts I
 		result.Warnings = append(result.Warnings, innerResult.Warnings...)
 	}
 
+	// Preserve metadata generated during the temp install, then write it against
+	// the real destination after the swap. Writing the temp install directly to
+	// opts.SourceDir would create ../../ temp-path keys for nested skills.
+	updatedMeta := readTempUpdateMeta(tempDir)
+
 	// Installation succeeded - now safe to remove original and move new
-	if err := os.RemoveAll(destPath); err != nil {
-		return nil, fmt.Errorf("failed to remove existing skill: %w", err)
+	if err := swapStagedIntoSource(opts.SourceDir, tempDest, destPath, opts.SourceFollow); err != nil {
+		return nil, err
 	}
 
-	if err := os.Rename(tempDest, destPath); err != nil {
-		// Rename failed (possibly cross-device), try copy instead
-		if err := copyDir(tempDest, destPath); err != nil {
-			return nil, fmt.Errorf("failed to move updated skill: %w", err)
+	if updatedMeta != nil {
+		if err := WriteMetaToStore(opts.SourceDir, destPath, updatedMeta); err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("failed to write metadata: %v", err))
 		}
 	}
 
 	result.Action = "reinstalled"
 	return result, nil
+}
+
+func readTempUpdateMeta(tempDir string) *SkillMeta {
+	store, err := LoadMetadata(tempDir)
+	if err != nil {
+		return nil
+	}
+	entry := store.Get("skill")
+	if entry == nil {
+		return nil
+	}
+	return &SkillMeta{
+		Source:      entry.Source,
+		Kind:        entry.Kind,
+		Type:        entry.Type,
+		InstalledAt: entry.InstalledAt,
+		RepoURL:     entry.RepoURL,
+		Subdir:      entry.Subdir,
+		Version:     entry.Version,
+		TreeHash:    entry.TreeHash,
+		FileHashes:  entry.FileHashes,
+		Layout:      entry.Layout,
+		Branch:      entry.Branch,
+		Commit:      entry.Commit,
+	}
+}
+
+func hasDescendantSkillFile(root string) bool {
+	found := false
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || found {
+			return nil
+		}
+		if info.IsDir() {
+			if path != root && info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.Name() == "SKILL.md" && filepath.Dir(path) != root {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+func updateRepoRootOrchestrator(source *Source, destPath string, result *InstallResult, opts InstallOptions) (bool, error) {
+	discovery, err := DiscoverFromGitWithProgress(source, opts.OnProgress)
+	if err != nil {
+		return false, fmt.Errorf("failed to discover repository for orchestrator update: %w", err)
+	}
+	defer CleanupDiscovery(discovery)
+
+	rootSkill, ok := repoRootOrchestratorRoot(discovery)
+	if !ok {
+		return false, nil
+	}
+
+	if opts.DryRun {
+		result.Action = "would reinstall root skill"
+		return true, nil
+	}
+
+	tempDir, err := os.MkdirTemp("", "skillshare-update-*")
+	if err != nil {
+		return true, fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	tempDest := filepath.Join(tempDir, "skill")
+	innerResult, err := installFromDiscoveryInternal(discovery, rootSkill, tempDest, InstallOptions{
+		Name:             opts.Name,
+		Force:            false,
+		AuditOverride:    opts.AuditOverride,
+		DryRun:           false,
+		Update:           false,
+		OnProgress:       opts.OnProgress,
+		SkipAudit:        opts.SkipAudit,
+		AuditThreshold:   opts.AuditThreshold,
+		AuditProjectRoot: opts.AuditProjectRoot,
+		AuditAcceptRoot:  opts.SourceDir,
+		AuditAcceptPath:  destPath,
+	}, false)
+	if err != nil {
+		return true, err
+	}
+	if innerResult != nil {
+		result.AuditRiskScore = innerResult.AuditRiskScore
+		result.AuditRiskLabel = innerResult.AuditRiskLabel
+		result.AuditSkipped = innerResult.AuditSkipped
+		result.AuditThreshold = innerResult.AuditThreshold
+		result.Warnings = append(result.Warnings, innerResult.Warnings...)
+	}
+
+	if err := swapStagedIntoSource(opts.SourceDir, tempDest, destPath, opts.SourceFollow); err != nil {
+		return true, err
+	}
+
+	fullSource, fullSubdir := discoveredSkillSourceParts(discovery, rootSkill)
+	if err := writeDiscoveredSkillMetadata(discovery, rootSkill, destPath, opts.SourceDir, fullSource, fullSubdir, opts.SourceFollow); err != nil {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("failed to write metadata: %v", err))
+	}
+
+	result.Action = "reinstalled"
+	return true, nil
+}
+
+func repoRootOrchestratorRoot(discovery *DiscoveryResult) (SkillInfo, bool) {
+	if discovery == nil || discovery.Source == nil || discovery.Source.HasSubdir() {
+		return SkillInfo{}, false
+	}
+	for _, skill := range discovery.Skills {
+		if skill.Path == "." && descendantSkillPaths(discovery, skill) != nil {
+			return skill, true
+		}
+	}
+	return SkillInfo{}, false
+}
+
+// checkoutOnBranch reports whether a pull keeps a checkout on branch. An empty
+// branch is the remote default the clone tracks, and a commit pin is checked
+// out detached on purpose; any other branch needs a fresh clone.
+func checkoutOnBranch(repoPath, branch string) bool {
+	if branch == "" || IsCommitSHA(branch) {
+		return true
+	}
+	out, err := gitenv.Command("-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	return err == nil && strings.TrimSpace(string(out)) == branch
 }

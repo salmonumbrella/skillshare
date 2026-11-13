@@ -76,6 +76,12 @@ ci-scripts
 _internal-*
 ```
 
+Individual team members who need a skill that `.skillignore` blocks can create a `.skillignore.local` in the same directory (not committed to git) to override it locally:
+
+```text title=".skillignore.local"
+!_internal-my-tool
+```
+
 ### Step 3: Share the install command
 
 Send this to your team:
@@ -148,20 +154,15 @@ See [Tracked Repositories](/docs/understand/tracked-repositories#nested-skills--
 
 When multiple skills share the same `name` field, sync checks whether they actually land on the same target after `include`/`exclude` filters are applied.
 
-**Filters isolate the collision** — informational only:
-
-```
-ℹ Duplicate skill names exist but are isolated by target filters:
-  'ui' (2 definitions)
-```
+**Filters isolate the collision** — nothing is printed; the skills never reach the same target.
 
 **Collision reaches the same target** — actionable warning:
 
 ```
-⚠ Target 'claude': skill name 'ui' is defined in multiple places:
-  - _team-a/frontend/ui
-  - _team-b/components/ui
-Rename one in SKILL.md or adjust include/exclude filters
+! 1 duplicate skill names detected
+  ui                              _team-a/ vs _team-b/
+  Rename one in SKILL.md or adjust include/exclude filters
+  1 name collision(s) excluded
 ```
 
 **Solution:** Use namespaced names or route with filters:
@@ -289,6 +290,28 @@ See [Environment Variables](/docs/reference/appendix/environment-variables#git-a
 | `uninstall <name>...` | Remove tracked repo(s) |
 | `list` | List all skills and tracked repos |
 | `status` | Show sync status |
+
+---
+
+## Organization Agents
+
+A tracked organization repo can ship **agents** alongside skills. Place them in a top-level `agents/` directory next to `skills/`:
+
+```
+your-org/org-shared/
+├── skills/                  # Discovered as skills
+│   ├── api-design/
+│   │   └── SKILL.md
+│   └── security/
+│       └── SKILL.md
+└── agents/                  # Discovered as agents
+    ├── reviewer.md
+    └── auditor.md
+```
+
+When teammates run `skillshare install github.com/your-org/org-shared --track`, both directories are picked up automatically. `skillshare update --all` keeps both in sync, and `skillshare sync` (or `skillshare sync agents`) propagates the agents to agent-capable targets (Claude, Cursor, Augment, OpenCode).
+
+`.agentignore` files inside the org repo are honored on disk but should generally live in the consumer's source root (or `.agentignore.local`) so individual machines can opt out without editing the upstream repo. See [Agents](/docs/understand/agents) for the full discovery rules.
 
 ---
 

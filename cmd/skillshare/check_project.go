@@ -3,9 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"skillshare/internal/config"
-	"skillshare/internal/ui"
 )
 
 func cmdCheckProject(root string, opts *checkOptions) error {
@@ -13,28 +11,35 @@ func cmdCheckProject(root string, opts *checkOptions) error {
 		return fmt.Errorf("no project config found in %s", root)
 	}
 
-	sourcePath := filepath.Join(root, ".skillshare", "skills")
-	if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
-		return fmt.Errorf("no project skills directory found")
+	projectCfg, err := config.LoadProject(root)
+	if err != nil {
+		return fmt.Errorf("failed to load project config: %w", err)
 	}
 
 	var extraNames []string
-	projectCfg, err := config.LoadProject(root)
-	if err != nil {
-		ui.Warning("Failed to load project config for target validation: %v", err)
-	} else {
-		for _, t := range projectCfg.Targets {
-			if t.Name != "" {
-				extraNames = append(extraNames, t.Name)
-			}
+	for _, t := range projectCfg.Targets {
+		if t.Name != "" {
+			extraNames = append(extraNames, t.Name)
 		}
 	}
 
+	sourcePath := projectCfg.EffectiveSkillsSource(root)
+	// --all still has the agents to check when the project has no skills.
+	if _, err := os.Stat(sourcePath); os.IsNotExist(err) && !opts.allKinds {
+		return fmt.Errorf("no project skills directory found")
+	}
+
+	opts.parseOpts = parseOptsFromProjectConfig(projectCfg)
+
 	// No names and no groups → check all (existing behavior)
 	if len(opts.names) == 0 && len(opts.groups) == 0 {
-		return runCheck(sourcePath, opts.json, extraNames)
+		agentsDir := ""
+		if opts.allKinds {
+			agentsDir = projectCfg.EffectiveAgentsSource(root)
+		}
+		return runCheck(sourcePath, agentsDir, root, opts, extraNames, projectSkillsWalk(root, projectCfg))
 	}
 
 	// Filtered check
-	return runCheckFiltered(sourcePath, opts)
+	return runCheckFiltered(sourcePath, root, opts, projectSkillsWalk(root, projectCfg))
 }

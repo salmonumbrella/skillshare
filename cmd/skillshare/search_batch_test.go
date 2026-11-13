@@ -1,10 +1,16 @@
 package main
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"skillshare/internal/install"
+	"skillshare/internal/search"
+	"skillshare/internal/testutil"
 )
 
 func TestClassifyFailureDetail(t *testing.T) {
@@ -142,7 +148,7 @@ func TestRepoSourceForGroupedClone(t *testing.T) {
 				t.Fatalf("test input must include subdir, got empty for %q", tt.input)
 			}
 
-			repo := repoSourceForGroupedClone(src)
+			repo := repoSourceForGroupedClone(src, install.ParseOptions{})
 
 			if repo.Subdir != "" {
 				t.Errorf("repo.Subdir = %q, want empty", repo.Subdir)
@@ -166,6 +172,102 @@ func TestRepoSourceForGroupedClone(t *testing.T) {
 			}
 			if parsedRoot.CloneURL != src.CloneURL {
 				t.Errorf("parsed root CloneURL = %q, want %q", parsedRoot.CloneURL, src.CloneURL)
+			}
+		})
+	}
+}
+
+func TestGroupByRepo_PinnedWebURLs(t *testing.T) {
+	// Stands in for the remote: "feature/x" is a branch, "nope" is unknown,
+	// and any other first segment is a branch or tag.
+	resolve := func(s *install.Source) error {
+		switch {
+		case strings.Contains(s.Raw, "/tree/feature/x/"):
+			s.ApplyRecordedBranch("feature/x")
+		case strings.Contains(s.Raw, "/tree/nope/"):
+			return errors.New("ref not found")
+		default:
+			s.ApplyRecordedBranch(s.Branch)
+		}
+		return nil
+	}
+	selected := []search.SearchResult{
+		{Name: "a", Source: "github.com/org/skills/tree/v1/skills/a"},
+		{Name: "b", Source: "github.com/org/skills/tree/v1/skills/b"},
+		{Name: "c", Source: "github.com/org/skills/tree/v2/skills/c"},
+		{Name: "d", Source: "github.com/org/skills/tree/feature/x/skills/d"},
+		{Name: "e", Source: "github.com/org/skills/tree/feature/x/skills/e"},
+		{Name: "f", Source: "github.com/org/skills/tree/nope/skills/f"},
+		{Name: "g", Source: "github.com/org/skills/skills/g"},
+		{Name: "h", Source: "github.com/org/skills/skills/h"},
+	}
+
+	groups, singles := groupByRepo(selected, install.ParseOptions{}, resolve)
+
+	var got []string
+	for _, g := range groups {
+		var names []string
+		for _, r := range g.results {
+			names = append(names, r.Name)
+		}
+		got = append(got, g.source.Branch+":"+strings.Join(names, ","))
+	}
+	if want := []string{"v1:a,b", ":g,h"}; !slices.Equal(got, want) {
+		t.Errorf("groups = %v, want %v", got, want)
+	}
+	var single []string
+	for _, sr := range singles {
+		single = append(single, sr.Name)
+	}
+	// c is alone on v2; d and e have a ref containing "/"; f did not resolve.
+	if want := []string{"d", "e", "f", "c"}; !slices.Equal(single, want) {
+		t.Errorf("singles = %v, want %v", single, want)
+	}
+}
+
+func TestGroupByRepo_ConfiguredHosts(t *testing.T) {
+	base := t.TempDir()
+	repo := testutil.SetupBareRemoteRepo(t, base)
+	const skillA = "---\nname: a\ndescription: First skill\n---\n# First skill\n"
+	const skillB = "---\nname: b\ndescription: Second skill\n---\n# Second skill\n"
+	testutil.SeedRemoteBranch(t, base, repo, "main", map[string]string{
+		"skills/a/SKILL.md": skillA,
+		"skills/b/SKILL.md": skillB,
+	})
+	for _, tt := range []struct {
+		host, username, tokenVar string
+		opts                     install.ParseOptions
+	}{
+		{"cnb.corp.example", "cnb", "CNB_TOKEN", install.ParseOptions{CNBHosts: []string{"cnb.corp.example"}}},
+		{"forge.corp.example", "x-access-token", "GITEA_TOKEN", install.ParseOptions{GiteaHosts: []string{"forge.corp.example"}}},
+	} {
+		t.Run(tt.host, func(t *testing.T) {
+			t.Setenv(tt.tokenVar, "grouped-search-token")
+			testutil.ServePrivateGit(t, repo, tt.username, "grouped-search-token")
+			selected := []search.SearchResult{
+				{Name: "a", Source: "https://" + tt.host + "/org/repo/skills/a"},
+				{Name: "b", Source: "https://" + tt.host + "/org/repo/skills/b"},
+			}
+			groups, singles := groupByRepo(selected, tt.opts, func(*install.Source) error { return nil })
+			if len(groups) != 1 || len(singles) != 0 {
+				t.Fatalf("groups = %d, singles = %d; want one shared clone", len(groups), len(singles))
+			}
+			root := repoSourceForGroupedClone(groups[0].source, tt.opts)
+			discovery, err := install.DiscoverFromGitWithProgress(&root, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer install.CleanupDiscovery(discovery)
+			dest := t.TempDir()
+			for _, result := range selected {
+				got := installFromDiscoveryResult(discovery, result, dest, tt.opts)
+				if got.status != "installed" {
+					t.Fatalf("grouped install %s: %+v", result.Name, got)
+				}
+				body, err := os.ReadFile(filepath.Join(dest, result.Name, "SKILL.md"))
+				if err != nil || !strings.Contains(string(body), "name: "+result.Name) {
+					t.Fatalf("installed %s content = %q, error = %v", result.Name, body, err)
+				}
 			}
 		})
 	}

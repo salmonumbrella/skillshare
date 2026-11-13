@@ -37,19 +37,7 @@ targets:
 	result := sb.RunCLIInDir(projectRoot, "status", "-g")
 	result.AssertSuccess(t)
 	// Should show global source, not project source
-	result.AssertOutputContains(t, sb.SourcePath)
-}
-
-func TestMode_AutoDetect_ProjectWhenConfigExists(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-	projectRoot := sb.SetupProjectDir("claude")
-	sb.CreateProjectSkill(projectRoot, "auto-detect", map[string]string{"SKILL.md": "# A"})
-
-	// No flag → auto-detect project mode
-	result := sb.RunCLIInDir(projectRoot, "list")
-	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Installed skills (project)")
+	result.AssertRowContains(t, "skills", "~/.config/skillshare/skills")
 }
 
 func TestMode_AutoDetect_GlobalWhenNoConfig(t *testing.T) {

@@ -1,0 +1,112 @@
+{
+  "rootInstructions": "AGENTS.md",
+  "budgets": {
+    "rootInstructionsMaxBytes": 8192,
+    "defaultTopicMaxBytes": 16384
+  },
+  "topics": {
+    "architecture": {
+      "description": "Trace repository structure, data flow, and CLI or Web API boundaries.",
+      "sources": [
+        {
+          "path": "wiki/architecture.md"
+        }
+      ]
+    },
+    "cli-development": {
+      "description": "Add or change Go CLI commands, flags, handlers, TUIs, or mutating behavior.",
+      "sources": [
+        {
+          "path": "wiki/cli-development.md"
+        }
+      ]
+    },
+    "testing": {
+      "description": "Build, test, reproduce bugs, and use the devcontainer or ssenv.",
+      "sources": [
+        {
+          "path": "wiki/testing.md"
+        },
+        {
+          "path": "CONTRIBUTING.md",
+          "heading": "Development Setup"
+        }
+      ]
+    },
+    "e2e-runbooks": {
+      "description": "Write or run ai_docs/tests E2E runbooks, or verify on a Windows guest.",
+      "sources": [
+        {
+          "path": "wiki/e2e-runbooks.md"
+        }
+      ]
+    },
+    "frontend": {
+      "description": "Change React, CSS, layout, or visual behavior in the dashboard or website.",
+      "sources": [
+        {
+          "path": "wiki/frontend.md"
+        },
+        {
+          "path": "website/AGENTS.md"
+        }
+      ]
+    },
+    "herdr": {
+      "description": "Change the native Herdr panel, its gallery packages, or layout integration.",
+      "sources": [
+        {
+          "path": "wiki/herdr.md"
+        },
+        {
+          "path": "herdr/AGENTS.md"
+        }
+      ]
+    },
+    "documentation": {
+      "description": "Update README files, website docs, command flags, translations, or the built-in skill.",
+      "sources": [
+        {
+          "path": "wiki/documentation.md"
+        },
+        {
+          "path": "CONTRIBUTING.md",
+          "heading": "Translated READMEs"
+        }
+      ]
+    },
+    "release": {
+      "description": "Write changelogs or release notes, bump versions, tag, or release.",
+      "sources": [
+        {
+          "path": "wiki/release.md"
+        }
+      ]
+    },
+    "audit": {
+      "description": "Read-only consistency checks for flags, docs, tests, targets, handler splits, oplog, or Web API.",
+      "sources": [
+        {
+          "path": "wiki/audit.md"
+        }
+      ]
+    },
+    "pull-requests": {
+      "description": "Open a pull request or handle its review comments, including Codex review.",
+      "sources": [
+        {
+          "path": "wiki/pull-requests.md"
+        }
+      ]
+    },
+    "ai-context": {
+      "description": "Maintain the documentation router and fix topic, path, budget, or orphan check failures.",
+      "sources": [
+        {
+          "path": "wiki/ai-context.md"
+        }
+      ]
+    }
+  },
+  "unrouted": {}
+}

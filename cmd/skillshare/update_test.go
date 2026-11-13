@@ -7,8 +7,60 @@ import (
 	"testing"
 
 	"skillshare/internal/audit"
+	"skillshare/internal/check"
 	"skillshare/internal/install"
+	"skillshare/internal/testutil"
 )
+
+func TestBatchUpdateTrackedAgents_ConfiguredHosts(t *testing.T) {
+	for _, tt := range []struct {
+		host, username, tokenVar string
+		opts                     install.ParseOptions
+	}{
+		{"cnb.corp.example", "cnb", "CNB_TOKEN", install.ParseOptions{CNBHosts: []string{"cnb.corp.example"}}},
+		{"gitea.corp.example", "x-access-token", "GITEA_TOKEN", install.ParseOptions{GiteaHosts: []string{"gitea.corp.example"}}},
+	} {
+		t.Run(tt.host, func(t *testing.T) {
+			base := t.TempDir()
+			remote := testutil.SetupBareRemoteRepo(t, base)
+			testutil.SeedRemoteBranch(t, base, remote, "main", map[string]string{"reviewer.md": "# Original agent\n"})
+			root := filepath.Join(base, "agents")
+			checkout := filepath.Join(root, "_repo")
+			// The private transport replaces global Git config; keep checkout
+			// line endings stable when it disables the Windows autocrlf default.
+			testutil.RunGit(t, "", "clone", "--config", "core.autocrlf=false", remote, checkout)
+			before := testutil.RunGit(t, checkout, "rev-parse", "HEAD")
+			const updated = "# Updated reviewer\nReview changes carefully.\n"
+			seed := filepath.Join(base, "seed-main")
+			if err := os.WriteFile(filepath.Join(seed, "reviewer.md"), []byte(updated), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			testutil.RunGit(t, seed, "add", ".")
+			testutil.RunGit(t, seed, "commit", "-m", "update reviewer")
+			testutil.RunGit(t, seed, "push", "origin", "HEAD:main")
+			t.Setenv(tt.tokenVar, "tracked-agent-update-token")
+			testutil.ServePrivateGit(t, remote, tt.username, "tracked-agent-update-token")
+			cloneURL := "https://" + tt.host + "/org/repo.git"
+			testutil.RunGit(t, checkout, "remote", "set-url", "origin", cloneURL)
+			store := install.NewMetadataStore()
+			store.Set("_repo", &install.MetadataEntry{Source: cloneURL, Kind: "agent", Tracked: true, Branch: "main"})
+			if err := store.Save(root); err != nil {
+				t.Fatal(err)
+			}
+			agents := []check.AgentCheckResult{{Name: "_repo/reviewer.md", RepoPath: checkout, RepoURL: cloneURL}}
+			items, count, failed := batchUpdateAgents(root, agents, &updateAgentArgs{}, "", false, tt.opts)
+			if count != 1 || failed != 0 {
+				t.Fatalf("tracked agent update: updated=%d, failed=%d, items=%+v", count, failed, items)
+			}
+			if body, err := os.ReadFile(filepath.Join(checkout, "reviewer.md")); err != nil || string(body) != updated {
+				t.Fatalf("updated agent content = %q, error = %v", body, err)
+			}
+			if after := testutil.RunGit(t, checkout, "rev-parse", "HEAD"); after == before {
+				t.Fatal("tracked checkout did not advance to the updated revision")
+			}
+		})
+	}
+}
 
 func TestIsSecurityError(t *testing.T) {
 	tests := []struct {
@@ -90,7 +142,9 @@ func setupUpdatableSkill(t *testing.T, sourceDir, name string) {
 	dir := filepath.Join(sourceDir, name)
 	os.MkdirAll(dir, 0755)
 	os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("# "+name), 0644)
-	install.WriteMeta(dir, &install.SkillMeta{Source: "github.com/test/" + name, Type: "github"})
+	store, _ := install.LoadMetadata(sourceDir)
+	store.Set(name, &install.MetadataEntry{Source: "github.com/test/" + name, Type: "github"})
+	store.Save(sourceDir)
 }
 
 func TestResolveByGlob_MatchesTrackedRepos(t *testing.T) {
@@ -175,5 +229,43 @@ func TestResolveByGlob_SortedByName(t *testing.T) {
 	}
 	if matches[0].name > matches[1].name || matches[1].name > matches[2].name {
 		t.Errorf("results not sorted: %s, %s, %s", matches[0].name, matches[1].name, matches[2].name)
+	}
+}
+
+// An unprefixed git checkout is not a tracked repo: a group walk updates it as
+// the regular skill its metadata describes, beside the _-prefixed repos (#476).
+func TestResolveGroupUpdatable_UnprefixedCheckoutIsRegularSkill(t *testing.T) {
+	src := t.TempDir()
+	setupTrackedRepo(t, src, "org/_team")
+	setupUpdatableSkill(t, src, "org/solo")
+	// A submodule or worktree has a .git file, not a directory.
+	if err := os.WriteFile(filepath.Join(src, "org", "solo", ".git"), []byte("gitdir: ../../elsewhere\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	matches, err := resolveGroupUpdatable("org", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]updateTarget{}
+	for _, m := range matches {
+		got[filepath.ToSlash(m.name)] = m
+	}
+	if len(got) != 2 || !got["org/_team"].isRepo || got["org/solo"].isRepo || got["org/solo"].meta == nil {
+		t.Fatalf("matches = %+v, want org/_team as repo and org/solo as skill with metadata", matches)
+	}
+}
+
+func TestIsGroupDir_UnprefixedCheckoutIsGroup(t *testing.T) {
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "bundle", ".git"), 0755)
+	setupTrackedRepo(t, src, "_team")
+	store, _ := install.LoadMetadata(src)
+
+	if !isGroupDir("bundle", src, store) {
+		t.Error("an unprefixed checkout is a group, not a tracked repo")
+	}
+	if isGroupDir("_team", src, store) {
+		t.Error("a _-prefixed checkout is a tracked repo, not a group")
 	}
 }

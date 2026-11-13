@@ -50,19 +50,12 @@ Sort by stars (most popular first)
 Interactive selector → Install selected skill
 ```
 
-## Preview
+## Choosing what to install
 
-<p align="center">
-  <img src="/img/search-demo.png" alt="search demo" width="720" />
-</p>
-
-**Controls:**
-- `↑` `↓` — Navigate results
-- `Enter` — Install selected skill
-- `Ctrl+C` — Cancel and exit
-- Type to filter results
-
-After installing, you can search again or press `Enter` to quit.
+In a terminal, the results open in a selector with the details of the highlighted
+skill beside the list. Select several to install them together; with nothing
+selected, `Enter` installs the highlighted one. The keys are listed at the bottom
+of the screen.
 
 ## Options
 
@@ -103,12 +96,17 @@ skillshare search commit --list
 
 Output:
 ```
-  1.  fix                      facebook/react/.claude/skills/fix        ★ 242.7k
-      Use when you have lint errors, formatting issues...
-  2.  verify                   facebook/react/.claude/skills/verify     ★ 242.7k
-      Use when you want to validate changes before committing...
-  3.  commit-helper            cockroachdb/cockroach/.claude/skills/commit-helper ★ 31.8k
-      Help create git commits and PRs with properly formatted messages...
+  fix            facebook/react/.claude/skills/fix         ★ 242.7k
+                 Use when you have lint errors, formatting issues...
+  verify         facebook/react/.claude/skills/verify      ★ 242.7k
+                 Use when you want to validate changes before committing...
+  commit-helper  ...ockroach/.claude/skills/commit-helper  ★ 31.8k
+                 Help create git commits and PRs with properly formatted messages...
+
+Found 3 skills
+
+Next
+  skillshare install <source>  install one
 ```
 
 ### JSON Output
@@ -146,7 +144,7 @@ Installed skills go to `.skillshare/skills/` and the project config is updated a
 skillshare search frontend -n 5   # Show only top 5 results
 ```
 
-## Authentication
+## Authentication {#authentication}
 
 GitHub Code Search API requires authentication. skillshare automatically detects your credentials:
 
@@ -212,13 +210,13 @@ skillshare search --hub              # Uses "team" hub
 ```
 
 Resolution order for `--hub <value>`:
-1. URL or path (starts with `http`, `/`, `.`, `~`, `file://`) → used directly
+1. URL or path (starts with `http`, `/`, `.`, `~`, `file://`, or an SSH URL such as `git@…`/`ssh://…`) → used directly
 2. Otherwise → label lookup from saved hubs
 3. Bare `--hub` (no value) → config default → community hub fallback
 
 See [`hub`](./hub.md) for managing saved hubs.
 
-## Private Index Search
+## Private Index Search {#private-index-search}
 
 Search from a private hub index instead of GitHub:
 
@@ -229,12 +227,22 @@ skillshare search react --hub ./skillshare-hub.json
 # HTTP URL
 skillshare search react --hub https://internal.corp/skills/skillshare-hub.json
 
+# SSH URL — clones the repo and reads the index (works with private/GHE hosts)
+skillshare search react --hub git@github.com:org/skills.git
+skillshare search react --hub git@ghe.corp.com:team/skills.git//hubs/team.json
+
 # Browse all skills (empty query)
 skillshare search --hub ./skillshare-hub.json --json
 
 # Equals syntax also works
 skillshare search react --hub=./skillshare-hub.json
 ```
+
+:::note SSH hub sources
+An SSH `--hub` value is resolved by shallow-cloning the repo (using your SSH agent/keys) and reading the index file from it. The file path inside the repo comes from the `//path` suffix — `git@host:org/repo.git//hubs/team.json` — and defaults to `skillshare-hub.json` at the repo root when omitted. Both scp-style (`git@host:org/repo.git`) and scheme-style (`ssh://git@host/org/repo.git`) URLs are accepted.
+
+In the [web dashboard](./ui.md), SSH hub sources must be [saved first](./hub.md#hub-add); the server only clones saved hubs.
+:::
 
 Build an index with [`hub index`](./hub.md):
 
@@ -272,7 +280,7 @@ skillshare search database
 
 ### Continuous Search
 
-In interactive mode, after installing a skill (or canceling), you can search again without restarting:
+When nothing is found, or when you press `Esc` in the selector, you are asked for a new keyword:
 
 ```
 ? Search again (or press Enter to quit): react

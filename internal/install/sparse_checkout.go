@@ -2,13 +2,14 @@ package install
 
 import (
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
+
+	"skillshare/internal/gitenv"
 )
 
 func gitSupportsSparseCheckout() bool {
-	out, err := exec.Command("git", "--version").Output()
+	out, err := gitenv.Command("--version").Output()
 	if err != nil {
 		return false
 	}
@@ -43,16 +44,25 @@ func supportsSparseCheckoutVersion(versionOutput string) bool {
 	return major == 2 && minor >= 25
 }
 
-func sparseCloneSubdir(url, subdir, destPath string, extraEnv []string, onProgress ProgressCallback) error {
+func sparseCloneSubdir(url, subdir, destPath, branch string, extraEnv []string, onProgress ProgressCallback) error {
 	subdir = strings.TrimSpace(subdir)
 	if subdir == "" {
 		return fmt.Errorf("sparse checkout requires non-empty subdir")
 	}
 
-	cloneArgs := []string{"clone", "--filter=blob:none", "--no-checkout", "--depth", "1", "--quiet", url, destPath}
-	if onProgress != nil {
-		cloneArgs = []string{"clone", "--filter=blob:none", "--no-checkout", "--depth", "1", "--progress", url, destPath}
+	cloneArgs := []string{"clone", "--filter=blob:none", "--no-checkout", "--depth", "1"}
+	// clone --branch rejects a commit SHA: clone the default branch and fetch
+	// the commit below instead.
+	sha := IsCommitSHA(branch)
+	if branch != "" && !sha {
+		cloneArgs = append(cloneArgs, "--branch", branch)
 	}
+	if onProgress != nil {
+		cloneArgs = append(cloneArgs, "--progress")
+	} else {
+		cloneArgs = append(cloneArgs, "--quiet")
+	}
+	cloneArgs = append(cloneArgs, url, destPath)
 	if err := runGitCommandWithProgress(cloneArgs, "", extraEnv, onProgress); err != nil {
 		return err
 	}
@@ -61,9 +71,13 @@ func sparseCloneSubdir(url, subdir, destPath string, extraEnv []string, onProgre
 		return err
 	}
 
-	if err := runGitCommandWithProgress([]string{"checkout"}, destPath, extraEnv, nil); err != nil {
-		return err
+	if sha {
+		// Servers only resolve a full SHA here; an abbreviated one fails and the
+		// caller falls back to a full clone.
+		if err := runGitCommandWithProgress([]string{"fetch", "--quiet", "--depth", "1", "--filter=blob:none", "origin", branch}, destPath, extraEnv, nil); err != nil {
+			return err
+		}
+		return runGitCommandWithProgress([]string{"checkout", "--quiet", "--detach", "FETCH_HEAD"}, destPath, extraEnv, nil)
 	}
-
-	return nil
+	return runGitCommandWithProgress([]string{"checkout"}, destPath, extraEnv, nil)
 }

@@ -11,6 +11,18 @@ rules:
     pattern: prompt-injection
     message: "SYSTEM: prompt override detected"
     regex: '(?im)^\s*(SYSTEM|OVERRIDE|IGNORE|ADMIN|ROOT):'
+    # Lowercase config keys whose value is data on the same line are not
+    # directives; uppercase labels always match. Each key accepts only the
+    # value kinds its config uses: scalars for all, space-free paths for root
+    # (RE2 has no backreferences, so each quoting is listed), and inline
+    # objects for ignore whose words are joined by punctuation, not spaces or
+    # slashes, or inline arrays of quoted space-free items (globs). root also
+    # accepts a typed parameter (root: Path, lang: set[str] | None = None):
+    # every type and type argument is a capitalized or builtin name, and
+    # further parameters must be name: Type. No empty values (an indented
+    # block follows) and no trailing comments (# and // do not hide text in
+    # Markdown).
+    exclude: '^\s*(?:(?:system|override|ignore|admin|root):\s*(?:true|false|yes|no|on|off|null|~|-?\d+(?:\.\d+)?)|root:\s*(?:"(?:[.~/]|\w[\w.-]*/|[A-Za-z]:\\)[^\s"'']*"|''(?:[.~/]|\w[\w.-]*/|[A-Za-z]:\\)[^\s"'']*''|(?:[.~/]|\w[\w.-]*/|[A-Za-z]:\\)[^\s"'']*)|ignore:\s*\{\s*(?:["'']?[\w-]*["'']?\s*[:,\[\]]\s*)*["'']?[\w-]*["'']?\s*\}|ignore:\s*\[\s*(?:(?:"[^\s"]*"|''[^\s'']*'')(?:\s*,\s*(?:"[^\s"]*"|''[^\s'']*''))*\s*,?\s*)?\]|root:\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object))*\])?(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object))*\])?)*\])?(?:\s*\|\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object))*\])?(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object))*\])?)*\])?)*(?:\s*=\s*(?:None|True|False|-?\d+(?:\.\d+)?|"[^\s"]*"|''[^\s'']*''))?(?:\s*,\s*\w+\s*:\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object))*\])?(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object))*\])?)*\])?(?:\s*\|\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object))*\])?(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\[(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object)(?:\s*[,|]\s*(?:[A-Z]\w*|str|int|float|bool|bytes|list|dict|set|tuple|object))*\])?)*\])?)*(?:\s*=\s*(?:None|True|False|-?\d+(?:\.\d+)?|"[^\s"]*"|''[^\s'']*''))?)*),?\s*$'
 
   - id: prompt-injection-2
     severity: HIGH
@@ -59,12 +71,21 @@ rules:
     regex: '[\x{E0001}-\x{E007F}]'
 
   # ── CRITICAL: output suppression directives ──
-  # A skill that hides its actions from the user is a strong malicious signal.
+  # Explicit concealment of actions or instructions is a strong malicious signal.
   - id: prompt-injection-4
     severity: CRITICAL
     pattern: prompt-injection
     message: "Output suppression directive — attempts to hide actions from user"
-    regex: '(?i)(don''t\s+tell\s+the\s+user|do\s+not\s+tell\s+the\s+user|do\s+not\s+(mention|reveal)\s+this\s+(instruction|change|action|to\s+the\s+user)|never\s+(mention|reveal)\s+this\s+instruction|hide\s+this\s+from\s+the\s+user|remove\s+(this\s+)?from\s+(chat|conversation)\s+history)'
+    regex: '(?i)((don''t|do\s+not)\s+tell\s+the\s+user\s+(about\s+)?(this|the)\s+(instruction|change|action)\b|do\s+not\s+(mention|reveal)\s+this\s+(instruction|change|action|to\s+the\s+user)|never\s+(mention|reveal)\s+this\s+instruction|hide\s+this\s+from\s+the\s+user|remove\s+(this\s+)?from\s+(chat|conversation)\s+history)'
+
+  # A generic disclosure restriction may be advice or concealment. Keep it
+  # visible without treating an ambiguous prefix as confirmed malicious intent.
+  - id: prompt-injection-5
+    severity: HIGH
+    pattern: prompt-injection
+    message: "Possible output suppression — review disclosure restriction"
+    regex: '(?i)(don''t|do\s+not)\s+tell\s+the\s+user'
+    exclude: '(?i)(don''t|do\s+not)\s+tell\s+the\s+user\s+(about\s+)?(this|the)\s+(instruction|change|action)\b'
 
   # ── HIGH: hidden unicode (zero-width characters) ──
   - id: hidden-unicode-0
@@ -224,7 +245,7 @@ rules:
     pattern: external-link
     message: "External URL in markdown link"
     regex: '\]\(https?://[^)]+\)'
-    exclude: '(?i)\]\(https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)[:/)]'
+    exclude: '(?i)\]\(https?://(localhost|127\.0\.0\.1|0\.0\.0\.0|learn\.microsoft\.com|developers\.figma\.com|developer\.mozilla\.org|lawsofux\.com|help\.figma\.com|developer\.apple\.com|help\.obsidian\.md|azure\.microsoft\.com|web\.dev|www\.microsoft\.com|opentelemetry\.io|nextjs\.org|motion\.dev|www\.radix-ui\.com|ui\.shadcn\.com|tailwindcss\.com|caniuse\.com)([:/)]|\?)'
 
   # ── HIGH: remote code execution (pipe to interpreter) ──
   - id: fetch-with-pipe-0
@@ -327,3 +348,110 @@ rules:
     pattern: shell-chain
     message: "Command chaining detected; verify intent"
     regex: '(?m)(\|\||&&|;)\s*(rm|chmod|curl|wget|bash|sh)\b'
+
+  # Narrow imperative prose patterns; anchor at the start to avoid prohibitions.
+  - id: anti-refusal-0
+    severity: HIGH
+    pattern: anti-refusal
+    message: "Directive to comply despite safety policies"
+    confidence: 0.85
+    regex: '(?i)^\s*(?:(?:[-*+>]|\d+[.)])\s*)?(?:\*\*)?(?:never\s+refuse\s+any\s+request|always\s+(?:comply(?:\s+with\s+(?:any|all|every)\s+(?:user\s+)?requests?)?|answer(?:\s+(?:(?:any|all|every)\s+)?(?:user\s+)?questions?)?))(?:\*\*)?\s*[,]?\s*(?:regardless\s+of|despite|even\s+if)\s+(?:(?:any|all|the|your|its|their)\s+)?(?:safety|security|refusal)\s+(?:policies|policy|rules|restrictions|checks|guidelines|protocols|requirements)\b'
+
+  - id: prompt-leakage-0
+    severity: HIGH
+    pattern: prompt-leakage
+    message: "Directive to disclose hidden system instructions"
+    confidence: 0.85
+    regex: '(?i)^\s*(?:(?:[-*+>]|\d+[.)])\s*)?(?:\*\*)?(?:reveal|print|disclose|output|show)\s+(?:(?:your|the|hidden|original)\s+){1,3}(?:system\s+prompt|system\s+instructions)\b(?:\s+to\s+(?:the\s+)?user\b|\s*[.!]|\s*$)'
+
+  - id: memory-poisoning-0
+    severity: HIGH
+    pattern: memory-poisoning
+    message: "Directive to persist a safety override in memory"
+    confidence: 0.85
+    regex: '(?i)^\s*(?:(?:[-*+>]|\d+[.)])\s*)?(?:\*\*)?(?:remember\s+permanently|save\s+to\s+(?:long[- ]term\s+)?memory)\b.{0,100}\b(?:safety|security)\s+(?:checks|rules|policies|restrictions)\s+(?:are(?:\s+to\s+be)?|is(?:\s+to\s+be)?|should\s+be|must\s+be|gets)\s+(?:disabled|ignored|bypassed)\b'
+
+  - id: agent-snooping-0
+    severity: HIGH
+    pattern: agent-snooping
+    message: "Directive to disclose or access agent configuration or another skill without permission"
+    confidence: 0.85
+    regex: '(?i)^\s*(?:(?:[-*+>]|\d+[.)])\s*)?(?:\*\*)?(?:read|open|copy)\s+(?:~/(?:\.claude|\.codex|\.gemini)/\S+|mcp\.json|another\s+skill''s\s+SKILL\.md)\s+(?:and\s+(?:then\s+)?(?:send|share|exfiltrate)|without\s+(?:permission|consent))\b'
+
+  - id: persistence-0
+    severity: HIGH
+    pattern: persistence
+    message: "Directive to establish persistent execution"
+    confidence: 0.85
+    regex: '(?i)^\s*(?:(?:[-*+>]|\d+[.)])\s*)?(?:\*\*)?(?:install\s+a\s+cron\s+job\b|run\s+(?:crontab\s+-e|launchctl\s+load|systemctl\s+enable)\b|append\s+.{1,100}\s+to\s+~/\.(?:bashrc|zshrc|profile)\b).{0,100}\b(?:run|install|execute|launch|load)\s+(?:the\s+)?(?:payload\b(?:\s+(?:every|at|on|from|with)\b|\s*[.,;!]|\s*$)|(?:malware|backdoor)\b)|^\s*(?:(?:[-*+>]|\d+[.)])\s*)?(?:\*\*)?append\s+.{0,80}\b(?:payload|malware|backdoor)\b.{0,80}\s+to\s+~/\.(?:bashrc|zshrc|profile)\b'
+
+  # Sensitive destinations are evidence, not a runtime SSRF verdict. Metadata
+  # hosts deliberately remain visible in every admitted text format.
+  - id: ssrf-metadata-0
+    severity: CRITICAL
+    pattern: ssrf-metadata
+    message: "Cloud metadata host reference — review request context and possible credential exposure"
+    regex: '(?i)(?:^|[^a-z0-9_.])(?:169\.254\.(?:169\.254|170\.2)|100\.100\.100\.200|metadata\.google\.internal)(?:[^a-z0-9_.]|\.(?:[^a-z0-9_.]|$)|$)|(?:^|[^a-z0-9_.:]|[^0-9a-f:]:)fd00:ec2::254(?:[^a-z0-9_.:]|:(?:[^0-9a-f:]|$)|$)'
+
+  - id: ssrf-internal-0
+    severity: MEDIUM
+    pattern: ssrf-internal
+    message: "Request to a loopback, private, link-local or internal destination (static evidence)"
+    files: ['*.py', '*.js', '*.ts', '*.rb', '*.php', '*.php3', '*.php4', '*.php5', '*.phtml', '*.sh', '*.bash', '*.zsh', '*.fish']
+    regex: '(?:\b(?:requests|httpx|axios)\.(?:get|post|put|patch|delete|head|options)|\b(?:fetch|urlopen|file_get_contents|fopen)|\burllib\.request\.urlopen|\bNet::HTTP\.(?:get|post)|\bURI\.open)\s*\(\s*(?:URI\s*\(\s*)?["''](https?://[^"''\s]+)|\b(?:curl|wget)\b[^\n;|]*?["'']?(https?://[^"''\s;|)]+)'
+
+  - id: ssrf-dynamic-0
+    severity: MEDIUM
+    confidence: 0.6
+    pattern: ssrf-dynamic
+    message: "Dynamic request target — destination or validation unknown; review source and validation"
+    files: ['*.py', '*.js', '*.ts', '*.rb', '*.php', '*.php3', '*.php4', '*.php5', '*.phtml']
+    regex: '(?:\b(?:requests|httpx|axios)\.(?:get|post|put|patch|delete|head|options)|\b(?:fetch|urlopen|file_get_contents|fopen)|\burllib\.request\.urlopen|\bURI\.open)\s*\(\s*(?:(?:req|request)\.(?:query|body|params|args|GET)\b|\$_(?:GET|POST|REQUEST)\s*\[|params\s*\[|f["'']https?://\{|`https?://\$\{)'
+
+  - id: unsafe-deserialization-python
+    severity: HIGH
+    pattern: unsafe-deserialization
+    message: "Python pickle/marshal/dill deserialization can execute code with untrusted data"
+    files: ['*.py']
+    regex: '\b(?:pickle|marshal|dill)\.loads?\s*\('
+
+  - id: unsafe-deserialization-yaml
+    severity: HIGH
+    pattern: unsafe-deserialization
+    message: "Unsafe YAML loader or load call without an explicit SafeLoader/CSafeLoader"
+    files: ['*.py']
+    regex: '\byaml\.(?:load|load_all|unsafe_load|unsafe_load_all|full_load|full_load_all)\s*\('
+
+  - id: unsafe-deserialization-torch
+    severity: HIGH
+    pattern: unsafe-deserialization
+    message: "torch.load without explicit weights_only=True in this call"
+    files: ['*.py']
+    regex: '\btorch\.load\s*\('
+
+  - id: unsafe-deserialization-php
+    severity: HIGH
+    pattern: unsafe-deserialization
+    message: "PHP unserialize can instantiate objects from untrusted data"
+    files: ['*.php', '*.php3', '*.php4', '*.php5', '*.phtml']
+    regex: '(?i)\bunserialize\s*\('
+
+  - id: unsafe-deserialization-ruby
+    severity: HIGH
+    pattern: unsafe-deserialization
+    message: "Ruby Marshal.load/restore can execute code with untrusted data"
+    files: ['*.rb']
+    regex: '\bMarshal\.(?:load|restore)\s*\('
+
+  - id: unsafe-deserialization-js
+    severity: HIGH
+    pattern: unsafe-deserialization
+    message: "node-serialize dependency can deserialize executable values; review usage"
+    files: ['*.js', '*.ts']
+    regex: '(?:\brequire\s*\(\s*["'']node-serialize["'']\s*\)|\bfrom\s+["'']node-serialize["''])'
+
+  # File-level detector: thresholds and Markdown exemptions live in Go.
+  - id: whitespace-padding
+    severity: MEDIUM
+    pattern: whitespace-padding
+    message: "Padding may push instructions out of view; review context"

@@ -3,12 +3,12 @@
 package integration
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"skillshare/internal/install"
 	"skillshare/internal/testutil"
 )
 
@@ -22,7 +22,7 @@ func TestUninstallProject_RemovesSkill(t *testing.T) {
 
 	result := sb.RunCLIInDirWithInput(projectRoot, "y\n", "uninstall", "to-remove", "-p")
 	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "Uninstalled")
+	result.AssertAnyOutputContains(t, "✓ Uninstall to-remove")
 
 	if sb.FileExists(filepath.Join(projectRoot, ".skillshare", "skills", "to-remove")) {
 		t.Error("skill directory should be removed")
@@ -39,38 +39,7 @@ func TestUninstallProject_Force_SkipsConfirmation(t *testing.T) {
 
 	result := sb.RunCLIInDir(projectRoot, "uninstall", "bye", "--force", "-p")
 	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "Uninstalled")
-}
-
-func TestUninstallProject_UpdatesConfig(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-	projectRoot := sb.SetupProjectDir("claude")
-
-	// Create remote skill with meta
-	skillDir := sb.CreateProjectSkill(projectRoot, "remote", map[string]string{
-		"SKILL.md": "# Remote",
-	})
-	meta := map[string]interface{}{"source": "org/skills/remote", "type": "github"}
-	metaJSON, _ := json.Marshal(meta)
-	os.WriteFile(filepath.Join(skillDir, ".skillshare-meta.json"), metaJSON, 0644)
-
-	// Write config and registry with the skill
-	sb.WriteProjectConfig(projectRoot, `targets:
-  - claude
-`)
-	os.WriteFile(filepath.Join(projectRoot, ".skillshare", "registry.yaml"), []byte(`skills:
-  - name: remote
-    source: org/skills/remote
-`), 0644)
-
-	result := sb.RunCLIInDir(projectRoot, "uninstall", "remote", "--force", "-p")
-	result.AssertSuccess(t)
-
-	registryContent := sb.ReadFile(filepath.Join(projectRoot, ".skillshare", "registry.yaml"))
-	if strings.Contains(registryContent, "remote") {
-		t.Error("registry should not contain removed skill")
-	}
+	result.AssertAnyOutputContains(t, "✓ Uninstall bye")
 }
 
 func TestUninstallProject_NotFound_Error(t *testing.T) {
@@ -93,7 +62,7 @@ func TestUninstallProject_DryRun(t *testing.T) {
 
 	result := sb.RunCLIInDir(projectRoot, "uninstall", "keep", "--dry-run", "-p")
 	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "dry-run")
+	result.AssertAnyOutputContains(t, "Dry run — nothing was written")
 
 	if !sb.FileExists(filepath.Join(projectRoot, ".skillshare", "skills", "keep")) {
 		t.Error("dry-run should not remove skill")
@@ -128,9 +97,12 @@ func TestUninstallProject_MultipleSkills(t *testing.T) {
 		t.Error("skill-b should be removed")
 	}
 
-	registryContent := sb.ReadFile(filepath.Join(projectRoot, ".skillshare", "registry.yaml"))
-	if strings.Contains(registryContent, "skill-a") || strings.Contains(registryContent, "skill-b") {
-		t.Error("registry should not contain removed skills")
+	store, err := install.LoadMetadata(filepath.Join(projectRoot, ".skillshare", "skills"))
+	if err != nil {
+		t.Fatalf("load metadata: %v", err)
+	}
+	if store.Has("skill-a") || store.Has("skill-b") {
+		t.Error("metadata should not contain removed skills")
 	}
 }
 
@@ -157,7 +129,7 @@ func TestUninstallProject_Group(t *testing.T) {
 	}
 }
 
-func TestUninstallProject_TrackedRepo_GitStatusErrorWarnsAndContinues(t *testing.T) {
+func TestUninstallProject_TrackedRepo_GitStatusErrorBlocksUninstall(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
 	projectRoot := sb.SetupProjectDir("claude")
@@ -172,11 +144,11 @@ func TestUninstallProject_TrackedRepo_GitStatusErrorWarnsAndContinues(t *testing
 	}
 
 	result := sb.RunCLIInDirWithInput(projectRoot, "y\n", "uninstall", "broken-repo", "-p")
-	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "Could not check git status")
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "failed to check git status")
 
-	if sb.FileExists(repoDir) {
-		t.Error("tracked repo should still be uninstalled when git status check fails")
+	if !sb.FileExists(repoDir) {
+		t.Error("tracked repo must stay in place when git status cannot be read")
 	}
 }
 
@@ -193,8 +165,7 @@ func TestUninstallProject_GroupDir_RemovesConfigEntries(t *testing.T) {
 
 	sb.WriteProjectConfig(projectRoot, `targets:
   - claude
-`)
-	os.WriteFile(filepath.Join(projectRoot, ".skillshare", "registry.yaml"), []byte(`skills:
+skills:
   - name: skill-a
     source: github.com/org/repo/skill-a
     group: mygroup
@@ -204,7 +175,14 @@ func TestUninstallProject_GroupDir_RemovesConfigEntries(t *testing.T) {
   - name: skill-c
     source: github.com/org/repo/skill-c
     group: other
-`), 0644)
+`)
+	// Write metadata directly
+	skillsDir := filepath.Join(projectRoot, ".skillshare", "skills")
+	store := install.NewMetadataStore()
+	store.Set("skill-a", &install.MetadataEntry{Source: "github.com/org/repo/skill-a", Group: "mygroup"})
+	store.Set("skill-b", &install.MetadataEntry{Source: "github.com/org/repo/skill-b", Group: "mygroup"})
+	store.Set("skill-c", &install.MetadataEntry{Source: "github.com/org/repo/skill-c", Group: "other"})
+	store.Save(skillsDir)
 
 	result := sb.RunCLIInDir(projectRoot, "uninstall", "mygroup", "--force", "-p")
 	result.AssertSuccess(t)
@@ -214,16 +192,24 @@ func TestUninstallProject_GroupDir_RemovesConfigEntries(t *testing.T) {
 		t.Error("mygroup directory should be removed")
 	}
 
-	// Registry should no longer contain mygroup skills
-	registryContent := sb.ReadFile(filepath.Join(projectRoot, ".skillshare", "registry.yaml"))
-	if strings.Contains(registryContent, "skill-a") {
-		t.Error("registry should not contain skill-a after group uninstall")
+	// Metadata should no longer contain mygroup skills
+	store2, err := install.LoadMetadata(skillsDir)
+	if err != nil {
+		t.Fatalf("load metadata: %v", err)
 	}
-	if strings.Contains(registryContent, "skill-b") {
-		t.Error("registry should not contain skill-b after group uninstall")
+	if store2.Has("skill-a") {
+		t.Error("metadata should not contain skill-a after group uninstall")
 	}
-	if !strings.Contains(registryContent, "skill-c") {
-		t.Error("registry should still contain skill-c from other group")
+	if store2.Has("skill-b") {
+		t.Error("metadata should not contain skill-b after group uninstall")
+	}
+	if !store2.Has("skill-c") {
+		t.Error("metadata should still contain skill-c from other group")
+	}
+
+	cfg := sb.ReadFile(filepath.Join(projectRoot, ".skillshare", "config.yaml"))
+	if strings.Contains(cfg, "skill-a") || strings.Contains(cfg, "skill-b") || !strings.Contains(cfg, "skill-c") {
+		t.Errorf("config.yaml should keep only skill-c:\n%s", cfg)
 	}
 }
 
@@ -239,30 +225,29 @@ func TestUninstallProject_GroupDirWithTrailingSlash_RemovesConfigEntries(t *test
 	sb.WriteProjectConfig(projectRoot, `targets:
   - claude
 `)
-	os.WriteFile(filepath.Join(projectRoot, ".skillshare", "registry.yaml"), []byte(`skills:
-  - name: scan
-    source: github.com/org/repo/scan
-    group: security
-  - name: hardening
-    source: github.com/org/repo/hardening
-    group: security
-  - name: keep
-    source: github.com/org/repo/keep
-    group: other
-`), 0644)
+	// Write metadata directly to .metadata.json
+	skillsDir := filepath.Join(projectRoot, ".skillshare", "skills")
+	store := install.NewMetadataStore()
+	store.Set("scan", &install.MetadataEntry{Source: "github.com/org/repo/scan", Group: "security"})
+	store.Set("hardening", &install.MetadataEntry{Source: "github.com/org/repo/hardening", Group: "security"})
+	store.Set("keep", &install.MetadataEntry{Source: "github.com/org/repo/keep", Group: "other"})
+	store.Save(skillsDir)
 
 	result := sb.RunCLIInDir(projectRoot, "uninstall", "security/", "--force", "-p")
 	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "Uninstalled group: security")
+	result.AssertAnyOutputContains(t, "✓ Uninstall security")
 
-	registryContent := sb.ReadFile(filepath.Join(projectRoot, ".skillshare", "registry.yaml"))
-	if strings.Contains(registryContent, "scan") {
-		t.Error("registry should not contain scan after security/ uninstall")
+	store, err := install.LoadMetadata(filepath.Join(projectRoot, ".skillshare", "skills"))
+	if err != nil {
+		t.Fatalf("load metadata: %v", err)
 	}
-	if strings.Contains(registryContent, "hardening") {
-		t.Error("registry should not contain hardening after security/ uninstall")
+	if store.Has("scan") {
+		t.Error("metadata should not contain scan after security/ uninstall")
 	}
-	if !strings.Contains(registryContent, "keep") {
-		t.Error("registry should still contain keep from other group")
+	if store.Has("hardening") {
+		t.Error("metadata should not contain hardening after security/ uninstall")
+	}
+	if !store.Has("keep") {
+		t.Error("metadata should still contain keep from other group")
 	}
 }

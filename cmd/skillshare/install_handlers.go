@@ -10,12 +10,26 @@ import (
 	"skillshare/internal/audit"
 	"skillshare/internal/config"
 	"skillshare/internal/install"
+	"skillshare/internal/sync"
 	"skillshare/internal/ui"
+	"skillshare/internal/utils"
 	"skillshare/internal/validate"
-	appversion "skillshare/internal/version"
 )
 
 func handleTrackedRepoInstall(source *install.Source, cfg *config.Config, opts install.InstallOptions) (installLogSummary, error) {
+	trackedKind, err := install.InferTrackedKind(source, opts.Kind)
+	if err != nil {
+		return installLogSummary{}, err
+	}
+	opts.Kind = trackedKind
+
+	trackSourceDir := cfg.EffectiveSkillsSource()
+	if trackedKind == "agent" {
+		trackSourceDir = cfg.EffectiveAgentsSource()
+	} else if err := checkIntoFolder(trackSourceDir, opts); err != nil {
+		return installLogSummary{}, err
+	}
+
 	logSummary := installLogSummary{
 		Source:         source.Raw,
 		DryRun:         opts.DryRun,
@@ -26,20 +40,8 @@ func handleTrackedRepoInstall(source *install.Source, cfg *config.Config, opts i
 		AuditThreshold: opts.AuditThreshold,
 	}
 
-	// Show logo with version
-	ui.Logo(appversion.Version)
-
-	// Step 1: Show source
-	ui.StepStart("Source", source.Raw)
-	if opts.Name != "" {
-		ui.StepContinue("Name", "_"+opts.Name)
-	}
-	if opts.Into != "" {
-		ui.StepContinue("Into", opts.Into)
-	}
-
-	// Step 2: Clone with tree spinner
-	progressMsg := "Cloning repository..."
+	// Clone with a spinner; the Source row follows once it is done
+	progressMsg := "Cloning " + sourceLabel(source.Raw) + "..."
 	if source.HasSubdir() {
 		progressMsg = "Sparse-checkout cloning subdirectory..."
 	}
@@ -50,7 +52,7 @@ func handleTrackedRepoInstall(source *install.Source, cfg *config.Config, opts i
 		}
 	}
 
-	result, err := install.InstallTrackedRepo(source, cfg.Source, opts)
+	result, err := install.InstallTrackedRepo(source, trackSourceDir, opts)
 	if err != nil {
 		if errors.Is(err, install.ErrSkipSameRepo) {
 			treeSpinner.Warn(firstWarningLine(err.Error()))
@@ -64,16 +66,31 @@ func handleTrackedRepoInstall(source *install.Source, cfg *config.Config, opts i
 		return logSummary, err
 	}
 
-	treeSpinner.Success("Cloned")
+	treeSpinner.Stop()
+	ui.StepDone("Source", sourceLabel(source.Raw))
+	if opts.Into != "" {
+		ui.StepContinue("Into", opts.Into)
+	}
 
-	// Step 3: Show result
+	// Show result
 	if opts.DryRun {
 		ui.StepEnd("Action", result.Action)
 		fmt.Println()
-		ui.Warning("[dry-run] Would install tracked repo")
+		ui.DryRun()
 	} else {
-		ui.StepContinue("Found", fmt.Sprintf("%d skill(s)", result.SkillCount))
-		renderTrackedRepoMeta(result.RepoName, result.Skills, result.RepoPath)
+		if trackedKind == "agent" {
+			ui.StepContinue("Found", plural(result.AgentCount, "agent"))
+			renderTrackedRepoMeta("Agents", result.Agents)
+		} else {
+			counts := sync.SkillCounts{Skills: result.SkillCount, Variants: result.SkillCount}
+			if discovered, err := sync.DiscoverSourceSkills(trackSourceDir, cfg.SkillsWalk()); err == nil {
+				_, repos := sync.CountSkillsByRepo(discovered)
+				rel, _ := filepath.Rel(trackSourceDir, result.RepoPath)
+				counts = repos[filepath.ToSlash(rel)]
+			}
+			ui.StepContinue("Found", sourceSkillCountText(counts.Skills, counts.Variants))
+			renderTrackedRepoMeta("Skills", result.Skills)
+		}
 	}
 
 	// Display warnings and risk info
@@ -86,15 +103,29 @@ func handleTrackedRepoInstall(source *install.Source, cfg *config.Config, opts i
 	renderInstallWarningsWithResult("", result.Warnings, opts.AuditVerbose, res)
 
 	if !opts.DryRun {
+		printInstallRow(result.RepoName, result.RepoPath, false, treeSpinner.Started())
 		logSummary.SkillCount = result.SkillCount
 		logSummary.InstalledSkills = append(logSummary.InstalledSkills, result.Skills...)
 	}
 
-	// Show next steps
+	// Show next steps. Skip the sync hint when the tracked repo had nothing
+	// to discover — suggesting "Run sync to distribute skills" when no skill
+	// was found is misleading.
 	if !opts.DryRun {
-		ui.SectionLabel("Next Steps")
-		ui.Info("Run 'skillshare sync' to distribute skills to all targets")
-		ui.Info("Run 'skillshare update %s' to update this repo later", result.RepoName)
+		var next []string
+		if trackedKind == "agent" {
+			if result.AgentCount > 0 {
+				next = append(next, "skillshare sync agents", "link them into your targets")
+			}
+			next = append(next, "skillshare update agents --all", "update tracked agent repos later")
+		} else {
+			if result.SkillCount > 0 {
+				next = append(next, "skillshare sync", "link them into your targets")
+			}
+			// --into places the repo in a folder; update takes the path from the source root.
+			next = append(next, "skillshare update "+filepath.ToSlash(filepath.Join(opts.Into, result.RepoName)), "update this repo later")
+		}
+		ui.Next(next...)
 	}
 
 	return logSummary, nil
@@ -110,20 +141,8 @@ func handleGitInstall(source *install.Source, cfg *config.Config, opts install.I
 		AuditThreshold: opts.AuditThreshold,
 	}
 
-	// Show logo with version
-	ui.Logo(appversion.Version)
-
-	// Step 1: Show source
-	ui.StepStart("Source", source.Raw)
-	if source.HasSubdir() {
-		ui.StepContinue("Subdir", source.Subdir)
-	}
-	if opts.Into != "" {
-		ui.StepContinue("Into", opts.Into)
-	}
-
-	// Step 2: Clone with tree spinner animation
-	progressMsg := "Cloning repository..."
+	// Clone with a spinner; the Source row follows once it is done
+	progressMsg := "Cloning " + sourceLabel(source.Raw) + "..."
 	if source.HasSubdir() && source.GitHubOwner() != "" && source.GitHubRepo() != "" {
 		progressMsg = "Downloading via GitHub API..."
 	}
@@ -146,26 +165,45 @@ func handleGitInstall(source *install.Source, cfg *config.Config, opts install.I
 		return logSummary, err
 	}
 	defer install.CleanupDiscovery(discovery)
+	logSummary.planSkills(source, nil)
 
-	treeSpinner.Success("Cloned")
-
-	// Show subdir-specific warnings (e.g. GitHub API fallback notices)
+	treeSpinner.Stop()
+	ui.StepDone("Source", sourceLabel(source.Raw))
 	if source.HasSubdir() {
-		for _, w := range discovery.Warnings {
-			ui.Warning("%s", w)
-		}
+		ui.StepContinue("Subdir", source.Subdir)
+	}
+	if opts.Into != "" {
+		ui.StepContinue("Into", opts.Into)
+	}
+
+	// Show discovery warnings (API fallback notices, skipped submodules)
+	for _, w := range discovery.Warnings {
+		ui.Warning("%s", w)
 	}
 
 	// Cross-path duplicate detection: block if same repo is already installed
 	// at a different location (e.g. user forgot they used --into before).
 	if !opts.Force && source.CloneURL != "" {
-		if err := install.CheckCrossPathDuplicate(cfg.Source, source.CloneURL, opts.Into); err != nil {
+		if err := install.CheckCrossPathDuplicate(cfg.EffectiveSkillsSource(), source.CloneURL, opts.Into); err != nil {
 			return logSummary, err
+		}
+	}
+
+	// Validate -a/--agent names up front so an unknown agent fails before any
+	// skill is installed, instead of leaving a half-success (skill installed,
+	// agent filter silently dropped). Applies even when the repo has no agents
+	// at all — -a asserts the agent exists. (issue #183)
+	if opts.HasAgentFilter() {
+		if _, notFound := filterAgentsByName(discovery.Agents, opts.AgentNames); len(notFound) > 0 {
+			return logSummary, fmt.Errorf("agents not found: %s", strings.Join(notFound, ", "))
 		}
 	}
 
 	// Subdir mode handles single skill before empty check (shows "1 skill: name")
 	if source.HasSubdir() && len(discovery.Skills) == 1 {
+		if err := resolveSkillUpdateNames(discovery.Skills, source, cfg, opts); err != nil {
+			return logSummary, err
+		}
 		skill := discovery.Skills[0]
 		if opts.Name != "" {
 			if err := validate.SkillName(opts.Name); err != nil {
@@ -174,22 +212,17 @@ func handleGitInstall(source *install.Source, cfg *config.Config, opts install.I
 			skill.Name = opts.Name
 		}
 		ui.StepContinue("Found", fmt.Sprintf("1 skill: %s", skill.Name))
+		logSummary.planSkills(source, []install.SkillInfo{skill})
 
-		displayPath := skill.Name
-		if opts.Into != "" {
-			displayPath = filepath.Join(opts.Into, skill.Name)
-		}
+		renderSkillMeta(skill)
 
-		renderSkillMeta(skill, displayPath)
-
-		destPath := destWithInto(cfg.Source, opts, skill.Name)
-		if err := ensureIntoDirExists(cfg.Source, opts); err != nil {
+		destPath := destWithInto(cfg.EffectiveSkillsSource(), opts, skill.Name)
+		if err := ensureIntoDirExists(cfg.EffectiveSkillsSource(), opts); err != nil {
 			return logSummary, fmt.Errorf("failed to create --into directory: %w", err)
 		}
 
-		fmt.Println()
-		installSpinner := ui.StartSpinner("Installing...")
-
+		installStart := time.Now()
+		installSpinner := ui.StartSpinner("Installing " + skill.Name + "...")
 		result, err := install.InstallFromDiscovery(discovery, skill, destPath, opts)
 		if err != nil {
 			installSpinner.Stop()
@@ -200,40 +233,50 @@ func handleGitInstall(source *install.Source, cfg *config.Config, opts install.I
 			if errors.Is(err, audit.ErrBlocked) {
 				return logSummary, renderBlockedAuditError(err)
 			}
-			ui.ErrorMsg("Failed to install: %v", err)
+			ui.StepFail("Install", skill.Name)
 			return logSummary, err
 		}
 
 		installSpinner.Stop()
-		if opts.DryRun {
-			ui.Warning("[dry-run] Would install: %s", skill.Name)
-		} else {
-			ui.SuccessMsg("Installed: %s", skill.Name)
-		}
 		renderInstallWarningsWithResult("", result.Warnings, opts.AuditVerbose, result)
+		printInstallRow(skill.Name, destPath, opts.DryRun, installStart)
 
 		if !opts.DryRun {
-			ui.SectionLabel("Next Steps")
-			ui.Info("Run 'skillshare sync' to distribute to all targets")
+			ui.Next("skillshare sync", "link it into your targets")
 			logSummary.InstalledSkills = append(logSummary.InstalledSkills, skill.Name)
 			logSummary.SkillCount = len(logSummary.InstalledSkills)
 		}
+		installDiscoveredAgents(discovery, cfg, opts)
 		return logSummary, nil
 	}
 
-	// Step 3: Show found skills
-	if len(discovery.Skills) == 0 {
-		ui.StepEnd("Found", "No skills (no SKILL.md files)")
+	// Step 3: Show found resources
+	if len(discovery.Skills) == 0 && len(discovery.Agents) == 0 {
+		ui.StepEnd("Found", "No skills or agents found")
 		return logSummary, nil
 	}
 
-	ui.StepEnd("Found", fmt.Sprintf("%d skill(s)", len(discovery.Skills)))
+	// Pure agent repo — no skills, only agents
+	if len(discovery.Skills) == 0 && len(discovery.Agents) > 0 {
+		ui.StepEnd("Found", plural(len(discovery.Agents), "agent"))
+		agentsRoot := cfg.EffectiveAgentsSource()
+		agentsDir := agentsDirWithInto(agentsRoot, opts)
+		agentOpts := opts
+		agentOpts.SourceDir = agentsRoot
+		return handleAgentInstall(discovery, agentsDir, agentOpts, logSummary)
+	}
+
+	foundMsg := plural(len(discovery.Skills), "skill")
+	if len(discovery.Agents) > 0 {
+		foundMsg += ", " + plural(len(discovery.Agents), "agent")
+	}
+	ui.StepEnd("Found", foundMsg)
 
 	// Apply --exclude early so excluded skills never appear in prompts
 	if len(opts.Exclude) > 0 {
 		discovery.Skills = applyExclude(discovery.Skills, opts.Exclude)
 		if len(discovery.Skills) == 0 {
-			ui.Info("All skills were excluded")
+			ui.Done(ui.MarkNone, "All skills were excluded", 0)
 			return logSummary, nil
 		}
 	}
@@ -244,6 +287,9 @@ func handleGitInstall(source *install.Source, cfg *config.Config, opts install.I
 
 	// Single skill (non-subdir): show detailed box and install directly
 	if len(discovery.Skills) == 1 {
+		if err := resolveSkillUpdateNames(discovery.Skills, source, cfg, opts); err != nil {
+			return logSummary, err
+		}
 		skill := discovery.Skills[0]
 		if opts.Name != "" {
 			if err := validate.SkillName(opts.Name); err != nil {
@@ -251,22 +297,16 @@ func handleGitInstall(source *install.Source, cfg *config.Config, opts install.I
 			}
 			skill.Name = opts.Name
 		}
+		logSummary.planSkills(source, []install.SkillInfo{skill})
 
-		// Determine local installation info for display (relative to skills dir)
-		displayPath := skill.Name
-		if opts.Into != "" {
-			displayPath = filepath.Join(opts.Into, skill.Name)
-		}
+		renderSkillMeta(skill)
 
-		renderSkillMeta(skill, displayPath)
-
-		destPath := destWithInto(cfg.Source, opts, skill.Name)
-		if err := ensureIntoDirExists(cfg.Source, opts); err != nil {
+		destPath := destWithInto(cfg.EffectiveSkillsSource(), opts, skill.Name)
+		if err := ensureIntoDirExists(cfg.EffectiveSkillsSource(), opts); err != nil {
 			return logSummary, fmt.Errorf("failed to create --into directory: %w", err)
 		}
-		fmt.Println()
-
-		installSpinner := ui.StartSpinner("Installing...")
+		installStart := time.Now()
+		installSpinner := ui.StartSpinner("Installing " + skill.Name + "...")
 		result, err := install.InstallFromDiscovery(discovery, skill, destPath, opts)
 		if err != nil {
 			installSpinner.Stop()
@@ -277,24 +317,20 @@ func handleGitInstall(source *install.Source, cfg *config.Config, opts install.I
 			if errors.Is(err, audit.ErrBlocked) {
 				return logSummary, renderBlockedAuditError(err)
 			}
-			ui.ErrorMsg("Failed to install: %v", err)
+			ui.StepFail("Install", skill.Name)
 			return logSummary, err
 		}
 
 		installSpinner.Stop()
-		if opts.DryRun {
-			ui.Warning("[dry-run] Would install: %s", skill.Name)
-		} else {
-			ui.SuccessMsg("Installed: %s", skill.Name)
-		}
 		renderInstallWarningsWithResult("", result.Warnings, opts.AuditVerbose, result)
+		printInstallRow(skill.Name, destPath, opts.DryRun, installStart)
 
 		if !opts.DryRun {
-			ui.SectionLabel("Next Steps")
-			ui.Info("Run 'skillshare sync' to distribute to all targets")
+			ui.Next("skillshare sync", "link it into your targets")
 			logSummary.InstalledSkills = append(logSummary.InstalledSkills, skill.Name)
 			logSummary.SkillCount = len(logSummary.InstalledSkills)
 		}
+		installDiscoveredAgents(discovery, cfg, opts)
 
 		return logSummary, nil
 	}
@@ -305,21 +341,32 @@ func handleGitInstall(source *install.Source, cfg *config.Config, opts install.I
 		if err != nil {
 			return logSummary, err
 		}
+		if err := resolveSkillUpdateNames(selected, source, cfg, opts); err != nil {
+			return logSummary, err
+		}
 
 		if opts.DryRun {
+			logSummary.planSkills(source, selected)
+			if err := checkIntoFolder(cfg.EffectiveSkillsSource(), opts); err != nil {
+				return logSummary, err
+			}
 			fmt.Println()
 			printSkillListCompact(selected)
 			fmt.Println()
-			ui.Warning("[dry-run] Would install %d skill(s)", len(selected))
+			ui.Done(ui.MarkNone, "Would install "+plural(len(selected), "skill"), 0)
+			ui.DryRun()
 			return logSummary, nil
 		}
 
-		fmt.Println()
 		batchSummary := installSelectedSkills(selected, discovery, cfg, opts)
+		if batchSummary.Err != nil {
+			return logSummary, batchSummary.Err
+		}
 		logSummary.InstalledSkills = append(logSummary.InstalledSkills, batchSummary.InstalledSkills...)
 		logSummary.FailedSkills = append(logSummary.FailedSkills, batchSummary.FailedSkills...)
 		logSummary.SkillCount = len(logSummary.InstalledSkills)
-		return logSummary, nil
+		installDiscoveredAgents(discovery, cfg, opts)
+		return logSummary, allSkillsFailedError(len(batchSummary.InstalledSkills)+batchSummary.SkippedSkills, batchSummary.Failures)
 	}
 
 	if opts.DryRun {
@@ -327,13 +374,14 @@ func handleGitInstall(source *install.Source, cfg *config.Config, opts install.I
 		fmt.Println()
 		printSkillListCompact(discovery.Skills)
 		fmt.Println()
-		ui.Warning("[dry-run] Would prompt for selection")
+		ui.Done(ui.MarkNone, "Would ask which skills to install", 0)
+		ui.DryRun()
 		return logSummary, nil
 	}
 
 	// Non-TTY with large repo: require explicit flags
 	if !ui.IsTTY() && len(discovery.Skills) >= largeRepoThreshold {
-		ui.Info("Found %d skills. Non-interactive mode requires --all, --yes, or --skill <names>", len(discovery.Skills))
+		ui.Note(fmt.Sprintf("Found %d skills. Non-interactive mode requires --all, --yes, or --skill <names>", len(discovery.Skills)))
 		return logSummary, fmt.Errorf("interactive selection not available in non-TTY mode")
 	}
 
@@ -345,17 +393,43 @@ func handleGitInstall(source *install.Source, cfg *config.Config, opts install.I
 	}
 
 	if len(selected) == 0 {
-		ui.Info("No skills selected")
+		ui.Done(ui.MarkNone, "No skills selected", 0)
 		return logSummary, nil
 	}
+	if err := resolveSkillUpdateNames(selected, source, cfg, opts); err != nil {
+		return logSummary, err
+	}
 
-	fmt.Println()
 	batchSummary := installSelectedSkills(selected, discovery, cfg, opts)
+	if batchSummary.Err != nil {
+		return logSummary, batchSummary.Err
+	}
 	logSummary.InstalledSkills = append(logSummary.InstalledSkills, batchSummary.InstalledSkills...)
 	logSummary.FailedSkills = append(logSummary.FailedSkills, batchSummary.FailedSkills...)
 	logSummary.SkillCount = len(logSummary.InstalledSkills)
+	installDiscoveredAgents(discovery, cfg, opts)
 
-	return logSummary, nil
+	return logSummary, allSkillsFailedError(len(batchSummary.InstalledSkills)+batchSummary.SkippedSkills, batchSummary.Failures)
+}
+
+func resolveSkillUpdateNames(skills []install.SkillInfo, source *install.Source, cfg *config.Config, opts install.InstallOptions) error {
+	if !opts.Update {
+		return nil
+	}
+	names := make(map[string]bool)
+	for i := range skills {
+		name, err := install.ExistingSkillInstallName(cfg.EffectiveSkillsSource(), source, skills[i], opts)
+		if err != nil {
+			return err
+		}
+		key := strings.ToLower(name)
+		if names[key] {
+			return fmt.Errorf("skill name collision after resolving installed names: %s; update each installed skill by name instead", name)
+		}
+		names[key] = true
+		skills[i].Name = name
+	}
+	return nil
 }
 
 // largeBatchProgressThreshold is the skill count above which a progress bar
@@ -378,42 +452,18 @@ func installSelectedSkills(selected []install.SkillInfo, discovery *install.Disc
 
 	// Ensure Into directory exists for batch installs
 	if opts.Into != "" {
-		if err := ensureIntoDirExists(cfg.Source, opts); err != nil {
+		if err := ensureIntoDirExists(cfg.EffectiveSkillsSource(), opts); err != nil {
 			if installSpinner != nil {
 				installSpinner.Fail("Failed to create --into directory")
 			}
 			if progressBar != nil {
 				progressBar.Stop()
-				ui.ErrorMsg("Failed to create --into directory")
 			}
-			return installBatchSummary{}
+			return installBatchSummary{Err: fmt.Errorf("failed to create --into directory: %w", err)}
 		}
 	}
 
-	// Detect orchestrator: if root skill (path=".") is selected, children nest under it
-	var parentName string
-	var rootIdx = -1
 	for i, skill := range selected {
-		if skill.Path == "." {
-			parentName = skill.Name
-			rootIdx = i
-			break
-		}
-	}
-
-	// Reorder: install root skill first so children can nest under it
-	orderedSkills := selected
-	if rootIdx > 0 {
-		orderedSkills = make([]install.SkillInfo, 0, len(selected))
-		orderedSkills = append(orderedSkills, selected[rootIdx])
-		orderedSkills = append(orderedSkills, selected[:rootIdx]...)
-		orderedSkills = append(orderedSkills, selected[rootIdx+1:]...)
-	}
-
-	// Track if root was installed (children are already included in root)
-	rootInstalled := false
-
-	for i, skill := range orderedSkills {
 		if installSpinner != nil {
 			installSpinner.NextStep(fmt.Sprintf("Installing %s...", skill.Name))
 			if i == 0 {
@@ -424,33 +474,12 @@ func installSelectedSkills(selected []install.SkillInfo, discovery *install.Disc
 			progressBar.UpdateTitle(fmt.Sprintf("Installing %s", skill.Name))
 		}
 
-		// Determine destination path and effective --into for force hints.
-		var destPath string
+		// Determine destination path. Each skill installs independently
+		// at the top level (or under --into if specified). Root orchestrator
+		// skills (Path=".") get only their SKILL.md copied (handled in
+		// install_apply.go), so no nesting is needed.
+		destPath := destWithInto(cfg.EffectiveSkillsSource(), opts, skill.Name)
 		skillOpts := opts
-		if skill.Path == "." {
-			// Root skill - install directly
-			destPath = destWithInto(cfg.Source, opts, skill.Name)
-		} else if parentName != "" {
-			// Child skill with parent selected - nest under parent group
-			effectiveInto := parentName
-			if opts.Into != "" {
-				effectiveInto = filepath.Join(opts.Into, parentName)
-			}
-			skillOpts.Into = effectiveInto
-			destPath = destWithInto(cfg.Source, opts, filepath.Join(parentName, skill.Name))
-		} else {
-			// Standalone child skill - install to root
-			destPath = destWithInto(cfg.Source, opts, skill.Name)
-		}
-
-		// If root was installed, children are already included - skip reinstall
-		if rootInstalled && skill.Path != "." {
-			results = append(results, skillInstallResult{skill: skill, success: true, message: fmt.Sprintf("included in %s", parentName)})
-			if progressBar != nil {
-				progressBar.Increment()
-			}
-			continue
-		}
 
 		installResult, err := install.InstallFromDiscovery(discovery, skill, destPath, skillOpts)
 		if err != nil {
@@ -465,17 +494,9 @@ func installSelectedSkills(selected []install.SkillInfo, discovery *install.Disc
 			continue
 		}
 
-		if skill.Path == "." {
-			rootInstalled = true
-		}
-		message := "installed"
-		if len(installResult.Warnings) > 0 {
-			message = fmt.Sprintf("installed (%d warning(s))", len(installResult.Warnings))
-		}
 		results = append(results, skillInstallResult{
 			skill:          skill,
 			success:        true,
-			message:        message,
 			warnings:       installResult.Warnings,
 			auditRiskLabel: installResult.AuditRiskLabel,
 			auditRiskScore: installResult.AuditRiskScore,
@@ -505,8 +526,10 @@ func installSelectedSkills(selected []install.SkillInfo, discovery *install.Disc
 			summary.InstalledSkills = append(summary.InstalledSkills, r.skill.Name)
 		case r.skipped:
 			// Same-repo skips are not failures; exclude from FailedSkills.
+			summary.SkippedSkills++
 		default:
 			summary.FailedSkills = append(summary.FailedSkills, r.skill.Name)
+			summary.Failures = append(summary.Failures, install.SkillFailure{Name: r.skill.Name, Err: r.err})
 		}
 	}
 	return summary
@@ -557,27 +580,10 @@ func displayInstallResults(results []skillInstallResult, spinner *ui.Spinner, au
 	failed := len(failures)
 	skippedCount := len(skipped)
 
-	// Summary line — skipped does not count as failure.
-	summaryMsg := buildInstallSummary(installed, failed, skippedCount)
+	var took time.Duration
 	if spinner != nil {
-		switch {
-		case failed > 0 && installed == 0:
-			spinner.Fail(summaryMsg)
-		case failed > 0:
-			spinner.Warn(summaryMsg)
-		case skippedCount > 0:
-			spinner.Success(summaryMsg)
-		default:
-			spinner.Success(summaryMsg)
-		}
-	} else {
-		// Progress bar mode — print summary line directly
-		fmt.Println()
-		if failed > 0 && installed == 0 {
-			ui.ErrorMsg("%s", summaryMsg)
-		} else {
-			ui.SuccessMsg("%s", summaryMsg)
-		}
+		spinner.Stop()
+		took = time.Since(spinner.Started())
 	}
 
 	// Show failures first with details
@@ -594,16 +600,16 @@ func displayInstallResults(results []skillInstallResult, spinner *ui.Spinner, au
 		ui.SectionLabel("Blocked / Failed")
 		if len(blockedFailures) > 0 && !auditVerbose {
 			threshold := summarizeBlockedThreshold(blockedFailures)
-			ui.Warning("%d skill(s) blocked by security audit (%s threshold)", len(blockedFailures), formatBlockedThresholdLabel(threshold))
-			ui.Info("Use --force to continue blocked installs, or --skip-audit to bypass scanning for this run")
+			ui.Warning("%s blocked by security audit (%s threshold)", plural(len(blockedFailures), "skill"), formatBlockedThresholdLabel(threshold))
+			ui.Note("Use --force to continue blocked installs, or --skip-audit to bypass scanning for this run")
 		}
 
 		const blockedVerboseLimit = 20
 		if auditVerbose && len(blockedFailures) > blockedVerboseLimit {
 			// Large batch: summary line + first N verbose + rest compact
 			threshold := summarizeBlockedThreshold(blockedFailures)
-			ui.Warning("%d skill(s) blocked by security audit (%s threshold)", len(blockedFailures), formatBlockedThresholdLabel(threshold))
-			ui.Info("Use --force to continue blocked installs, or --skip-audit to bypass scanning for this run")
+			ui.Warning("%s blocked by security audit (%s threshold)", plural(len(blockedFailures), "skill"), formatBlockedThresholdLabel(threshold))
+			ui.Note("Use --force to continue blocked installs, or --skip-audit to bypass scanning for this run")
 			for i, r := range blockedFailures {
 				digest := parseAuditBlockedFailure(r.message)
 				if i < blockedVerboseLimit {
@@ -614,7 +620,7 @@ func displayInstallResults(results []skillInstallResult, spinner *ui.Spinner, au
 			}
 			remaining := len(blockedFailures) - blockedVerboseLimit
 			if remaining > 0 {
-				ui.Info("%d more blocked skill(s) shown in compact form above", remaining)
+				ui.Note(fmt.Sprintf("%d more blocked skill%s shown in compact form above", remaining, pluralS(remaining)))
 			}
 		} else {
 			for _, r := range blockedFailures {
@@ -643,7 +649,7 @@ func displayInstallResults(results []skillInstallResult, spinner *ui.Spinner, au
 		}
 		ui.SectionLabel(label)
 		renderSkippedByGroup(skipped)
-		ui.Info("Use 'skillshare update' to refresh, or --force to overwrite")
+		ui.Note("Use 'skillshare update' to refresh, or --force to overwrite")
 	}
 
 	// Show successes — condensed when many
@@ -668,12 +674,14 @@ func displayInstallResults(results []skillInstallResult, spinner *ui.Spinner, au
 			ui.StepDone(fmt.Sprintf("%d skills installed", installed), detail)
 		default:
 			for _, r := range successes {
+				note := ""
+				if n := len(r.warnings); n > 0 {
+					note = ui.DimText(plural(n, "warning"))
+				}
+				ui.StepDone(r.skill.Name, note)
 				if installed == 1 {
-					// Single skill: show full audit info
-					fmt.Println()
+					// Single skill: show its full audit
 					renderInstallWarningsWithResult("", r.warnings, auditVerbose, r.result)
-				} else {
-					ui.StepDone(r.skill.Name, r.message)
 				}
 			}
 		}
@@ -685,14 +693,14 @@ func displayInstallResults(results []skillInstallResult, spinner *ui.Spinner, au
 			skillsWithWarnings := countSkillsWithWarnings(results)
 			if skillsWithWarnings <= 20 {
 				// Small batch: show full verbose detail per skill
-				ui.Warning("%d warning(s) detected during install", totalWarnings)
+				ui.Warning("%s during install", plural(totalWarnings, "warning"))
 				for _, r := range results {
 					renderInstallWarnings(r.skill.Name, r.warnings, true)
 				}
 			} else {
 				// Large batch: compact summary + only HIGH/CRITICAL findings from top skills
 				renderBatchInstallWarningsCompact(results, totalWarnings,
-					"%d audit finding line(s) across all skills; HIGH/CRITICAL detail expanded below")
+					"%s across all skills; HIGH/CRITICAL detail expanded below")
 				fmt.Println()
 				ui.Warning("HIGH/CRITICAL detail (top skills):")
 				shown := 0
@@ -705,7 +713,7 @@ func displayInstallResults(results []skillInstallResult, spinner *ui.Spinner, au
 				}
 				remaining := skillsWithWarnings - shown
 				if remaining > 0 {
-					ui.Info("%d more skill(s) with findings; use 'skillshare check <name>' for details", remaining)
+					ui.Note(fmt.Sprintf("%s more with findings — run skillshare check <name> for details", plural(remaining, "skill")))
 				}
 			}
 		} else if len(results) > 100 {
@@ -715,9 +723,18 @@ func displayInstallResults(results []skillInstallResult, spinner *ui.Spinner, au
 		}
 	}
 
+	// Closing line — skipped does not count as failure.
+	mark := ui.MarkOK
+	switch {
+	case failed > 0 && installed == 0:
+		mark = ui.MarkFail
+	case failed > 0:
+		mark = ui.MarkWarn
+	}
+	fmt.Println()
+	ui.Done(mark, buildInstallSummary(installed, failed, skippedCount, "skill"), took)
 	if installed > 0 {
-		ui.SectionLabel("Next Steps")
-		ui.Info("Run 'skillshare sync' to distribute to all targets")
+		ui.Next("skillshare sync", "link them into your targets")
 	}
 }
 
@@ -766,20 +783,52 @@ func renderSkippedByGroup(skipped []skillInstallResult) {
 	}
 }
 
-// buildInstallSummary formats the one-line summary for batch install results.
-func buildInstallSummary(installed, failed, skipped int) string {
+// buildInstallSummary formats the one-line summary for batch install results;
+// noun is "skill" or "agent".
+func buildInstallSummary(installed, failed, skipped int, noun string) string {
 	parts := make([]string, 0, 3)
 	if installed > 0 {
-		parts = append(parts, fmt.Sprintf("Installed %d", installed))
+		parts = append(parts, "Installed "+plural(installed, noun))
 	}
 	if failed > 0 {
-		parts = append(parts, fmt.Sprintf("failed %d", failed))
+		parts = append(parts, fmt.Sprintf("%d failed", failed))
 	}
 	if skipped > 0 {
 		parts = append(parts, fmt.Sprintf("%d skipped", skipped))
 	}
 	if len(parts) == 0 {
-		return "No skills installed"
+		return "No " + noun + "s installed"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// buildConfigInstallSummary formats the summary for installing from config,
+// counting tracked repos apart from single skills.
+func buildConfigInstallSummary(r install.ConfigInstallResult) string {
+	var parts []string
+	plainInstalled := r.Installed - r.InstalledRepos
+	if r.InstalledRepos > 0 {
+		parts = append(parts, fmt.Sprintf("Installed %s (%s)",
+			plural(r.InstalledRepos, "tracked repo"), plural(r.InstalledRepoSkills, "skill")))
+		if plainInstalled > 0 {
+			parts = append(parts, plural(plainInstalled, "skill"))
+		}
+	} else {
+		parts = append(parts, "Installed "+plural(plainInstalled, "skill"))
+	}
+	if r.Skipped > 0 {
+		skipped := fmt.Sprintf("%d skipped", r.Skipped)
+		if r.SkippedRepos > 0 {
+			kinds := []string{plural(r.SkippedRepos, "repo")}
+			if n := r.Skipped - r.SkippedRepos; n > 0 {
+				kinds = append(kinds, plural(n, "skill"))
+			}
+			skipped += " (" + strings.Join(kinds, ", ") + ")"
+		}
+		parts = append(parts, skipped)
+	}
+	if len(r.FailedSkills) > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed", len(r.FailedSkills)))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -812,43 +861,29 @@ func handleDirectInstall(source *install.Source, cfg *config.Config, opts instal
 
 	// Set the name in source for display
 	source.Name = skillName
+	logSummary.planSkills(source, []install.SkillInfo{{Name: skillName, Path: "."}})
 
 	// Determine destination path
-	destPath := destWithInto(cfg.Source, opts, skillName)
+	destPath := destWithInto(cfg.EffectiveSkillsSource(), opts, skillName)
 
 	// Ensure Into directory exists
-	if err := ensureIntoDirExists(cfg.Source, opts); err != nil {
+	if err := ensureIntoDirExists(cfg.EffectiveSkillsSource(), opts); err != nil {
 		return logSummary, fmt.Errorf("failed to create --into directory: %w", err)
 	}
 
 	// Cross-path duplicate detection (same as handleGitInstall)
 	if !opts.Force && source.CloneURL != "" {
-		if err := install.CheckCrossPathDuplicate(cfg.Source, source.CloneURL, opts.Into); err != nil {
+		if err := install.CheckCrossPathDuplicate(cfg.EffectiveSkillsSource(), source.CloneURL, opts.Into); err != nil {
 			return logSummary, err
 		}
 	}
 
-	// Show logo with version
-	ui.Logo(appversion.Version)
-
-	// Step 1: Show source info
-	ui.StepStart("Source", source.Raw)
-	ui.StepContinue("Name", skillName)
-	if opts.Into != "" {
-		ui.StepContinue("Into", opts.Into)
-	}
-	if source.HasSubdir() {
-		ui.StepContinue("Subdir", source.Subdir)
-	}
-
-	// Step 2: Clone/copy with tree spinner
-	var actionMsg string
+	// Clone or copy with a spinner; the Source row follows once it is done
+	actionMsg := "Copying"
 	if source.IsGit() {
-		actionMsg = "Cloning repository..."
-	} else {
-		actionMsg = "Copying files..."
+		actionMsg = "Cloning"
 	}
-	treeSpinner := ui.StartTreeSpinner(actionMsg, true)
+	treeSpinner := ui.StartTreeSpinner(actionMsg+" "+skillName, true)
 	if source.IsGit() && ui.IsTTY() {
 		opts.OnProgress = func(line string) {
 			treeSpinner.Update(line)
@@ -869,22 +904,19 @@ func handleDirectInstall(source *install.Source, cfg *config.Config, opts instal
 		return logSummary, err
 	}
 
-	// Display result
-	if opts.DryRun {
-		treeSpinner.Success("Ready")
-		fmt.Println()
-		ui.Warning("[dry-run] %s", result.Action)
-	} else {
-		treeSpinner.Success(fmt.Sprintf("Installed: %s", skillName))
+	treeSpinner.Stop()
+	ui.StepDone("Source", sourceLabel(source.Raw))
+	if opts.Into != "" {
+		ui.StepContinue("Into", opts.Into)
 	}
+	if source.HasSubdir() {
+		ui.StepContinue("Subdir", source.Subdir)
+	}
+	renderInstallWarningsWithResult("", result.Warnings, opts.AuditVerbose, result)
+	printInstallRow(skillName, destPath, opts.DryRun, treeSpinner.Started())
 
-	// Display warnings
-	renderInstallWarnings("", result.Warnings, opts.AuditVerbose)
-
-	// Show next steps
 	if !opts.DryRun {
-		ui.SectionLabel("Next Steps")
-		ui.Info("Run 'skillshare sync' to distribute to all targets")
+		ui.Next("skillshare sync", "link it into your targets")
 		logSummary.InstalledSkills = append(logSummary.InstalledSkills, skillName)
 		logSummary.SkillCount = len(logSummary.InstalledSkills)
 	}
@@ -900,26 +932,24 @@ func installFromGlobalConfig(cfg *config.Config, opts install.InstallOptions) (i
 		AuditVerbose: opts.AuditVerbose,
 	}
 
-	reg, regErr := config.LoadRegistry(filepath.Dir(config.ConfigPath()))
-	if regErr != nil {
-		return summary, fmt.Errorf("failed to load registry: %w", regErr)
+	store, storeErr := install.LoadMetadataWithMigration(cfg.EffectiveSkillsSource(), "")
+	if storeErr != nil {
+		return summary, fmt.Errorf("failed to load metadata: %w", storeErr)
 	}
-	ctx := &globalInstallContext{cfg: cfg, reg: reg}
+	ctx := &globalInstallContext{cfg: cfg, store: store}
 
 	if len(ctx.ConfigSkills()) == 0 {
-		ui.Info("No remote skills defined in registry")
-		ui.Info("Install a skill first: skillshare install <source>")
+		ui.Done(ui.MarkNone, "No remote skills defined in metadata", 0)
+		ui.Next("skillshare install <source>", "install a skill first")
 		return summary, nil
 	}
 
-	ui.Logo(appversion.Version)
 	total := len(ctx.ConfigSkills())
 	installStart := time.Now()
 
 	// Use quiet mode + TreeSpinner: suppress per-skill output, show summary
 	opts.Quiet = true
-	ui.StepStart("Installing", fmt.Sprintf("%d skill(s) from config", total))
-	treeSpinner := ui.StartTreeSpinner("Resolving skills...", false)
+	treeSpinner := ui.StartTreeSpinner(fmt.Sprintf("Installing %s from config...", plural(total, "skill")), false)
 	if ui.IsTTY() {
 		opts.OnProgress = func(line string) {
 			if text := parseGitProgressLine(line); text != "" {
@@ -935,9 +965,9 @@ func installFromGlobalConfig(cfg *config.Config, opts install.InstallOptions) (i
 	summary.SkillCount = len(result.InstalledSkills)
 
 	if err != nil {
-		treeSpinner.Fail("Install failed")
+		treeSpinner.Stop()
 		elapsed := time.Since(installStart)
-		parts := []string{fmt.Sprintf("Installed %d skill(s)", len(result.InstalledSkills))}
+		parts := []string{"Installed " + plural(len(result.InstalledSkills), "skill")}
 		if len(result.FailedSkills) > 0 {
 			parts = append(parts, fmt.Sprintf("%d failed", len(result.FailedSkills)))
 		}
@@ -945,62 +975,72 @@ func installFromGlobalConfig(cfg *config.Config, opts install.InstallOptions) (i
 		return summary, err
 	}
 
+	treeSpinner.Stop()
 	if opts.DryRun {
-		treeSpinner.Success("Ready")
+		ui.DryRun()
 		return summary, nil
 	}
 
-	treeSpinner.Success("Done")
-
 	elapsed := time.Since(installStart)
-	parts := []string{fmt.Sprintf("Installed %d skill(s)", result.Installed)}
-	if result.Skipped > 0 {
-		parts = append(parts, fmt.Sprintf("%d skipped", result.Skipped))
-	}
-	if len(result.FailedSkills) > 0 {
-		parts = append(parts, fmt.Sprintf("%d failed", len(result.FailedSkills)))
-	}
 	status := "success"
 	if len(result.FailedSkills) > 0 {
 		status = "error"
 	}
-	ui.StepResult(status, strings.Join(parts, ", "), elapsed)
+	ui.StepResult(status, buildConfigInstallSummary(result), elapsed)
 
 	// Show failed details
 	if len(result.FailedSkills) > 0 {
 		fmt.Println()
-		for _, name := range result.FailedSkills {
-			ui.StepFail(name, "install failed")
+		for _, f := range result.Failures {
+			ui.StepFail(f.Name, firstWarningLine(f.Err.Error()))
 		}
 	}
 
-	// Sync hint
 	if result.Installed > 0 {
-		fmt.Println()
-		ui.Info("Run 'skillshare sync' to distribute to all targets")
+		ui.Next("skillshare sync", "link them into your targets")
 	}
 
-	return summary, nil
+	return summary, allSkillsFailedError(len(result.InstalledSkills)+result.Skipped, result.Failures)
 }
 
-// renderSkillMeta prints skill description, license, and location as inline tree steps.
-func renderSkillMeta(skill install.SkillInfo, displayPath string) {
+// renderSkillMeta prints the skill's description and license; the Install
+// row that follows names where it goes.
+func renderSkillMeta(skill install.SkillInfo) {
 	if skill.Description != "" {
 		ui.StepContinue("Desc", truncateDesc(skill.Description, 100))
 	}
 	if skill.License != "" {
 		ui.StepContinue("License", skill.License)
 	}
-	ui.StepEnd("Location", "skills/"+displayPath)
 }
 
-// renderTrackedRepoMeta prints tracked repo metadata as inline tree steps.
-func renderTrackedRepoMeta(repoName string, skills []string, repoPath string) {
-	ui.StepContinue("Tracked", repoName)
-	if len(skills) > 0 && len(skills) <= 10 {
-		ui.StepContinue("Skills", strings.Join(skills, ", "))
+// sourceLabel is an install source for display, with the home folder as ~.
+func sourceLabel(raw string) string {
+	if rest, ok := strings.CutPrefix(raw, "file://"); ok {
+		return "file://" + utils.FoldHomePath(rest)
 	}
-	ui.StepEnd("Location", repoPath)
+	return utils.FoldHomePath(raw)
+}
+
+// printInstallRow reports a skill installed into destPath, or one a dry run
+// would install there.
+func printInstallRow(name, destPath string, dryRun bool, start time.Time) {
+	value := name + " " + ui.DimText("→ "+utils.FoldHomePath(destPath))
+	if dryRun {
+		ui.Row(ui.MarkNone, "Install", value, ui.RowWidth("Install"))
+		fmt.Println()
+		ui.DryRun()
+		return
+	}
+	ui.Row(ui.MarkOK, "Install", value+ui.Took(time.Since(start)), ui.RowWidth("Install"))
+}
+
+// renderTrackedRepoMeta names what a tracked repo holds, when the list is
+// short enough to read; label is "Skills" or "Agents".
+func renderTrackedRepoMeta(label string, names []string) {
+	if len(names) > 0 && len(names) <= 10 {
+		ui.StepContinue(label, strings.Join(names, ", "))
+	}
 }
 
 // truncateDesc truncates a description string to max runes, appending " ..." if truncated.
@@ -1010,4 +1050,262 @@ func truncateDesc(s string, max int) string {
 		return s
 	}
 	return string(runes[:max]) + " ..."
+}
+
+// handleAgentInstall installs agents from a pure-agent repo.
+// Matches the skill install flow: single→direct, multi→TUI/flags, batch progress.
+func handleAgentInstall(discovery *install.DiscoveryResult, agentsDir string, opts install.InstallOptions, logSummary installLogSummary) (installLogSummary, error) {
+	agents := discovery.Agents
+
+	// Single agent: install directly (matches single-skill pattern)
+	if len(agents) == 1 && !opts.HasAgentFilter() && !opts.ShouldInstallAll() {
+		agent := agents[0]
+		if opts.DryRun {
+			ui.Row(ui.MarkNone, "Install", agent.Name+" "+ui.DimText("→ "+utils.FoldHomePath(filepath.Join(agentsDir, agent.FileName))), ui.RowWidth("Install"))
+			fmt.Println()
+			ui.DryRun()
+			return logSummary, nil
+		}
+		spinner := ui.StartSpinner(fmt.Sprintf("Installing agent %s...", agent.Name))
+		result, err := install.InstallAgentFromDiscovery(discovery, agent, agentsDir, opts)
+		spinner.Stop()
+		if err != nil {
+			ui.StepFail("Install", agent.Name)
+			return logSummary, err
+		}
+		if result.Action == "skipped" {
+			ui.StepSkip(agent.Name, strings.Join(result.Warnings, "; "))
+		} else {
+			ui.Row(ui.MarkOK, "Install", agent.Name+" "+ui.DimText("→ "+utils.FoldHomePath(filepath.Join(agentsDir, agent.FileName)))+ui.Took(time.Since(spinner.Started())), ui.RowWidth("Install"))
+			logSummary.SkillCount = 1
+			logSummary.InstalledSkills = append(logSummary.InstalledSkills, agent.Name)
+			ui.Next("skillshare sync agents", "link it into your targets")
+		}
+		return logSummary, nil
+	}
+
+	// Dry-run: show list and return
+	if opts.DryRun {
+		selected := agents
+		if opts.HasAgentFilter() || opts.ShouldInstallAll() {
+			var err error
+			selected, err = selectAgents(agents, opts)
+			if err != nil {
+				return logSummary, err
+			}
+		}
+		fmt.Println()
+		for _, a := range selected {
+			fmt.Printf("  %s  %s\n", a.Name, ui.DimText(a.FileName))
+		}
+		fmt.Println()
+		ui.Done(ui.MarkNone, "Would install "+plural(len(selected), "agent"), 0)
+		ui.DryRun()
+		return logSummary, nil
+	}
+
+	// Non-interactive: --all/--yes or -a filter
+	if opts.HasAgentFilter() || opts.ShouldInstallAll() {
+		selected, err := selectAgents(agents, opts)
+		if err != nil {
+			return logSummary, err
+		}
+		fmt.Println()
+		batchSummary := installSelectedAgents(selected, discovery, agentsDir, opts)
+		logSummary.InstalledSkills = append(logSummary.InstalledSkills, batchSummary.InstalledSkills...)
+		logSummary.FailedSkills = append(logSummary.FailedSkills, batchSummary.FailedSkills...)
+		logSummary.SkillCount = len(logSummary.InstalledSkills)
+		return logSummary, nil
+	}
+
+	// Non-TTY fallback
+	if !ui.IsTTY() {
+		ui.Note(fmt.Sprintf("Found %d agents. Non-interactive mode requires --all, --yes, or -a <names>", len(agents)))
+		return logSummary, fmt.Errorf("interactive selection not available in non-TTY mode")
+	}
+
+	// Interactive TUI selection
+	fmt.Println()
+	selected, err := selectAgents(agents, opts)
+	if err != nil {
+		return logSummary, err
+	}
+	if len(selected) == 0 {
+		ui.Done(ui.MarkNone, "No agents selected", 0)
+		return logSummary, nil
+	}
+
+	fmt.Println()
+	batchSummary := installSelectedAgents(selected, discovery, agentsDir, opts)
+	logSummary.InstalledSkills = append(logSummary.InstalledSkills, batchSummary.InstalledSkills...)
+	logSummary.FailedSkills = append(logSummary.FailedSkills, batchSummary.FailedSkills...)
+	logSummary.SkillCount = len(logSummary.InstalledSkills)
+	return logSummary, nil
+}
+
+// installDiscoveredAgents installs agents from a mixed repo after skills have been installed.
+func installDiscoveredAgents(discovery *install.DiscoveryResult, cfg *config.Config, opts install.InstallOptions) {
+	if len(discovery.Agents) == 0 {
+		return
+	}
+	// Don't auto-install the repo's agents when the user scoped the install to
+	// specific skills (--kind skill or -s/--skill) without also requesting
+	// agents via -a. Agents only come along on --all/--yes or an explicit
+	// agent request. (issue #183)
+	if opts.Kind == "skill" || (opts.HasSkillFilter() && !opts.HasAgentFilter()) {
+		return
+	}
+
+	// Honor agent selection: -a/--agent installs only the named agents,
+	// --all/--yes installs all, otherwise prompt. (issue #183)
+	selected, err := selectAgents(discovery.Agents, opts)
+	if err != nil {
+		ui.ErrorMsg("%v", err)
+		return
+	}
+	if len(selected) == 0 {
+		return
+	}
+
+	agentsRoot := cfg.EffectiveAgentsSource()
+	agentsDir := agentsDirWithInto(agentsRoot, opts)
+	agentOpts := opts
+	agentOpts.SourceDir = agentsRoot
+	ui.Section("Agents")
+	for _, agent := range selected {
+		spinner := ui.StartSpinner(fmt.Sprintf("Installing agent %s...", agent.Name))
+		result, err := install.InstallAgentFromDiscovery(discovery, agent, agentsDir, agentOpts)
+		spinner.Stop()
+		switch {
+		case err != nil:
+			ui.StepFail(agent.Name, err.Error())
+		case result.Action == "skipped":
+			ui.StepSkip(agent.Name, strings.Join(result.Warnings, "; "))
+		case agentOpts.DryRun:
+			ui.Row(ui.MarkNone, agent.Name, "would install", ui.RowWidth(agent.Name))
+		default:
+			ui.StepDone(agent.Name, "installed")
+		}
+	}
+}
+
+// agentInstallResult tracks the outcome of a single agent install.
+type agentInstallResult struct {
+	agent   install.AgentInfo
+	success bool
+	skipped bool
+	message string
+}
+
+// installSelectedAgents installs a batch of agents with progress display.
+func installSelectedAgents(selected []install.AgentInfo, discovery *install.DiscoveryResult, agentsDir string, opts install.InstallOptions) installBatchSummary {
+	results := make([]agentInstallResult, 0, len(selected))
+
+	var installSpinner *ui.Spinner
+	var progressBar *ui.ProgressBar
+	if len(selected) > largeBatchProgressThreshold {
+		progressBar = ui.StartProgress("Installing agents", len(selected))
+	} else {
+		installSpinner = ui.StartSpinnerWithSteps("Installing...", len(selected))
+	}
+
+	for i, agent := range selected {
+		if installSpinner != nil {
+			installSpinner.NextStep(fmt.Sprintf("Installing %s...", agent.Name))
+			if i == 0 {
+				installSpinner.Update(fmt.Sprintf("Installing %s...", agent.Name))
+			}
+		}
+		if progressBar != nil {
+			progressBar.UpdateTitle(fmt.Sprintf("Installing %s", agent.Name))
+		}
+
+		result, err := install.InstallAgentFromDiscovery(discovery, agent, agentsDir, opts)
+		if err != nil {
+			results = append(results, agentInstallResult{agent: agent, message: err.Error()})
+		} else if result.Action == "skipped" {
+			results = append(results, agentInstallResult{agent: agent, skipped: true, message: strings.Join(result.Warnings, "; ")})
+		} else {
+			results = append(results, agentInstallResult{agent: agent, success: true})
+		}
+
+		if progressBar != nil {
+			progressBar.Increment()
+		}
+	}
+
+	if progressBar != nil {
+		progressBar.Stop()
+	}
+
+	displayAgentInstallResults(results, installSpinner)
+
+	summary := installBatchSummary{}
+	for _, r := range results {
+		if r.success {
+			summary.InstalledSkills = append(summary.InstalledSkills, r.agent.Name)
+		} else if !r.skipped {
+			summary.FailedSkills = append(summary.FailedSkills, r.agent.Name)
+		}
+	}
+	return summary
+}
+
+// displayAgentInstallResults renders the install outcome for a batch of agents.
+func displayAgentInstallResults(results []agentInstallResult, spinner *ui.Spinner) {
+	var installed, failed, skippedCount int
+	for _, r := range results {
+		switch {
+		case r.success:
+			installed++
+		case r.skipped:
+			skippedCount++
+		default:
+			failed++
+		}
+	}
+
+	var took time.Duration
+	if spinner != nil {
+		spinner.Stop()
+		took = time.Since(spinner.Started())
+	}
+
+	if failed > 0 {
+		ui.SectionLabel("Failed")
+		for _, r := range results {
+			if !r.success && !r.skipped {
+				ui.StepFail(r.agent.Name, r.message)
+			}
+		}
+	}
+	if skippedCount > 0 {
+		ui.SectionLabel("Skipped")
+		for _, r := range results {
+			if r.skipped {
+				ui.StepSkip(r.agent.Name, r.message)
+			}
+		}
+	}
+	if installed > 0 {
+		ui.SectionLabel("Installed")
+		for _, r := range results {
+			if r.success {
+				ui.StepDone(r.agent.Name, "")
+			}
+		}
+	}
+
+	mark := ui.MarkOK
+	switch {
+	case failed > 0 && installed == 0:
+		mark = ui.MarkFail
+	case failed > 0:
+		mark = ui.MarkWarn
+	}
+	fmt.Println()
+	ui.Done(mark, buildInstallSummary(installed, failed, skippedCount, "agent"), took)
+	if installed > 0 {
+		ui.Next("skillshare sync agents", "link them into your targets")
+	}
 }

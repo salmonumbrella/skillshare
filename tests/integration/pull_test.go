@@ -24,7 +24,7 @@ targets: {}
 
 	result := sb.RunCLI("pull")
 
-	result.AssertSuccess(t)
+	result.AssertFailure(t)
 	result.AssertOutputContains(t, "not a git repository")
 }
 
@@ -45,7 +45,7 @@ targets: {}
 
 	result := sb.RunCLI("pull")
 
-	result.AssertSuccess(t)
+	result.AssertFailure(t)
 	result.AssertOutputContains(t, "No git remote")
 }
 
@@ -93,7 +93,7 @@ targets: {}
 
 	result := sb.RunCLI("pull")
 
-	result.AssertSuccess(t)
+	result.AssertFailure(t)
 	result.AssertOutputContains(t, "Local changes detected")
 }
 
@@ -139,7 +139,7 @@ targets: {}
 	result := sb.RunCLI("pull", "--dry-run")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "dry-run")
+	result.AssertOutputContains(t, "Dry run — nothing was written")
 }
 
 func TestPull_ActualPull_AndSyncs(t *testing.T) {
@@ -277,7 +277,7 @@ targets:
 	result := sb.RunCLI("pull")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Pull complete")
+	result.AssertOutputContains(t, "✓ Pull")
 }
 
 func TestPull_FirstPull_BothHaveSkills_NoForce_MergesAndSyncs(t *testing.T) {
@@ -303,7 +303,7 @@ targets:
 
 	result := sb.RunCLI("pull")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Pull complete")
+	result.AssertOutputContains(t, "✓ Pull")
 
 	// Both local and remote skills should be synced to target.
 	if !sb.FileExists(filepath.Join(targetPath, "local-skill", "SKILL.md")) {
@@ -311,37 +311,6 @@ targets:
 	}
 	if !sb.FileExists(filepath.Join(targetPath, "remote-skill", "SKILL.md")) {
 		t.Error("remote skill should be synced after merge")
-	}
-}
-
-func TestPull_BothHaveSkills_MergesSuccessfully(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets: {}
-`)
-
-	bareRepo := testutil.SetupBareRemoteRepo(t, sb.Home)
-	testutil.SeedRemoteBranch(t, sb.Home, bareRepo, "main", map[string]string{
-		"remote-skill/SKILL.md": "# Remote Skill",
-	})
-
-	initLocalRepoWithRemotePull(t, sb.SourcePath, bareRepo)
-	sb.CreateSkill("local-skill", map[string]string{"SKILL.md": "# Local Skill"})
-	testutil.RunGit(t, sb.SourcePath, "add", "-A")
-	testutil.RunGit(t, sb.SourcePath, "commit", "-m", "local skill")
-
-	result := sb.RunCLI("pull")
-	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Pull complete")
-
-	// Both skills should exist after merge.
-	if !sb.FileExists(filepath.Join(sb.SourcePath, "local-skill", "SKILL.md")) {
-		t.Error("local skill should be preserved after merge")
-	}
-	if !sb.FileExists(filepath.Join(sb.SourcePath, "remote-skill", "SKILL.md")) {
-		t.Error("remote skill should exist after merge")
 	}
 }
 
@@ -365,7 +334,7 @@ targets: {}
 
 	result := sb.RunCLI("pull")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Pull complete")
+	result.AssertOutputContains(t, "✓ Pull")
 
 	if !sb.FileExists(filepath.Join(sb.SourcePath, "README.md")) {
 		t.Error("README from remote should exist after auto-merge")
@@ -376,7 +345,7 @@ targets: {}
 
 	pushResult := sb.RunCLI("push", "-m", "after auto-merge")
 	pushResult.AssertSuccess(t)
-	pushResult.AssertOutputContains(t, "Push complete")
+	pushResult.AssertOutputContains(t, "✓ Push")
 }
 
 func TestPull_FirstPull_RemoteNoSkills_LocalNoSkills_ResetAndTrack(t *testing.T) {
@@ -397,7 +366,7 @@ targets: {}
 
 	result := sb.RunCLI("pull")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Pull complete")
+	result.AssertOutputContains(t, "✓ Pull")
 
 	if !sb.FileExists(filepath.Join(sb.SourcePath, "README.md")) {
 		t.Error("README from remote should exist after reset")
@@ -429,7 +398,7 @@ targets: {}
 
 	result := sb.RunCLI("pull", "--force")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Pull complete")
+	result.AssertOutputContains(t, "✓ Pull")
 
 	if !sb.FileExists(filepath.Join(sb.SourcePath, "remote-skill", "SKILL.md")) {
 		t.Error("remote skill should exist after force pull")
@@ -457,7 +426,7 @@ targets: {}
 
 	result := sb.RunCLI("pull")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Pull complete")
+	result.AssertOutputContains(t, "✓ Pull")
 
 	if !sb.FileExists(filepath.Join(sb.SourcePath, "remote-skill", "SKILL.md")) {
 		t.Error("remote skill should be pulled from custom default branch")

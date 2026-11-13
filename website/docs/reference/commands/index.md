@@ -11,14 +11,24 @@ Complete reference for all skillshare commands.
 | I want to... | Command |
 |--------------|---------|
 | Set up skillshare for the first time | [`init`](./init.md) |
+| Manage project folders from the global config | [`project`](/docs/reference/commands/project) |
 | Install a skill from GitHub | [`install`](./install.md) |
 | Create my own skill | [`new`](./new.md) |
 | Sync skills to all AI CLIs | [`sync`](./sync.md) |
 | Check what's out of sync | [`status`](./status.md) / [`diff`](./diff.md) |
 | Search for community skills | [`search`](./search.md) |
 | Update installed skills | [`check`](./check.md) then [`update`](./update.md) |
-| Sync across machines | [`push`](./push.md) / [`pull`](./pull.md) |
+| Temporarily hide a skill without removing it | [`enable` / `disable`](./enable.md) |
+| Move installed skills into folders | [`move`](./move.md) |
+| Save or sync changes with git | [`commit`](./commit.md) / [`push`](./push.md) / [`pull`](./pull.md) |
+| Set up an MCP server once for every tool | [`mcp`](./mcp.md) |
+| Manage native hooks across tools | [`hooks`](./hooks.md) |
+| Manage complete plugins across supported tools | [`plugin`](./plugin.md) |
+| Manage non-skill resources (rules, commands) | [`extras`](./extras.md) |
+| Manage single-file `.md` agents | Most commands accept `agents` or `--kind agent` — see [Agents](/docs/understand/agents) |
+| See which skills use the most context tokens | [`analyze`](./analyze.md) |
 | Fix something broken | [`doctor`](./doctor.md) |
+| Enable tab-completion in my shell | [`completion`](./completion.md) |
 | Open the web dashboard | [`ui`](./ui.md) |
 
 ---
@@ -27,11 +37,15 @@ Complete reference for all skillshare commands.
 
 | Category | Commands |
 |----------|----------|
-| **Core** | `init`, `install`, `uninstall`, `list`, `search`, `sync`, `status` |
-| **Skill Management** | `new`, `check`, `update`, `upgrade` |
-| **Target Management** | `target`, `diff` |
-| **Sync Operations** | `collect`, `backup`, `restore`, `trash`, `push`, `pull` |
-| **Security & Utilities** | `audit`, `hub`, `log`, `doctor`, `tui`, `ui`, `version` |
+| **Core** | `init`, `install`, `uninstall`, `link`, `unlink`, `list`, `search`, `sync`, `status` |
+| **Skill Management** | `new`, `check`, `update`, `upgrade`, `enable`, `disable`, `move` |
+| **MCP Connections** | `mcp` (`add`, `edit`, `import`, `list`, `remove`, `restore`), `sync mcp` |
+| **Hooks** | `hooks` (`list`, `add`, `edit`, `import`, `enable`, `disable`, `remove`, `sync`, `restore`) |
+| **Plugin Management** | `plugin` (`list`, `discover`, `add`, `import`, `unimport`, `inspect`, `sync`, `check`, `update`, `enable`, `disable`, `remove`) |
+| **Target Management** | `target`, `project`, `diff` |
+| **Extras Management** | `extras` (`init`, `list`, `remove`, `collect`) |
+| **Sync Operations** | `collect`, `backup`, `restore`, `trash`, `commit`, `push`, `pull` |
+| **Security & Utilities** | `analyze`, `audit`, `hub`, `log`, `doctor`, `tui`, `ui`, `completion`, `version` |
 
 ---
 
@@ -42,6 +56,8 @@ Complete reference for all skillshare commands.
 | [init](./init.md) | First-time setup |
 | [install](./install.md) | Add a skill from a repo or path |
 | [uninstall](./uninstall.md) | Remove a skill |
+| [link](./link.md) | Link a folder of your own skills into the source |
+| [unlink](./unlink.md) | Remove a link from the source |
 | [list](./list.md) | List all skills |
 | [search](./search.md) | Search for skills |
 | [sync](./sync.md) | Push skills to all targets |
@@ -54,14 +70,32 @@ Complete reference for all skillshare commands.
 | [new](./new.md) | Create a new skill |
 | [check](./check.md) | Check for available updates |
 | [update](./update.md) | Update a skill or tracked repo |
+| [updates](/docs/reference/commands/updates) | Control automatic version checks and notifications |
 | [upgrade](./upgrade.md) | Upgrade CLI or built-in skill |
+| [enable / disable](./enable.md) | Temporarily enable or disable skills |
+| [move](./move.md) | Move installed skills or folders without losing install records |
 
 ## Target Management
 
 | Command | Description |
 |---------|-------------|
 | [target](./target.md) | Manage targets |
+| [project](/docs/reference/commands/project) | Manage project folders and sync their skills and agents |
 | [diff](./diff.md) | Show differences between source and targets |
+
+## Extras Management
+
+| Command | Description |
+|---------|-------------|
+| [extras](./extras.md) | Manage non-skill resources (rules, commands, prompts) |
+
+## MCP, Hooks and Plugins
+
+| Command | Description |
+|---------|-------------|
+| [mcp](./mcp.md) | Define MCP servers once and sync them into each tool's native config |
+| [hooks](./hooks.md) | Manage native hook definitions, synchronization and recovery |
+| [plugin](./plugin.md) | Install complete plugins and choose which tools receive them |
 
 ## Sync Operations
 
@@ -71,19 +105,22 @@ Complete reference for all skillshare commands.
 | [backup](./backup.md) | Create backup of targets |
 | [restore](./restore.md) | Restore targets from backup |
 | [trash](./trash.md) | Manage uninstalled skills in trash |
-| [push](./push.md) | Push to git remote |
+| [commit](./commit.md) | Create a local git commit without pushing |
+| [push](./push.md) | Commit and push to git remote |
 | [pull](./pull.md) | Pull from git remote and sync |
 
 ## Security & Utilities
 
 | Command | Description |
 |---------|-------------|
+| [analyze](./analyze.md) | Analyze context window usage |
 | [audit](./audit.md) | Scan skills for security threats |
 | [log](./log.md) | View operations and audit logs |
 | [doctor](./doctor.md) | Diagnose issues |
 | [tui](./tui.md) | Toggle interactive TUI mode |
 | [ui](./ui.md) | Launch web dashboard |
 | [hub](./hub.md) | Manage skill hub sources |
+| [completion](./completion.md) | Generate shell completion scripts |
 | [version](./version.md) | Show CLI version |
 
 ---
@@ -117,7 +154,8 @@ skillshare new my-skill
 skillshare sync
 skillshare sync --dry-run
 
-# Cross-machine
+# Git checkpoints / cross-machine
+skillshare commit -m "Update skill"
 skillshare push -m "Add skill"
 skillshare pull
 
@@ -126,8 +164,13 @@ skillshare status
 skillshare list
 skillshare diff
 
+# Enable/disable skills
+skillshare disable draft-*
+skillshare enable draft-*
+
 # Maintenance
 skillshare update --all
+skillshare analyze
 skillshare audit
 skillshare log
 skillshare doctor
@@ -152,6 +195,10 @@ skillshare check
 # Trash management
 skillshare trash list
 skillshare trash restore my-skill
+
+# Shell completion
+skillshare completion bash --install
+skillshare completion zsh --install
 
 # Version
 skillshare version

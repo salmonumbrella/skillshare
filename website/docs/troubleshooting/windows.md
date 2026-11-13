@@ -26,9 +26,9 @@ irm https://raw.githubusercontent.com/runkids/skillshare/main/install.ps1 | iex
 
 ### Does skillshare need admin privileges?
 
-**No.** skillshare uses NTFS junctions instead of symlinks, which don't require admin privileges.
+**No.** Folders (skills, and agents or extras in `symlink` mode) are linked with NTFS junctions, which work like symlinks for directories and don't require admin privileges.
 
-NTFS junctions work like symlinks for directories but are available to all users.
+Single files can't be linked with a junction. Modes that link files — agents in `merge` mode, the files of a directory extra in `merge` mode, and single-file extras such as a shared `AGENTS.md` — use real symlinks, which need [Developer Mode](#file-links-need-windows-developer-mode-copying-instead) (or an Administrator shell). Without it, skillshare copies those files instead.
 
 ---
 
@@ -117,11 +117,33 @@ Then restart.
 2. Check antivirus isn't blocking
 3. Run PowerShell as Administrator (rarely needed)
 
+### `file links need Windows Developer Mode; copying instead`
+
+**Cause:** Windows only lets you create file symlinks with Developer Mode on (or from an Administrator shell). Agents in `merge` mode, directory extras in `merge` mode, and single-file extras (such as a shared `AGENTS.md`) link single files, so without Developer Mode `sync` copies them instead and shows this line. `status`, `doctor`, and `extras list` show these targets as `copy`.
+
+The copies are tracked, so they still behave like links as far as sync is concerned:
+
+- They are updated when the source changes, and removed when the source is removed.
+- Files you created yourself in the target are left alone, as in `merge` mode.
+- Once file links work, the next sync replaces the copies with links.
+
+**Solution:** Nothing is required; the copies keep working. To get links instead, turn on Developer Mode (Windows 11: **Settings → System → For developers → Developer Mode**; Windows 10: **Settings → Update & Security → For developers**), then run `skillshare sync --all` again. Restart `skillshare ui` if it is running.
+
+Identical local files are reported as `local preserved`; `sync extras` does not suggest `--force` for them. They remain local files, not managed links.
+
+### Agent files or AGENTS.md show a folder icon and can't be read
+
+**Cause:** Older versions linked single files with a directory junction. Explorer shows the file as a folder, and tools can't read it.
+
+**Solution:** Run `skillshare sync --all` (or `skillshare sync agents` / `skillshare sync extras`). Sync replaces these broken links with a file symlink, or with a copy when Developer Mode is off. On the dashboard's **AGENTS.md** tab, an affected target shows a warning; switching it to `copy` also fixes it.
+
 ### `symlinks not working`
 
-**Cause:** You're seeing symlinks instead of junctions.
+**Note:** On Windows, skillshare links folders with NTFS junctions and single files with symlinks. If you see symlink errors, ensure you're using the Windows version of skillshare.
 
-**Note:** skillshare uses NTFS junctions on Windows, not symlinks. If you see symlink errors, ensure you're using the Windows version of skillshare.
+### `Incorrect function` in Antigravity
+
+Antigravity cannot traverse junctions. See [Antigravity does not load synced skills](./common-errors.md#antigravity-does-not-load-synced-skills).
 
 ---
 

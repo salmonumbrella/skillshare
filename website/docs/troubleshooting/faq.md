@@ -36,7 +36,17 @@ Then create skills directly in `~/.claude/skills/` — they won't be touched.
 
 ### I use a dotfiles manager (stow/chezmoi/yadm) — will skillshare break my symlinks?
 
-No. Skillshare detects external symlinks on both source and target directories and preserves them. All commands — sync, update, uninstall, list, diff, install — resolve symlinks and operate on the underlying directories without removing the links themselves. See [Dotfiles Manager Compatibility](/docs/reference/commands/sync#dotfiles-manager-compatibility) for details.
+No. A symlinked source root or target directory is resolved and preserved; see [Dotfiles Manager Compatibility](/docs/reference/commands/sync#dotfiles-manager-compatibility).
+
+Links **inside** the skills source are different. By default, discovery ignores first-level links and `skillshare doctor` reports them as not followed. Set `follow_source_links: true` in the global or project config to discover skills through directory links directly under that source, one level only. [`skillshare link <path>`](../reference/commands/link.md) creates such a link and checks it first. Deeper links are not followed for discovery. See [Configuration — `follow_source_links`](../reference/targets/configuration.md#follow_source_links) for safety guards, writes through the link, and Windows junction guidance.
+
+For a linked tracked repo such as `_dev-skills`, `skillshare update _dev-skills` runs git in the real checkout, and `--force` resets that checkout. `skillshare unlink _dev-skills` removes only the link, never the checkout.
+
+### Can I keep skills on an external drive?
+
+Yes, with `follow_source_links: true`: link the checkout on the drive into the source (`skillshare link /Volumes/Work/dev-skills --enable`). When the drive is not mounted, commands skip the link with a warning and delete nothing: target links, copies, and install metadata for those skills stay as they are. Mount the drive and run `skillshare sync` again to resume. Keep the mount path stable (`/Volumes/<name>` on macOS, a fixed drive letter on Windows). See [Skills on an external drive](../reference/targets/configuration.md#skills-on-an-external-drive).
+
+If you version-control `config.yaml` via dotfiles, consider enabling `preserve_tilde_on_save: true` to keep paths as `~/...` instead of absolute — see [Configuration](/docs/reference/targets/configuration#preserve_tilde_on_save).
 
 ---
 
@@ -140,7 +150,7 @@ They are complementary — backup protects targets from sync changes, trash prot
 
 ### Can I sync specific skills to specific CLIs?
 
-Yes. For example, skill A only to Claude, skill B to Gemini and Codex, skill C to all:
+Yes. For example, skill A only to Claude, skill B to Antigravity and Codex, skill C to all:
 
 **Option 1: `targets` field in SKILL.md** (set by skill author)
 
@@ -156,7 +166,7 @@ targets: [claude]
 # skills/skill-b/SKILL.md
 ---
 name: skill-b
-targets: [gemini, codex]
+targets: [antigravity, codex]
 ---
 ```
 
@@ -186,14 +196,14 @@ Both approaches can be combined — config filters are applied first, then the s
 
 ## Targets
 
-### Using universal alongside npx skills
+### Using universal alongside npx skills {#using-universal-alongside-npx-skills}
 
 The `universal` target points to `~/.agents/skills`, the same directory used by the [npx skills CLI](https://github.com/vercel-labs/skills). Both tools can manage this directory simultaneously with some caveats:
 
 **What works:**
 - In merge mode (default), skillshare creates **symlinks** in `~/.agents/skills/`; npx skills creates **real directories**. They coexist as long as skill names don't collide.
 - skillshare's prune logic only removes entries it manages — it won't delete files installed by npx skills.
-- Agent CLIs (Claude Code, Cursor, etc.) read directories directly, so they see skills from both tools.
+- Agent CLIs (Claude Code, Pi, etc.) read directories directly, so they see skills from both tools.
 
 **What to watch out for:**
 - **Name collision** — If both tools install a skill with the same name, the last sync/install wins. Avoid installing the same skill through both tools.
@@ -217,7 +227,7 @@ Keep the universal target in **merge mode** (default) for the safest coexistence
 
 ### I used `claude-code` (or `gemini-cli`, etc.) as a project target — is that still valid?
 
-Yes. Old project target names like `claude-code`, `gemini-cli`, `github-copilot` still resolve via aliases. However, the canonical name is now the same as the global name (e.g., `claude`, `gemini`, `copilot`). We recommend updating your `.skillshare/config.yaml` to use the short name:
+Yes. Old project target names like `claude-code`, `gemini-cli`, `github-copilot` still resolve via aliases. For example, `gemini-cli` resolves to `gemini`. We recommend updating your `.skillshare/config.yaml` to use the canonical name:
 
 ```yaml
 # Before
@@ -367,6 +377,50 @@ By default, indefinitely. Clean up with:
 ```bash
 skillshare backup --cleanup
 ```
+
+---
+
+## Agents
+
+### What's the difference between agents and skills?
+
+Skills are **directories** containing a `SKILL.md` file (and optionally helpers, examples, templates). Agents are **single `.md` files** with frontmatter — no nested structure. Both support install, sync, audit, check, backup, and trash.
+
+See [Agents](/docs/understand/agents) for the full comparison and the agent file format.
+
+### Which targets support agents?
+
+Out of the box: `claude`, `cursor`, `augment`, `opencode` (plus the `universal` alias). Other targets are silently skipped during agent sync with a `No agents folder: <targets>` warning. You can add an agent path manually by editing `config.yaml`:
+
+```yaml
+targets:
+  myapp:
+    path: ~/myapp/skills
+    agents:
+      path: ~/myapp/agents
+```
+
+### How do I disable a single agent without deleting it?
+
+Use the `disable` command (or edit `.agentignore` directly):
+
+```bash
+skillshare disable my-agent --kind agent     # Adds entry to .agentignore
+skillshare enable my-agent --kind agent      # Removes the entry
+```
+
+`.agentignore` lives in the agents source root (`~/.config/skillshare/agents/.agentignore` globally, `.skillshare/agents/.agentignore` in project mode) and uses [gitignore syntax](https://git-scm.com/docs/gitignore). A `.agentignore.local` overlay is also supported for local-only overrides.
+
+### Can I backup agents in project mode?
+
+Yes — and **only** agents. `backup` is not allowed in project mode for skills, but the agents flow is the explicit exception:
+
+```bash
+skillshare backup -p agents     # Backs up project agent targets
+skillshare backup -p --all      # Same as above; --all narrows to agents in project mode
+```
+
+If you forget the `agents` filter, you'll see `backup is not supported in project mode (except for agents)`. Same rule applies to `restore`. Agent backups are stored under `<target>-agents/` next to the regular skill backups.
 
 ---
 

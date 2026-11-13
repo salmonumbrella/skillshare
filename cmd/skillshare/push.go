@@ -3,13 +3,14 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	"skillshare/internal/config"
 	gitops "skillshare/internal/git"
+	"skillshare/internal/gitenv"
 	"skillshare/internal/install"
 	"skillshare/internal/oplog"
 	"skillshare/internal/ui"
@@ -18,6 +19,7 @@ import (
 // pushOptions holds parsed push command options
 type pushOptions struct {
 	dryRun  bool
+	pull    bool
 	message string
 }
 
@@ -30,6 +32,8 @@ func parsePushArgs(args []string) *pushOptions {
 		switch arg {
 		case "--dry-run", "-n":
 			opts.dryRun = true
+		case "--pull":
+			opts.pull = true
 		case "-m", "--message":
 			if i+1 < len(args) {
 				i++
@@ -49,20 +53,21 @@ func parsePushArgs(args []string) *pushOptions {
 
 // checkGitRepo verifies source is a git repo with remote
 func checkGitRepo(sourcePath string, spinner *ui.Spinner) error {
-	gitDir := sourcePath + "/.git"
-	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+	cmd := gitenv.Command("rev-parse", "--is-inside-work-tree")
+	cmd.Dir = sourcePath
+	if err := cmd.Run(); err != nil {
 		spinner.Fail("Source is not a git repository")
-		ui.Info("  Run: skillshare init --remote <url>")
+		ui.Note("Run: skillshare init --remote <url>")
 		return fmt.Errorf("not a git repository")
 	}
 
-	cmd := exec.Command("git", "remote")
+	cmd = gitenv.Command("remote")
 	cmd.Dir = sourcePath
 	output, err := cmd.Output()
 	if err != nil || strings.TrimSpace(string(output)) == "" {
 		spinner.Fail("No git remote configured")
-		ui.Info("  Run: cd %s && git remote add origin <url>", sourcePath)
-		ui.Info("  Or:  skillshare init --remote <url>")
+		ui.Note(fmt.Sprintf("Run: cd %s && git remote add origin <url>", sourcePath))
+		ui.Note("Or:  skillshare init --remote <url>")
 		return fmt.Errorf("no remote configured")
 	}
 
@@ -71,7 +76,7 @@ func checkGitRepo(sourcePath string, spinner *ui.Spinner) error {
 
 // getGitChanges returns uncommitted changes
 func getGitChanges(sourcePath string) (string, error) {
-	cmd := exec.Command("git", "status", "--porcelain")
+	cmd := gitenv.Command("status", "--porcelain")
 	cmd.Dir = sourcePath
 	output, err := cmd.Output()
 	if err != nil {
@@ -81,9 +86,10 @@ func getGitChanges(sourcePath string) (string, error) {
 }
 
 // stageAndCommit stages all changes and commits
-func stageAndCommit(sourcePath, message string, spinner *ui.Spinner) error {
+func stageAndCommit(sourcePath, skills, operation, message string, spinner *ui.Spinner) error {
+	printSourceLinkWarnings(sourcePath, skills, operation, spinner)
 	spinner.Update("Staging changes...")
-	cmd := exec.Command("git", "add", "-A")
+	cmd := gitenv.Command("add", "-A")
 	cmd.Dir = sourcePath
 	if err := cmd.Run(); err != nil {
 		spinner.Fail("Failed to stage changes")
@@ -91,7 +97,7 @@ func stageAndCommit(sourcePath, message string, spinner *ui.Spinner) error {
 	}
 
 	spinner.Update("Committing...")
-	cmd = exec.Command("git", "commit", "-m", message)
+	cmd = gitenv.Command("commit", "-m", message)
 	cmd.Dir = sourcePath
 	if err := cmd.Run(); err != nil {
 		spinner.Fail("Failed to commit")
@@ -99,6 +105,59 @@ func stageAndCommit(sourcePath, message string, spinner *ui.Spinner) error {
 	}
 
 	return nil
+}
+
+// commitConfigSafety commits the config.yaml removal and .gitignore repair
+// EnsureConfigUntracked made, leaving any other worktree changes unstaged.
+func commitConfigSafety(source string) error {
+	// Another process may have edited .gitignore while the pull ran; only the
+	// appended config.yaml rule belongs in this commit.
+	if !gitignoreOnlyGainedConfigRule(source) {
+		return fmt.Errorf(".gitignore changed while pulling; commit it, then run: skillshare push")
+	}
+	add := gitenv.Command("add", "--", ".gitignore")
+	add.Dir = source
+	if err := add.Run(); err != nil {
+		return fmt.Errorf("failed to stage .gitignore: %w", err)
+	}
+	staged := gitenv.Command("diff", "--cached", "--quiet")
+	staged.Dir = source
+	if staged.Run() == nil {
+		return nil // nothing to commit
+	}
+	// Commit the index as staged: a pathspec would re-add config.yaml from disk.
+	commit := gitenv.Command("commit", "-m", "Keep config.yaml out of version control")
+	commit.Dir = source
+	if out, err := commit.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to commit config.yaml safety changes: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// gitignoreOnlyGainedConfigRule reports whether .gitignore differs from its
+// staged version only by appended config.yaml lines, the change
+// EnsureConfigUntracked makes.
+func gitignoreOnlyGainedConfigRule(source string) bool {
+	show := gitenv.Command("show", ":.gitignore")
+	show.Dir = source
+	base, _ := show.Output() // missing from the index: EnsureConfigUntracked created it
+	cur, err := os.ReadFile(filepath.Join(source, ".gitignore"))
+	if err != nil {
+		return len(base) == 0 && os.IsNotExist(err)
+	}
+	if !strings.HasPrefix(string(cur), string(base)) {
+		return false
+	}
+	added := string(cur[len(base):])
+	if len(base) > 0 && !strings.HasSuffix(string(base), "\n") {
+		added = strings.TrimPrefix(added, "\n")
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(added, "\n"), "\n") {
+		if line != "" && line != "config.yaml" {
+			return false
+		}
+	}
+	return true
 }
 
 // isAuthError returns true when git output indicates an authentication failure.
@@ -110,53 +169,34 @@ func isAuthError(output string) bool {
 func hintGitRemoteError(output string) {
 	switch {
 	case isAuthError(output):
-		ui.Info("  Authentication failed — options:")
-		ui.Info("    1. SSH URL: git remote set-url origin git@<host>:<owner>/<repo>.git")
-		ui.Info("    2. Token env var: GITHUB_TOKEN, GITLAB_TOKEN, BITBUCKET_TOKEN, AZURE_DEVOPS_TOKEN, or SKILLSHARE_GIT_TOKEN")
+		ui.Note("Authentication failed — options:")
+		ui.Note("  1. SSH URL: git remote set-url origin git@<host>:<owner>/<repo>.git")
+		ui.Note("  2. Token env var: GITHUB_TOKEN, GITLAB_TOKEN, BITBUCKET_TOKEN, AZURE_DEVOPS_TOKEN, or SKILLSHARE_GIT_TOKEN")
 		if runtime.GOOS == "windows" {
-			ui.Info("       PowerShell: $env:GITLAB_TOKEN = \"glpat-xxxx\"")
+			ui.Note("     PowerShell: $env:GITLAB_TOKEN = \"glpat-xxxx\"")
 		} else {
-			ui.Info("       export GITLAB_TOKEN=glpat-xxxx")
+			ui.Note("     export GITLAB_TOKEN=glpat-xxxx")
 		}
-		ui.Info("    3. Git credential helper: gh auth login")
-		ui.Info("  Docs: https://skillshare.runkids.cc/docs/reference/environment-variables#git-authentication")
+		ui.Note("  3. Git credential helper: gh auth login")
+		ui.Note("Docs: https://skillshare.runkids.cc/docs/reference/environment-variables#git-authentication")
 	case strings.Contains(output, "Could not read from remote"):
-		ui.Info("  Check SSH keys: ssh -T git@github.com")
-		ui.Info("  Or use HTTPS:   git remote set-url origin https://github.com/you/repo.git")
+		ui.Note("Check SSH keys: ssh -T git@github.com")
+		ui.Note("Or use HTTPS:   git remote set-url origin https://github.com/you/repo.git")
 	case strings.Contains(output, "not found") || strings.Contains(output, "does not exist"):
-		ui.Info("  Check remote URL: git remote get-url origin")
+		ui.Note("Check remote URL: git remote get-url origin")
 	case strings.Contains(output, "could not resolve host"):
-		ui.Info("  Check network connection")
+		ui.Note("Check network connection")
 	}
 }
 
 // gitPush pushes to remote, auto-setting upstream on first push.
-func gitPush(sourcePath string, spinner *ui.Spinner) error {
+func gitPush(sourcePath string, spinner *ui.Spinner, opts install.ParseOptions) error {
 	spinner.Update("Pushing to remote...")
 
-	authEnv := gitops.AuthEnvForRepo(sourcePath)
-	args := []string{"push"}
-	localBranch, err := gitops.GetCurrentBranch(sourcePath)
-	if err != nil {
-		localBranch = "main"
-	}
-
-	if !gitops.HasUpstream(sourcePath) {
-		remoteBranch := detectRemoteDefaultBranchForPush(sourcePath, authEnv)
-		if remoteBranch != "" && remoteBranch != localBranch {
-			args = append(args, "-u", "origin", localBranch+":"+remoteBranch)
-		} else {
-			args = append(args, "-u", "origin", localBranch)
-		}
-	} else if remoteName, upstreamBranch := upstreamTrackingBranch(sourcePath); remoteName != "" && upstreamBranch != "" && upstreamBranch != localBranch {
-		// push.default=simple refuses pushing when upstream branch name differs
-		// from local branch name. Push explicitly to tracked upstream branch.
-		args = []string{"push", remoteName, "HEAD:" + upstreamBranch}
-	}
-
-	cmd := exec.Command("git", args...)
+	authEnv := gitops.AuthEnvForRepo(sourcePath, opts)
+	cmd := gitenv.Command(gitops.PushArgs(sourcePath, authEnv)...)
 	cmd.Dir = sourcePath
-	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	cmd.Env = append(cmd.Env, "LC_ALL=C")
 	if len(authEnv) > 0 {
 		cmd.Env = append(cmd.Env, authEnv...)
 	}
@@ -167,48 +207,20 @@ func gitPush(sourcePath string, spinner *ui.Spinner) error {
 		fmt.Print(outStr)
 		hintGitRemoteError(outStr)
 		if !strings.Contains(outStr, "Could not read from remote") && !isAuthError(outStr) {
-			ui.Info("  Remote may have newer changes")
-			ui.Info("  Run: skillshare pull")
-			ui.Info("  Then: skillshare push")
+			ui.Note("Remote may have newer changes")
+			ui.Next("skillshare pull", "get them first", "skillshare push", "then push again")
 		}
 		return fmt.Errorf("push failed")
 	}
 	return nil
 }
 
-func upstreamTrackingBranch(sourcePath string) (remoteName, branch string) {
-	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
-	cmd.Dir = sourcePath
-	out, err := cmd.Output()
-	if err != nil {
-		return "", ""
-	}
-	ref := strings.TrimSpace(string(out))
-	parts := strings.SplitN(ref, "/", 2)
-	if len(parts) != 2 {
-		return "", ""
-	}
-	return parts[0], parts[1]
-}
-
-func detectRemoteDefaultBranchForPush(sourcePath string, authEnv []string) string {
-	fetchCmd := exec.Command("git", "fetch", "origin")
-	fetchCmd.Dir = sourcePath
-	if len(authEnv) > 0 {
-		fetchCmd.Env = append(os.Environ(), authEnv...)
-	}
-	if err := fetchCmd.Run(); err != nil {
-		return ""
+func cmdPush(args []string) (err error) {
+	if wantsHelp(args) {
+		printPushHelp()
+		return nil
 	}
 
-	branch, err := gitops.GetRemoteDefaultBranch(sourcePath)
-	if err != nil {
-		return ""
-	}
-	return branch
-}
-
-func cmdPush(args []string) error {
 	start := time.Now()
 	opts := parsePushArgs(args)
 
@@ -217,55 +229,210 @@ func cmdPush(args []string) error {
 		return fmt.Errorf("config not found: run 'skillshare init' first")
 	}
 
-	ui.Header("Pushing to remote")
+	if !opts.dryRun {
+		defer func() {
+			e := oplog.NewEntry("push", statusFromErr(err), time.Since(start))
+			e.Args = map[string]any{"message": opts.message, "pull": opts.pull}
+			if err != nil {
+				e.Message = err.Error()
+			}
+			oplog.WriteWithLimit(config.ConfigPath(), oplog.OpsFile, e, logMaxEntries()) //nolint:errcheck
+		}()
+	}
 
 	spinner := ui.StartSpinner("Checking repository...")
 
-	if err := checkGitRepo(cfg.Source, spinner); err != nil {
-		return nil // Error already displayed
-	}
-
-	changes, err := getGitChanges(cfg.Source)
+	source, err := resolveGitRoot(cfg, spinner)
 	if err != nil {
-		spinner.Fail("Failed to check git status")
 		return err
 	}
-	hasChanges := changes != ""
 
-	if opts.dryRun {
-		spinner.Stop()
-		ui.Warning("[dry-run] No changes will be made")
-		fmt.Println()
-		if hasChanges {
-			lines := strings.Split(changes, "\n")
-			ui.Info("Would stage %d file(s):", len(lines))
-			for _, line := range lines {
-				ui.Info("  %s", line)
-			}
-			ui.Info("Would commit with message: %s", opts.message)
-		} else {
-			ui.Info("No changes to commit")
-		}
-		ui.Info("Would push to remote")
-		return nil
+	if err := checkGitRepo(source, spinner); err != nil {
+		return err
 	}
-
-	if hasChanges {
-		if err := stageAndCommit(cfg.Source, opts.message, spinner); err != nil {
+	if cfg.GitRoot == "root" {
+		if err := gitops.CheckUnpushedConfigHistory(source, parseOptsFromConfig(cfg)); err != nil {
+			spinner.Fail("Cannot safely push config.yaml history")
 			return err
 		}
 	}
 
-	if err := gitPush(cfg.Source, spinner); err != nil {
-		return nil // Error already displayed
+	sweep := rootScopeSafetySweep(cfg, source, opts.dryRun)
+	if sweep.hasNotice() {
+		spinner.Stop()
+		sweep.printNotices(source)
+		if len(sweep.nested) > 0 {
+			return errNestedRepos // would push empty submodules — abort
+		}
+		spinner = ui.StartSpinner("Checking changes...")
+	}
+
+	changes, err := getGitChanges(source)
+	if err != nil {
+		spinner.Fail("Failed to check git status")
+		return err
+	}
+	changes = sweep.previewChanges(changes)
+	hasChanges := changes != ""
+
+	width := ui.RowWidth("Commit", "Pull", "Push", "Sync")
+	var files []string
+	if hasChanges {
+		files = strings.Split(changes, "\n")
+	}
+
+	if opts.dryRun {
+		spinner.Stop()
+		if hasChanges {
+			printSourceLinkWarnings(source, cfg.EffectiveSkillsSource(), "push", spinner)
+			ui.Row(ui.MarkNone, "Commit", "would commit "+plural(len(files), "file")+ui.DimText(" · "+opts.message), width)
+			for _, line := range files {
+				ui.Note(porcelainChange(line))
+			}
+		} else {
+			ui.Row(ui.MarkNone, "Commit", "nothing to commit", width)
+		}
+		if opts.pull {
+			ui.Row(ui.MarkNone, "Pull", "would merge remote changes", width)
+		}
+		ui.Row(ui.MarkNone, "Push", "would push to "+pushDestination(source), width)
+		if opts.pull {
+			ui.Row(ui.MarkNone, "Sync", "would sync targets", width)
+		}
+		fmt.Println()
+		ui.DryRun()
+		return nil
+	}
+
+	if hasChanges {
+		if err := stageAndCommit(source, cfg.EffectiveSkillsSource(), "push", opts.message, spinner); err != nil {
+			return err
+		}
+		spinner.Stop()
+		ui.Row(ui.MarkOK, "Commit", plural(len(files), "file")+ui.DimText(" · "+opts.message), width)
+	} else {
+		spinner.Stop()
+		ui.Row(ui.MarkNone, "Commit", "nothing to commit", width)
+	}
+
+	if opts.pull {
+		pullStart := time.Now()
+		spinner = ui.StartSpinner("Pulling from remote...")
+		info, _, err := integrateRemote(source, false, cfg.GitRoot == "root", spinner, parseOptsFromConfig(cfg))
+		if err != nil {
+			if hasChanges {
+				ui.Note("Your changes are committed locally; resolve, then run: skillshare push --pull")
+			}
+			return err
+		}
+		spinner.Stop()
+		if info != nil {
+			ui.Row(ui.MarkOK, "Pull", pullSummary(info)+ui.Took(time.Since(pullStart)), width)
+			printCommitNotes(info.Commits)
+		}
+		// The pull may have brought in a remote-tracked config.yaml after the
+		// safety sweep ran; untrack it again so this push removes it remotely.
+		if cfg.GitRoot == "root" {
+			removed, err := gitops.EnsureConfigUntracked(source)
+			if err != nil {
+				return err
+			}
+			// It may also have repaired a pulled .gitignore that stopped ignoring
+			// config.yaml; commit only those safety changes, never other edits
+			// made while the pull ran.
+			if err := commitConfigSafety(source); err != nil {
+				return err
+			}
+			if removed {
+				ui.Success("Removed config.yaml from version control")
+				ui.Note("Kept on disk; it holds machine-specific paths")
+			}
+		}
+	}
+
+	if cfg.GitRoot == "root" {
+		if err := gitops.CheckUnpushedConfigHistory(source, parseOptsFromConfig(cfg)); err != nil {
+			return err
+		}
+	}
+	spinner = ui.StartSpinner("Pushing to remote...")
+	if err := gitPush(source, spinner, parseOptsFromConfig(cfg)); err != nil {
+		return err
 	}
 
 	spinner.Stop()
-	ui.SuccessMsg("Push complete (%.1fs)", time.Since(start).Seconds())
+	ui.Row(ui.MarkOK, "Push", "to "+pushDestination(source)+ui.Took(time.Since(start)), width)
 
-	e := oplog.NewEntry("push", "ok", time.Since(start))
-	e.Args = map[string]any{"message": opts.message}
-	oplog.WriteWithLimit(config.ConfigPath(), oplog.OpsFile, e, logMaxEntries()) //nolint:errcheck
-
+	if !opts.pull {
+		ui.Next("skillshare pull", "get these changes on another machine")
+		return nil
+	}
+	if err := syncPulledScope(cfg); err != nil {
+		fmt.Println()
+		ui.Row(ui.MarkWarn, "Sync", "remote updated, but syncing targets failed", width)
+		var retry []string
+		for _, args := range pulledScopeSyncArgs(cfg.GitRoot) {
+			retry = append(retry, "skillshare sync "+strings.Join(args, " "), "retry")
+		}
+		ui.Next(retry...)
+		return fmt.Errorf("pushed, but target sync failed: %w", err)
+	}
 	return nil
+}
+
+// porcelainChange turns a `git status --porcelain` line into the "~ path",
+// "+ path", "- path" form update uses for changed files.
+func porcelainChange(line string) string {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return line
+	}
+	path := strings.Join(fields[1:], " ")
+	switch {
+	case fields[0] == "??" || strings.Contains(fields[0], "A"):
+		return "+ " + path
+	case strings.Contains(fields[0], "D"):
+		return "- " + path
+	}
+	return "~ " + path
+}
+
+// pushDestination names the upstream branch, such as "origin/main", or
+// "origin" before the first push sets one. It never prints the remote URL,
+// which can carry credentials.
+func pushDestination(sourcePath string) string {
+	cmd := gitenv.Command("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	cmd.Dir = sourcePath
+	if out, err := cmd.Output(); err == nil {
+		if upstream := strings.TrimSpace(string(out)); upstream != "" {
+			return upstream
+		}
+	}
+	return "origin"
+}
+
+func printPushHelp() {
+	printHelp("skillshare push [options]", "Commit and push source skills to git remote.",
+		helpGroup{title: "Options", rows: []helpRow{
+			{"-m, --message <msg>", "Commit message (default: \"Update skills\")"},
+			{"--pull", "Merge remote changes before pushing, then sync targets"},
+			{"-n, --dry-run", "Preview changes without applying"},
+		}},
+		helpExamples(
+			helpRow{"skillshare push", "Push with default message"},
+			helpRow{"skillshare push -m \"Add new skill\"", "Push with custom message"},
+			helpRow{"skillshare push --pull", "Sync both ways with the remote"},
+			helpRow{"skillshare push --dry-run", "Preview what would happen"},
+		),
+	)
+}
+
+// printSourceLinkWarnings stops progress output before displaying advisory text.
+func printSourceLinkWarnings(root, skills, operation string, spinner *ui.Spinner) {
+	for _, warning := range gitops.SourceLinkWarnings(root, skills, operation) {
+		if spinner != nil {
+			spinner.Stop()
+		}
+		ui.Warning("%s", warning)
+	}
 }

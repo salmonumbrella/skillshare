@@ -1,0 +1,300 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"skillshare/internal/config"
+	"skillshare/internal/oplog"
+	"skillshare/internal/ui"
+)
+
+func cmdExtrasMode(args []string) error {
+	start := time.Now()
+
+	mode, rest, err := parseModeArgs(args, "--target", "--mode", "--add-include", "--add-exclude", "--remove-include", "--remove-exclude")
+	if err != nil {
+		return err
+	}
+	parsedFilters, rest, err := parseFilterFlags(rest)
+	if err != nil {
+		return err
+	}
+	if parsedFilters.Agents.hasUpdates() {
+		return fmt.Errorf("agent filter flags are not supported for extras; use --add-include/--add-exclude/--remove-include/--remove-exclude")
+	}
+	filters := parsedFilters.Skills
+
+	cwd, _ := os.Getwd()
+	mode = resolveAutoMode(mode, cwd)
+
+	applyModeLabel(mode)
+
+	var name, targetPath, syncMode string
+	var flattenSet bool
+	var flattenVal bool
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case "--target":
+			if i+1 >= len(rest) {
+				return fmt.Errorf("--target requires a path argument")
+			}
+			i++
+			targetPath = rest[i]
+		case "--mode":
+			if i+1 >= len(rest) {
+				return fmt.Errorf("--mode requires an argument (merge/copy/symlink)")
+			}
+			i++
+			syncMode = rest[i]
+		case "--flatten":
+			flattenSet = true
+			flattenVal = true
+		case "--no-flatten":
+			flattenSet = true
+			flattenVal = false
+		case "--help", "-h":
+			printExtrasModeHelp()
+			return nil
+		default:
+			if name == "" {
+				name = rest[i]
+			} else {
+				return fmt.Errorf("unexpected argument: %s", rest[i])
+			}
+		}
+	}
+
+	if name == "" {
+		return fmt.Errorf("extras name is required: skillshare extras <name> --mode <mode> [--target <path>]")
+	}
+	if syncMode == "" && !flattenSet && !filters.hasUpdates() {
+		return fmt.Errorf("--mode, --flatten/--no-flatten, or an include/exclude flag is required")
+	}
+
+	if syncMode != "" {
+		if err := config.ValidateExtraMode(syncMode); err != nil {
+			return err
+		}
+	}
+
+	// Load config to resolve target when --target is omitted
+	var extras []config.ExtraConfig
+	var configPath string
+	var saveFn func() error
+	var validateFn func() error
+
+	if mode == modeProject {
+		projCfg, loadErr := config.LoadProject(cwd)
+		if loadErr != nil {
+			return loadErr
+		}
+		extras = projCfg.Extras
+		configPath = config.ProjectConfigPath(cwd)
+		saveFn = func() error { return projCfg.Save(cwd) }
+		validateFn = func() error { return projCfg.ValidateExtras(cwd, name) }
+	} else {
+		cfg, loadErr := config.Load()
+		if loadErr != nil {
+			return loadErr
+		}
+		extras = cfg.Extras
+		configPath = config.ConfigPath()
+		saveFn = cfg.Save
+		validateFn = func() error { return cfg.ValidateExtras(name) }
+	}
+
+	// Auto-resolve target when omitted
+	if targetPath == "" {
+		for _, extra := range extras {
+			if extra.Name == name {
+				switch len(extra.Targets) {
+				case 0:
+					return fmt.Errorf("extra %q has no targets", name)
+				case 1:
+					targetPath = extra.Targets[0].Path
+				default:
+					// flatten-only changes apply to all targets when --target is omitted
+					if flattenSet && syncMode == "" && !filters.hasUpdates() {
+						return applyFlattenAll(extras, name, flattenVal, saveFn, configPath, start)
+					}
+					return fmt.Errorf("extra %q has %d targets — use --target to specify which one", name, len(extra.Targets))
+				}
+				break
+			}
+		}
+		if targetPath == "" {
+			return fmt.Errorf("extra %q not found", name)
+		}
+	}
+
+	var currentFlatten bool
+	var currentMode string
+	for _, extra := range extras {
+		if extra.Name == name {
+			for _, t := range extra.Targets {
+				if extraTargetPathMatches(mode, cwd, t.Path, targetPath) {
+					currentFlatten = t.Flatten
+					currentMode = t.Mode
+					targetPath = t.Path
+					break
+				}
+			}
+			break
+		}
+	}
+
+	newMode := syncMode
+	if newMode == "" {
+		newMode = currentMode
+	}
+	newFlatten := currentFlatten
+	if flattenSet {
+		newFlatten = flattenVal
+	}
+
+	if err := config.ValidateExtraFlatten(newFlatten, newMode); err != nil {
+		return err
+	}
+
+	if syncMode != "" {
+		if err := applyExtraTarget(extras, name, targetPath, func(t *config.ExtraTargetConfig) { t.Mode = syncMode }); err != nil {
+			return err
+		}
+	}
+	if flattenSet {
+		if err := applyExtraTarget(extras, name, targetPath, func(t *config.ExtraTargetConfig) { t.Flatten = flattenVal }); err != nil {
+			return err
+		}
+	}
+	var filterChanges []string
+	if filters.hasUpdates() {
+		var filterErr error
+		if err := applyExtraTarget(extras, name, targetPath, func(t *config.ExtraTargetConfig) {
+			filterChanges, filterErr = applyFilterUpdates(&t.Include, &t.Exclude, filters)
+		}); err != nil {
+			return err
+		}
+		if filterErr != nil {
+			return filterErr
+		}
+	}
+	_, updated := findExtraByName(extras, name)
+	if err := config.ValidateExtraConfig(updated); err != nil {
+		return err
+	}
+
+	if err := validateFn(); err != nil {
+		return err
+	}
+	if err := saveFn(); err != nil {
+		return fmt.Errorf("failed to save config: %w", err)
+	}
+
+	// Build success message
+	var parts []string
+	if syncMode != "" {
+		parts = append(parts, fmt.Sprintf("mode=%s", syncMode))
+	}
+	if flattenSet {
+		parts = append(parts, fmt.Sprintf("flatten=%v", flattenVal))
+	}
+	parts = append(parts, filterChanges...)
+	if len(parts) == 0 {
+		parts = append(parts, "no changes")
+	}
+	ui.Done(ui.MarkOK, fmt.Sprintf("Updated %s target %s: %s", name, shortenPath(targetPath), strings.Join(parts, ", ")), 0)
+
+	e := oplog.NewEntry("extras-mode", "ok", time.Since(start))
+	e.Args = map[string]any{"name": name, "target": targetPath, "mode": syncMode, "flatten": flattenVal}
+	if len(filterChanges) > 0 {
+		e.Args["filters"] = filterChanges
+	}
+	oplog.WriteWithLimit(configPath, oplog.OpsFile, e, logMaxEntries()) //nolint:errcheck
+
+	return nil
+}
+
+// applyFlattenAll sets flatten on all targets of an extra. Validates each
+// target's mode before applying. Used when --flatten/--no-flatten is passed
+// without --target on a multi-target extra.
+func applyFlattenAll(extras []config.ExtraConfig, name string, flatten bool, saveFn func() error, configPath string, start time.Time) error {
+	for i, extra := range extras {
+		if extra.Name != name {
+			continue
+		}
+		for j := range extra.Targets {
+			if err := config.ValidateExtraFlatten(flatten, extra.Targets[j].Mode); err != nil {
+				return fmt.Errorf("target %s: %w", extra.Targets[j].Path, err)
+			}
+			extras[i].Targets[j].Flatten = flatten
+		}
+		if extra.File != "" {
+			if err := config.ValidateExtraConfig(extras[i]); err != nil {
+				return err
+			}
+		}
+
+		if err := saveFn(); err != nil {
+			return fmt.Errorf("failed to save config: %w", err)
+		}
+
+		label := "enabled"
+		if !flatten {
+			label = "disabled"
+		}
+		ui.Done(ui.MarkOK, fmt.Sprintf("Flatten %s for all %d targets of %s", label, len(extra.Targets), name), 0)
+
+		e := oplog.NewEntry("extras-mode", "ok", time.Since(start))
+		e.Args = map[string]any{"name": name, "flatten": flatten, "all_targets": true}
+		oplog.WriteWithLimit(configPath, oplog.OpsFile, e, logMaxEntries()) //nolint:errcheck
+		return nil
+	}
+	return fmt.Errorf("extra %q not found", name)
+}
+
+// applyExtraTarget finds an extra by name and target path, then applies a
+// mutation. Operates on the extras slice in-place (caller must save config).
+func applyExtraTarget(extras []config.ExtraConfig, name, targetPath string, apply func(*config.ExtraTargetConfig)) error {
+	for i, extra := range extras {
+		if extra.Name != name {
+			continue
+		}
+		for j := range extra.Targets {
+			if extra.Targets[j].Path == targetPath {
+				apply(&extras[i].Targets[j])
+				return nil
+			}
+		}
+		return fmt.Errorf("target %q not found in extra %q", targetPath, name)
+	}
+	return fmt.Errorf("extra %q not found", name)
+}
+
+func printExtrasModeHelp() {
+	printHelp("skillshare extras <name> --mode <mode> [--target <path>]", "Change the sync mode, flatten setting, or file filters of an extra's target.\nFilters use .gitignore patterns on paths inside the source: draft* matches\nat any depth, images/ covers a folder. Files that stop matching are pruned\non the next sync in merge mode; copy mode leaves them in place.",
+		helpGroup{title: "Arguments", rows: []helpRow{
+			{"name", "Extra name (e.g., rules, commands)"},
+		}},
+		helpGroup{title: "Options", rows: []helpRow{
+			{"--mode <mode>", "New sync mode: merge, copy, or symlink"},
+			{"--flatten", "Enable flatten (sync subdirectory files into target root)"},
+			{"--no-flatten", "Disable flatten"},
+			{"--add-include <pattern>", "Sync only files matching this pattern (repeatable)"},
+			{"--add-exclude <pattern>", "Skip files matching this pattern (repeatable)"},
+			{"--remove-include <pattern>", "Remove an include pattern"},
+			{"--remove-exclude <pattern>", "Remove an exclude pattern"},
+			{"--target <path>", "Target directory path (optional if extra has only one target)"},
+			{"-p, --project", "Use project mode (.skillshare/)"},
+			{"-g, --global", "Use global mode (~/.config/skillshare/)"},
+		}},
+		helpExamples(
+			helpRow{"skillshare extras rules --mode copy", ""},
+			helpRow{"skillshare extras agents --flatten", ""},
+			helpRow{"skillshare extras docs --target ~/.claude/docs --add-include index.md --add-include learning.md", ""},
+			helpRow{"skillshare extras docs --add-exclude \"draft*\" --add-exclude images/", ""},
+		),
+	)
+}

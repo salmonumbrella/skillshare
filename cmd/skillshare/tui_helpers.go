@@ -5,8 +5,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
 	"skillshare/internal/config"
+	"skillshare/internal/theme"
 	"skillshare/internal/ui"
 )
 
@@ -36,14 +38,6 @@ func shouldLaunchTUI(noTUI bool, cfg *config.Config) bool {
 func wrapAndScroll(content string, width, detailScroll, viewHeight int) (string, string) {
 	content = hardWrapContent(content, width)
 	return applyDetailScrollSplit(content, detailScroll, viewHeight)
-}
-
-// appendScrollInfo appends scroll position info to help text when present.
-func appendScrollInfo(help, scrollInfo string) string {
-	if scrollInfo != "" {
-		return help + "  " + scrollInfo
-	}
-	return help
 }
 
 // applyDetailScrollSplit applies scrolling and returns (visible content, scroll info).
@@ -94,26 +88,9 @@ func formatDurationShort(d time.Duration) string {
 // Minimum terminal width for horizontal split; below this use vertical layout.
 const tuiMinSplitWidth = 80
 
-// renderHorizontalSplit renders a left-right split with a vertical border column.
-// leftContent and rightContent are pre-rendered strings.
-func renderHorizontalSplit(leftContent, rightContent string, leftWidth, rightWidth, panelHeight int) string {
-	leftPanel := lipgloss.NewStyle().
-		Width(leftWidth).MaxWidth(leftWidth).
-		Height(panelHeight).MaxHeight(panelHeight).
-		Render(leftContent)
-
-	borderStyle := tc.Border.
-		Height(panelHeight).MaxHeight(panelHeight)
-	borderCol := strings.Repeat("│\n", panelHeight)
-	borderPanel := borderStyle.Render(strings.TrimRight(borderCol, "\n"))
-
-	rightPanel := lipgloss.NewStyle().
-		Width(rightWidth).MaxWidth(rightWidth).
-		PaddingLeft(1).
-		Render(rightContent)
-
-	return lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, borderPanel, rightPanel)
-}
+// Minimum terminal width for the audit and log split panels, which need less
+// room than tuiMinSplitWidth; below this they use a vertical layout.
+const tuiNarrowSplitWidth = 70
 
 // truncateStr truncates a string to maxLen, appending "..." if needed.
 func truncateStr(s string, maxLen int) string {
@@ -124,4 +101,40 @@ func truncateStr(s string, maxLen int) string {
 		return s[:maxLen]
 	}
 	return s[:maxLen-3] + "..."
+}
+
+// newTUIFilterInput builds the "/ " filter input shared by all TUIs.
+// Pass "" for no placeholder.
+func newTUIFilterInput(placeholder string) textinput.Model {
+	fi := textinput.New()
+	fi.Prompt = "/ "
+	fi.PromptStyle = theme.Accent()
+	fi.Cursor.Style = theme.Accent()
+	fi.Placeholder = placeholder
+	return fi
+}
+
+// handleTUIFilterKey handles a key press while the filter input is focused.
+// esc clears the filter and re-applies it; enter locks the filter in without
+// re-applying; any other key goes to the input and re-applies only when the
+// value changed.
+func handleTUIFilterKey(msg tea.KeyMsg, filtering *bool, text *string, input *textinput.Model, apply func()) tea.Cmd {
+	switch msg.String() {
+	case "esc":
+		*filtering = false
+		*text = ""
+		input.SetValue("")
+		apply()
+		return nil
+	case "enter":
+		*filtering = false
+		return nil
+	}
+	var cmd tea.Cmd
+	*input, cmd = input.Update(msg)
+	if newVal := input.Value(); newVal != *text {
+		*text = newVal
+		apply()
+	}
+	return cmd
 }

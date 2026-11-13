@@ -3,11 +3,11 @@
 package integration
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"skillshare/internal/install"
 	"skillshare/internal/testutil"
 )
 
@@ -101,26 +101,6 @@ func TestUpdate_StaleWarning_NoPruneFlag(t *testing.T) {
 	}
 }
 
-func TestUpdate_Prune_RegistryCleanup(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-	setupGlobalConfig(sb)
-
-	_, _, staleName := setupMultiSkillRepo(t, sb)
-
-	result := sb.RunCLI("update", "--all", "--prune", "--skip-audit")
-	result.AssertSuccess(t)
-
-	// Check registry does not contain the stale skill
-	regPath := filepath.Join(filepath.Dir(sb.ConfigPath), "registry.yaml")
-	if _, err := os.Stat(regPath); err == nil {
-		regContent := sb.ReadFile(regPath)
-		if contains(regContent, staleName) {
-			t.Errorf("registry should not contain pruned skill %q", staleName)
-		}
-	}
-}
-
 // TestUpdate_Prune_AllStale verifies that when ALL skills from a repo are
 // deleted upstream, --prune removes them all without panic or error.
 func TestUpdate_Prune_AllStale(t *testing.T) {
@@ -168,7 +148,7 @@ func TestUpdate_Prune_AllStale(t *testing.T) {
 	}
 
 	// Registry should not contain either
-	regPath := filepath.Join(filepath.Dir(sb.ConfigPath), "registry.yaml")
+	regPath := filepath.Join(sb.SourcePath, "registry.yaml")
 	if _, err := os.Stat(regPath); err == nil {
 		regContent := sb.ReadFile(regPath)
 		for _, name := range []string{"alpha", "beta"} {
@@ -215,7 +195,7 @@ func TestUpdate_Prune_StandaloneSkill(t *testing.T) {
 	// With --prune: should remove
 	result2 := sb.RunCLI("update", "--all", "--prune", "--skip-audit")
 	result2.AssertSuccess(t)
-	result2.AssertAnyOutputContains(t, "Pruned")
+	result2.AssertAnyOutputContains(t, "pruned")
 
 	if _, err := os.Stat(filepath.Join(sb.SourcePath, "my-skill")); !os.IsNotExist(err) {
 		t.Error("standalone stale skill should have been pruned")
@@ -277,7 +257,7 @@ func TestUpdate_Prune_NestedIntoSkill(t *testing.T) {
 	}
 
 	// Registry should not contain stale-nested
-	regPath := filepath.Join(filepath.Dir(sb.ConfigPath), "registry.yaml")
+	regPath := filepath.Join(sb.SourcePath, "registry.yaml")
 	if _, err := os.Stat(regPath); err == nil {
 		regContent := sb.ReadFile(regPath)
 		if contains(regContent, "stale-nested") {
@@ -289,18 +269,24 @@ func TestUpdate_Prune_NestedIntoSkill(t *testing.T) {
 	}
 }
 
-// writeMetaForRepo writes metadata matching a repo-installed skill.
+// writeMetaForRepo writes metadata matching a repo-installed skill to the centralized store.
 func writeMetaForRepo(t *testing.T, skillDir, repoURL, subdir string) {
 	t.Helper()
-	meta := map[string]any{
-		"source":   repoURL + "//" + subdir,
-		"type":     "github",
-		"repo_url": repoURL,
-		"subdir":   subdir,
-		"version":  "abc123",
+	sourceDir := findSourceRoot(skillDir)
+	rel, _ := filepath.Rel(sourceDir, skillDir)
+
+	store, err := install.LoadMetadata(sourceDir)
+	if err != nil {
+		t.Fatalf("writeMetaForRepo: load: %v", err)
 	}
-	data, _ := json.Marshal(meta)
-	if err := os.WriteFile(filepath.Join(skillDir, ".skillshare-meta.json"), data, 0644); err != nil {
-		t.Fatalf("writeMetaForRepo: %v", err)
+	store.Set(rel, &install.MetadataEntry{
+		Source:  repoURL + "//" + subdir,
+		Type:    "github",
+		RepoURL: repoURL,
+		Subdir:  subdir,
+		Version: "abc123",
+	})
+	if err := store.Save(sourceDir); err != nil {
+		t.Fatalf("writeMetaForRepo: save: %v", err)
 	}
 }

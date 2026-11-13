@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,8 +35,26 @@ pre{background:#f0f0f0;padding:12px 16px;border-radius:6px;overflow-x:auto}</sty
 
 // spaHandlerFromDisk serves a SPA from a directory on disk.
 // Unknown paths fall back to index.html for client-side routing.
-func spaHandlerFromDisk(dir string) http.Handler {
+// A <base> tag for basePath, plus a <script> injecting window.__BASE_PATH__ when
+// basePath is non-empty, is inserted into index.html after <head>.
+func spaHandlerFromDisk(dir, basePath string) http.Handler {
 	fileServer := http.FileServer(http.Dir(dir))
+
+	// Always cache index.html at startup (avoids per-request disk reads on SPA fallback).
+	// When basePath is set, inject window.__BASE_PATH__ for the frontend.
+	var cachedIndex []byte
+	indexPath := filepath.Join(dir, "index.html")
+	if raw, err := os.ReadFile(indexPath); err == nil {
+		// The build links its files as ./assets/...; without a base, a page opened at a
+		// nested route such as /targets/claude asks for /targets/assets/... instead.
+		encodedHref, _ := json.Marshal(basePath + "/")
+		injection := "<base href=" + string(encodedHref) + ">"
+		if basePath != "" {
+			encoded, _ := json.Marshal(basePath)
+			injection += "<script>window.__BASE_PATH__=" + string(encoded) + "</script>"
+		}
+		cachedIndex = []byte(strings.Replace(string(raw), "<head>", "<head>"+injection, 1))
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Try to serve the file directly
@@ -46,18 +65,26 @@ func spaHandlerFromDisk(dir string) http.Handler {
 
 		fullPath := filepath.Join(dir, path)
 		if _, err := os.Stat(fullPath); err == nil {
+			if path == "index.html" && cachedIndex != nil {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Write(cachedIndex)
+				return
+			}
+			// The file server takes a type from the system, and on Windows the registry
+			// can get .svg wrong. The browser then refuses to draw the image.
+			if strings.HasSuffix(path, ".svg") {
+				w.Header().Set("Content-Type", "image/svg+xml")
+			}
 			fileServer.ServeHTTP(w, r)
 			return
 		}
 
-		// SPA fallback: serve index.html
-		indexPath := filepath.Join(dir, "index.html")
-		index, err := os.ReadFile(indexPath)
-		if err != nil {
-			http.Error(w, "UI assets not found", http.StatusNotFound)
+		// SPA fallback: serve cached index.html
+		if cachedIndex != nil {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(cachedIndex)
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(index)
+		http.Error(w, "UI assets not found", http.StatusNotFound)
 	})
 }

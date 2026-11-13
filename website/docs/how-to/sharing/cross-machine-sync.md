@@ -79,20 +79,25 @@ This works even after initial setup — it just adds the remote.
 
 ## Second Machine Setup
 
-On a new machine, **the same command works**:
+Run `skillshare init`, choose **Connect my existing skillshare repo**, and paste the repo URL:
+
+<p>
+  <img src="/img/init-connect-demo.png" alt="skillshare init connecting to an existing repo" width="720" />
+</p>
+
+Or pass the URL directly:
 
 ```bash
 skillshare init --remote git@github.com:you/my-skills.git
 ```
 
-Init automatically detects that the remote has existing skills and pulls them down. No manual `git clone` needed.
+Init checks the repo before writing anything, then pulls it down. No manual `git clone` needed.
 
 :::info What happens behind the scenes
-1. Creates source directory and initializes git
-2. Adds remote and runs `git fetch`
-3. Detects remote has skills → resets local to match remote
-4. Sets up tracking branch
-5. Auto-detects and configures local targets
+1. Clones the repo into a temporary folder to count its skills and detect its layout: a whole-folder repo pushed with `--git-root root`, or skills in a `skills/` folder
+2. Skills on this machine with the same name as one in the repo use the repo version; skills only on this machine are kept and added on the next `skillshare push`
+3. After you confirm: creates the source, initializes git, adds the remote, resets to the remote branch, and sets up tracking
+4. Configures the detected local targets and offers a first sync
 :::
 
 If you prefer manual control:
@@ -114,7 +119,10 @@ skillshare sync
 # Edit skills (changes visible immediately via symlinks)
 $EDITOR ~/.config/skillshare/skills/my-skill/SKILL.md
 
-# Push to remote
+# Optional: create a local checkpoint without pushing
+skillshare commit -m "Update my-skill"
+
+# Push to remote when ready to share
 skillshare push -m "Update my-skill"
 ```
 
@@ -124,11 +132,115 @@ skillshare push -m "Update my-skill"
 skillshare pull
 ```
 
-That's it. `pull` automatically runs `sync` after pulling.
+That's it. `pull` automatically runs `sync` after pulling. It syncs what the [git root scope](/docs/reference/targets/configuration#git-root) holds: skills by default, agents or extras with those scopes, and all three with `git_root: root`. Plugins, MCP servers and hooks need the extra steps below.
+
+### Both ways in one command
+
+When you edit skills on more than one machine, run this instead of `push` and `pull`:
+
+```bash
+skillshare push --pull -m "Update my-skill"
+```
+
+It commits your changes, merges what the other machines pushed, pushes, and syncs targets. A conflict stops it before anything is pushed. See [Push and Pull Together](/docs/reference/commands/push#push-and-pull-together).
+
+---
+
+## Plugins, MCP and Hooks {#plugins-mcp-hooks}
+
+`push` and `pull` version the files in the git root directory. Plugins, hooks and MCP servers are settings in `config.yaml`, and `config.yaml` is never part of that repository: the default `skills` scope keeps it outside the repo, and the `root` scope ignores it. Each machine keeps its own `config.yaml`, with its own targets and paths.
+
+| Resource | Stored in | Moves with `push` / `pull` |
+|---|---|---|
+| Skills | Skills source | Yes |
+| Agents | Agents source | With `git_root: agents` or `root` |
+| Extras | Extras source | With `git_root: extras` or `root` |
+| MCP servers | `config.yaml`, or the file named by `sources.mcp` | Only when that file is inside the repository |
+| Plugins | `plugins:` in `config.yaml` | No |
+| Hooks | `hooks:` in `config.yaml` | No |
+
+After pulling on another machine, apply the rest yourself:
+
+```bash
+skillshare pull
+skillshare sync --all              # adds agents, extras, MCP and hooks
+skillshare sync plugins --no-tui   # plugins are never part of --all
+```
+
+### MCP servers {#mcp-servers}
+
+Keep the server definitions in a separate file inside the repository. With `git_root: root`, the repository is the directory that holds `config.yaml` (`~/.config/skillshare`, or `%AppData%\skillshare` on Windows), so a relative `sources.mcp` path is committed while `config.yaml` stays local:
+
+```yaml title="config.yaml (on each machine)"
+sources:
+  mcp: ./mcp.yaml
+
+mcp:
+  targets: [claude, codex]
+```
+
+`mcp.targets` stays in `config.yaml`, so each machine chooses its own receiving clients. Set `sources.mcp` on every machine. To move existing servers out of `config.yaml`, see [Split MCP into its own file](/docs/how-to/daily-tasks/sharing-mcp#split-mcp-into-its-own-file). To switch an existing setup to the `root` scope, see [`git_root`](/docs/reference/targets/configuration#git-root).
+
+Skillshare stores credentials as `fromEnv` references, never as values. Set those environment variables on each machine where the Agent can read them.
+
+### Plugins {#plugins}
+
+Share the `plugins:` section of the config to share version 2 declarations: sources,
+refs and selected targets. Keep `StateDir` local on every machine. Alternatively,
+use **Plugins → Share** to copy an add command into a separately managed config.
+
+On a new machine, run `skillshare plugin sync` to review and install source-managed
+plugins using local snapshot paths. Review and commit pinning are **per machine**:
+a shared branch ref is resolved when that machine installs or updates it. A
+non-interactive sync may install a newer commit than another machine reviewed.
+Use a commit SHA as `source_ref` when every machine must use the same revision.
+Local source paths must exist on each machine.
+
+Native-only declarations show **Import required on this machine** and sync skips
+them. Install in the native client, then run
+`skillshare plugin import LOCAL-ID --from TARGET --name NAME` on each machine.
+Importing into an existing source declaration only records a local receipt;
+other machines keep their source recipe and installation.
+
+Before the first v2 edit, upgrade every writer and run `skillshare plugin list`
+on **each machine while the shared YAML is still legacy** to save its local
+migration hints. See [plugin state and migration](/docs/reference/commands/plugin#host-state).
+
+`sync` installs missing plugins, reconciles changed refs and retries local cleanup.
+Use `skillshare plugin check` and `skillshare plugin update` for new releases on an
+unchanged ref.
+
+### Hooks {#hooks}
+
+Hooks have no separate file. Copy the `hooks:` section of `config.yaml` to the other machine, then run `skillshare sync hooks`.
+
+### What stays on each machine {#per-machine}
+
+- The native CLIs that install plugins (`claude`, `codex`, and so on) must be installed and on `PATH` where Skillshare runs. A scheduled job often has a shorter `PATH` than your terminal. Codex is also found inside the Codex desktop app and in Homebrew's folders; set [`SKILLSHARE_CODEX_CLI`](/docs/reference/appendix/environment-variables#skillshare_codex_cli) on a machine where it is elsewhere.
+- Sign-ins, OAuth tokens, native trust prompts and enabled/disabled state stay in each Agent.
+- The values of environment variables that MCP servers reference.
 
 ---
 
 ## Commands
+
+### Commit
+
+Create a local checkpoint without pushing:
+
+```bash
+skillshare commit                  # Default message
+skillshare commit -m "Add pdf"     # Custom message
+skillshare commit --dry-run        # Preview
+```
+
+**What happens:**
+```
+git add -A
+git commit -m "Add pdf"
+```
+
+`commit` does not require a remote and never pushes.
 
 ### Push
 
@@ -156,13 +268,22 @@ skillshare pull
 
 **What happens:**
 ```
-git pull           # or fetch + reset on first pull
+git pull           # merges when both machines committed; fetch + merge or reset on first pull
 skillshare sync
 ```
 
 ---
 
 ## Conflict Handling
+
+### Pull fails (local uncommitted changes)
+
+If you want to keep the local changes but are not ready to push them yet, commit them locally first:
+
+```bash
+skillshare commit -m "Save local changes"
+skillshare pull
+```
 
 ### Push fails (remote ahead)
 
@@ -180,7 +301,7 @@ skillshare pull
 skillshare push
 ```
 
-### Pull fails (local uncommitted changes)
+### Pull still fails with local uncommitted changes
 
 ```
 $ skillshare pull
@@ -191,11 +312,15 @@ Local changes detected
 
 **Solution:**
 ```bash
-# Option 1: Push your changes first
+# Option 1: Commit locally first
+skillshare commit -m "Local changes"
+skillshare pull
+
+# Option 2: Push your changes first
 skillshare push -m "Local changes"
 skillshare pull
 
-# Option 2: Stash changes temporarily
+# Option 3: Stash changes temporarily
 cd ~/.config/skillshare/skills
 git stash
 skillshare pull
@@ -204,12 +329,21 @@ git stash pop
 
 ### Merge conflicts
 
+When both machines committed, `pull` merges them. Conflicts in `.metadata.json` resolve automatically. A conflict in any other file stops the pull, undoes the merge, and names the files:
+
+```
+$ skillshare pull
+pull stopped: this machine and the remote both changed my-skill/SKILL.md; the merge was undone, resolve it with git in ~/.config/skillshare/skills
+```
+
+**Solution:**
 ```bash
 cd ~/.config/skillshare/skills
-git status                    # See conflicted files
-# Edit files to resolve
+git pull --no-rebase          # Redo the merge and keep the conflicts
+# Edit the conflicted files
 git add .
-git commit -m "Resolve conflicts"
+git commit --no-edit
+skillshare push
 skillshare sync
 ```
 
@@ -248,6 +382,16 @@ ssh-keygen -t ed25519 -C "your@email.com"
 # Add public key to GitHub
 ```
 
+### Portable paths for dotfiles
+
+If you share `config.yaml` via dotfiles, enable `preserve_tilde_on_save` to keep paths as `~/...` instead of `/home/alice/...`:
+
+```yaml
+preserve_tilde_on_save: true
+```
+
+This prevents noisy diffs when the same config is used across machines with different usernames or OS-specific home prefixes. See [Configuration — preserve_tilde_on_save](/docs/reference/targets/configuration#preserve_tilde_on_save).
+
 ### Multiple remotes
 
 Add backup remotes:
@@ -267,7 +411,7 @@ skillshare pull 2>/dev/null
 
 ---
 
-## Alternative: Install from Config
+## Alternative: Install from Config {#alternative-install-from-config}
 
 If you don't want to set up a git remote, `config.yaml` doubles as a portable skill manifest. Every `install` / `uninstall` auto-updates the `skills:` section, and `skillshare install` (no args) reinstalls everything listed:
 

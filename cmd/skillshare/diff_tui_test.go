@@ -57,7 +57,7 @@ func TestBuildDiffDetail_ShowsExpandedFilesFromModelState(t *testing.T) {
 	}
 
 	out := m.buildDiffDetail()
-	if !strings.Contains(out, "── demo-skill files ──") {
+	if !strings.Contains(out, "demo-skill files") {
 		t.Fatalf("detail view missing files header:\n%s", out)
 	}
 	if !strings.Contains(out, "local.txt") {
@@ -138,5 +138,30 @@ func TestBuildDiffDetail_ShowsEmptyExpandHint(t *testing.T) {
 	out := m.buildDiffDetail()
 	if !strings.Contains(out, "(No file-level diff available)") {
 		t.Fatalf("detail view missing empty expand hint:\n%s", out)
+	}
+}
+
+func TestDiffTUI_KeptOnlyTarget(t *testing.T) {
+	results := []targetDiffResult{{
+		name: "claude",
+		mode: "copy",
+		items: []copyDiffEntry{
+			{name: "emil-design-prototype", action: "remove", reason: "local folder; the skill stays at prototype", keptAt: "prototype"},
+		},
+	}}
+	m := newDiffTUIModel(results)
+	m.refreshDetailCache()
+
+	if _, desc := (diffTargetItem{result: results[0]}).row(); !strings.Contains(desc, "1 kept") {
+		t.Errorf("row = %q, want 1 kept", desc)
+	}
+	if title := m.renderTitleLine(); !strings.Contains(title, "1 kept under old name") || strings.Contains(title, "differ") {
+		t.Errorf("title = %q, want a kept count and no differ", title)
+	}
+	detail := m.buildDiffDetail()
+	for _, want := range []string{"emil-design-prototype (stays at prototype)", "after renaming or removing the local folders"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("detail missing %q:\n%s", want, detail)
+		}
 	}
 }

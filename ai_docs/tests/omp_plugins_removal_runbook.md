@@ -1,0 +1,284 @@
+# OMP Plugin Removal and Reinstall E2E
+
+## Scope
+
+Use native OMP 18.6.1 or later and an inert plugin to verify scoped removal, retained
+shared cache used by an invisible project, and reinstall into a new cache
+identity. A scope-matching native registry version may differ from the recorded binding when its cache path is verified. An unverifiable batch update reports failure while continuing other targets. No Agent session, extension code or real user configuration is used.
+
+## Environment
+
+Run in the devcontainer with a fresh `ssenv` and the pinned OMP/Bun installation
+on PATH. Keep the environment and JSON report for inspection. Each step is
+self-contained; the native `plugin` commands do not start an Agent session.
+
+## Steps
+
+### 1. Remove a user install without damaging an invisible project, then reinstall
+
+```bash
+set -eu
+cd /workspace
+go build -o "$HOME/omp-removal-skillshare" ./cmd/skillshare
+ss="$HOME/omp-removal-skillshare"
+cd "$HOME"
+mkdir -p "$HOME/removal-source/.claude-plugin" "$HOME/removal-source/skills/removal" "$HOME/foreign-project/.omp"
+cat > "$HOME/removal-source/.claude-plugin/plugin.json" <<'EOF'
+{"name":"removal-probe","version":"1.0.0","description":"An inert fixture with a long description for native scoped removal and retained shared cache verification."}
+EOF
+cat > "$HOME/removal-source/package.json" <<'EOF'
+{"name":"removal-runtime","version":"1.0.0","omp":{"extensions":["index.ts"]}}
+EOF
+cat > "$HOME/removal-source/skills/removal/SKILL.md" <<'EOF'
+---
+name: removal
+description: Inert removal fixture
+---
+Never execute anything.
+EOF
+cat > "$HOME/removal-source/index.ts" <<EOF
+import { writeFileSync } from 'node:fs';
+writeFileSync('$HOME/extension-executed', 'unsafe');
+export default function () {}
+EOF
+"$ss" plugin add "$HOME/removal-source" --target omp --no-tui -g > "$HOME/add.log"
+omp plugin list --json > "$HOME/native-before.json"
+id=$(jq -r '.marketplace[] | select(.scope == "user") | .id' "$HOME/native-before.json")
+cache=$(jq -r '.marketplace[] | select(.scope == "user") | .entries[0].installPath' "$HOME/native-before.json")
+test -n "$id" && test -d "$cache"
+(cd "$HOME/foreign-project" && omp plugin install "$id" --scope project > "$HOME/foreign-install.log")
+foreign="$HOME/foreign-project/.omp/plugins"
+sha256sum "$foreign/installed_plugins.json" "$foreign/omp-plugins.lock.json" > "$HOME/foreign-before.sha"
+(cd "$cache" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$HOME/cache-before.sha"
+"$ss" plugin remove removal-probe --dry-run --json -g > "$HOME/remove-plan.json"
+jq -e '.blocked == false and .changes[0].action == "remove" and .changes[0].messageKey == "plugins.note.ompRemoval"' "$HOME/remove-plan.json" >/dev/null
+revision=$(jq -r '.revision' "$HOME/remove-plan.json")
+"$ss" plugin remove removal-probe --revision "$revision" --no-tui -g > "$HOME/remove.log"
+omp plugin list --json > "$HOME/native-removed.json"
+jq -e '.marketplace | all(.scope != "user")' "$HOME/native-removed.json" >/dev/null
+test ! -e "$HOME/.omp/plugins/node_modules/removal-runtime"
+jq -e '.plugins | has("removal-runtime") | not' "$HOME/.omp/plugins/omp-plugins.lock.json" >/dev/null
+sha256sum -c "$HOME/foreign-before.sha" > /dev/null
+(cd "$cache" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$HOME/cache-after.sha"
+cmp "$HOME/cache-before.sha" "$HOME/cache-after.sha"
+test -f "$foreign/node_modules/removal-runtime/index.ts"
+(cd "$HOME/foreign-project" && omp plugin list --json) | jq -e --arg id "$id" '.marketplace | any(.id == $id and .scope == "project")' > /dev/null
+"$ss" plugin add "$HOME/removal-source" --target omp --dry-run --json -g > "$HOME/reinstall-plan.json"
+jq -e --arg id "$id" '.blocked == false and .changes[0].id != $id and .changes[0].messageKey == "plugins.note.ompFreshCache"' "$HOME/reinstall-plan.json" > /dev/null
+"$ss" plugin add "$HOME/removal-source" --target omp --no-tui -g > "$HOME/reinstall.log"
+omp plugin list --json | jq -e --arg id "$id" --arg cache "$cache" '.marketplace | any(.scope == "user" and .id != $id and .entries[0].installPath != $cache)' > /dev/null
+sha256sum -c "$HOME/foreign-before.sha" > /dev/null
+test -f "$foreign/node_modules/removal-runtime/index.ts"
+test ! -e "$HOME/extension-executed"
+printf '{"removed":true,"foreignProjectIntact":true,"reinstalledFresh":true,"executed":false}\n'
+```
+
+**Expected:**
+- exit_code: 0
+- jq: .removed and .foreignProjectIntact and .reinstalledFresh and (.executed == false)
+
+### 2. Deselect and sync a project installation while retaining the user installation
+
+```bash
+set -eu
+cd /workspace
+go build -o "$HOME/omp-project-removal-skillshare" ./cmd/skillshare
+ss="$HOME/omp-project-removal-skillshare"
+project="$HOME/removal-project"
+source="$HOME/project-removal-source"
+mkdir -p "$source/.claude-plugin" "$source/skills/removal" "$project/.skillshare/skills" "$project/.omp"
+cat > "$source/.claude-plugin/plugin.json" <<'EOF'
+{"name":"project-removal-probe","version":"1.0.0"}
+EOF
+cat > "$source/package.json" <<'EOF'
+{"name":"project-removal-runtime","version":"1.0.0"}
+EOF
+cat > "$source/skills/removal/SKILL.md" <<'EOF'
+---
+name: removal
+description: Inert project removal fixture
+---
+No executable resources.
+EOF
+cat > "$project/.skillshare/config.yaml" <<'EOF'
+source: ./skills
+targets:
+  omp:
+    path: .omp/skills
+EOF
+cd "$project"
+"$ss" plugin add "$source" --target omp --no-tui -p > "$HOME/project-add.log"
+omp plugin list --json > "$HOME/project-native.json"
+id=$(jq -r '.marketplace[] | select(.scope == "project") | .id' "$HOME/project-native.json")
+cache=$(jq -r '.marketplace[] | select(.scope == "project") | .entries[0].installPath' "$HOME/project-native.json")
+(cd "$HOME" && omp plugin install "$id" --scope user > "$HOME/user-install.log")
+userRoot="$HOME/.omp/plugins"
+sha256sum "$userRoot/installed_plugins.json" "$userRoot/omp-plugins.lock.json" > "$HOME/user-before.sha"
+"$ss" plugin disable project-removal-probe --target omp --no-tui -p > "$HOME/project-disable.log"
+"$ss" plugin sync project-removal-probe --no-tui -p > "$HOME/project-sync.log"
+omp plugin list --json | jq -e --arg id "$id" '.marketplace | all(.id != $id or .scope != "project")' > /dev/null
+test ! -e "$project/.omp/plugins/node_modules/project-removal-runtime"
+test -f "$userRoot/node_modules/project-removal-runtime/package.json"
+test -d "$cache"
+sha256sum -c "$HOME/user-before.sha" > /dev/null
+printf '{"projectRemoved":true,"userUnchanged":true,"cacheRetained":true}\n'
+```
+
+**Expected:**
+- exit_code: 0
+- jq: .projectRemoved and .userUnchanged and .cacheRetained
+
+### 3. Receive a changed source on a second machine and sync once
+
+```bash
+set -eu
+cd "${SKILLSHARE_TEST_WORKTREE:-/workspace}"
+go build -o "$HOME/source-change-skillshare" ./cmd/skillshare
+ss="$HOME/source-change-skillshare"
+lab=$(mktemp -d "$HOME/source-change.XXXXXX")
+for host in a b; do
+  mkdir -p "$lab/$host/home" "$lab/$host/config/skillshare" "$lab/$host/state" "$lab/$host/data" "$lab/$host/cache"
+  printf 'targets: {}\n' > "$lab/$host/config/skillshare/config.yaml"
+done
+machine() {
+  selected=$1
+  shift
+  env HOME="$lab/$selected/home" XDG_CONFIG_HOME="$lab/$selected/config" \
+    XDG_STATE_HOME="$lab/$selected/state" XDG_DATA_HOME="$lab/$selected/data" \
+    XDG_CACHE_HOME="$lab/$selected/cache" "$@"
+}
+for recipe in old new; do
+  mkdir -p "$lab/$recipe/.claude-plugin" "$lab/$recipe/skills/probe"
+  printf '{"name":"source-change-probe","version":"1.0.0"}\n' > "$lab/$recipe/.claude-plugin/plugin.json"
+  printf '{"name":"source-change-runtime","version":"1.0.0"}\n' > "$lab/$recipe/package.json"
+  printf '%s\n' '---' 'name: probe' 'description: Inert source change fixture' '---' 'No executable resources.' > "$lab/$recipe/skills/probe/SKILL.md"
+done
+machine a "$ss" plugin add "$lab/old" --target omp --no-tui -g > "$lab/add-a.log"
+cp "$lab/a/config/skillshare/config.yaml" "$lab/b/config/skillshare/config.yaml"
+machine b "$ss" plugin sync source-change-probe --no-tui -g > "$lab/install-b.log"
+machine b omp plugin list --json > "$lab/native-old.json"
+old_id=$(jq -r '.marketplace[] | select(.scope == "user") | .id' "$lab/native-old.json")
+old_cache=$(jq -r '.marketplace[] | select(.scope == "user") | .entries[0].installPath' "$lab/native-old.json")
+test -n "$old_id" && test -f "$old_cache/package.json"
+sha256sum "$old_cache/package.json" > "$lab/retained-cache.sha"
+machine a "$ss" plugin remove source-change-probe --no-tui -g > "$lab/remove-a.log"
+machine a "$ss" plugin add "$lab/new" --target omp --no-tui -g > "$lab/replace-a.log"
+cp "$lab/a/config/skillshare/config.yaml" "$lab/b/config/skillshare/config.yaml"
+cp "$lab/b/config/skillshare/config.yaml" "$lab/intent-before.yaml"
+machine b "$ss" plugin sync source-change-probe --dry-run --json -g > "$lab/plan.json"
+jq -e '.blocked == false and (.changes | map(.action)) == ["remove", "install"]' "$lab/plan.json" > /dev/null
+revision=$(jq -r '.revision' "$lab/plan.json")
+machine b "$ss" plugin sync source-change-probe --revision "$revision" --no-tui -g > "$lab/sync-b.log"
+cmp "$lab/intent-before.yaml" "$lab/b/config/skillshare/config.yaml"
+sha256sum -c "$lab/retained-cache.sha" > /dev/null
+machine b omp plugin list --json | jq -e --arg old "$old_id" '.marketplace | length == 1 and .[0].id != $old' > /dev/null
+machine b "$ss" plugin sync source-change-probe --dry-run --json -g | jq -e '.blocked == false and (.changes | map(.action)) == ["noop"]' > /dev/null
+# A direct source-field edit has the same cleanup/install contract.
+sed "s|$lab/new|$lab/old|g" "$lab/intent-before.yaml" > "$lab/b/config/skillshare/config.yaml"
+machine b "$ss" plugin update source-change-probe --dry-run --json -g > "$lab/edit-plan.json"
+jq -e '.blocked == false and (.changes | map(.action)) == ["remove", "install"]' "$lab/edit-plan.json" > /dev/null
+revision=$(jq -r '.revision' "$lab/edit-plan.json")
+machine b "$ss" plugin update source-change-probe --revision "$revision" --no-tui -g > "$lab/update-b.log"
+printf '{"sourceReplaced":true,"sharedIntentUnchanged":true,"cacheRetained":true,"directEditReplaced":true}\n'
+```
+
+**Expected:**
+- exit_code: 0
+- jq: .sourceReplaced and .sharedIntentUnchanged and .cacheRetained and .directEditReplaced
+
+### 4. Remove an installation whose native registry version differs
+
+This constructs a second native cache version in the isolated HOME, preserving the
+binding recorded by Skillshare. It changes only the fixture's native registration.
+
+```bash
+set -eu
+cd /workspace
+go build -o "$HOME/version-removal-skillshare" ./cmd/skillshare
+ss="$HOME/version-removal-skillshare"
+source="$HOME/version-removal-source"
+mkdir -p "$source/.claude-plugin" "$source/skills/probe"
+printf '%s\n' '{"name":"version-probe","version":"1.0.0"}' > "$source/.claude-plugin/plugin.json"
+printf '%s\n' '{"name":"version-runtime","version":"1.0.0"}' > "$source/package.json"
+printf '%s\n' '---' 'name: probe' 'description: Inert fixture' '---' 'No executable resources.' > "$source/skills/probe/SKILL.md"
+cd "$HOME"
+"$ss" plugin add "$source" --target omp --no-tui -g > "$HOME/version-add.log"
+registry="$HOME/.omp/plugins/installed_plugins.json"
+omp plugin list --json > "$HOME/version-native.json"
+id=$(jq -r '.marketplace[] | select(.scope == "user" and (.id | startswith("version-probe@"))) | .id' "$HOME/version-native.json")
+old=$(jq -r --arg id "$id" '.plugins[$id][0].installPath' "$registry")
+test -n "$id" && test -d "$old"
+new="${old%___*}___2.0.0"
+cp -R "$old" "$new"
+link="$HOME/.omp/plugins/node_modules/version-runtime"
+test "$(readlink "$link")" = "$old"
+rm "$link"
+ln -s "$new" "$link"
+jq --arg id "$id" --arg path "$new" '.plugins[$id][0].version = "2.0.0" | .plugins[$id][0].installPath = $path' "$registry" > "$registry.tmp"
+mv "$registry.tmp" "$registry"
+"$ss" plugin remove version-probe --dry-run --json -g > "$HOME/version-plan.json"
+jq -e '.blocked == false and .changes[0].action == "remove" and .changes[0].binding.version == "1.0.0"' "$HOME/version-plan.json" > /dev/null
+revision=$(jq -r '.revision' "$HOME/version-plan.json")
+"$ss" plugin remove version-probe --revision "$revision" --no-tui -g > "$HOME/version-remove.log"
+jq -e --arg id "$id" '.plugins | has($id) | not' "$registry" > /dev/null
+test ! -e "$link" && test -d "$new" && test -d "$old"
+printf '{"removed":true,"bothCachesRetained":true}\n'
+```
+
+**Expected:**
+- exit_code: 0
+- jq: .removed and .bothCachesRetained
+
+### 5. Report an unverifiable OMP update while updating a healthy target
+
+Replacing the fixture's runtime link with a directory makes ownership unverifiable. Both
+targets use an inert source in the isolated HOME.
+
+```bash
+set -eu
+cd /workspace
+go build -o "$HOME/batch-failure-skillshare" ./cmd/skillshare
+ss="$HOME/batch-failure-skillshare"
+source="$HOME/batch-failure-source"
+mkdir -p "$source/.claude-plugin" "$source/.cursor-plugin" "$source/skills/probe"
+printf '%s\n' '{"name":"batch-probe","version":"1.0.0"}' > "$source/.claude-plugin/plugin.json"
+printf '%s\n' '{"name":"batch-probe","version":"1.0.0"}' > "$source/.cursor-plugin/plugin.json"
+printf '%s\n' '{"name":"batch-runtime","version":"1.0.0"}' > "$source/package.json"
+printf '%s\n' '---' 'name: probe' 'description: Inert fixture' '---' 'No executable resources.' > "$source/skills/probe/SKILL.md"
+cd "$HOME"
+"$ss" plugin add "$source" --target omp --target cursor --no-tui -g > "$HOME/batch-add.log"
+registry="$HOME/.omp/plugins/installed_plugins.json"
+cp "$registry" "$HOME/batch-registry-before.json"
+link="$HOME/.omp/plugins/node_modules/batch-runtime"
+test -L "$link"
+rm "$link"
+mkdir "$link"
+printf '%s\n' '{"name":"batch-probe","version":"2.0.0"}' > "$source/.claude-plugin/plugin.json"
+printf '%s\n' '{"name":"batch-probe","version":"2.0.0"}' > "$source/.cursor-plugin/plugin.json"
+printf '%s\n' '---' 'name: probe' 'description: Inert fixture' '---' 'Updated fixture.' > "$source/skills/probe/SKILL.md"
+set +e
+"$ss" plugin update --all --dry-run --json -g > "$HOME/batch-plan.json" 2> "$HOME/batch-plan.err"
+plan_status=$?
+"$ss" plugin update --all --json -g > "$HOME/batch-result.json" 2> "$HOME/batch-result.err"
+update_status=$?
+set -e
+test "$plan_status" -ne 0 && test "$update_status" -ne 0
+jq -e '.changes | any(.target == "omp" and .failed == true and (.message | length > 0))' "$HOME/batch-plan.json" > /dev/null
+jq -e '.results | any(.target == "omp" and .status == "failed") and any(.target == "cursor" and .status == "installed")' "$HOME/batch-result.json" > /dev/null
+cmp "$HOME/batch-registry-before.json" "$registry"
+printf '{"dryRunFailed":true,"ompFailed":true,"cursorUpdated":true}\n'
+```
+
+**Expected:**
+- exit_code: 0
+- jq: .dryRunFailed and .ompFailed and .cursorUpdated
+
+## Pass Criteria
+
+The scoped registry, runtime selection and link are removed rather than disabled;
+foreign registrations, links and cache bytes remain unchanged. Reinstall uses a
+fresh identity, and no extension executes during management.
+
+A second machine completes a source replacement in one reviewed sync; direct source edits also reconcile through update. Shared intent and retained cache remain intact.
+
+Removal follows a verified native registry version that differs from the binding and keeps both caches. A batch update reports the unverifiable OMP target as failed, exits nonzero in dry run and apply, and still updates the healthy target without changing OMP's registry.

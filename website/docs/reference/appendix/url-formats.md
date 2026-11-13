@@ -21,7 +21,8 @@ All source URL patterns recognized by `skillshare install`.
 | Azure DevOps shorthand | `ado:org/project/repo` | Expands to `dev.azure.com` URL |
 | Azure DevOps HTTPS | `https://dev.azure.com/org/proj/_git/repo` | Modern format |
 | Azure DevOps SSH | `git@ssh.dev.azure.com:v3/org/proj/repo` | SSH v3 format |
-| Local path | `~/my-skill` or `/abs/path` | Copies directory to source |
+| Azure DevOps Server | `https://custom-host/org/proj/_git/repo` | Requires `azure_hosts` config |
+| Local path | `~/my-skill`, `/abs/path`, or `C:\path` | Copies directory to source |
 | Git file URL | `file:///path/to/repo` | Local git clone (for testing) |
 
 ## GitHub Shorthand
@@ -150,6 +151,9 @@ skillshare install ~/my-skill
 
 # Relative path
 skillshare install ./local-skill
+
+# Windows drive-letter path
+skillshare install D:\skills\my-skill
 ```
 
 Local installs **copy** files (not symlink) and are not updatable via `skillshare update`.
@@ -200,6 +204,51 @@ skillshare install git@ssh.dev.azure.com:v3/org/project/repo
 If you get an authentication error with HTTPS, switch to SSH URLs. skillshare sets `GIT_TERMINAL_PROMPT=0` to prevent hanging credential prompts, so interactive HTTPS auth won't work.
 :::
 
+## Custom GitLab Domains {#custom-gitlab-domains}
+
+Hosts containing `gitlab` or `jihulab` in the name (e.g., `gitlab.com`, `jihulab.com`, `onprem.gitlab.internal`) are automatically detected and parsed with nested subgroup support.
+
+For self-managed GitLab instances on custom domains (e.g., `git.company.com`), add the hostname to [`gitlab_hosts`](../targets/configuration.md#gitlab_hosts) in your config:
+
+```yaml
+gitlab_hosts:
+  - git.company.com
+```
+
+This tells skillshare to treat the full URL path as the repository, matching GitLab's nested subgroup behavior.
+
+**Without config**, you can use `.git` to mark the end of the repo path:
+
+```bash
+# Installs from git.company.com/team/frontend/ui (full path as repo)
+skillshare install git.company.com/team/frontend/ui.git
+```
+
+
+## Gitea and CNB {#gitea-and-cnb}
+
+`gitea.com`, any host with `gitea` in its name, and `cnb.cool` are recognised. The path is read as `owner/repo`, and anything after it is the subdirectory:
+
+```bash
+skillshare install https://gitea.com/owner/repo/skills/review
+skillshare install https://cnb.cool/org/repo/skills
+```
+
+For a self-hosted instance on another domain, list the hostname in [`gitea_hosts`](../targets/configuration.md#gitea_hosts) or [`cnb_hosts`](../targets/configuration.md#cnb_hosts). Private repos use [`GITEA_TOKEN`](./environment-variables.md#gitea_token) and [`CNB_TOKEN`](./environment-variables.md#cnb_token).
+
+## Custom Azure DevOps Domains {#custom-azure-domains}
+
+The built-in Azure DevOps patterns match `dev.azure.com` and `*.visualstudio.com` automatically.
+
+For self-hosted Azure DevOps Server instances on custom domains, add the hostname to [`azure_hosts`](../targets/configuration.md#azure_hosts) in your config:
+
+```yaml
+azure_hosts:
+  - azuredevops.mycompany.com
+```
+
+This tells skillshare to route URLs with `/_git/` on that host through Azure DevOps parsing, which correctly constructs the clone URL without appending `.git`.
+
 ## Platform Support
 
 | Feature | GitHub | GitLab | Bitbucket | Gitea | GHE | Azure DevOps | AtomGit/Gitee |
@@ -212,4 +261,4 @@ If you get an authentication error with HTTPS, switch to SSH URLs. skillshare se
 
 ## Related
 
-- [Install command](../commands/install.md) — full install options and examples
+- [Install command](/docs/reference/commands/install) — full install options and examples

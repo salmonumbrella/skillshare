@@ -1,0 +1,101 @@
+# mdproof Lessons Learned
+
+### [assertion] Use jq: for JSON output, not python3 pipe
+
+- **Context**: extras_refactor_json_runbook had 7 steps using `python3 -c` to parse JSON and print key=value pairs for substring assertions
+- **Discovery**: mdproof's native `jq:` assertion is cleaner — one-liner per check, no script maintenance, and jq-exit-code failure is automatic
+- **Fix**: Replace `cmd --json | python3 -c "import json; ..."` with bare `cmd --json` + `jq:` assertions
+- **Runbooks affected**: extras_refactor_json_runbook.md (steps 3, 4, 7, 10, 11, 17, 18)
+
+### [gotcha] cat >> is not idempotent across re-runs
+
+- **Context**: Several runbooks used `cat >> config.yaml` to append YAML sections (extras, gitlab_hosts)
+- **Discovery**: If a runbook is re-run in the same ssenv (or /tmp persists), `cat >>` appends duplicate YAML keys, causing parse errors
+- **Fix**: Prepend `sed -i '/^section:/,$d'` before `cat >>` to strip existing section first. Or use CLI commands (`ss extras init`, `ss extras remove --force`) which handle duplicates gracefully
+- **Runbooks affected**: extras_refactor_json_runbook.md, sync_extras_runbook.md, gitlab_hosts_config_runbook.md
+
+### [gotcha] ssenv only isolates $HOME — /tmp/ persists across environments
+
+- **Context**: Steps creating files in /tmp/ (e.g., /tmp/test-project, /tmp/extras-proj) left artifacts that broke re-runs
+- **Discovery**: `ssenv` sets an isolated `$HOME` but shares `/tmp/`, `/var/`, and other system paths with the host container
+- **Fix**: Add `rm -rf /tmp/<path>` at the start of steps that create /tmp/ directories. Or use mdproof.json `step_setup` for common cleanup patterns
+- **Runbooks affected**: extras_refactor_json_runbook.md, extras_commands_runbook.md, gitlab_hosts_config_runbook.md
+
+### [gotcha] ssenv --init creates default extras — runbooks must clean up
+
+- **Context**: Runbook Step 1 assumed an empty environment (`ss extras list --json` → `[]`), but `ssenv create --init` pre-creates a `rules` extra
+- **Discovery**: `--init` runs `ss init` which creates default extras (rules). Subsequent `extras init rules` fails with "already exists", and target dirs (e.g., `~/.claude/rules/`) already exist before any runbook step syncs
+- **Fix**: Add cleanup at the start of runbooks that assume no pre-existing extras: `ss extras remove rules --force -g 2>/dev/null || true` + `rm -rf ~/.claude/rules 2>/dev/null || true`
+- **Runbooks affected**: extras_commands_runbook.md (step 1), sync_extras_runbook.md (step 1)
+
+### [gotcha] echo > symlink writes through to source
+
+- **Context**: Step tried `echo "content" > target/file.md` to create a "local file" after sync, but the file was a symlink
+- **Discovery**: Shell `echo > symlink` writes to the symlink's target, not creating a new file. This means the "local file" ends up in source, and `collect` sees nothing to collect
+- **Fix**: Create files with different names than synced files, or `rm` the symlink first then create the file
+- **Runbooks affected**: extras_commands_runbook.md (step 18 collect), extras_refactor_json_runbook.md
+
+### [critical] Shell variables do NOT persist across code blocks
+
+- **Context**: symlinked_dir_sync_runbook defined `REAL_SOURCE`, `CLAUDE_TARGET`, `REAL_TARGET` in Step 0 and Step 6 code blocks, then referenced them in Steps 6–19 (14 code blocks total)
+- **Discovery**: mdproof executes each fenced code block as an isolated `bash -c` invocation. Shell variables, `cd` state, and environment variables set in one block are completely gone in the next block — even within the same step (sub-commands). This caused 9/20 step failures where paths like `$REAL_TARGET/alpha/SKILL.md` expanded to `/alpha/SKILL.md`
+- **Fix**: Re-define all needed variables at the top of EVERY code block that uses them. No shortcuts — `export` doesn't help, sourcing a file isn't built-in
+- **Impact**: This is the #1 source of false failures in multi-step runbooks. Steps may also "pass for wrong reasons" (e.g., `test -d ""` → false → prints "REMOVED OK" matching assertion)
+- **Runbooks affected**: symlinked_dir_sync_runbook.md (14 code blocks fixed)
+
+### [gotcha] jq: assertions fail when stdout mixes CLI text with JSON
+
+- **Context**: extras_source_config_runbook steps 6 and 11 had multi-command blocks: `ss extras remove ... ; ss extras init ... ; ss extras list --json`. The jq assertions checked JSON fields like `.[0].source_type == "default"`
+- **Discovery**: jq assertions parse the ENTIRE stdout as JSON. When a step mixes non-JSON CLI output (e.g., "✓ Removed rules from extras config") with JSON from `--json`, jq can't parse it and the assertion fails — even though the JSON portion contains the correct data
+- **Fix**: Redirect non-JSON commands to `/dev/null` (`ss extras remove ... >/dev/null 2>&1`) so that only the `--json` output remains in stdout. Alternative: split into separate steps (one for setup, one for JSON assertion)
+- **Runbooks affected**: extras_source_config_runbook.md (steps 6, 11)
+
+### [gotcha] Expected lines starting with `no ...` can be parsed as negation
+
+- **Context**: `target_local_agents_visibility_runbook.md` originally asserted `- no source agents yet (1 local)` for plain-text target output
+- **Discovery**: mdproof interpreted that Expected line as a negated substring assertion instead of a positive one because it began with `no`
+- **Fix**: Avoid bare Expected lines that start with `no`. Prefix them with stable surrounding text such as `Status:  no source agents yet (1 local)` or switch to `regex:` / `jq:` assertions
+- **Runbooks affected**: `target_local_agents_visibility_runbook.md`
+
+### [gotcha] Don't nest ssenv inside mdproof — use mdproof's own isolation
+
+- **Context**: cli-e2e-test skill wraps mdproof inside `ssenv enter $ENV -- mdproof ...`, but mdproof.json has its own `setup` command that runs `ss init -g --force`
+- **Discovery**: `ssenv create --init` already initializes the environment. When mdproof's setup then runs `ss init -g --force`, it fails with "already initialized" (exit code 1), causing ALL steps to be "skipped". mdproof's `isolation: per-runbook` creates its own isolated `$HOME`/`$TMPDIR` per runbook, making ssenv redundant
+- **Fix**: Run `mdproof` directly inside the container (`docker exec $CONTAINER mdproof ...`) without wrapping in `ssenv`. mdproof handles its own isolation. Only use ssenv for manual interactive debugging
+- **Runbooks affected**: All runbooks when run via the cli-e2e-test skill
+
+### [pattern] Self-contained steps avoid mdproof setup conflicts
+
+- **Context**: extras_flatten_runbook needed multi-step state (step 1 creates source files, step 4 syncs them). But mdproof.json's `setup` re-runs `ss init -g --force` before EACH step, wiping config.yaml including extras configuration from previous steps
+- **Discovery**: The mdproof global `setup` is designed to give each step a clean init state. This conflicts with runbooks that build state across steps (extras init → sync → verify). Combined with the ssenv+mdproof dual HOME isolation issue, the flatten runbook couldn't use mdproof at all
+- **Fix**: Make each step fully self-contained — every step includes its own cleanup + source creation + extras init + action + assertion in one bash block. Verbose but reliable. The runbook was ultimately executed via direct `ssenv enter ... -- bash -c '...'` instead of mdproof
+- **Tradeoff**: Self-contained steps are verbose (~15 lines per step vs ~3) but eliminate all setup/state dependency issues. Best for extras runbooks where state must persist across config operations
+- **Runbooks affected**: extras_flatten_runbook.md (all 9 steps are self-contained)
+
+### [gotcha] extras remove writes error to stdout, not stderr
+
+- **Context**: `ss extras remove agents --force -g 2>/dev/null || true` was used to clean up before JSON-only steps, but "extra not found" error text still appeared in stdout
+- **Discovery**: `ss extras remove` writes `✗ extra "agents" not found` to **stdout** (via `ui.Warning`), not stderr. `2>/dev/null` only redirects stderr, so the error text pollutes stdout and breaks jq assertions in the same step
+- **Fix**: Use `>/dev/null 2>&1` (redirect both stdout AND stderr) for cleanup commands in steps that need pure JSON output
+- **Runbooks affected**: extras_flatten_runbook.md
+
+### [gotcha] chmod 0444 does not block writes when running as root
+
+- **Context**: `TestLog_SyncPartialStatus` used `os.Chmod(dir, 0444)` to make a target directory read-only, expecting sync to fail on that target and log `"status":"partial"`
+- **Discovery**: The devcontainer runs as root. Root ignores POSIX permission bits — `chmod 0444` has no effect. The "broken" target synced successfully, so the oplog recorded `"status":"ok"` instead of `"partial"`
+- **Fix**: Use a **dangling symlink** instead: `os.Symlink("/nonexistent/path", targetPath)`. This makes `os.Stat` return "not exist" (passes config validation) but `os.MkdirAll` fails because the symlink entry blocks directory creation. Works regardless of UID
+- **Runbooks affected**: `tests/integration/log_test.go` (`TestLog_SyncPartialStatus`)
+
+### [gotcha] Full-directory mdproof runs cause inter-runbook state leakage
+
+- **Context**: Running `mdproof --report json /path/to/tests/` executes all runbooks sequentially in the same environment (same ssenv). Earlier runbooks install skills, modify config, fill trash — this state persists for later runbooks
+- **Discovery**: In a full run of 22 runbooks, the first clean run had 2 failures. But the second run (same ssenv, re-running mdproof) had 10 failures — all due to accumulated state from the first run (1257 trash items, stale registry entries, leftover extras). Even within a single full run, alphabetically-later runbooks can fail because of state left by earlier ones
+- **Fix**: (1) Each runbook should clean up its own footprint in Step 1 (rm -rf /tmp/ paths, clear trash, reset config sections). (2) For authoritative results, run each runbook in its own fresh ssenv. (3) Full-directory runs are useful as smoke tests but failures should be re-verified in isolation before treating them as real bugs
+- **Runbooks affected**: extras_refactor_json (file_count mismatch from extras_commands leftovers), gitlab_hosts_config (trash from previous runbooks broke go test), registry_yaml_split (/tmp/ state from prior runs)
+
+### [assertion] `ss sync --json` has no `.errors` field — use `.linked` / `.details`
+
+- **Context**: `global_sources_map_runbook` step 5 asserted `jq: .errors == 0` on `ss sync --json` to verify a successful sync. The assertion failed because the output schema doesn't include an `errors` key at all (jq returns `null`, which compares unequal to `0`)
+- **Discovery**: `ss sync --json` emits `{targets, linked, local, updated, pruned, ignored_count, ignored_skills, dry_run, duration, details[], context_cost}`. Failure is signalled by the process exit code and per-target details, not by a top-level `errors` field. Many AI-generated assertions assume a generic `.errors == 0` pattern from REST APIs — that pattern doesn't apply here
+- **Fix**: Assert positive evidence of the sync outcome instead. Examples: `jq: .linked == <N>` for "N skills got linked", `jq: .details[0].name == "<target>"` for target-level reporting, `jq: .updated == 0` for "nothing changed in this re-run". Pair with `exit_code: 0` for the failure-case guard
+- **Runbooks affected**: global_sources_map_runbook.md (step 5 fixed before merging)

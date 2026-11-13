@@ -37,7 +37,7 @@ func TestHub_IndexGeneratesJSON(t *testing.T) {
 
 	result := sb.RunCLI("hub", "index")
 	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "Found 2 skill(s)")
+	result.AssertAnyOutputContains(t, "with 2 skills")
 
 	// Verify generated file
 	data, err := os.ReadFile(filepath.Join(sb.SourcePath, "skillshare-hub.json"))
@@ -87,7 +87,7 @@ func TestHub_IndexEmptySource(t *testing.T) {
 
 	result := sb.RunCLI("hub", "index")
 	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "Found 0 skill(s)")
+	result.AssertAnyOutputContains(t, "with 0 skills")
 
 	data, err := os.ReadFile(filepath.Join(sb.SourcePath, "skillshare-hub.json"))
 	if err != nil {
@@ -152,15 +152,6 @@ func TestHub_IndexMinimalOmitsMetadata(t *testing.T) {
 			t.Errorf("minimal mode should not contain %q", key)
 		}
 	}
-}
-
-func TestHub_Help(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	result := sb.RunCLI("hub", "--help")
-	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "index")
 }
 
 func TestHub_IndexHelp(t *testing.T) {

@@ -4,13 +4,13 @@ sidebar_position: 2
 
 # Daily Workflow
 
-The edit → sync → push/pull cycle for everyday skill management.
+The edit → sync → commit/push/pull cycle for everyday skill management.
 
 ## Overview
 
 ```mermaid
 flowchart LR
-    EDIT["EDIT"] --> SYNC["SYNC"] --> PUSH["PUSH"] --> REMOTE["Remote"]
+    EDIT["EDIT"] --> SYNC["SYNC"] --> COMMIT["COMMIT"] --> PUSH["PUSH"] --> REMOTE["Remote"]
     EDIT --- SRC["Source"]
     SYNC --- TGT["Targets"]
     REMOTE --> PULL["Pull"]
@@ -53,7 +53,7 @@ skillshare sync
 ```
 
 :::tip Why is sync a separate step?
-Sync is intentionally decoupled from install/update/uninstall. This lets you batch multiple changes (e.g., install 3 skills → sync once), preview with `--dry-run` before propagating, and keep full control of when targets update. See [Source & Targets: Why Sync is a Separate Step](/docs/understand/source-and-targets#why-sync-is-a-separate-step) for details.
+Sync is intentionally decoupled from install/update/uninstall. This lets you batch multiple changes (e.g., install 3 skills → sync once), preview with `--dry-run` before propagating, and review target link and copy changes. Existing symlinks still expose source content changes immediately. See [Source & Targets: Why Sync is a Separate Step](/docs/understand/source-and-targets#why-sync-is-a-separate-step) for details.
 :::
 
 ### Preview first
@@ -62,13 +62,41 @@ Sync is intentionally decoupled from install/update/uninstall. This lets you bat
 skillshare sync --dry-run
 ```
 
+The dashboard's **Sync** page shows the same preview for each target before anything is written:
+
+![Sync page previewing changes per target before writing](/img/web-sync-demo.png)
+
+### Sync agents only
+
+If you only changed agents (or only want to push agents to agent-capable targets), scope the sync:
+
+```bash
+skillshare sync agents
+```
+
+`skillshare sync` runs both skills and agents in one shot. See [Agents](/docs/understand/agents) for the agent file format and supported targets.
+
 ---
 
-## Cross-Machine Sync
+## Git Checkpoints and Cross-Machine Sync
 
-If you use git remote:
+### Commit locally
+
+Use `commit` when you want a local restore point without pushing to a remote:
+
+```bash
+skillshare commit -m "Update draft skill"
+```
+
+This runs:
+1. `git add .`
+2. `git commit -m "Update draft skill"`
+
+`commit` works even when the source repo has no remote configured.
 
 ### Push changes (from this machine)
+
+If you use a git remote, `push` commits and shares changes in one command:
 
 ```bash
 skillshare push -m "Add new skill"
@@ -78,6 +106,8 @@ This runs:
 1. `git add .`
 2. `git commit -m "Add new skill"`
 3. `git push`
+
+If other machines push too, use `skillshare push --pull -m "Add new skill"` instead: it merges their changes before pushing and syncs targets afterwards. See [Push and Pull Together](/docs/reference/commands/push#push-and-pull-together).
 
 ### Pull changes (to this machine)
 
@@ -99,6 +129,22 @@ This runs:
 skillshare new code-review
 $EDITOR ~/.config/skillshare/skills/code-review/SKILL.md
 skillshare sync
+```
+
+### Edit or add an agent
+
+Agents are single `.md` files in `~/.config/skillshare/agents/`. Create or edit them directly with your editor:
+
+```bash
+$EDITOR ~/.config/skillshare/agents/reviewer.md
+skillshare sync agents
+```
+
+`disable` / `enable` toggle individual agents via `.agentignore` without deleting them:
+
+```bash
+skillshare disable reviewer --kind agent     # Excludes from sync
+skillshare enable reviewer --kind agent      # Re-enables
 ```
 
 ### Update a tracked repo
@@ -137,6 +183,7 @@ Add to your shell startup:
 # ~/.bashrc or ~/.zshrc
 alias ss="skillshare"
 alias sss="skillshare sync"
+alias ssc="skillshare commit"
 alias ssp="skillshare push"
 alias ssl="skillshare pull"
 ```
@@ -157,7 +204,7 @@ skillshare diff
 ```bash
 # Weekly maintenance
 skillshare audit             # Scan for security threats
-skillshare backup --cleanup  # Remove old backups
+skillshare backup --cleanup  # Remove old snapshots and abandoned incomplete directories
 skillshare doctor            # Check for issues
 ```
 
@@ -167,5 +214,6 @@ skillshare doctor            # Check for issues
 
 - [sync](/docs/reference/commands/sync) — Core sync command
 - [status](/docs/reference/commands/status) — Check sync state
+- [commit](/docs/reference/commands/commit) — Local git checkpoint without pushing
 - [push](/docs/reference/commands/push) / [pull](/docs/reference/commands/pull) — Cross-machine sync
 - [Skill Discovery](/docs/how-to/daily-tasks/skill-discovery) — Find new skills

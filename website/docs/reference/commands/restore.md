@@ -21,26 +21,7 @@ skillshare restore claude --dry-run                    # Preview
 
 ## Interactive TUI
 
-On a TTY, `skillshare restore` (with no arguments) launches a unified restore TUI:
-
-1. **Source picker** — Choose between "Backup Restore" and "Trash Restore"
-2. **Backup Restore** — Select a target, then browse backup versions with a detail panel showing:
-   - Backup date, size, and skill count
-   - Diff vs current target (added/removed skills)
-   - Individual file listings
-3. **Trash Restore** — Opens the trash TUI to restore deleted skills
-
-### Key Bindings
-
-| Key | Action |
-|-----|--------|
-| `↑`/`↓` | Navigate targets / versions |
-| `Enter` | Select target / restore version |
-| `/` | Filter targets |
-| `d` | Delete a backup version |
-| `Ctrl+d`/`Ctrl+u` | Scroll detail panel |
-| `Esc` | Go back |
-| `q`/`Ctrl+C` | Quit |
+On a TTY, `skillshare restore` with no arguments first asks whether to restore from a backup or from the trash. For a backup, pick a target and browse its backup versions: each shows its date, size, and what it would add or remove compared with the target now, and old versions can be deleted from there. Trash opens the trash TUI. The keys are listed at the bottom of the screen.
 
 Use `--no-tui` to skip the TUI and show a plain backup list instead.
 
@@ -59,10 +40,15 @@ flowchart TD
 
 | Flag | Description |
 |------|-------------|
+| `--all` | Restore both skills and agents |
+| `--project, -p` | Use project mode (`.skillshare/backups/`); **agents only** |
+| `--global, -g` | Use global mode (default for skills) |
 | `--from, -f <timestamp>` | Restore from specific backup |
 | `--force` | Overwrite without confirmation |
 | `--dry-run, -n` | Preview without making changes |
 | `--no-tui` | Skip interactive TUI, show backup list instead |
+
+`restore` also accepts a positional kind argument: `skillshare restore agents claude` restores the agent backup for the `claude` target.
 
 ## Finding Backups
 
@@ -73,10 +59,15 @@ skillshare backup --list
 ```
 
 ```
-All backups (15.3 MB total)
-  2026-01-20_15-30-00  claude, cursor     4.2 MB
-  2026-01-19_10-00-00  claude             2.1 MB
-  2026-01-18_09-00-00  claude, cursor     4.0 MB
+Backups  ~/.local/share/skillshare/backups
+  2026-01-20_15-30-00  claude, cursor · 4.2 MB
+  2026-01-19_10-00-00  claude · 2.1 MB
+  2026-01-18_09-00-00  claude, cursor · 4.0 MB
+
+3 backups, 10.3 MB
+
+Next
+  skillshare restore <target> --from <timestamp>  roll a target back
 ```
 
 ## Examples
@@ -97,18 +88,14 @@ skillshare restore claude --force
 
 ## After Restoring
 
-After restore, your target will have regular directories instead of symlinks. To re-sync:
+`restore` replaces the target directory with the snapshot's contents. Because backups capture only local content — symlinked skills are excluded, see [What Gets Backed Up](/docs/reference/commands/backup#what-gets-backed-up) — run `sync` afterwards to bring synced skills back:
 
 ```bash
-skillshare restore claude    # Restore backup
-skillshare sync              # Re-sync from source (creates symlinks)
+skillshare restore claude    # Restore local content from backup
+skillshare sync              # Recreate symlinks for synced skills
 ```
 
-Or keep the restored state:
-```bash
-skillshare restore claude    # Restore backup
-# Done - skills are now local copies
-```
+Restored content is regular files, not symlinks. If the target only ever held local skills, the restore alone is enough.
 
 ## Use Cases
 
@@ -138,7 +125,27 @@ skillshare restore claude --from 2026-01-15_10-00-00
 skillshare sync  # Return to current state
 ```
 
+### Agent Restore
+
+Agent restore mirrors skill restore but operates on the parallel `<target>-agents` backup entries created by `backup agents` (and the auto-backup that runs before `sync agents`):
+
+```bash
+skillshare restore agents claude                       # Latest agent backup for claude
+skillshare restore agents claude --from 2026-01-19_10-00-00
+skillshare restore agents -p                           # Project agents (the only project mode allowed)
+skillshare restore --all claude                        # Skills + agents in one shot
+```
+
+In project mode, restore — like backup — only operates on agents. Without the `agents` argument it errors:
+
+```
+restore is not supported in project mode (except for agents)
+```
+
+When listing backups via `skillshare backup --list`, agent backups show as separate entries with the `-agents` suffix (e.g. `claude-agents`).
+
 ## See Also
 
 - [backup](/docs/reference/commands/backup) — Create and manage backups
 - [sync](/docs/reference/commands/sync) — Re-sync after restore
+- [Agents](/docs/understand/agents) — Agent resource model

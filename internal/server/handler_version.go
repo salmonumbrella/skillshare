@@ -7,40 +7,114 @@ import (
 	versioncheck "skillshare/internal/version"
 )
 
+func (s *Server) handleUpdatePolicy(w http.ResponseWriter, r *http.Request) {
+	policy, err := config.ReadUpdatePolicy()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, policy)
+}
+
 func (s *Server) handleVersionCheck(w http.ResponseWriter, r *http.Request) {
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
+	source := s.cfg.EffectiveSkillsSource()
+	projectRoot := s.projectRoot
+	s.mu.RUnlock()
+
+	isProjectMode := projectRoot != ""
+	policy, err := config.ReadUpdatePolicy()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	manual := r.URL.Query().Get("manual") == "true"
+	check := policy.Enabled || manual
+
 	cliVersion := versioncheck.Version
+	method := detectUIInstallMethod()
 	cliUpdateAvailable := false
 	var cliLatest *string
+	cliDevMode := cliVersion == "" || cliVersion == "dev"
 
-	// CLI version check (uses 24h cache)
-	if result := versioncheck.Check(cliVersion, versioncheck.InstallDirect); result != nil {
-		cliUpdateAvailable = result.UpdateAvailable
-		cliLatest = &result.LatestVersion
+	// Dev builds expose a simulated update so the browser update/restart flow can be tested.
+	if check && cliDevMode {
+		latest := "dev-ui-flow"
+		cliUpdateAvailable = true
+		cliLatest = &latest
+	} else if check {
+		var result *versioncheck.CheckResult
+		if manual {
+			var err error
+			result, err = versioncheck.CheckNow(cliVersion, method)
+			if err != nil {
+				writeError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+		} else {
+			result = versioncheck.Check(cliVersion, method)
+		}
+		if result != nil {
+			// CLI version check (uses 24h cache)
+			cliUpdateAvailable = result.UpdateAvailable
+			cliLatest = &result.LatestVersion
+		}
+	}
+
+	// `skillshare upgrade` updates both everywhere but leaves a Nix-store CLI
+	// to Nix, so the dialog also says how Nix updates it.
+	var nixUpgradeCommand *string
+	if method.IsNix() {
+		command := method.UpgradeCommand()
+		nixUpgradeCommand = &command
 	}
 
 	// Skill version (local) — always check global source for built-in skill
-	skillSourceDir := s.cfg.Source
-	if s.IsProjectMode() {
-		if globalCfg, err := config.Load(); err == nil {
-			skillSourceDir = globalCfg.Source
+	skillSourceDir := source
+	if isProjectMode {
+		if globalCfg, err := config.LoadReadOnly(); err == nil {
+			skillSourceDir = globalCfg.EffectiveSkillsSource()
 		}
 	}
 	skillVersion := versioncheck.ReadLocalSkillVersion(skillSourceDir)
 
-	// Skill version (remote) — network call with 3s timeout
+	// Skill version (remote) — uses 24h cache, network call with 3s timeout
 	var skillLatest *string
 	skillUpdateAvailable := false
-	if skillVersion != "" {
-		if remote := versioncheck.FetchRemoteSkillVersion(); remote != "" {
+	if check && skillVersion != "" && (manual || config.AutoUpdateCheckEnabled()) {
+		var remote string
+		if manual {
+			remote = versioncheck.FetchRemoteSkillVersion()
+			if remote == "" {
+				writeError(w, http.StatusBadGateway, "failed to check built-in skill version")
+				return
+			}
+		} else {
+			remote = versioncheck.CachedRemoteSkillVersion()
+		}
+		if remote != "" {
 			skillLatest = &remote
-			skillUpdateAvailable = remote != skillVersion
+			skillUpdateAvailable = versioncheck.SkillOutdated(skillVersion, remote)
 		}
 	}
 
+	if !manual {
+		policy, err = config.ReadUpdatePolicy()
+		if err != nil || !policy.Enabled {
+			cliLatest, skillLatest = nil, nil
+			cliUpdateAvailable, skillUpdateAvailable = false, false
+		}
+	}
 	writeJSON(w, map[string]any{
+		"autoCheckEnabled":     policy.Enabled,
+		"autoCheckConfigured":  policy.Configured,
+		"autoCheckEnvOverride": policy.EnvOverride,
 		"cliVersion":           cliVersion,
 		"cliLatest":            cliLatest,
 		"cliUpdateAvailable":   cliUpdateAvailable,
+		"cliDevMode":           cliDevMode,
+		"nixUpgradeCommand":    nixUpgradeCommand,
 		"skillVersion":         skillVersion,
 		"skillLatest":          skillLatest,
 		"skillUpdateAvailable": skillUpdateAvailable,

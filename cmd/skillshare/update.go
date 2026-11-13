@@ -10,6 +10,8 @@ import (
 	"skillshare/internal/config"
 	"skillshare/internal/install"
 	"skillshare/internal/oplog"
+	"skillshare/internal/sourcewalk"
+	ssync "skillshare/internal/sync"
 	"skillshare/internal/ui"
 	"skillshare/internal/utils"
 )
@@ -31,13 +33,23 @@ type updateOptions struct {
 
 // updateJSONOutput is the JSON representation for update --json output.
 type updateJSONOutput struct {
-	Updated        int              `json:"updated"`
-	Skipped        int              `json:"skipped"`
-	SecurityFailed int              `json:"security_failed"`
-	Pruned         int              `json:"pruned"`
-	DryRun         bool             `json:"dry_run"`
-	Duration       string           `json:"duration"`
-	Items          []updateJSONItem `json:"items"`
+	Updated             int                         `json:"updated"`
+	UpToDate            int                         `json:"up_to_date,omitempty"`
+	Skipped             int                         `json:"skipped"`
+	SecurityFailed      int                         `json:"security_failed"`
+	Pruned              int                         `json:"pruned"`
+	DryRun              bool                        `json:"dry_run"`
+	Duration            string                      `json:"duration"`
+	Items               []updateJSONItem            `json:"items"`
+	MissingTrackedRepos *missingTrackedReposSummary `json:"missing_tracked_repos,omitempty"`
+}
+
+// missingTrackedReposSummary aggregates tracked repos declared in metadata whose
+// clone directories are absent on disk, so the per-item error stays concise while
+// the recovery hint is surfaced once. See issue #212.
+type missingTrackedReposSummary struct {
+	Names []string `json:"names"`
+	Hint  string   `json:"hint"`
 }
 
 type updateJSONItem struct {
@@ -110,7 +122,7 @@ func parseUpdateArgs(args []string) (*updateOptions, bool, error) {
 func cmdUpdate(args []string) error {
 	start := time.Now()
 
-	mode, rest, err := parseModeArgs(args)
+	mode, rest, err := parseModeArgs(args, "--audit-threshold", "--threshold", "-T", "--group", "-G")
 	if err != nil {
 		return err
 	}
@@ -120,15 +132,27 @@ func cmdUpdate(args []string) error {
 		return fmt.Errorf("cannot determine working directory: %w", err)
 	}
 
-	if mode == modeAuto {
-		if projectConfigExists(cwd) {
-			mode = modeProject
-		} else {
-			mode = modeGlobal
-		}
-	}
+	mode = resolveAutoMode(mode, cwd)
 
 	applyModeLabel(mode)
+
+	// Extract kind filter (e.g. "skillshare update agents")
+	kind, rest := parseKindArg(rest)
+
+	// Agent-only update: dispatch to correct scope
+	if kind == kindAgents {
+		if mode == modeProject {
+			return cmdUpdateAgentsProject(rest, cwd, start)
+		}
+		cfg, loadErr := config.Load()
+		if loadErr != nil {
+			if hasFlag(rest, "--json") {
+				return writeJSONError(loadErr)
+			}
+			return loadErr
+		}
+		return cmdUpdateAgents(rest, cfg, start)
+	}
 
 	if mode == modeProject {
 		// Parse opts for logging (cmdUpdateProject parses again internally)
@@ -164,32 +188,22 @@ func cmdUpdate(args []string) error {
 	if opts.threshold == "" {
 		opts.threshold = cfg.Audit.BlockThreshold
 	}
+	sourcePath := utils.ResolveSymlink(cfg.EffectiveSkillsSource())
+	walk := cfg.SkillsWalk()
 
 	// In JSON mode, redirect all UI output to stderr early so the
 	// header, step, spinner, and handler output don't corrupt stdout.
-	var restoreJSONUI func()
-	restoreJSONUIIfNeeded := func() {
-		if restoreJSONUI != nil {
-			restoreJSONUI()
-			restoreJSONUI = nil
-		}
-	}
-	if opts.jsonOutput {
-		restoreJSONUI = suppressUIToDevnull()
-	}
-	defer restoreJSONUIIfNeeded()
+	jsonUI := newJSONUISuppressor(opts.jsonOutput)
+	defer jsonUI.Flush()
 
 	jsonWriteError := func(err error) error {
-		restoreJSONUIIfNeeded()
+		jsonUI.Flush()
 		return writeJSONError(err)
 	}
 	jsonWriteResult := func(result *updateResult, cmdErr error) error {
-		restoreJSONUIIfNeeded()
+		jsonUI.Flush()
 		return updateOutputJSON(result, opts.dryRun, start, cmdErr)
 	}
-
-	ui.Header(ui.WithModeLabel("Updating"))
-	ui.StepStart("Source", cfg.Source)
 
 	// --- Resolve targets ---
 	var targets []updateTarget
@@ -199,8 +213,12 @@ func cmdUpdate(args []string) error {
 	if opts.all {
 		// Recursive discovery for --all
 		scanSpinner := ui.StartSpinner("Scanning skills...")
-		walkRoot := utils.ResolveSymlink(cfg.Source)
-		err := filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
+		walkRoot := sourcePath
+		metaStore, metaErr := install.LoadMetadataWithMigration(sourcePath, "")
+		if metaErr != nil {
+			resolveWarnings = append(resolveWarnings, fmt.Sprintf("could not read skill metadata: %v", metaErr))
+		}
+		err := sourcewalk.Walk(walkRoot, walk, func(path string, info os.FileInfo, err error) error {
 			if err != nil || path == walkRoot {
 				return nil
 			}
@@ -211,27 +229,35 @@ func cmdUpdate(args []string) error {
 				return filepath.SkipDir
 			}
 
-			// Tracked repo
-			if info.IsDir() && strings.HasPrefix(info.Name(), "_") {
-				if install.IsGitRepo(path) {
-					rel, _ := filepath.Rel(walkRoot, path)
-					if !seen[rel] {
-						seen[rel] = true
-						targets = append(targets, updateTarget{name: rel, path: path, isRepo: true})
+			// Followed checkouts are skipped whatever their name: a root SKILL.md
+			// would otherwise schedule them as a regular update below.
+			if info.IsDir() {
+				if warning, skip := followedRepoSkipped(walk, walkRoot, path); skip {
+					if warning != "" {
+						resolveWarnings = append(resolveWarnings, warning)
 					}
 					return filepath.SkipDir
 				}
 			}
 
+			// Tracked repo
+			if info.IsDir() && install.IsTrackedCheckout(path) {
+				rel, _ := filepath.Rel(walkRoot, path)
+				if !seen[rel] {
+					seen[rel] = true
+					targets = append(targets, updateTarget{name: rel, path: path, isRepo: true})
+				}
+				return filepath.SkipDir
+			}
+
 			// Regular skill
 			if !info.IsDir() && info.Name() == "SKILL.md" {
 				skillDir := filepath.Dir(path)
-				meta, metaErr := install.ReadMeta(skillDir)
-				if metaErr == nil && meta != nil && meta.Source != "" {
-					rel, _ := filepath.Rel(walkRoot, skillDir)
-					if rel != "." && !seen[rel] {
+				rel, _ := filepath.Rel(walkRoot, skillDir)
+				if rel != "." && !seen[rel] {
+					if entry := metaStore.GetByPath(rel); entry != nil && entry.Source != "" {
 						seen[rel] = true
-						targets = append(targets, updateTarget{name: rel, path: skillDir, isRepo: false, meta: meta})
+						targets = append(targets, updateTarget{name: rel, path: skillDir, isRepo: false, meta: entry})
 					}
 				}
 			}
@@ -244,12 +270,22 @@ func cmdUpdate(args []string) error {
 			}
 			return fmt.Errorf("failed to scan skills: %w", err)
 		}
+		resolveWarnings = append(resolveWarnings, ssync.SourceLinkWarnings(walk, false)...)
+		missingRepos, _ := install.GetMissingTrackedRepos(sourcePath, walk)
+		for _, repo := range missingRepos {
+			if !seen[repo.Name] {
+				seen[repo.Name] = true
+				targets = append(targets, updateTarget{name: repo.Name, path: filepath.Join(sourcePath, filepath.FromSlash(repo.Name)), isRepo: true})
+			}
+		}
 	} else {
+		// Load store once for name resolution
+		nameStore, _ := install.LoadMetadata(sourcePath)
 		// Resolve by specific names/groups
 		for _, name := range opts.names {
 			// Glob pattern matching (e.g. "core-*", "_team-?")
 			if isGlobPattern(name) {
-				globMatches, globErr := resolveByGlob(cfg.Source, name)
+				globMatches, globErr := resolveByGlob(sourcePath, name, walk)
 				if globErr != nil {
 					resolveWarnings = append(resolveWarnings, fmt.Sprintf("%s: %v", name, globErr))
 					continue
@@ -258,7 +294,7 @@ func cmdUpdate(args []string) error {
 					resolveWarnings = append(resolveWarnings, fmt.Sprintf("%s: no skills match pattern", name))
 					continue
 				}
-				ui.Info("Pattern '%s' matched %d item(s)", name, len(globMatches))
+				ui.Note(fmt.Sprintf("Pattern '%s' matched %s", name, plural(len(globMatches), "item")))
 				for _, m := range globMatches {
 					if !seen[m.name] {
 						seen[m.name] = true
@@ -268,8 +304,8 @@ func cmdUpdate(args []string) error {
 				continue
 			}
 
-			if isGroupDir(name, cfg.Source) {
-				groupMatches, groupErr := resolveGroupUpdatable(name, cfg.Source)
+			if isGroupDir(name, sourcePath, nameStore) {
+				groupMatches, groupErr := resolveGroupUpdatable(name, sourcePath, walk)
 				if groupErr != nil {
 					resolveWarnings = append(resolveWarnings, fmt.Sprintf("%s: %v", name, groupErr))
 					continue
@@ -278,7 +314,7 @@ func cmdUpdate(args []string) error {
 					resolveWarnings = append(resolveWarnings, fmt.Sprintf("%s: no updatable skills in group", name))
 					continue
 				}
-				ui.Info("'%s' is a group — expanding to %d updatable skill(s)", name, len(groupMatches))
+				ui.Note(fmt.Sprintf("'%s' is a group — expanding to %s", name, plural(len(groupMatches), "updatable skill")))
 				for _, m := range groupMatches {
 					if !seen[m.name] {
 						seen[m.name] = true
@@ -288,7 +324,7 @@ func cmdUpdate(args []string) error {
 				continue
 			}
 
-			match, err := resolveByBasename(cfg.Source, name)
+			match, err := resolveByBasename(sourcePath, name, walk)
 			if err != nil {
 				resolveWarnings = append(resolveWarnings, fmt.Sprintf("%s: %v", name, err))
 				continue
@@ -300,7 +336,7 @@ func cmdUpdate(args []string) error {
 		}
 
 		for _, group := range opts.groups {
-			groupMatches, err := resolveGroupUpdatable(group, cfg.Source)
+			groupMatches, err := resolveGroupUpdatable(group, sourcePath, walk)
 			if err != nil {
 				resolveWarnings = append(resolveWarnings, fmt.Sprintf("--group %s: %v", group, err))
 				continue
@@ -317,17 +353,6 @@ func cmdUpdate(args []string) error {
 			}
 		}
 	}
-
-	// Count repos vs skills for summary
-	var repoCount, skillCount int
-	for _, t := range targets {
-		if t.isRepo {
-			repoCount++
-		} else {
-			skillCount++
-		}
-	}
-	ui.StepEnd("Items", fmt.Sprintf("%d tracked repo(s), %d skill(s)", repoCount, skillCount))
 
 	for _, w := range resolveWarnings {
 		ui.Warning("%s", w)
@@ -352,7 +377,7 @@ func cmdUpdate(args []string) error {
 	}
 
 	// --- Execute ---
-	uc := &updateContext{sourcePath: cfg.Source, opts: opts}
+	uc := &updateContext{sourcePath: sourcePath, registryDir: cfg.RegistryDir, opts: opts, parseOpts: parseOptsFromConfig(cfg), follow: walk.Follow}
 
 	if len(targets) == 1 {
 		// Single target: verbose path
@@ -361,7 +386,11 @@ func cmdUpdate(args []string) error {
 		var r updateResult
 		var updateErr error
 		if t.isRepo {
-			r, updateErr = updateTrackedRepo(uc, t.name)
+			if mr, missing := missingTrackedRepoResult(t); opts.all && missing {
+				r = mr
+			} else {
+				r, updateErr = updateTrackedRepo(uc, t.name)
+			}
 		} else {
 			r, updateErr = updateRegularSkill(uc, t.name)
 		}
@@ -376,14 +405,11 @@ func cmdUpdate(args []string) error {
 		if opts.jsonOutput {
 			return jsonWriteResult(&r, updateErr)
 		}
+		displayMissingTrackedReposWarning(r.missingTrackedRepos)
 		return updateErr
 	}
 
 	// Multiple targets: batch path
-	if opts.dryRun {
-		ui.Warning("[dry-run] No changes will be made")
-	}
-
 	batchResult, batchErr := executeBatchUpdate(uc, targets)
 
 	// Build oplog names
@@ -412,9 +438,17 @@ func updateOutputJSON(result *updateResult, dryRun bool, start time.Time, update
 	}
 	if result != nil {
 		output.Updated = result.updated
+		output.UpToDate = result.upToDate
 		output.Skipped = result.skipped
 		output.SecurityFailed = result.securityFailed
 		output.Pruned = result.pruned
+		output.Items = result.items
+		if len(result.missingTrackedRepos) > 0 {
+			output.MissingTrackedRepos = &missingTrackedReposSummary{
+				Names: result.missingTrackedRepos,
+				Hint:  missingTrackedRepoHint(),
+			}
+		}
 	}
 	return writeJSONResult(&output, updateErr)
 }
@@ -465,6 +499,9 @@ func logUpdateOp(cfgPath string, names []string, opts *updateOptions, mode strin
 		if result.securityFailed > 0 {
 			a["security_failed"] = result.securityFailed
 		}
+		if result.upToDate > 0 {
+			a["up_to_date"] = result.upToDate
+		}
 		if result.skipped > 0 {
 			a["skipped"] = result.skipped
 		}
@@ -480,53 +517,41 @@ func logUpdateOp(cfgPath string, names []string, opts *updateOptions, mode strin
 }
 
 func printUpdateHelp() {
-	fmt.Println(`Usage: skillshare update <name>... [options]
-       skillshare update --group <group> [options]
-       skillshare update --all [options]
-
-Update one or more skills or tracked repositories.
-
-For tracked repos (_repo-name): runs git pull
-For regular skills: reinstalls from stored source metadata
-
-If a positional name matches a group directory (not a repo or skill), it is
-automatically expanded to all updatable skills in that group.
-
-Safety: Tracked repos with uncommitted changes are skipped by default.
-Use --force to discard local changes and update.
-
-Arguments:
-  name...             Skill name(s) or tracked repo name(s)
-                      Supports glob patterns (e.g. "core-*", "_team-?")
-
-Options:
-  --all, -a           Update all tracked repos + skills with metadata
-  --group, -G <name>  Update all updatable skills in a group (repeatable)
-  --force, -f         Discard local changes and force update
-  --dry-run, -n       Preview without making changes
-  --skip-audit        Skip post-update security audit
-  --audit-threshold, --threshold, -T <t>
-                      Override update audit block threshold (critical|high|medium|low|info;
-                      shorthand: c|h|m|l|i, plus crit, med)
-  --diff              Show file-level change summary after update
-  --audit-verbose     Show detailed per-skill audit findings in batch mode
-  --prune             Remove stale skills (deleted upstream) instead of warning
-  --json              Output results as JSON
-  --project, -p       Use project-level config in current directory
-  --global, -g        Use global config (~/.config/skillshare)
-  --help, -h          Show this help
-
-Examples:
-  skillshare update my-skill              # Update single skill from source
-  skillshare update a b c                 # Update multiple skills at once
-  skillshare update "core-*"             # Update all matching a glob pattern
-  skillshare update --group frontend      # Update all skills in frontend/
-  skillshare update x -G backend          # Mix names and groups
-  skillshare update _team-skills          # Update tracked repo (git pull)
-  skillshare update team-skills           # _ prefix is optional for repos
-  skillshare update --all                 # Update all tracked repos + skills
-  skillshare update --all -T high         # Use HIGH threshold for this run
-  skillshare update --all --dry-run       # Preview updates
-  skillshare update _team --force         # Discard changes and update
-  skillshare update --all --prune        # Update all + remove stale skills`)
+	printHelp("skillshare update <name>... [options]\n       skillshare update [agents] <name|--all> [options]\n       skillshare update --group <group> [options]\n       skillshare update --all [options]", "Update one or more skills or tracked repositories.\n\nFor tracked repos (_repo-name): runs git pull\nFor regular skills: reinstalls from stored source metadata\n(--all, --group, and several names with -p skip skills already at the\nupstream commit)\n\nIf a positional name matches a group directory (not a repo or skill), it is\nautomatically expanded to all updatable skills in that group.\n\nSafety: Tracked repos with uncommitted changes and skills edited since\ninstall are skipped by default, and updates with audit findings at/above\nthe block threshold are blocked before publication. Use --force to override both; --skip-audit skips scanning entirely.",
+		helpGroup{title: "Arguments", rows: []helpRow{
+			{"name...", "Skill name(s) or tracked repo name(s)\nSupports glob patterns (e.g. \"core-*\", \"_team-?\")"},
+		}},
+		helpGroup{title: "Options", rows: []helpRow{
+			{"-a, --all", "Update all tracked repos + skills with metadata"},
+			{"-G, --group <name>", "Update all updatable skills in a group (repeatable)"},
+			{"-f, --force", "Discard local changes, proceed despite audit findings,\nand reinstall skills already at the upstream commit"},
+			{"-n, --dry-run", "Preview without making changes"},
+			{"--skip-audit", "Skip security audit"},
+			{"-T, --audit-threshold, --threshold <t>", ""},
+			{"", "Override update audit block threshold (critical|high|medium|low|info;\nshorthand: c|h|m|l|i, plus crit, med)"},
+			{"--diff", "Show file-level change summary after update"},
+			{"--audit-verbose", "Show detailed per-skill audit findings in batch mode"},
+			{"--prune", "Remove stale skills (deleted upstream) instead of warning"},
+			{"--json", "Output results as JSON"},
+			{"-p, --project", "Use project-level config in current directory"},
+			{"-g, --global", "Use global config (~/.config/skillshare)"},
+		}},
+		helpExamples(
+			helpRow{"skillshare update my-skill", "Update single skill from source"},
+			helpRow{"skillshare update a b c", "Update multiple skills at once"},
+			helpRow{"skillshare update \"core-*\"", "Update all matching a glob pattern"},
+			helpRow{"skillshare update --group frontend", "Update all skills in frontend/"},
+			helpRow{"skillshare update x -G backend", "Mix names and groups"},
+			helpRow{"skillshare update _team-skills", "Update tracked repo (git pull)"},
+			helpRow{"skillshare update team-skills", "_ prefix is optional for repos"},
+			helpRow{"skillshare update --all", "Update all tracked repos + skills"},
+			helpRow{"skillshare update --all -T high", "Use HIGH threshold for this run"},
+			helpRow{"skillshare update --all --dry-run", "Preview updates"},
+			helpRow{"skillshare update _team --force", "Discard changes and update"},
+			helpRow{"skillshare update --all --prune", "Update all + remove stale skills"},
+			helpRow{"skillshare update agents --all", "Update all agents"},
+			helpRow{"skillshare update agents tutor", "Update a single agent"},
+			helpRow{"skillshare update agents -G demo", "Update all agents in demo/"},
+		),
+	)
 }

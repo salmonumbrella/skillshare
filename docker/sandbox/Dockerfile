@@ -1,14 +1,14 @@
 # Build arguments (must be before first FROM for cross-stage visibility)
 ARG NODE_VERSION=24
-ARG PNPM_VERSION=10.28.0
-ARG GO_VERSION=1.25.5
+ARG PNPM_VERSION=12.6.0
+ARG GO_VERSION=1.26.10
 
 # Stage 1: Build frontend assets (for playground UI)
 FROM node:${NODE_VERSION}-bookworm-slim AS ui-builder
 ARG PNPM_VERSION
 RUN npm install -g pnpm@${PNPM_VERSION}
 WORKDIR /ui
-COPY ui/package.json ui/pnpm-lock.yaml ./
+COPY ui/package.json ui/pnpm-lock.yaml ui/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY ui/ ./
 RUN pnpm run build
@@ -26,7 +26,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Go development tools
-RUN go install github.com/air-verse/air@latest \
+# air pinned: v1.67.2+ requires go >= 1.26, image runs GO_VERSION with GOTOOLCHAIN=local
+RUN go install github.com/air-verse/air@v1.67.1 \
     && go install github.com/go-delve/delve/cmd/dlv@latest
 
 # Copy node runtime from ui-builder stage (for devcontainer / interactive use)
@@ -47,7 +48,8 @@ RUN chmod +x /entrypoint.sh
 WORKDIR /workspace
 
 COPY go.mod go.sum ./
-RUN go mod download
+# The module proxy sometimes drops a download mid-stream; retry before failing the build.
+RUN for i in 1 2 3; do go mod download && exit 0; echo "go mod download failed (attempt $i), retrying" >&2; sleep 10; done; exit 1
 RUN mkdir -p /go/build-cache /go/pkg/mod && chmod -R 0777 /go/build-cache /go/pkg/mod
 
 ENTRYPOINT ["/entrypoint.sh"]

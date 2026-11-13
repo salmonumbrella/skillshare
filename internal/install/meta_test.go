@@ -1,6 +1,7 @@
 package install
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,6 +63,90 @@ func TestInstallFromDiscovery_FullSubdirUsesForwardSlashes(t *testing.T) {
 	}
 	if fullSubdir != "skills/my-skill" {
 		t.Errorf("fullSubdir = %q, want %q", fullSubdir, "skills/my-skill")
+	}
+}
+
+// Regression for #859: the source recorded for a skill picked out of a whole
+// repository must parse back into that repository and the skill's path.
+func TestBuildDiscoverySkillSource_RoundTrips(t *testing.T) {
+	opts := ParseOptions{GitLabHosts: []string{"code.example.com"}}
+	for _, typed := range []string{
+		"org/skills",
+		"https://github.com/org/skills",
+		"https://git.example.com/team/skills",
+		"https://git.example.com/team/skills.git",
+		"gitlab.com/team/skills",
+		"https://gitlab.com/group/sub/skills/",
+		"https://gitlab.com/team/skills.git",
+		"https://gitlab.com/team/skills/-/tree/main",
+		"https://code.example.com/group/sub/skills",
+		"https://bitbucket.org/team/skills",
+		"https://bitbucket.org/team/skills/src/main",
+		"https://bitbucket.org/src/skills",
+		"https://dev.azure.com/org/project/_git/skills",
+		"git@gitlab.com:team/skills.git",
+		"ssh://git@gitlab.com/team/skills.git",
+		"file:///srv/skills",
+	} {
+		t.Run(typed, func(t *testing.T) {
+			source, err := ParseSourceWithOptions(typed, opts)
+			if err != nil {
+				t.Fatalf("parse typed source: %v", err)
+			}
+			recorded := buildDiscoverySkillSource(source, "pack/x")
+			got, err := ParseSourceWithOptions(recorded, opts)
+			if err != nil {
+				t.Fatalf("parse recorded source %q: %v", recorded, err)
+			}
+			if got.CloneURL != source.CloneURL || got.Subdir != "pack/x" || got.Branch != source.Branch {
+				t.Errorf("recorded %q parsed as repo %q subdir %q branch %q, want repo %q subdir %q branch %q",
+					recorded, got.CloneURL, got.Subdir, got.Branch, source.CloneURL, "pack/x", source.Branch)
+			}
+		})
+	}
+}
+
+// An install recorded in the single-slash form from before #859 is still
+// recognized as the same skill, so `install --update` keeps updating it. A
+// repository of its own at that URL is a different install.
+func TestIsDiscoverySkillSource_FormBefore859(t *testing.T) {
+	source, err := ParseSource("file:///srv/skills")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const recorded = "file:///srv/skills/x"
+	if !isDiscoverySkillSource(&MetadataEntry{Source: recorded, RepoURL: "file:///srv/skills", Subdir: "x"}, source, "x") {
+		t.Error("single-slash source of the same repository not recognized")
+	}
+	if isDiscoverySkillSource(&MetadataEntry{Source: recorded, RepoURL: recorded}, source, "x") {
+		t.Error("a repository installed from the same URL was taken for the skill")
+	}
+}
+
+// Regression for #862: a record written before #859 holds a source that parses
+// as another repository; its recorded repository and path rebuild it.
+func TestRecordedSource(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		entry   MetadataEntry
+		wantRaw string
+	}{
+		{"file source in the old form", MetadataEntry{Source: "file:///srv/skills/pack/x", RepoURL: "file:///srv/skills", Subdir: "pack/x"}, "file:///srv/skills//pack/x"},
+		{"gitlab source in the old form", MetadataEntry{Source: "https://gitlab.com/team/skills/x", RepoURL: "https://gitlab.com/team/skills.git", Subdir: "x"}, "https://gitlab.com/team/skills.git/x"},
+		{"bitbucket source in the old form", MetadataEntry{Source: "https://bitbucket.org/team/skills/x", RepoURL: "https://bitbucket.org/team/skills.git", Subdir: "x"}, "https://bitbucket.org/team/skills.git/x"},
+		{"repository of its own at that URL", MetadataEntry{Source: "https://gitlab.com/team/skills/x", RepoURL: "https://gitlab.com/team/skills/x.git"}, "https://gitlab.com/team/skills/x"},
+		{"source that already parses", MetadataEntry{Source: "github.com/org/skills/x", RepoURL: "https://github.com/org/skills.git", Subdir: "x"}, "github.com/org/skills/x"},
+		{"record that names another repository", MetadataEntry{Source: "https://gitlab.com/team/skills/x", RepoURL: "https://gitlab.com/other/repo.git", Subdir: "x"}, "https://gitlab.com/team/skills/x"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			source, err := RecordedSource(&tt.entry, ParseOptions{})
+			if err != nil {
+				t.Fatalf("RecordedSource: %v", err)
+			}
+			if source.Raw != tt.wantRaw {
+				t.Errorf("source = %q, want %q", source.Raw, tt.wantRaw)
+			}
+		})
 	}
 }
 
@@ -156,6 +241,9 @@ func TestComputeFileHashes_SkipsMetaAndGit(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, ".skillshare-meta.json"), []byte("{}"), 0644)
 	os.MkdirAll(filepath.Join(dir, ".git", "objects"), 0755)
 	os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("ref: refs/heads/main"), 0644)
+	os.WriteFile(filepath.Join(dir, ".DS_Store"), []byte{0}, 0644)
+	os.MkdirAll(filepath.Join(dir, "assets"), 0755)
+	os.WriteFile(filepath.Join(dir, "assets", ".DS_Store"), []byte{0}, 0644)
 
 	hashes, err := ComputeFileHashes(dir)
 	if err != nil {
@@ -181,5 +269,116 @@ func TestComputeFileHashes_Deterministic(t *testing.T) {
 
 	if h1["file.txt"] != h2["file.txt"] {
 		t.Errorf("hashes differ: %s vs %s", h1["file.txt"], h2["file.txt"])
+	}
+}
+
+func TestComputeFileHashes_DirectorySymlink(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "target"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"SKILL.md", "target/README.md", "z-last.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("target", filepath.Join(dir, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	hashes, err := ComputeFileHashes(dir)
+	if err != nil {
+		t.Fatalf("ComputeFileHashes: %v", err)
+	}
+	if len(hashes) != 3 {
+		t.Fatalf("expected only 3 regular files, got %v", hashes)
+	}
+	for _, name := range []string{"SKILL.md", "target/README.md", "z-last.txt"} {
+		if hashes[name] == "" {
+			t.Errorf("missing hash for %s", name)
+		}
+	}
+}
+
+func TestComputeFileHashes_FileSymlink(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "target.txt"), []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target.txt", filepath.Join(dir, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	hashes, err := ComputeFileHashes(dir)
+	if err != nil {
+		t.Fatalf("ComputeFileHashes: %v", err)
+	}
+	if len(hashes) != 2 || hashes["link"] != hashes["target.txt"] {
+		t.Fatalf("file symlink should still hash target content: %v", hashes)
+	}
+}
+
+func TestComputeFileHashes_BrokenSymlinkReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a-valid.txt"), []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("missing", filepath.Join(dir, "z-broken")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	hashes, err := ComputeFileHashes(dir)
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected missing target error, got %v", err)
+	}
+	if hashes != nil {
+		t.Fatalf("must not return partial hashes as successful: %v", hashes)
+	}
+}
+
+// Regression for #777: the repo source rebuilt from an agent's metadata must
+// reproduce that metadata's source when the agent is written back.
+func TestAgentRepoSource_RoundTripsAgentSource(t *testing.T) {
+	tests := []struct {
+		name       string
+		source     string
+		agentPath  string
+		repoSubdir string
+	}{
+		{"github whole repo", "github.com/you/repo/agents/demo.md", "agents/demo.md", ""},
+		{"github repo subdir", "github.com/you/repo/pack/agents/demo.md", "agents/demo.md", "pack"},
+		{"ssh whole repo", "git@github.com:you/repo.git//agents/demo.md", "agents/demo.md", ""},
+		{"ssh repo subdir", "git@github.com:you/repo.git//pack/agents/demo.md", "agents/demo.md", "pack"},
+		{"file whole repo", "file:///tmp/repo//agents/demo.md", "agents/demo.md", ""},
+		{"file repo subdir", "file:///tmp/repo//pack/agents/demo.md", "agents/demo.md", "pack"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source, err := AgentRepoSource(&MetadataEntry{Source: tt.source, Subdir: tt.agentPath}, ParseOptions{})
+			if err != nil {
+				t.Fatalf("AgentRepoSource: %v", err)
+			}
+			got := buildDiscoverySkillSource(source, tt.agentPath)
+			if got != tt.source || source.Subdir != tt.repoSubdir {
+				t.Errorf("got source %q subdir %q, want %q subdir %q", got, source.Subdir, tt.source, tt.repoSubdir)
+			}
+		})
+	}
+}
+
+// Sources earlier updates broke (#777): the dashboard appended the agent path
+// a second time, which is repaired; the CLI dropped the repository, which
+// cannot be repaired and asks for a reinstall.
+func TestAgentRepoSource_BrokenSources(t *testing.T) {
+	doubled := &MetadataEntry{Source: "github.com/you/repo/agents/demo.md/agents/demo.md", Subdir: "agents/demo.md", RepoURL: "https://github.com/you/repo.git", Type: "github-subdir"}
+	source, err := AgentRepoSource(doubled, ParseOptions{})
+	if err != nil {
+		t.Fatalf("doubled path: %v", err)
+	}
+	if got := buildDiscoverySkillSource(source, doubled.Subdir); got != "github.com/you/repo/agents/demo.md" {
+		t.Errorf("doubled path rebuilt as %q", got)
+	}
+
+	lost := &MetadataEntry{Source: "/agents/demo.md", Subdir: "agents/demo.md", Type: "unknown-subdir"}
+	if _, err := AgentRepoSource(lost, ParseOptions{}); !errors.Is(err, ErrAgentSourceLost) {
+		t.Errorf("lost source: got %v, want ErrAgentSourceLost", err)
 	}
 }

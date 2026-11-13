@@ -15,9 +15,9 @@ You have a team skill repository and want to ensure every PR:
 
 ## Solution
 
-### GitHub Actions
+### GitHub Actions (with setup-skillshare)
 
-Create `.github/workflows/skill-validation.yml`:
+The [`setup-skillshare`](https://github.com/marketplace/actions/setup-skillshare) action handles installation, initialization, and optional security auditing in one step.
 
 ```yaml
 name: Skill Validation
@@ -31,26 +31,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install skillshare
-        run: curl -fsSL https://raw.githubusercontent.com/runkids/skillshare/main/install.sh | sh
-
-      - name: Initialize
-        run: skillshare init
-
-      - name: Install skills from this repo
-        run: skillshare install . --into ci-check
-
-      - name: Security audit
-        run: skillshare audit --threshold high --format json
-
-      - name: Dry-run sync
-        run: skillshare sync --dry-run
+      - uses: runkids/setup-skillshare@v1
+        with:
+          source: ./skills
+          audit: true
+          audit-threshold: high
+      - run: skillshare sync --dry-run
 ```
 
 ### GitHub Actions with SARIF Upload
 
-To get inline PR annotations via [GitHub Code Scanning](https://docs.github.com/en/code-security/code-scanning), add SARIF output alongside the JSON report:
+To get inline PR annotations via [GitHub Code Scanning](https://docs.github.com/en/code-security/code-scanning), use SARIF output. When `audit-output` is set, the action saves the results and records the exit code instead of failing, so the SARIF file can still be uploaded. Add a final step that fails the job on findings:
 
 ```yaml
 name: Skill Security Scan
@@ -67,20 +58,14 @@ jobs:
       security-events: write
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install skillshare
-        run: curl -fsSL https://raw.githubusercontent.com/runkids/skillshare/main/install.sh | sh
-
-      - name: Initialize
-        run: skillshare init
-
-      - name: Install skills from this repo
-        run: skillshare install . --into ci-check
-
-      - name: Security audit (JSON + SARIF)
-        run: |
-          skillshare audit --threshold high --format json > audit-report.json
-          skillshare audit --threshold high --format sarif > results.sarif || true
+      - uses: runkids/setup-skillshare@v1
+        id: skillshare
+        with:
+          source: ./skills
+          audit: true
+          audit-threshold: high
+          audit-format: sarif
+          audit-output: results.sarif
 
       - name: Upload SARIF to Code Scanning
         if: always()
@@ -89,15 +74,29 @@ jobs:
           sarif_file: results.sarif
           category: skillshare-audit
 
-      - name: Upload JSON report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: audit-report
-          path: audit-report.json
+      - run: skillshare sync --dry-run
 
-      - name: Dry-run sync
-        run: skillshare sync --dry-run
+      - name: Fail on audit findings
+        if: steps.skillshare.outputs.audit-exit-code != '0'
+        run: exit 1
+```
+
+### Without the action (manual setup)
+
+If you prefer not to use the action, you can install skillshare directly:
+
+```yaml
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          curl -fsSL https://raw.githubusercontent.com/runkids/skillshare/main/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: skillshare init --no-copy --all-targets --no-git --no-skill --source ./skills
+      - run: skillshare audit --threshold high --format json
+      - run: skillshare sync --dry-run
 ```
 
 ### GitLab CI
@@ -143,7 +142,7 @@ The `audit` command supports multiple output formats for different CI/CD integra
 ```bash
 # Block deployment if any skill has findings at or above threshold
 skillshare audit --threshold high
-echo $?  # 0 = clean, 1 = findings found
+echo $?  # 0 = below threshold, 1 = findings, 2 = error
 ```
 
 ### SARIF Output

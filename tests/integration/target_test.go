@@ -26,7 +26,7 @@ targets: {}
 
 	result.AssertSuccess(t)
 	result.AssertOutputContains(t, "Added target")
-	result.AssertOutputContains(t, "Run 'skillshare sync'")
+	result.AssertOutputContains(t, "skillshare sync")
 
 	// Verify config was updated
 	configContent := sb.ReadFile(sb.ConfigPath)
@@ -84,30 +84,6 @@ targets: {}
 
 	result.AssertFailure(t)
 	result.AssertAnyOutputContains(t, "does not exist")
-}
-
-func TestTargetRemove_ExistingTarget_Removes(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("skill1", map[string]string{"SKILL.md": "# Skill 1"})
-	targetPath := sb.CreateTarget("claude")
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets:
-  claude:
-    path: ` + targetPath + `
-`)
-
-	result := sb.RunCLI("target", "remove", "claude")
-
-	result.AssertSuccess(t)
-
-	// Verify config was updated
-	configContent := sb.ReadFile(sb.ConfigPath)
-	if strings.Contains(configContent, "claude") {
-		t.Error("target should be removed from config")
-	}
 }
 
 func TestTargetRemove_DryRun_DoesNotRemove(t *testing.T) {
@@ -216,6 +192,36 @@ targets:
 	}
 }
 
+// Codex and universal share ~/.agents/skills. Removing one must leave the links
+// the other still syncs there, not turn them into copies it no longer manages.
+func TestTargetRemove_SharedPath_KeepsOtherTargetsSkills(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("skill1", map[string]string{"SKILL.md": "# Skill 1"})
+	shared := sb.CreateTarget("agents")
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  universal:
+    path: ` + shared + `
+  codex:
+    path: ` + shared + `
+`)
+	sb.RunCLI("sync").AssertSuccess(t)
+
+	preview := sb.RunCLI("target", "remove", "codex", "--dry-run")
+	preview.AssertSuccess(t)
+	preview.AssertOutputContains(t, "universal uses the same folder")
+
+	sb.RunCLI("target", "remove", "codex").AssertSuccess(t)
+
+	info, err := os.Lstat(filepath.Join(shared, "skill1"))
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("universal's link was not kept: %v", err)
+	}
+}
+
 func TestTargetRemove_MergeMode_PreservesLocalSkills(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
@@ -300,8 +306,8 @@ targets:
 
 	result.AssertSuccess(t)
 	result.AssertOutputContains(t, "claude")
-	result.AssertOutputContains(t, "Path:")
-	result.AssertOutputContains(t, "Mode:")
+	result.AssertOutputContains(t, "Path      ")
+	result.AssertOutputContains(t, "Mode      ")
 }
 
 func TestTargetInfo_CopyMode_ShowsManagedCount(t *testing.T) {
@@ -324,7 +330,7 @@ targets:
 	result := sb.RunCLI("target", "claude")
 	result.AssertSuccess(t)
 	result.AssertOutputContains(t, "copy")
-	result.AssertOutputContains(t, "managed: 2")
+	result.AssertOutputContains(t, "2 managed")
 }
 
 func TestTargetInfo_CopyMode_ManagedCountMatchesDisk(t *testing.T) {
@@ -350,8 +356,8 @@ targets:
 	// managed count should reflect actual disk state (1, not 2)
 	result := sb.RunCLI("target", "claude")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "managed: 1")
-	result.AssertOutputNotContains(t, "managed: 2")
+	result.AssertOutputContains(t, "1 managed")
+	result.AssertOutputNotContains(t, "2 managed")
 }
 
 func TestTargetInfo_CopyMode_ManagedCountIgnoresNonDirectory(t *testing.T) {
@@ -377,8 +383,8 @@ targets:
 
 	result := sb.RunCLI("target", "claude")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "managed: 1")
-	result.AssertOutputNotContains(t, "managed: 2")
+	result.AssertOutputContains(t, "1 managed")
+	result.AssertOutputNotContains(t, "2 managed")
 }
 
 func TestTargetMode_SetsMode(t *testing.T) {
@@ -424,6 +430,26 @@ targets:
 	result.AssertAnyOutputContains(t, "invalid mode")
 }
 
+func TestTargetList_NoTUI_FallsBackToPlainText(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	claudePath := sb.CreateTarget("claude")
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + claudePath + `
+`)
+
+	result := sb.RunCLI("target", "list", "--no-tui")
+
+	result.AssertSuccess(t)
+	result.AssertOutputContains(t, "claude")
+	result.AssertOutputContains(t, "merge · flat")
+	result.AssertOutputContains(t, "merge")
+}
+
 func TestTarget_NoSubcommand_ShowsUsage(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
@@ -436,4 +462,47 @@ targets: {}
 
 	result.AssertFailure(t)
 	result.AssertAnyOutputContains(t, "usage")
+}
+
+// A second account of an Agent: the target names the Agent and its other config directory,
+// and skills land where that Agent looks for them there.
+func TestTargetAdd_AgentConfigDir_SyncsIntoThatDirectory(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+	sb.CreateSkill("hello", map[string]string{"SKILL.md": "---\nname: hello\n---\n# Hello"})
+	dir := filepath.Join(sb.Home, ".claude-work")
+
+	result := sb.RunCLI("target", "add", "claude-work", "--agent", "claude", "--config-dir", dir)
+	result.AssertSuccess(t)
+	result.AssertOutputContains(t, "~/.claude-work/skills")
+	if content := sb.ReadFile(sb.ConfigPath); !strings.Contains(content, "agent: claude") || strings.Contains(content, "path:") {
+		t.Fatalf("config:\n%s", content)
+	}
+
+	sb.RunCLI("sync").AssertSuccess(t)
+	if _, err := os.Stat(filepath.Join(dir, "skills", "hello", "SKILL.md")); err != nil {
+		t.Fatalf("skill not synced into the config directory: %v", err)
+	}
+
+	sb.RunCLI("target", "add", "claude-other", "--agent", "cursor", "--config-dir", filepath.Join(sb.Home, ".x")).AssertFailure(t)
+}
+
+// --cli names a compatible executable for the account's plugin commands, such as omo for Pi.
+func TestTargetAdd_AgentConfigDir_CLI(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+	sb.RunCLI("target", "add", "omo", "--agent", "pi", "--config-dir", filepath.Join(sb.Home, ".omo", "agent"), "--cli", "omo").AssertSuccess(t)
+	if content := sb.ReadFile(sb.ConfigPath); !strings.Contains(content, "cli: omo") {
+		t.Fatalf("config:\n%s", content)
+	}
+
+	sb.RunCLI("target", "add", "omo-rel", "--agent", "pi", "--config-dir", filepath.Join(sb.Home, ".omo-rel"), "--cli", "bin/omo").AssertFailure(t)
 }

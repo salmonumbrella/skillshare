@@ -1,22 +1,25 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
 	"skillshare/internal/config"
 	"skillshare/internal/oplog"
 	"skillshare/internal/sync"
+	"skillshare/internal/targetsummary"
+	"skillshare/internal/theme"
 	"skillshare/internal/ui"
 	"skillshare/internal/utils"
 	"skillshare/internal/validate"
 )
 
 func targetAddProject(args []string, root string) error {
+	args, noSkills := stripNoSkillsFlag(args)
 	if len(args) < 1 || len(args) > 2 {
 		return fmt.Errorf("usage: skillshare target add <name> [path]")
 	}
@@ -31,10 +34,8 @@ func targetAddProject(args []string, root string) error {
 		return fmt.Errorf("invalid target name: %w", err)
 	}
 
-	if !projectConfigExists(root) {
-		if err := performProjectInit(root, projectInitOptions{}); err != nil {
-			return err
-		}
+	if err := ensureProjectConfig(root); err != nil {
+		return err
 	}
 
 	knownPath := ""
@@ -70,12 +71,12 @@ func targetAddProject(args []string, root string) error {
 
 	if !validate.IsLikelySkillsPath(absPath) {
 		ui.Warning("Path doesn't appear to be a skills directory")
-		fmt.Print("  Continue anyway? [y/N]: ")
-		var input string
-		fmt.Scanln(&input)
-		input = strings.ToLower(strings.TrimSpace(input))
-		if input != "y" && input != "yes" {
-			ui.Info("Cancelled")
+		ok, err := ui.ConfirmAction("Continue anyway?", false)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			ui.Cancelled("added")
 			return nil
 		}
 	}
@@ -93,7 +94,14 @@ func targetAddProject(args []string, root string) error {
 
 	entry := config.ProjectTargetEntry{Name: name}
 	if pathProvidedRequiresStorage(path, knownPath) {
-		entry.Path = path
+		entry.Skills = &config.ResourceTargetConfig{Path: path}
+	}
+	if noSkills {
+		entry.EnsureSkills().SetEnabled(false)
+	}
+	mode := config.NewTargetSkillsMode(cfg.TargetNaming, "")
+	if mode != "" {
+		entry.EnsureSkills().Mode = mode // a project target defaults to merge
 	}
 
 	cfg.Targets = append(cfg.Targets, entry)
@@ -101,12 +109,13 @@ func targetAddProject(args []string, root string) error {
 		return err
 	}
 
-	if err := os.MkdirAll(absPath, 0755); err != nil {
-		return fmt.Errorf("failed to create target directory: %w", err)
+	if !noSkills {
+		if err := os.MkdirAll(absPath, 0755); err != nil {
+			return fmt.Errorf("failed to create target directory: %w", err)
+		}
 	}
 
-	ui.Success("Added target: %s -> %s", name, path)
-	ui.Info("Run 'skillshare sync' to sync skills to this target")
+	reportTargetAdded(name, path, noSkills, mode != "")
 	return nil
 }
 
@@ -128,10 +137,8 @@ func targetRemoveProject(args []string, root string) error {
 		return err
 	}
 
-	if !projectConfigExists(root) {
-		if err := performProjectInit(root, projectInitOptions{}); err != nil {
-			return err
-		}
+	if err := ensureProjectConfig(root); err != nil {
+		return err
 	}
 
 	cfg, err := config.LoadProject(root)
@@ -149,26 +156,27 @@ func targetRemoveProject(args []string, root string) error {
 		return err
 	}
 
-	sourcePath := filepath.Join(root, ".skillshare", "skills")
+	sourcePath := cfg.EffectiveSkillsSource(root)
 
 	if opts.dryRun {
 		return targetRemoveProjectDryRun(toRemove, targets, sourcePath)
 	}
 
 	for _, name := range toRemove {
-		if target, ok := targets[name]; ok {
-			mode := target.Mode
+		if target, ok := targets[name]; ok && target.SkillsConfig().IsEnabled() {
+			sc := target.SkillsConfig()
+			mode := sc.Mode
 			if mode == "" {
 				mode = "merge"
 			}
 			if mode == "symlink" {
-				if err := unlinkSymlinkMode(target.Path, sourcePath); err != nil {
+				if err := unlinkSymlinkMode(sc.Path, sourcePath); err != nil {
 					ui.Warning("%s: %v", name, err)
 				}
 			} else {
 				// Remove copy-mode manifest if present
-				sync.RemoveManifest(target.Path)
-				if err := unlinkMergeModeSafe(target.Path, sourcePath); err != nil {
+				sync.RemoveManifest(sc.Path)
+				if err := unlinkMergeModeSafe(sc.Path, sourcePath); err != nil {
 					ui.Warning("%s: %v", name, err)
 				}
 			}
@@ -180,39 +188,44 @@ func targetRemoveProject(args []string, root string) error {
 		return err
 	}
 
-	for _, name := range toRemove {
-		ui.Success("Removed target: %s", name)
-	}
-	ui.Info("Run 'skillshare sync' to update target links")
+	ui.Done(ui.MarkOK, "Removed "+plural(len(toRemove), "target"), 0)
+	ui.Next("skillshare sync", "update target links")
 	return nil
 }
 
 func targetRemoveProjectDryRun(toRemove []string, targets map[string]config.TargetConfig, sourcePath string) error {
-	ui.Warning("Dry run mode - no changes will be made")
-	ui.Header("Unlinking targets (project)")
+	width := ui.RowWidth(toRemove...)
 	for _, name := range toRemove {
 		target, ok := targets[name]
 		if !ok {
-			ui.Info("%s: would remove from config (target missing)", name)
+			ui.Row(ui.MarkNone, name, "would remove from config · target missing", width)
 			continue
 		}
 
-		info, err := os.Lstat(target.Path)
+		sc := target.SkillsConfig()
+		if !sc.IsEnabled() {
+			ui.Row(ui.MarkNone, name, "would remove from config · skills off, folder left as is", width)
+			continue
+		}
+		info, err := os.Lstat(sc.Path)
 		if err != nil {
 			if os.IsNotExist(err) {
-				ui.Info("%s: would remove from config (path missing)", name)
+				ui.Row(ui.MarkNone, name, "would remove from config · folder not found", width)
 				continue
 			}
-			ui.Warning("%s: %v", name, err)
+			ui.Row(ui.MarkWarn, name, err.Error(), width)
 			continue
 		}
 
 		if info.IsDir() {
-			ui.Info("%s: would remove skill symlinks", name)
+			ui.Row(ui.MarkNone, name, "would remove skill symlinks and remove from config", width)
+		} else {
+			ui.Row(ui.MarkNone, name, "would remove from config", width)
 		}
-		ui.Info("%s: would remove from config", name)
 	}
 
+	fmt.Println()
+	ui.DryRun()
 	return nil
 }
 
@@ -257,58 +270,39 @@ func targetListProject(root string) error {
 }
 
 func targetListProjectWithJSON(root string, jsonOutput bool) error {
-	if !projectConfigExists(root) {
-		if err := performProjectInit(root, projectInitOptions{}); err != nil {
-			return err
-		}
+	if err := ensureProjectConfig(root); err != nil {
+		return err
 	}
 
-	cfg, err := config.LoadProject(root)
+	if jsonOutput {
+		items, err := buildTargetTUIItems(true, root)
+		if err != nil {
+			return err
+		}
+
+		outputItems := make([]targetListJSONItem, 0, len(items))
+		for _, item := range items {
+			outputItems = append(outputItems, newTargetListJSONItem(item))
+		}
+		output := struct {
+			Targets []targetListJSONItem `json:"targets"`
+		}{Targets: outputItems}
+		return writeJSON(&output)
+	}
+
+	items, err := buildTargetTUIItems(true, root)
 	if err != nil {
 		return err
 	}
 
-	targets := make([]config.ProjectTargetEntry, len(cfg.Targets))
-	copy(targets, cfg.Targets)
-	sort.Slice(targets, func(i, j int) bool {
-		return targets[i].Name < targets[j].Name
-	})
-
-	if jsonOutput {
-		var items []targetListJSONItem
-		for _, entry := range targets {
-			items = append(items, targetListJSONItem{
-				Name:    entry.Name,
-				Path:    projectTargetDisplayPath(entry),
-				Mode:    getTargetMode(entry.Mode, ""),
-				Include: entry.Include,
-				Exclude: entry.Exclude,
-			})
-		}
-		output := struct {
-			Targets []targetListJSONItem `json:"targets"`
-		}{Targets: items}
-		return writeJSON(&output)
-	}
-
-	ui.Header("Configured Targets (project)")
-	for _, entry := range targets {
-		displayPath := projectTargetDisplayPath(entry)
-		mode := entry.Mode
-		if mode == "" {
-			mode = "merge"
-		}
-		fmt.Printf("  %-12s %s (%s)\n", entry.Name, displayPath, mode)
-	}
+	printTargetListPlain(items)
 
 	return nil
 }
 
 func targetInfoProject(name string, args []string, root string) error {
-	if !projectConfigExists(root) {
-		if err := performProjectInit(root, projectInitOptions{}); err != nil {
-			return err
-		}
+	if err := ensureProjectConfig(root); err != nil {
+		return err
 	}
 
 	// Parse filter flags first, pass remaining to mode parsing
@@ -316,17 +310,12 @@ func targetInfoProject(name string, args []string, root string) error {
 	if err != nil {
 		return err
 	}
-
-	var newMode string
-	for i := 0; i < len(remaining); i++ {
-		switch remaining[i] {
-		case "--mode", "-m":
-			if i+1 >= len(remaining) {
-				return fmt.Errorf("--mode requires a value (merge, symlink, or copy)")
-			}
-			newMode = remaining[i+1]
-			i++
-		}
+	settings, err := parseTargetSettingFlags(remaining)
+	if err != nil {
+		return err
+	}
+	if err := checkTargetFlagCombination(settings, filterOpts); err != nil {
+		return err
 	}
 
 	cfg, err := config.LoadProject(root)
@@ -350,19 +339,57 @@ func targetInfoProject(name string, args []string, root string) error {
 	if filterOpts.hasUpdates() {
 		start := time.Now()
 		entry := &cfg.Targets[targetIdx]
-		changes, fErr := applyFilterUpdates(&entry.Include, &entry.Exclude, filterOpts)
-		if fErr != nil {
-			return fErr
+		var changes []string
+		mutated := false
+
+		if filterOpts.Skills.hasUpdates() {
+			s := entry.EnsureSkills()
+			skillChanges, fErr := applyFilterUpdates(&s.Include, &s.Exclude, filterOpts.Skills)
+			if fErr != nil {
+				return fErr
+			}
+			changes = append(changes, skillChanges...)
+			mutated = true
 		}
-		if err := cfg.Save(root); err != nil {
-			return err
+
+		if filterOpts.Agents.hasUpdates() {
+			agentBuilder, buildErr := targetsummary.NewProjectBuilder(cfg.EffectiveAgentsSource(root), root)
+			if buildErr != nil {
+				return buildErr
+			}
+			agentSummary, buildErr := agentBuilder.ProjectTarget(*entry)
+			if buildErr != nil {
+				return buildErr
+			}
+			if agentSummary == nil {
+				return fmt.Errorf("target '%s' does not have an agents path", name)
+			}
+			if agentSummary.Mode == "symlink" {
+				return fmt.Errorf("target '%s' agent include/exclude filters are ignored in symlink mode; use --agent-mode merge or --agent-mode copy first", name)
+			}
+
+			ac := entry.AgentsConfig()
+			include := append([]string(nil), ac.Include...)
+			exclude := append([]string(nil), ac.Exclude...)
+			agentChanges, fErr := applyFilterUpdates(&include, &exclude, filterOpts.Agents)
+			if fErr != nil {
+				return fErr
+			}
+			if len(agentChanges) > 0 {
+				a := entry.EnsureAgents()
+				a.Include = include
+				a.Exclude = exclude
+				mutated = true
+			}
+			changes = append(changes, scopeFilterChanges("agents", agentChanges)...)
 		}
-		for _, change := range changes {
-			ui.Success("%s: %s", name, change)
+
+		if mutated {
+			if err := cfg.Save(root); err != nil {
+				return err
+			}
 		}
-		if len(changes) > 0 {
-			ui.Info("Run 'skillshare sync' to apply filter changes")
-		}
+		printTargetFilterChanges(name, changes)
 
 		e := oplog.NewEntry("target", statusFromErr(nil), time.Since(start))
 		e.Args = map[string]any{
@@ -374,8 +401,12 @@ func targetInfoProject(name string, args []string, root string) error {
 		return nil
 	}
 
-	if newMode != "" {
-		return updateTargetModeProject(cfg, targetIdx, newMode, root)
+	if settings.Skills != nil {
+		return setTargetSkillsProject(cfg, targetIdx, *settings.Skills, settings.DryRun, root)
+	}
+
+	if settings.changesTarget() {
+		return updateTargetSettingsProject(cfg, targetIdx, settings, root)
 	}
 
 	targets, err := config.ResolveProjectTargets(root, cfg)
@@ -389,56 +420,66 @@ func targetInfoProject(name string, args []string, root string) error {
 	}
 
 	targetEntry := cfg.Targets[targetIdx]
-	sourcePath := filepath.Join(root, ".skillshare", "skills")
+	sourcePath := cfg.EffectiveSkillsSource(root)
+	agentBuilder, err := targetsummary.NewProjectBuilder(cfg.EffectiveAgentsSource(root), root)
+	if err != nil {
+		return err
+	}
+	agentSummary, err := agentBuilder.ProjectTarget(targetEntry)
+	if err != nil {
+		return err
+	}
 
-	mode := targetEntry.Mode
+	sc := targetEntry.SkillsConfig()
+	mode := sc.Mode
 	displayMode := mode
 	if mode == "" {
-		displayMode = "merge (default)"
+		displayMode = "merge" + ui.DimText(" (default)")
 		mode = "merge"
 	}
 
-	ui.Header(fmt.Sprintf("Target: %s", name))
-	fmt.Printf("  Path:    %s\n", projectTargetDisplayPath(targetEntry))
-	fmt.Printf("  Mode:    %s\n", displayMode)
-
-	switch mode {
-	case "symlink":
-		status := sync.CheckStatus(target.Path, sourcePath)
-		fmt.Printf("  Status:  %s\n", status)
-	case "copy":
-		status, managed, local := sync.CheckStatusCopy(target.Path)
-		fmt.Printf("  Status:  %s (%d managed, %d local)\n", status, managed, local)
-	default:
-		status, linked, local := sync.CheckStatusMerge(target.Path, sourcePath)
-		fmt.Printf("  Status:  %s (%d shared, %d local)\n", status, linked, local)
+	namingDisplay := config.EffectiveTargetNaming(sc.TargetNaming)
+	if sc.TargetNaming == "" {
+		namingDisplay += ui.DimText(" (default)")
 	}
 
-	fmt.Printf("  Include: %s\n", formatFilterList(targetEntry.Include))
-	fmt.Printf("  Exclude: %s\n", formatFilterList(targetEntry.Exclude))
+	var statusLine string
+	resolvedSC := target.SkillsConfig()
+	switch {
+	case !resolvedSC.IsEnabled():
+		statusLine = skillsOffSummary
+	case mode == "symlink":
+		statusLine = sync.CheckStatus(resolvedSC.Path, sourcePath).String()
+	case mode == "copy":
+		status, managed, local := sync.CheckStatusCopy(resolvedSC.Path)
+		statusLine = statusWithCounts(status, managed, "managed", local)
+	default:
+		status, linked, local := sync.CheckStatusMerge(resolvedSC.Path, sourcePath)
+		statusLine = statusWithCounts(status, linked, "linked", local)
+	}
+
+	fmt.Println(theme.Primary().Bold(true).Render(name))
+	printTargetSkillsSection(projectTargetDisplayPath(targetEntry), displayMode, namingDisplay, statusLine, sc.Include, sc.Exclude)
+	printTargetAgentSection(agentSummary)
 
 	return nil
 }
 
-func updateTargetModeProject(cfg *config.ProjectConfig, idx int, newMode string, root string) error {
-	if newMode != "merge" && newMode != "symlink" && newMode != "copy" {
-		return fmt.Errorf("invalid mode '%s'. Use 'merge', 'symlink', or 'copy'", newMode)
-	}
-
+func updateTargetSettingsProject(cfg *config.ProjectConfig, idx int, settings parsedTargetSettingFlags, root string) error {
 	entry := &cfg.Targets[idx]
-	oldMode := entry.Mode
-	if oldMode == "" {
-		oldMode = "merge"
+	sc := entry.SkillsConfig()
+	u := targetSettingsUpdate{name: entry.Name, oldMode: cmp.Or(sc.Mode, "merge"), oldNaming: sc.TargetNaming,
+		ensureSkills: entry.EnsureSkills, ensureAgents: entry.EnsureAgents, save: func() error { return cfg.Save(root) }}
+	if settings.AgentMode != "" {
+		agentBuilder, err := targetsummary.NewProjectBuilder(cfg.EffectiveAgentsSource(root), root)
+		if err != nil {
+			return err
+		}
+		if u.agent, err = agentBuilder.ProjectTarget(*entry); err != nil {
+			return err
+		}
 	}
-
-	entry.Mode = newMode
-	if err := cfg.Save(root); err != nil {
-		return err
-	}
-
-	ui.Success("Changed %s mode: %s -> %s", entry.Name, oldMode, newMode)
-	ui.Info("Run 'skillshare sync' to apply the new mode")
-	return nil
+	return u.apply(settings)
 }
 
 func unlinkMergeModeSafe(targetPath, sourcePath string) error {

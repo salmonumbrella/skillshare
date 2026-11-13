@@ -8,11 +8,58 @@ Check environment and diagnose issues with your skillshare setup.
 
 ```bash
 skillshare doctor
-skillshare doctor -p     # Project mode (.skillshare/config.yaml)
-skillshare doctor -g     # Force global mode
+skillshare doctor -p        # Project mode (.skillshare/config.yaml)
+skillshare doctor -g        # Force global mode
+skillshare doctor --json    # Structured JSON output for CI
 ```
 
-![doctor demo](/img/doctor-demo.png)
+```text
+skillshare doctor
+
+Environment
+✓ Config       ~/.config/skillshare/config.yaml
+  Config dir   ~/.config/skillshare
+  Data         ~/.local/share/skillshare
+  State        ~/.local/state/skillshare
+✓ Source       ~/.config/skillshare/skills · 43 skills
+✓ Agents       ~/.config/skillshare/agents · 2 agents
+  Skillignore  not configured
+✓ Links        supported
+! Git          not initialized (recommended for backup)
+✓ Integrity    27/27 skills verified
+
+Targets
+✓ claude    skills  merged · merge · 43 shared
+✓           agents  synced · merge · 2/2 linked
+✓ cursor    skills  merged · merge · 43 shared, 1 local
+✓           agents  synced · merge · 2/2 linked
+✓ gemini    skills  merged · merge · 43 shared
+…
+! gemini will see content from: universal
+  ~/.agents/skills ← universal
+  suggestion: …
+…
+✗ claude: 1 broken symlink: frontend__css-review
+…
+
+Extras
+✓ rules     2 files · 2/2 targets OK
+✓ commands  1 file · 1/1 targets OK
+✓ team      1 file · 4/4 targets OK
+
+Storage
+  Backups      last 2026-09-28_12-41-50 · 10m ago
+  Trash        1 item, 247 B · oldest under a day
+
+✗ 6 errors, 4 warnings · 1.2s
+
+Next
+  skillshare sync  bring the targets up to date
+```
+
+For tracked repositories with agent variants, the Source line shows `N skills, M variants`: logical skills and physical copies. The `variant_routing` check warns when symlink mode exposes all variants instead of selecting by agent; use merge or copy mode for selective routing.
+
+Bundled references use the audit structural checker in both modes: missing or incomplete checks are warnings, root escapes are errors. Global/project `audit-rules.yaml` disables apply. JSON entries use `bundled_references` and include the rule ID, source file, line and snippet. See [bundled reference checks](../../understand/audit-engine.md).
 
 ## When to Use
 
@@ -26,23 +73,43 @@ skillshare doctor -g     # Force global mode
 ```text
 skillshare doctor
 
-Checking environment
-  ✓ Config: ~/.config/skillshare/config.yaml
-  ✓ Source: ~/.config/skillshare/skills (12 skills)
-  ✓ Link support: OK
-  ✓ Git: initialized with remote
+Environment
+✓ Config       ~/.config/skillshare/config.yaml
+  Config dir   ~/.config/skillshare
+  Data         ~/.local/share/skillshare
+  State        ~/.local/state/skillshare
+✓ Source       ~/.config/skillshare/skills · 12 skills
+✓ Agents       ~/.config/skillshare/agents · 8 agents
+✓ Skillignore  2 patterns, 1 skill ignored
+✓ Links        supported
+✓ Git          initialized with remote
+✓ Integrity    12/12 skills verified
 
-Checking targets
-  ✓ claude    [merge]: merged (8 shared, 2 local)
-  ✓ cursor    [copy]: copied (8 managed, 0 local)
-  ⚠ codex     [merge]: needs sync
+Targets
+✓ claude    skills  merged · merge · 8 shared, 2 local
+✓           agents  synced · merge · 8/8 linked
+✓ codex     skills  merged · merge · 8 shared
+✓ cursor    skills  copied · copy · 8 managed
+✓           agents  synced · merge · 8/8 linked
+
+Extras
+✓ commands  3 files · 1/1 targets OK
+✓ rules     4 files · 1/1 targets OK
+
+MCP, hooks and plugins
+✓ MCP          all 2 servers OK
+✓ Hooks        all 1 hook in sync
+  Plugins      none configured
+
+Storage
+  Backups      last 2026-01-18_09-00-00 · 3d ago
+  Trash        empty
 
 Version
-  ✓ CLI: 1.2.0
-  ✓ Skill: 1.1.0
+✓ CLI          0.23.5
+✓ Skill        0.23.5
 
-Summary
-  ✓ All checks passed!
+✓ All checks passed · 0.4s
 ```
 
 ## Checks Performed
@@ -53,41 +120,139 @@ Summary
 |-------|-----------------|
 | Config | Config file exists and is valid |
 | Source | Source directory exists and is readable |
-| Link support | System can create symlinks |
+| Agents | Agents source directory exists (if configured) |
+| Skillignore | `.skillignore` (and `.skillignore.local`) active patterns and ignored skill count |
+| Source link | One line per first-level symlink or Windows junction in the skills source. With [`follow_source_links`](../targets/configuration.md#follow_source_links) off (the default): info, `not followed by discovery; its contents are invisible to skillshare. Set follow_source_links: true to follow it`. With it on: info `followed as a directory (follow_source_links)`, or a warning `not followed: <reason>` (target missing, the source root or a parent, or a sync target overlap) |
+| Links | System can create symlinks |
 | Git | Repository status and remote configuration |
+
+Source-link checks apply in both global and project mode. The source root is resolved as in discovery; only its first-level entries are checked. No source-link output is added when there are none. Each link also appears as an `undeclared_source_links` check in `doctor --json`, with status `info`, or `warning` for a link the policy skipped.
 
 ### Targets
 
-For each target:
-- Path exists and is writable
-- Sync mode matches actual state
-- Sync drift (linked/managed count vs target expected count after `include`/`exclude`)
+Each target shows sub-items for **skills** and **agents** (when agents are configured):
+- Skills: path, sync mode, sync state, shared/local counts
+  - "N skills not synced" counts only skills `sync` would place; ones it skips on purpose (an invalid name under `standard` or `prefixed` naming, or a name collision) are left out
+- Agents: sync mode, linked count, drift detection. On Windows without Developer Mode, `merge` shows as `copy`; up-to-date managed copies count as linked. Identical local files that skillshare does not own are preserved. In copy fallback, agent counts show them separately as `local preserved`, for example `0/1 linked, 1 local preserved`.
 - No broken symlinks
 - Duplicate-skill checks for unintended local collisions:
   - `merge` mode: skipped (local skills are expected)
   - `copy` mode: manifest-managed copies are ignored; only local colliding copies are warned
 - Valid include/exclude glob patterns
+- Naming and mode: a target that resolves to `prefixed` outside copy mode is an error, because sync would skip it
 - Info-level per-target compatibility hint when applicable (example target priority: `cursor` → `antigravity` → `copilot` → `opencode`; no hint when these targets are absent)
+
+### Path Overlap
+
+Doctor flags two classes of duplicate-skill risk before they reach the runtime picker:
+
+**`shared_target_paths`** — fires when two or more enabled targets resolve to the same primary path. Common cause: enabling both `universal` and a tool that writes to `~/.agents/skills` (e.g. `warp`, `witsy`).
+
+```text
+! Shared path ~/.agents/skills ← universal, warp
+```
+
+Resolution: disable one of the overlapping targets, or set a distinct path with `skillshare target <name> --path <dir>`.
+
+When the targets sharing a path have different `include` or `exclude` filters, `mode`, or `target_naming` (filters and naming don't matter when both targets use `symlink` mode, which links the whole folder), each sync redoes the folder the way one target wants and undoes the other's work, so the folder never settles and `sync` keeps showing the same pending changes. Doctor marks these and suggests turning skills off for all but one target (`universal` when it is one of them) instead of removing a target:
+
+```text
+! Shared path ~/.agents/skills ← codex, universal (different settings, so they undo each other on every sync)
+  suggestion: Keep universal syncing skills to ~/.agents/skills and stop the rest with `skillshare target codex --skills=false`.
+```
+
+`sync` prints the same targets with the command to run, and the dashboard's Sync page has a button that stops syncing skills for the target to drop, or, for a project target, a link to edit its project. Targets sharing a path with identical settings keep the resolution above.
+
+A target from a registered project (`<project>@<tool>`) has no skills switch of its own, because a project's skills setting covers all its targets. For one, the command drops only that tool from the project, `skillshare project edit <root> --target <other tools>`, or turns skills off with `skillshare project edit <root> --no-skills` when it is the project's only target.
+
+**`cross_target_discovery`** — fires when an enabled target's runtime is documented to also scan a directory another enabled target writes to. For example, a config left over from an older setup still points `codex` at the legacy `~/.codex/skills`, while `universal` writes to `~/.agents/skills` — which Codex also reads. Enabling both makes Codex see universal's content on top of its own.
+
+```text
+! codex will see content from: universal
+  ~/.agents/skills ← universal
+```
+
+Resolution: start by removing the scanning target (`codex` above). Its runtime already reads the shared directory, and no other tool is affected. Preview with `skillshare target remove codex --dry-run`. Removing the writer (`universal`) instead also hides those skills from every other tool that reads `~/.agents/skills`. Keep both targets only if the scanning target carries skills the writer filters out, and accept the duplicate listings in the runtime picker.
+
+OpenCode keeps one skill per name across `~/.claude/skills`, `~/.agents/skills`, and its own folder, so a skill synced from the source to both folders loads once. For `opencode`, the check only warns about skills it loads from another target's folder that are missing from OpenCode's own folder, and names them. A skill can be missing because sync leaves it out (through `targets:`, include/exclude, or a `target_naming: standard` skip) or because you keep it by hand in the other folder:
+
+```text
+! opencode loads 1 skill missing from its own folder, from: claude
+  ~/.claude/skills ← claude: claude-only
+```
+
+When a writer such as `claude` uses symlink mode and `opencode` does not, its folder is the source itself, so the check cannot tell which skills OpenCode receives there and shows the general warning.
+
+Resolution: sync those skills to `opencode` too, or set `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1` (or `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`, which also skips `.agents/skills`) where OpenCode runs. skillshare only sees its own environment: when the variable is also set where you run skillshare, `doctor`, `sync`, and the dashboard treat that folder as skipped, and `doctor` notes it:
+
+```text
+opencode skips ~/.claude/skills: OPENCODE_DISABLE_CLAUDE_CODE_SKILLS is set in this environment
+```
+
+If OpenCode starts with a different environment, for example from a desktop launcher, set the variable there as well.
+
+`shared_target_paths` reads configured paths only. `cross_target_discovery` also reads the built-in `also_scans` table, and for `opencode` the skills each target receives.
 
 ### Version
 
 - CLI version
-- skillshare skill version
+- skillshare skill version, with a warning when a newer skill is published (`skillshare upgrade --skill`)
 - Checks for available updates
 
 ### Skill Integrity
 
-For tracked skills with `.skillshare-meta.json` file hashes, doctor verifies that no files have been tampered with since installation:
+For installed skills with file hash metadata, doctor verifies that no files have been tampered with since installation:
 
 - Compares current SHA-256 hashes against stored hashes
 - Reports modified, missing, and added files per skill
-- Skills without metadata are flagged as "unverifiable"
+- Local skills (not in `.metadata.json`) are silently skipped — this is expected
+- Installed skills with metadata but missing `file_hashes` are flagged with their names
 
 ```text
-⚠ _team-repo__api-helper: 1 modified, 1 missing
-✓ Skill integrity: 5/6 verified
-⚠ Skill integrity: 2 skill(s) unverifiable (no metadata)
+! Integrity    5/6 skills verified
+!              _team-repo__api-helper: 1 modified, 1 missing
+!              1 skill missing file hashes: _old-repo__legacy-skill
 ```
+
+### Extras
+
+When extras are configured, verifies:
+- Each extra's settings are valid (mode, `flatten`, `as`) and no two extras claim the same file
+- Source directory exists for each extra
+- Target directories are reachable
+- Broken symlinks in each directory target (error)
+- Files that differ from the source, as `skillshare diff` reports them. Targets with `flatten` or `extension` are not compared.
+
+```text
+✗ rules     → ~/.claude/rules: broken symlink gone.md
+!           → ~/.claude/rules: 1 file out of sync (a.md missing in target)
+```
+
+### MCP
+
+Runs the static part of [`mcp check`](./mcp.md): referenced environment variables are set, `command` resolves on `PATH`, a package or image launched by `npx`, `uvx`, `pipx run`, `docker run` or `podman run` has a pinned version, client rules accept the server, and every entry is synced. Doctor does not resolve hosts or start servers; run `skillshare mcp check` or `skillshare mcp check --live` for that. Shows `info` when no server is configured.
+
+```text
+✗ MCP          docs: command no-such-mcp-binary was not found on PATH
+!              docs → claude: not synced yet; run skillshare sync mcp
+```
+
+### Hooks
+
+Previews `skillshare sync hooks` without writing. A failed preview is an error. Entries that sync would still add, update or remove, conflicts with native hooks, and advisory warnings (such as an event name the Agent does not document) are warnings. Shows `info` when no hook is configured.
+
+```text
+! Hooks        bash-log → claude: not synced (add)
+```
+
+### Plugins
+
+Previews plugin sync. A missing local source installation or a changed shared ref
+may require fetching the source to construct the preview. Blocked bindings,
+skipped bindings (including **Import required on this machine**), and pending
+installation or cleanup are warnings. Legacy reads save local migration hints
+without changing shared YAML. Checking an unchanged source for new releases stays
+in `skillshare plugin check`. Shows `info` when no package is configured.
 
 ### Other
 
@@ -95,7 +260,7 @@ For tracked skills with `.skillshare-meta.json` file hashes, doctor verifies tha
 - Skill-level `targets:` field validation (warns on unknown target names)
 - Last backup timestamp (global mode)
 - Trash status (item count, total size, oldest item age)
-- Broken symlinks in targets
+- Broken symlinks in targets. Target links behind a source link whose target is unavailable (an unmounted drive) are reported separately as a warning, `N links behind an unavailable source link, kept until it is back`, with no prune suggestion: `sync` keeps them on purpose, and the `broken_symlinks` check is `warning` instead of `error` in `doctor --json`.
 
 :::note Project Mode
 When a project has `.skillshare/config.yaml`, `skillshare doctor` auto-runs in project mode.
@@ -142,6 +307,8 @@ A skill was removed from source but symlink remains:
 skillshare sync  # Will prune orphaned symlinks
 ```
 
+If the line says `behind an unavailable source link, kept until it is back` instead, the skill lives behind a [followed source link](../targets/configuration.md#follow_source_links) whose target is away. Nothing to prune: mount the drive or restore the checkout and run `skillshare sync`.
+
 ### "Skills without SKILL.md"
 
 Skill folders missing required file:
@@ -153,45 +320,98 @@ skillshare new my-skill  # Creates proper structure
 
 ### "Link not supported"
 
-On Windows without Developer Mode:
+`doctor` links a test folder inside the system temp directory (`%TEMP%` on Windows, `$TMPDIR` or `/tmp` elsewhere). On Windows that link is an NTFS junction, which needs neither Administrator nor Developer Mode, so turning on Developer Mode does not fix this error. The `junction error:` line in the message shows why Windows refused. Check that the temp directory:
 
-1. Enable Developer Mode in Settings
-2. Or run as Administrator
+1. Is on a local NTFS drive, not FAT32, exFAT, or a network share (junctions only work on NTFS)
+2. Is writable by your account, and not blocked by antivirus or security software
+
+This check does not test file links. Without Developer Mode, agents and extras that link single files are copied instead; see [Windows troubleshooting](../../troubleshooting/windows.md#file-links-need-windows-developer-mode-copying-instead).
 
 ## Example Output with Issues
 
 ```
-Checking environment
-  ✓ Config: ~/.config/skillshare/config.yaml
-  ✓ Source: ~/.config/skillshare/skills (12 skills)
-  ✓ Link support: OK
-  ⚠ Git: 3 uncommitted change(s)
+Environment
+✓ Config       ~/.config/skillshare/config.yaml
+✓ Source       ~/.config/skillshare/skills · 12 skills
+✓ Agents       ~/.config/skillshare/agents · 8 agents
+✓ Links        supported
+! Git          3 uncommitted changes
+! Integrity    5/6 skills verified
+!              _team-repo__api-helper: 1 modified
+! Skills without SKILL.md: test-dir, temp
 
-⚠ Skills without SKILL.md: test-dir, temp
-⚠ _team-repo__api-helper: 1 modified
-✓ Skill integrity: 5/6 verified
-⚠ Skill integrity: 1 skill(s) unverifiable (no metadata)
+Targets
+✓ claude    skills  merged · merge · 8 shared, 2 local
+✓           agents  synced · merge · 8/8 linked
+! codex     skills  linked · merge · needs sync
+✓ cursor    skills  merged · merge · 6 shared
+! claude    1 skill not synced · 2/3 linked
+✗ cursor: 2 broken symlinks: old-skill, removed-skill
 
-Checking targets
-  ✓ claude    [merge]: merged (8 shared, 2 local)
-  ✗ cursor    [merge]: 2 broken symlink(s): old-skill, removed-skill
-  ⚠ codex     [merge->needs sync]: linked (needs sync to apply merge mode)
-  ⚠ claude: 1 skill(s) not synced (2/3 linked)
+Storage
+  Backups      last 2026-01-18_09-00-00 · 3d ago
+  Trash        2 items, 45.2 KB · oldest 3 days
 
 Version
-  ✓ CLI: 1.2.0
-  ⚠ Skill: 1.0.0 (update available: 1.1.0)
-    Run: skillshare upgrade --skill && skillshare sync
+✓ CLI          1.2.0
+✓ Skill        0.16.0
+  Update       v1.2.0 → v1.3.0 available
 
-Backups: last backup 2026-01-18_09-00-00 (3 days ago)
-ℹ Trash: 2 item(s) (45.2 KB), oldest 3 day(s)
+✗ 1 error, 5 warnings · 0.6s
 
-ℹ Update available: 1.2.0 -> 1.3.0
-  brew upgrade skillshare  OR  curl -fsSL .../install.sh | sh
-
-Summary
-  ✗ 1 error(s), 4 warning(s)
+Next
+  skillshare sync          bring the targets up to date
+  brew upgrade skillshare  update to v1.3.0
 ```
+
+A `nix profile` install gets `nix profile upgrade skillshare` as its Next line. When NixOS or Home Manager provides skillshare, the Update row says to update your Nix configuration and rebuild, and there is no Next line for it.
+
+## JSON Output
+
+Use `--json` for machine-readable output in CI pipelines and automation:
+
+```bash
+skillshare doctor --json
+```
+
+```json
+{
+  "checks": [
+    { "name": "source", "status": "pass", "message": "Source: ~/.config/skillshare/skills (12 skills)" },
+    { "name": "skillignore", "status": "pass", "message": ".skillignore: 3 patterns, 2 skills ignored", "details": ["test-*", "vendor/", "!important", "---", "test-draft", "vendor/lib"] },
+    { "name": "sync_drift", "status": "warning", "message": "claude: 1 skill(s) not synced (7/8 linked)", "details": ["new-skill"] },
+    { "name": "shared_target_paths", "status": "warning", "message": "1 shared target path(s) — enabled targets writing to the same directory may produce duplicate skills in runtime pickers", "details": ["~/.agents/skills ← universal, warp"], "suggestions": ["Choose one authoritative target for ~/.agents/skills; preview removing duplicate targets with `skillshare target remove <name> --global --dry-run` (currently: universal, warp)."] },
+    { "name": "broken_symlinks", "status": "error", "message": "cursor: 1 broken symlink(s)", "details": ["old-skill"] }
+  ],
+  "summary": { "total": 14, "pass": 12, "warnings": 1, "errors": 1, "info": 0 },
+  "version": { "current": "0.17.4", "latest": "0.18.0", "update_available": true }
+}
+```
+
+Check statuses: `pass`, `warning`, `error`, `info`. The `info` status is used for informational checks (e.g., `.skillignore` not found) that are neither passing nor failing. Info checks count toward `total` but not toward `pass`, `warnings`, or `errors`.
+
+Some warning checks (e.g. `shared_target_paths`, `cross_target_discovery`) also include an optional `suggestions` array with actionable remediation steps. The field is omitted when there is nothing to suggest.
+
+### Exit Codes
+
+| Condition | Exit Code |
+|-----------|-----------|
+| All checks pass (or warnings only) | `0` |
+| Any check has `error` status | `1` |
+
+### CI Example
+
+```bash
+# Fail pipeline if doctor finds errors
+skillshare doctor --json | jq -e '.summary.errors == 0'
+
+# Extract warnings for notification
+skillshare doctor --json | jq '[.checks[] | select(.status == "warning")]'
+```
+
+:::tip Web Dashboard
+The **Health Check** page in the web dashboard (`skillshare ui`) provides a visual version of `doctor --json` with filter toggles and expandable details.
+:::
 
 ## See Also
 

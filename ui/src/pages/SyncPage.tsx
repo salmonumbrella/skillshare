@@ -1,534 +1,561 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
-import {
-  RefreshCw,
-  Eye,
-  Zap,
-  ChevronDown,
-  ChevronRight,
-  Check,
-  Minus,
-  CheckCircle,
-  AlertCircle,
-  Folder,
-  ArrowRight,
-  Target,
-  FileText,
-  Info,
-} from 'lucide-react';
-import { Virtuoso } from 'react-virtuoso';
-import Card from '../components/Card';
-import Badge from '../components/Badge';
-import HandButton from '../components/HandButton';
+import { Fragment, useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { AlertCircle, ArrowDownToLine, Bot, ChevronDown, ChevronRight, CircleCheck, CircleMinus, EyeOff, Folder, FolderPlus, Gauge, Globe, Import, Minus, Plug, Plus, Puzzle, RefreshCw, TriangleAlert, Webhook } from 'lucide-react';
+import { api, formatTokenK, type SyncResponse } from '../api/client';
+import AgentIcon from '../components/AgentIcon';
+import Button from '../components/Button';
+import CollectDialog from '../components/CollectDialog';
+import { Checkbox } from '../components/Input';
+import PageHeader from '../components/PageHeader';
+import Spinner from '../components/Spinner';
+import Tooltip from '../components/Tooltip';
 import { useToast } from '../components/Toast';
-import { api, type SyncResult, type DiffTarget } from '../api/client';
-import { queryKeys } from '../lib/queryKeys';
-import StreamProgressBar from '../components/StreamProgressBar';
-import { wobbly, shadows } from '../design';
+import { hookLabel, hookMessage, rootName } from '../components/hooks/hooksView';
+import MCPNotices from '../components/mcp/MCPNotices';
+import { describeMessage, mcpClient, targetLabel } from '../components/mcp/mcpView';
+import { changeSets, countChanges, countEdited, discardable, receivesSkill, tally, extraGroups, groupByFolder, groupInSync, HOOKS_CHANGED, hooksGroups, MCP_CHANGED, mcpGroups, otherWarnings, resourceGroups, runSync, skippedHintKeys, type ChangeGroup, type Part, type RowIcon, type SyncFailure } from '../components/sync/syncView';
+import FolderConflictNotice from '../components/sync/FolderConflictNotice';
+import SyncResult from '../components/sync/SyncResult';
+import UnmatchedNotices from '../components/sync/UnmatchedNotices';
+import SyncError from '../components/sync/SyncError';
+import SkillsOffDialog from '../components/targets/SkillsOffDialog';
+import SegmentedControl from '../components/SegmentedControl';
+import { UninstallDialog } from '../components/resources/UninstallDialog';
+import { joinList } from '../components/targets/targetView';
+import { formatDateTime, formatRelativeTime, useI18n, useT, plural } from '../i18n';
+import { shortenHome } from '../lib/paths';
+import { formatAgentDisplayName, formatTrackedRepoName } from '../lib/resourceNames';
+import { queryKeys, staleTimes } from '../lib/queryKeys';
+import { useDiffQuery, useHooksQuery, useMcpQuery, useSkillsQuery, useSyncedTargetsQuery } from '../hooks/useSharedQueries';
+import { invalidate } from '../lib/queryEvents';
+import { useSyncMatrix } from '../hooks/useSyncMatrix';
+
+const ROW_ICON: Record<RowIcon, [typeof Plus, string]> = {
+  add: [Plus, 'text-ok'], adopt: [Import, 'text-info'], update: [RefreshCw, 'text-info'],
+  remove: [Minus, 'text-bad'], kept: [CircleMinus, 'text-ink-3'], conflict: [TriangleAlert, 'text-warn'],
+};
+/** A row's icon; `small` for names in a grid. Plus and minus draw thinner, so they go a size up. */
+function rowIcon(icon: RowIcon, small = false) {
+  const [Icon, tone] = ROW_ICON[icon];
+  return <Icon size={(icon === 'add' || icon === 'remove' ? 16 : 15) - (small ? 3 : 0)} className={`shrink-0 ${tone}`} />;
+}
+const PART_ICON: Record<Part, React.ReactNode> = { skill: <Puzzle size={14} />, agent: <Bot size={14} />, extra: <FolderPlus size={14} />, mcp: <Plug size={14} />, hooks: <Webhook size={14} /> };
+const PART_LABEL: Record<Part, string> = { skill: 'Skills', agent: 'Agents', extra: 'Extras', mcp: 'MCP', hooks: 'Hooks' };
+const PARTS = Object.keys(PART_LABEL) as Part[];
+/** A target with more rows than this starts collapsed. */
+const OPEN_ROWS = 8;
+const SET_LABEL = [['add', 'sync.set.add'], ['update', 'sync.set.update'], ['remove', 'sync.set.remove'], ['kept', 'sync.set.kept']] as const;
+const GROUP_BODY = 'flex flex-col gap-4 pb-[18px] pl-[52px] pr-[18px] pt-3.5 animate-fade-in [border-top:var(--sep)]';
+
+/** A target in an expanded list: its logo and name. */
+function TargetChip({ target, label }: { target: string; label: string }) {
+  return (
+    <span className="inline-flex h-7 items-center gap-[7px] rounded-[var(--r-ctl)] border border-line bg-surface pl-[5px] pr-2.5 text-[13px]">
+      <span className="inline-flex size-5 items-center justify-center rounded-[5px] bg-sunken"><AgentIcon target={target} size={14} /></span>
+      {label}
+    </span>
+  );
+}
+
+/** A labelled row of an expanded list: the label on the left, its items on the right. */
+function ScopeRow({ label, sub, icon, children }: { label: string; sub?: string; icon?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div className="grid grid-cols-[96px_minmax(0,1fr)] items-start gap-3">
+      <div className={`flex flex-col gap-0.5 ${sub ? 'pt-[3px]' : ''}`}>
+        <span className={`flex items-center gap-1.5 text-[12px] font-semibold text-ink-3 ${sub ? '' : 'h-7'}`}>{icon}{label}</span>
+        {sub && <span className="font-mono text-[11.5px] text-ink-3">{sub}</span>}
+      </div>
+      {children}
+    </div>
+  );
+}
 
 export default function SyncPage() {
+  const t = useT();
+  const { locale } = useI18n();
   const queryClient = useQueryClient();
-  const [dryRun, setDryRun] = useState(false);
-  const [force, setForce] = useState(false);
-  const [syncing, setSyncing] = useState(false);
-  const [results, setResults] = useState<SyncResult[] | null>(null);
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const { toast } = useToast();
-  const toastRef = useRef(toast);
-  useEffect(() => { toastRef.current = toast; });
+  const targets = useSyncedTargetsQuery();
+  const diff = useDiffQuery();
+  const extras = useQuery({ queryKey: queryKeys.extrasDiff(), queryFn: () => api.diffExtras(), staleTime: staleTimes.extras });
+  const mcp = useMcpQuery({ staleTime: staleTimes.extras });
+  const hooks = useHooksQuery({ staleTime: staleTimes.extras });
+  const log = useQuery({ queryKey: queryKeys.log('ops', 20, { cmd: 'sync' }), queryFn: () => api.listLog('ops', 20, { cmd: 'sync' }), staleTime: staleTimes.log });
 
-  // Diff state (SSE-based)
-  const [diffData, setDiffData] = useState<DiffTarget[] | null>(null);
-  const [diffLoading, setDiffLoading] = useState(false);
-  const [diffProgress, setDiffProgress] = useState<{ checked: number; total: number } | null>(null);
-  const esRef = useRef<EventSource | null>(null);
-  const startTimeRef = useRef<number>(0);
-
+  const [off, setOff] = useState<Set<Part>>(new Set());
+  const [force, setForce] = useState(false);
+  // The bar draws its bottom line once the line above it scrolls away.
+  const [stuck, setStuck] = useState(false);
+  const sentinel = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    return () => { esRef.current?.close(); };
+    const el = sentinel.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver(([e]) => setStuck(!e.isIntersecting));
+    io.observe(el);
+    return () => io.disconnect();
   }, []);
+  const [open, setOpen] = useState<Set<string>>(new Set());
+  const [collecting, setCollecting] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [runError, setRunError] = useState('');
+  const [outcome, setOutcome] = useState<SyncResponse | null>(null);
+  const [failures, setFailures] = useState<SyncFailure[]>([]);
+  const [stopping, setStopping] = useState('');
+  const [view, setView] = useState<'change' | 'target'>('change');
+  // Explicit open/closed per group; unset follows each group's default.
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [discarding, setDiscarding] = useState(false);
 
-  const runDiff = useCallback(() => {
-    esRef.current?.close();
-    setDiffLoading(true);
-    setDiffProgress(null);
-    startTimeRef.current = Date.now();
+  const plan = mcp.data?.plan;
+  const hooksPlan = hooks.data?.plan;
+  const parts = new Set(PARTS.filter((p) => !off.has(p)));
+  const diffs = diff.data?.diffs ?? [];
+  const resources = resourceGroups(diffs, targets.data?.targets ?? [], parts, force, { skill: diff.data?.ignored_skills, agent: diff.data?.agent_ignored_skills });
+  const mcpShown = parts.has('mcp') ? mcpGroups(plan) : [];
+  const hooksShown = parts.has('hooks') ? hooksGroups(hooksPlan) : [];
+  const groups: ChangeGroup[] = [...resources.groups, ...(parts.has('extra') ? extraGroups(extras.data?.extras ?? [], force) : []), ...mcpShown, ...hooksShown];
+  // A blocked plan applies nothing, so its rows are shown but not counted.
+  const count = countChanges(groups) - (plan?.blocked ? countChanges(mcpShown) : 0) - (hooksPlan?.blocked ? countChanges(hooksShown) : 0);
+  const edited = countEdited(groups);
+  const total = tally(groups.flatMap((g) => g.rows).filter((r) => r.counts));
+  const loading = diff.isPending || targets.isPending;
 
-    esRef.current = api.diffStream(
-      () => setDiffProgress({ checked: 0, total: 0 }),
-      (total) => setDiffProgress({ checked: 0, total }),
-      (_diff, checked) => setDiffProgress((p) => p ? { ...p, checked } : null),
-      (data) => {
-        setDiffData(data.diffs);
-        setDiffLoading(false);
-        setDiffProgress(null);
-      },
-      (err) => {
-        toastRef.current(err.message, 'error');
-        setDiffLoading(false);
-        setDiffProgress(null);
-      },
-    );
-  }, []);
+  const localByTarget = diffs
+    .map((d) => ({ target: d.target, items: (d.items ?? []).filter((i) => i.action === 'local' && parts.has(i.kind === 'agent' ? 'agent' : 'skill')) }))
+    .filter((d) => d.items.length > 0);
+  const local = localByTarget.flatMap((d) => d.items);
+  const skillIgnored = parts.has('skill') ? diff.data?.ignored_skills ?? [] : [];
+  const agentIgnored = parts.has('agent') ? diff.data?.agent_ignored_skills ?? [] : [];
+  const ignored = [...skillIgnored, ...agentIgnored];
+  const inSync = groupInSync(resources.inSync);
+  const skipped = parts.has('skill') ? diffs.filter((d) => (d.skippedCount ?? 0) > 0) : [];
+  const last = log.data?.entries.find((e) => !e.args?.dry_run);
+  const targetList = targets.data?.targets ?? [];
+  const conflicts = diff.data?.folder_conflicts ?? [];
+  const stopTarget = targetList.find((x) => x.name === stopping);
+  const stopConflict = conflicts.find((c) => c.stop.includes(stopping));
+  // Skill names and Discard all need the skills list and matrix only while skills are being added.
+  const addsSkills = !running && !outcome && resources.groups.some((g) => g.rows.some((r) => r.part === 'skill' && r.icon === 'add'));
+  const skills = useSkillsQuery({ enabled: addsSkills });
+  const matrix = useSyncMatrix(addsSkills);
+  const skillList = skills.data?.resources ?? [];
+  const toDiscard = !addsSkills || !matrix.matrix.length ? [] : discardable(resources.groups, skillList, (name) => matrix.getSkillTargets(name).filter(receivesSkill).map((e) => e.target));
+  // Show a skill by its source path; flattened target names (_repo__skills__x) are hard to read.
+  const relPaths = new Map(skillList.map((s) => [s.flatName, s.relPath]));
+  const display = (r: ChangeGroup['rows'][number]) => (r.part === 'skill' ? formatTrackedRepoName(relPaths.get(r.name) ?? r.name.replace(/__/g, '/')) : r.name);
+  const isOpen = (key: string, byDefault: boolean) => expanded[key] ?? byDefault;
+  const flip = (key: string, byDefault: boolean) => setExpanded((e) => ({ ...e, [key]: !(e[key] ?? byDefault) }));
 
-  useEffect(() => { runDiff(); }, [runDiff]);
+  const toggle = (set: Set<string>, key: string) => { const next = new Set(set); if (next.has(key)) next.delete(key); else next.add(key); return next; };
 
-  const handleSync = async () => {
-    setSyncing(true);
+  const sync = async () => {
+    setRunning(true);
+    setRunError('');
+    setOutcome(null);
+    setFailures([]);
     try {
-      const res = await api.sync({ dryRun, force });
-      setResults(res.results);
-      if (dryRun) {
-        toast('Dry run complete -- no changes were made.', 'info');
-      } else {
-        const totalLinked = res.results.reduce((sum, r) => sum + (r.linked?.length ?? 0), 0);
-        const totalUpdated = res.results.reduce((sum, r) => sum + (r.updated?.length ?? 0), 0);
-        toast(
-          `Sync complete! ${totalLinked} linked, ${totalUpdated} updated across ${res.results.length} target(s).`,
-          'success',
-        );
-      }
-      runDiff(); // Re-check diff after sync
-      queryClient.invalidateQueries({ queryKey: queryKeys.targets.all });
-      queryClient.invalidateQueries({ queryKey: queryKeys.overview });
-    } catch (e: unknown) {
-      toast((e as Error).message, 'error');
+      const { resources: result, failures: failed } = await runSync({
+        resources: parts.has('skill') && parts.has('agent') ? 'both' : parts.has('skill') ? 'skill' : parts.has('agent') ? 'agent' : null,
+        extras: parts.has('extra') && !!extras.data?.extras.length,
+        mcp: parts.has('mcp') && plan && !plan.blocked && (plan.migrates || plan.changes.some((c) => c.action !== 'unchanged')) ? plan : null,
+        hooks: parts.has('hooks') && hooksPlan && !hooksPlan.blocked && hooksPlan.changes.some((c) => c.action !== 'unchanged') ? hooksPlan : null,
+        force,
+      });
+      setOutcome(result ?? null);
+      setFailures(failed);
+      if (failed.length > 0) toast(t(plural('sync.toast.failed', failed.length), { count: failed.length }), 'warning');
+      else toast(t('sync.toast.done'), 'success');
+    } catch (err) {
+      const message = (err as Error).message;
+      setRunError(message === MCP_CHANGED ? t('sync.mcpChanged') : message === HOOKS_CHANGED ? t('sync.hooksChanged') : message);
     } finally {
-      setSyncing(false);
+      setRunning(false);
+      void invalidate(queryClient, 'syncRan');
     }
   };
 
-  // Calculate diff summary
-  const diffs = diffData ?? [];
-  const totalActions = diffs.reduce((sum, d) => sum + (d.items?.length ?? 0), 0);
-  const pendingLinks = diffs.reduce(
-    (sum, d) => sum + (d.items?.filter((i) => i.action === 'link').length ?? 0),
-    0,
-  );
-  const pendingUpdates = diffs.reduce(
-    (sum, d) => sum + (d.items?.filter((i) => i.action === 'update').length ?? 0),
-    0,
-  );
-  const pendingPrunes = diffs.reduce(
-    (sum, d) => sum + (d.items?.filter((i) => i.action === 'prune').length ?? 0),
-    0,
-  );
-  const pendingSkips = diffs.reduce(
-    (sum, d) => sum + (d.items?.filter((i) => i.action === 'skip').length ?? 0),
-    0,
-  );
-  const pendingLocal = diffs.reduce(
-    (sum, d) => sum + (d.items?.filter((i) => i.action === 'local').length ?? 0),
-    0,
-  );
-  const syncActions = totalActions - pendingLocal;
+  const failedTargets = new Set(failures.filter((f) => f.part !== 'extra').map((f) => f.target));
+  const syncedTargets = new Set((outcome?.results ?? []).map((r) => r.target).filter((name) => !failedTargets.has(name))).size;
 
-  return (
-    <div className="animate-sketch-in">
-      {/* Page header */}
-      <div className="mb-8">
-        <h2
-          className="text-3xl md:text-4xl font-bold text-pencil mb-2"
-          style={{ fontFamily: 'var(--font-heading)' }}
-        >
-          Sync
-        </h2>
-        <p className="text-pencil-light text-base">
-          Push your skills from source to all configured targets
-        </p>
-      </div>
+  const chevron = (open: boolean) => (open ? <ChevronDown size={15} className="shrink-0 text-ink-3" /> : <ChevronRight size={15} className="shrink-0 text-ink-3" />);
 
-      {/* Visual Pipeline */}
-      <div className="hidden md:flex items-center justify-center gap-4 mb-8">
-        <div
-          className="flex items-center gap-2 px-4 py-2 bg-postit border-2 border-pencil"
-          style={{ borderRadius: wobbly.sm, boxShadow: shadows.sm }}
-        >
-          <Folder size={18} strokeWidth={2.5} className="text-warning" />
-          <span className="text-base font-medium" style={{ fontFamily: 'var(--font-hand)' }}>
-            Source
-          </span>
-        </div>
-
-        <div className="flex items-center gap-1">
-          <svg width="60" height="20" viewBox="0 0 60 20" className="text-pencil-light">
-            <path
-              d="M0 10 Q15 4 30 10 Q45 16 60 10"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeDasharray="4 4"
-            />
-          </svg>
-        </div>
-
-        <div
-          className="flex items-center gap-2 px-4 py-2 bg-info-light border-2 border-pencil"
-          style={{ borderRadius: wobbly.sm, boxShadow: shadows.sm }}
-        >
-          <RefreshCw
-            size={18}
-            strokeWidth={2.5}
-            className={`text-blue ${syncing ? 'animate-spin' : ''}`}
-          />
-          <span className="text-base font-medium" style={{ fontFamily: 'var(--font-hand)' }}>
-            Sync Engine
-          </span>
-        </div>
-
-        <div className="flex items-center gap-1">
-          <svg width="60" height="20" viewBox="0 0 60 20" className="text-pencil-light">
-            <path
-              d="M0 10 Q15 4 30 10 Q45 16 60 10"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeDasharray="4 4"
-            />
-          </svg>
-        </div>
-
-        <div
-          className="flex items-center gap-2 px-4 py-2 bg-success-light border-2 border-pencil"
-          style={{ borderRadius: wobbly.sm, boxShadow: shadows.sm }}
-        >
-          <Target size={18} strokeWidth={2.5} className="text-success" />
-          <span className="text-base font-medium" style={{ fontFamily: 'var(--font-hand)' }}>
-            Targets ({diffs.length})
-          </span>
-        </div>
-      </div>
-
-      {/* Sync control area */}
-      <Card variant="postit" className="mb-6 text-center">
-        <div className="flex flex-col items-center gap-4">
-          {/* Status indicator */}
-          {diffLoading ? (
-            <p className="text-pencil-light text-base">Checking status...</p>
-          ) : syncActions > 0 ? (
-            <div className="flex flex-wrap items-center justify-center gap-3">
-              <span className="text-base text-pencil" style={{ fontFamily: 'var(--font-hand)' }}>
-                Pending changes:
-              </span>
-              {pendingLinks > 0 && <Badge variant="success">{pendingLinks} to link</Badge>}
-              {pendingUpdates > 0 && <Badge variant="info">{pendingUpdates} to update</Badge>}
-              {pendingSkips > 0 && <Badge variant="warning">{pendingSkips} skipped</Badge>}
-              {pendingPrunes > 0 && <Badge variant="danger">{pendingPrunes} to prune</Badge>}
-              {pendingLocal > 0 && <Badge variant="default">{pendingLocal} local only</Badge>}
-            </div>
-          ) : pendingLocal > 0 ? (
-            <div className="flex flex-wrap items-center justify-center gap-3">
-              <div className="flex items-center gap-2 text-success">
-                <CheckCircle size={18} strokeWidth={2.5} />
-                <span className="text-base font-medium" style={{ fontFamily: 'var(--font-hand)' }}>
-                  All targets are in sync!
-                </span>
-              </div>
-              <Badge variant="default">{pendingLocal} local only</Badge>
-            </div>
-          ) : (
-            <div className="flex items-center gap-2 text-success">
-              <CheckCircle size={18} strokeWidth={2.5} />
-              <span className="text-base font-medium" style={{ fontFamily: 'var(--font-hand)' }}>
-                All targets are in sync!
-              </span>
-            </div>
-          )}
-
-          {/* Big sync button */}
-          <HandButton
-            onClick={handleSync}
-            disabled={syncing}
-            variant="primary"
-            size="lg"
-            className="min-w-[200px]"
-          >
-            <RefreshCw
-              size={22}
-              strokeWidth={2.5}
-              className={syncing ? 'animate-spin' : ''}
-            />
-            {syncing ? 'Syncing...' : dryRun ? 'Preview Sync' : 'Sync Now'}
-          </HandButton>
-
-          {/* Advanced options toggle */}
-          <button
-            onClick={() => setShowAdvanced(!showAdvanced)}
-            className="flex items-center gap-1 text-base text-pencil-light hover:text-pencil transition-colors cursor-pointer"
-            style={{ fontFamily: 'var(--font-hand)' }}
-          >
-            {showAdvanced ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-            Advanced options
-          </button>
-
-          {/* Advanced options */}
-          {showAdvanced && (
-            <div className="flex items-center gap-6 animate-sketch-in">
-              <label className="flex items-center gap-2 text-base cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={dryRun}
-                  onChange={(e) => setDryRun(e.target.checked)}
-                  className="w-4 h-4 accent-blue"
-                />
-                <Eye size={16} strokeWidth={2.5} className="text-blue" />
-                <span style={{ fontFamily: 'var(--font-hand)' }}>Dry Run</span>
-              </label>
-
-              <label className="flex items-center gap-2 text-base cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={force}
-                  onChange={(e) => setForce(e.target.checked)}
-                  className="w-4 h-4 accent-accent"
-                />
-                <Zap size={16} strokeWidth={2.5} className="text-accent" />
-                <span style={{ fontFamily: 'var(--font-hand)' }}>Force</span>
-              </label>
-            </div>
-          )}
-        </div>
-      </Card>
-
-      {/* Sync results */}
-      {results && results.length > 0 && (
-        <div className="space-y-3 mt-6 mb-8">
-          <h2
-            className="text-lg font-bold text-pencil"
-            style={{ fontFamily: 'var(--font-heading)' }}
-          >
-            {dryRun ? 'Preview Results' : 'Results'}
-          </h2>
-          <SyncResults results={results} />
-        </div>
-      )}
-
-      {/* Diff preview */}
-      <div>
-        <h3
-          className="text-xl font-bold text-pencil mb-4"
-          style={{ fontFamily: 'var(--font-heading)' }}
-        >
-          Current Diff
-        </h3>
-        {diffLoading && diffProgress && (
-          <StreamProgressBar
-            count={diffProgress.checked}
-            total={diffProgress.total}
-            startTime={startTimeRef.current}
-            icon={RefreshCw}
-            labelDiscovering="Discovering skills..."
-            labelRunning="Computing diff..."
-            units="targets"
-          />
-        )}
-        {!diffLoading && diffData && <DiffView diffs={diffData} />}
-      </div>
-    </div>
-  );
-}
-
-/** Sync results visualization — compact per-target cards with badge counts */
-function SyncResults({ results }: { results: SyncResult[] }) {
-  if (results.length === 0) {
+  /** A group head's content; targets wrap it in a button that collapses them. */
+  const groupHead = (g: ChangeGroup) => {
+    const n = countChanges([g]);
     return (
-      <Card variant="outlined">
-        <p className="text-pencil-light text-center py-4">No results to show.</p>
-      </Card>
+      <>
+        {g.part === 'extra' ? <span className="ss-cat sm extra">{PART_ICON.extra}</span> : <span className="ss-at"><AgentIcon target={g.name} size={17} /></span>}
+        <span className="font-semibold">{g.part === 'mcp' ? targetLabel(g.name) : g.part === 'hooks' ? hookLabel(g.name) : g.name}</span>
+        <span className="ss-tag">{g.part === 'mcp' ? 'MCP' : g.part === 'hooks' ? 'Hooks' : g.mode}</span>
+        {g.path && <span className="min-w-0 truncate font-mono text-[12px] text-ink-3" title={g.path}>{shortenHome(g.path)}</span>}
+        {g.part === 'target' && failedTargets.has(g.name) && <span className="ss-tag bad shrink-0">{t('sync.result.lastFailed')}</span>}
+        {g.project && <span className="ss-tag shrink-0" title={g.project}>{g.part === 'hooks' ? rootName(g.project) : t('sync.mcp.offList', { project: shortenHome(g.project) })}</span>}
+        <span className="flex-1" />
+        {n > 0 && <span className="shrink-0 text-[12px] text-ink-2">{t(plural('sync.changes', n), { count: n })}</span>}
+      </>
     );
-  }
-
-  return (
-    <div className="space-y-3">
-      {results.map((r, i) => {
-        const linked = r.linked?.length ?? 0;
-        const updated = r.updated?.length ?? 0;
-        const skipped = r.skipped?.length ?? 0;
-        const pruned = r.pruned?.length ?? 0;
-        const hasChanges = linked > 0 || updated > 0;
-
-        return (
-          <Card
-            key={r.target}
-            style={{ animation: `fadeInUp 0.3s ease-out ${i * 100}ms both` }}
-          >
-            <div className="flex items-center gap-3">
-              {hasChanges ? (
-                <Check size={18} className="text-success shrink-0" />
-              ) : (
-                <Minus size={18} className="text-pencil-light shrink-0" />
-              )}
-              <span className="text-pencil font-medium flex-1" style={{ fontFamily: 'var(--font-hand)' }}>
-                {r.target}
-              </span>
-              <div className="flex gap-2 flex-wrap">
-                {linked > 0 && <Badge variant="success">{linked} linked</Badge>}
-                {updated > 0 && <Badge variant="info">{updated} updated</Badge>}
-                {skipped > 0 && <Badge variant="default">{skipped} skipped</Badge>}
-                {pruned > 0 && <Badge variant="warning">{pruned} pruned</Badge>}
-              </div>
-            </div>
-          </Card>
-        );
-      })}
-    </div>
-  );
-}
-
-function ActionBadge({ action }: { action: string }) {
-  const map: Record<string, { variant: 'success' | 'info' | 'warning' | 'danger' | 'default'; label: string }> = {
-    link: { variant: 'success', label: 'link' },
-    linked: { variant: 'success', label: 'linked' },
-    update: { variant: 'info', label: 'update' },
-    updated: { variant: 'info', label: 'updated' },
-    skip: { variant: 'warning', label: 'skip' },
-    skipped: { variant: 'warning', label: 'skipped' },
-    prune: { variant: 'danger', label: 'prune' },
-    pruned: { variant: 'danger', label: 'pruned' },
-    local: { variant: 'default', label: 'local' },
   };
-  const entry = map[action] ?? { variant: 'default' as const, label: action };
-  return <Badge variant={entry.variant}>{entry.label}</Badge>;
-}
 
-/** Diff preview with expandable targets */
-function DiffView({ diffs: rawDiffs }: { diffs: DiffTarget[] }) {
-  const diffs = rawDiffs ?? [];
-
-  if (diffs.length === 0) {
-    return (
-      <Card variant="outlined">
-        <div className="flex items-center justify-center gap-2 py-4 text-pencil-light">
-          <AlertCircle size={18} strokeWidth={2} />
-          <span>No targets configured.</span>
-        </div>
-      </Card>
-    );
-  }
-
-  return (
-    <div className="space-y-4">
-      {diffs.map((d) => (
-        <DiffTargetCard key={d.target} diff={d} />
-      ))}
+  const changeRows = (rows: ChangeGroup['rows']) => rows.map((r) => (
+    <div key={r.key} className="ss-r !min-h-[46px]">
+      {rowIcon(r.icon)}
+      <span className={`ss-cat sm ${r.part}`}>{PART_ICON[r.part]}</span>
+      <span className="w-[220px] shrink-0 truncate font-mono text-[13px] font-semibold" title={r.name}>{r.name}</span>
+      {r.part === 'hooks' && r.detail ? (
+        // A hooks reason is worded for this UI and can be long: hover shows all of it.
+        <span className="min-w-0 flex-1">
+          <Tooltip block content={hookMessage(t, r.detail)}>
+            <span className={`block truncate text-[13px] ${r.icon === 'conflict' ? 'text-warn' : 'text-ink-2'}`}>{r.text ? t(r.text) : hookMessage(t, r.detail)}</span>
+          </Tooltip>
+        </span>
+      ) : (
+        <span className={`min-w-0 flex-1 truncate text-[13px] ${r.icon === 'conflict' ? 'text-warn' : 'text-ink-2'}`} title={r.detail}>
+          {r.text ? t(r.text) : r.part === 'mcp' ? describeMessage(t, r.detail) : r.detail}
+        </span>
+      )}
     </div>
-  );
-}
+  ));
 
-/** Max items before switching from flat list to virtualized scroll */
-const VIRTUALIZE_THRESHOLD = 100;
-/** Height of the virtualized container */
-const VIRTUOSO_HEIGHT = 400;
+  /** Skill and agent changes as names by folder, three to a line: hundreds of rows stay readable. */
+  const itemGrid = (rows: ChangeGroup['rows'], icons = true, from = '') => {
+    // A skill and an agent can share a display path, so a path holds a list.
+    const byPath = new Map<string, ChangeGroup['rows']>();
+    for (const r of rows) byPath.set(display(r), [...(byPath.get(display(r)) ?? []), r]);
+    return groupByFolder([...byPath.keys()]).map(({ folder, items }) => {
+      // The head already names the shared root, so a folder drops it.
+      const label = (from && folder.startsWith(`${from}/`) && folder !== `${from}/` ? folder.slice(from.length + 1) : folder).replace(/\/$/, '');
+      const entries = items.flatMap((name) => byPath.get(folder + name)!.map((r) => ({ name, r })));
+      return (
+      <div key={folder} className="flex flex-col gap-1.5">
+        {folder && <div className="flex items-center gap-[7px] text-[12px] font-semibold text-ink-3"><Folder size={14} className="shrink-0" /><span className="font-mono">{label}</span> · {entries.length}</div>}
+        <div className={`grid grid-cols-3 gap-x-6 gap-y-1.5 font-mono text-[12.5px] ${folder ? 'pl-[21px]' : ''}`}>
+          {entries.map(({ name, r }) => {
+            const why = r.text ? t(r.text) : r.detail;
+            return <span key={r.key} className="flex min-w-0 items-center gap-1.5" title={why ? `${folder + name} · ${why}` : folder + name}>{icons && rowIcon(r.icon, true)}<span className="truncate">{name}</span></span>;
+          })}
+        </div>
+      </div>
+      );
+    });
+  };
 
-function DiffTargetCard({ diff }: { diff: DiffTarget }) {
-  const items = diff.items ?? [];
-  const [expanded, setExpanded] = useState(items.length <= VIRTUALIZE_THRESHOLD);
-  const localOnly = useMemo(() => items.filter((i) => i.action === 'local'), [items]);
-  const syncItems = useMemo(() => items.filter((i) => i.action !== 'local'), [items]);
-  const inSync = items.length === 0;
-  const onlyLocal = syncItems.length === 0 && localOnly.length > 0;
-
-  const hasSyncable = syncItems.some((i) => ['link', 'update', 'skip'].includes(i.action));
-  const hasLocal = localOnly.length > 0;
-  const useVirtualized = items.length > VIRTUALIZE_THRESHOLD;
-
-  return (
-    <Card>
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-3 cursor-pointer"
-      >
-        {expanded ? (
-          <ChevronDown size={16} strokeWidth={2.5} className="text-pencil-light shrink-0" />
-        ) : (
-          <ChevronRight size={16} strokeWidth={2.5} className="text-pencil-light shrink-0" />
-        )}
-        <Target size={16} strokeWidth={2.5} className="text-success shrink-0" />
-        <h4
-          className="font-bold text-pencil text-left flex-1"
-          style={{ fontFamily: 'var(--font-heading)' }}
-        >
-          {diff.target}
-        </h4>
-        {inSync ? (
-          <Badge variant="success">in sync</Badge>
-        ) : onlyLocal ? (
-          <Badge variant="default">{localOnly.length} local only</Badge>
-        ) : (
-          <div className="flex items-center gap-2">
-            <Badge variant="info">{syncItems.length} pending</Badge>
-            {localOnly.length > 0 && <Badge variant="default">{localOnly.length} local</Badge>}
+  const setCard = (set: ReturnType<typeof changeSets>[number], index: number) => {
+    const n = countChanges(set.targets);
+    const open = isOpen(set.key, index === 0);
+    const parts = new Set(set.rows.map((r) => r.part));
+    const counts = tally(set.rows);
+    const shown = SET_LABEL.filter(([icon]) => counts[icon]);
+    const noun = (count: number) => (parts.size === 1 ? [...parts][0] : 'item') + (count === 1 ? '' : 's');
+    // Where the changes come from, when they share one: the tracked repo or folder.
+    const paths = set.rows.map(display);
+    const roots = new Set(paths.map((p) => p.split('/')[0]));
+    const from = paths.length === 1 ? paths[0] : roots.size === 1 ? [...roots][0] : '';
+    return (
+      <Fragment key={set.key}>
+        <button type="button" className="ss-gh w-full cursor-pointer text-left" aria-expanded={open} onClick={() => flip(set.key, index === 0)}>
+          {chevron(open)}
+          {shown[0] && rowIcon(shown[0][0], true)}
+          <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+            <span className="truncate font-semibold">{shown.map(([icon, key]) => t(key, { count: counts[icon]!, noun: noun(counts[icon]!) })).join(' · ')}</span>
+            {from && <span className="truncate font-mono text-[12px] text-ink-3">{from}</span>}
+          </span>
+          {set.targets.some((g) => failedTargets.has(g.name)) && <span className="ss-tag bad shrink-0">{t('sync.result.lastFailed')}</span>}
+          <span className="ss-stack">{set.targets.slice(0, 5).map((g) => <span key={g.name} className="ss-at"><AgentIcon target={g.name} size={15} /></span>)}</span>
+          <span className="shrink-0 text-[12px] text-ink-2">{t(plural('sync.set.targets', set.targets.length), { count: set.targets.length })}</span>
+          <span className="w-[84px] shrink-0 text-right text-[12px] text-ink-2">{n > 0 && t(plural('sync.changes', n), { count: n })}</span>
+        </button>
+        {open && (
+          <div className={GROUP_BODY}>
+            <div className="flex flex-col gap-2">
+              <span className="text-[12px] font-semibold text-ink-3">{t('sync.set.targetList', { count: set.targets.length })}</span>
+              <div className="flex flex-wrap gap-2">{set.targets.map((g) => <TargetChip key={g.name} target={g.name} label={g.name} />)}</div>
+            </div>
+            {itemGrid(set.rows, shown.length > 1, paths.length > 1 ? from : '')}
           </div>
         )}
-      </button>
+      </Fragment>
+    );
+  };
 
-      {expanded && items.length > 0 && (
-        <div className="mt-3 pl-8 animate-sketch-in">
-          {useVirtualized ? (
-            <Virtuoso
-              style={{ height: VIRTUOSO_HEIGHT }}
-              totalCount={items.length}
-              overscan={200}
-              itemContent={(i) => <DiffItemRow item={items[i]} />}
-            />
-          ) : (
-            <div className="space-y-1.5">
-              {items.map((item, i) => (
-                <DiffItemRow key={i} item={item} />
-              ))}
-            </div>
-          )}
-
-          {/* Action hints */}
-          {(hasSyncable || hasLocal) && (
-            <div className="mt-3 pt-2 border-t border-dashed border-muted-dark space-y-1">
-              {hasSyncable && (
-                <div className="flex items-center gap-1.5 text-xs text-pencil-light">
-                  <Info size={12} className="shrink-0" />
-                  <span style={{ fontFamily: 'var(--font-hand)' }}>
-                    Run sync (or sync --force) to fix pending items
-                  </span>
-                </div>
-              )}
-              {hasLocal && (
-                <div className="flex items-center gap-1.5 text-xs text-pencil-light">
-                  <FileText size={12} className="shrink-0" />
-                  <span style={{ fontFamily: 'var(--font-hand)' }}>
-                    Use collect to import local-only skills to source
-                  </span>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
-      {expanded && inSync && (
-        <p className="mt-2 pl-8 text-base text-pencil-light" style={{ fontFamily: 'var(--font-hand)' }}>
-          Everything looks good! No changes needed.
-        </p>
-      )}
-    </Card>
-  );
-}
-
-function DiffItemRow({ item }: { item: { action: string; skill: string; reason?: string } }) {
   return (
-    <div className="flex items-center gap-2 text-base py-0.5">
-      <ActionBadge action={item.action} />
-      <ArrowRight size={12} className="text-muted-dark shrink-0" />
-      <span
-        className="text-pencil-light truncate"
-        style={{ fontFamily: "'Courier New', monospace", fontSize: '0.875rem' }}
-      >
-        {item.skill}
-      </span>
-      {item.reason && (
-        <span className="text-pencil-light/60 text-xs shrink-0">({item.reason})</span>
+    <div className="animate-page-in">
+      <div className="grid grid-cols-[minmax(0,1fr)_280px] items-start gap-8">
+        <div className="flex min-w-0 flex-col gap-4">
+          <PageHeader className="!mb-0" title={t('sync.title')} subtitle={t('sync.subtitle')} />
+          {/* Roomy padding for when it sticks; the negative margin keeps the gaps tight before that. */}
+          <div ref={sentinel} className="-mb-[17px] h-px" />
+          <div className={`ss-stickbar !py-4 -my-[14px] ${stuck ? 'stuck' : ''}`}>
+              <div className="flex flex-wrap items-center gap-[18px]">
+                <span className="text-[13px] text-ink-3">{t('sync.include')}</span>
+                {PARTS.map((p) => (
+                  <Checkbox key={p} size="sm" label={PART_LABEL[p]} checked={parts.has(p)} disabled={running} onChange={() => setOff((s) => toggle(s, p) as Set<Part>)} />
+                ))}
+                <span className="flex items-center gap-2" title={t('sync.forceHint')}>
+                  <button type="button" role="switch" aria-checked={force} aria-labelledby="sync-force" aria-describedby="sync-force-hint" className={`ss-sw ${force ? 'on' : ''} disabled:opacity-50`} disabled={running} onClick={() => setForce(!force)}>
+                    <i />
+                  </button>
+                  <span id="sync-force" className="text-[13px] font-semibold">Force</span>
+                  <span id="sync-force-hint" className="sr-only">{t('sync.forceHint')}</span>
+                </span>
+              </div>
+          </div>
+          {edited > 0 && (
+            <div className={`ss-note ${force ? 'warn' : 'inf'}`}>
+              {force ? <TriangleAlert size={16} /> : <CircleMinus size={16} />}
+              <span className="flex-1">{t(plural(`sync.edited.${force ? 'replace' : 'kept'}`, edited), { count: edited })}</span>
+            </div>
+          )}
+
+          {runError && <div className="ss-note bad"><AlertCircle size={16} /><SyncError key={runError} error={runError} /></div>}
+          {parts.has('mcp') && plan?.blocked && (
+            <div className="ss-note warn !items-center">
+              <TriangleAlert size={16} />
+              <span className="flex-1">{t('sync.mcpBlocked')}</span>
+              <Link to="/mcp" className="ss-btn sm">{t('sync.openMcp')}</Link>
+            </div>
+          )}
+          {parts.has('hooks') && hooksPlan?.blocked && (
+            <div className="ss-note warn !items-center">
+              <TriangleAlert size={16} />
+              <span className="flex-1">{t('sync.hooksBlocked')}</span>
+              <Link to="/hooks" className="ss-btn sm">{t('sync.openHooks')}</Link>
+            </div>
+          )}
+          {parts.has('mcp') && <MCPNotices notices={plan?.notices} />}
+          {parts.has('hooks') && hooks.data?.previewError && <div className="ss-note bad"><AlertCircle size={16} /><SyncError error={hooks.data.previewError} /></div>}
+          {parts.has('mcp') && mcp.data?.previewError && <div className="ss-note bad"><AlertCircle size={16} /><SyncError error={mcp.data.previewError} /></div>}
+          <SyncResult failures={failures} warnings={otherWarnings(outcome)} synced={syncedTargets} force={force} onForce={() => setForce(true)} />
+          <UnmatchedNotices items={outcome?.unmatched} />
+          {!!outcome?.path_overlap && (
+            <div className="ss-note warn !items-center">
+              <TriangleAlert size={16} />
+              <span className="flex-1">{t(plural('sync.pathOverlap', outcome.path_overlap), { count: outcome.path_overlap })}</span>
+              <Link to="/doctor" className="ss-btn sm">{t('sync.openDoctor')}</Link>
+            </div>
+          )}
+          {conflicts.map((c) => <FolderConflictNotice key={c.path} conflict={c} targets={targetList} onStop={setStopping} />)}
+
+          {!loading && !diff.error && groups.length > 0 && (
+            <div className="flex items-center gap-3">
+              <h2 className="ss-h2">{t(plural('sync.pending', count), { count })}</h2>
+              <span className="flex-1 text-[12px] text-ink-2">
+                {(['add', 'update', 'remove'] as const).filter((icon) => total[icon]).map((icon, i) => (
+                  <Fragment key={icon}>{i > 0 && ' · '}<span className={ROW_ICON[icon][1]}>{t(`sync.sum.${icon}`, { count: total[icon]! })}</span></Fragment>
+                ))}
+              </span>
+              <SegmentedControl
+                value={view}
+                onChange={setView}
+                options={[{ value: 'change', label: t('sync.view.change') }, { value: 'target', label: t('sync.view.target') }]}
+              />
+            </div>
+          )}
+          <div className="ss-list">
+            {loading ? (
+              <div className="ss-r gap-2 text-[13px] text-ink-2"><Spinner size="sm" />{t('sync.checking')}</div>
+            ) : diff.error ? (
+              <div className="ss-r text-[13px] text-bad"><AlertCircle size={16} /><SyncError error={diff.error.message} /></div>
+            ) : diffs.length === 0 && groups.length === 0 ? (
+              <div className="ss-r text-[13px] text-ink-2">
+                <span className="flex-1">{t('sync.noTargets')}</span>
+                <Link to="/targets" className="ss-btn sm">{t('sync.addTarget')}</Link>
+              </div>
+            ) : (
+              <>
+                {groups.length === 0 && (
+                  <div className="ss-r text-[13px]"><CircleCheck size={16} className="text-ok" />{t('sync.nothing')}</div>
+                )}
+                {view === 'change' && changeSets(resources.groups).map((set, i) => setCard(set, i))}
+                {(view === 'change' ? groups.filter((g) => g.part !== 'target') : groups).map((g) => {
+                  if (g.part !== 'target') return <Fragment key={g.key}><div className="ss-gh">{groupHead(g)}</div>{changeRows(g.rows)}</Fragment>;
+                  const open = isOpen(g.key, g.rows.length <= OPEN_ROWS);
+                  return (
+                    <Fragment key={g.key}>
+                      <button type="button" className="ss-gh w-full cursor-pointer text-left" aria-expanded={open} onClick={() => flip(g.key, g.rows.length <= OPEN_ROWS)}>{chevron(open)}{groupHead(g)}</button>
+                      {open && <div className={GROUP_BODY}>{itemGrid(g.rows)}</div>}
+                    </Fragment>
+                  );
+                })}
+                {resources.inSync.length > 0 && (
+                  <button type="button" className="ss-gh w-full text-left" aria-expanded={open.has('inSync')} onClick={() => setOpen((s) => toggle(s, 'inSync'))}>
+                    {!open.has('inSync') && <span className="ss-stack ml-1.5">{resources.inSync.slice(0, 4).map((name) => <span key={name} className="ss-at"><AgentIcon target={name} size={14} /></span>)}</span>}
+                    <span className="font-semibold">{t(plural('sync.inSync', resources.inSync.length), { count: resources.inSync.length })}</span>
+                    <span className="flex-1" />
+                    {open.has('inSync') ? <ChevronDown size={15} className="text-ink-3" /> : <ChevronRight size={15} className="text-ink-3" />}
+                  </button>
+                )}
+                {open.has('inSync') && (
+                  <div className="flex flex-col px-[18px] pb-[18px] pt-4 [border-top:var(--sep)] [&>*+*]:mt-3.5 [&>*+*]:pt-3.5 [&>*+*]:[border-top:var(--sep)]">
+                    {inSync.global.length > 0 && (
+                      <ScopeRow icon={<Globe size={13} />} label={`${t('resources.targets.global')} · ${inSync.global.length}`}>
+                        <div className="flex flex-wrap gap-2">{inSync.global.map((name) => <TargetChip key={name} target={name} label={name} />)}</div>
+                      </ScopeRow>
+                    )}
+                    {inSync.projects.length > 0 && (
+                      <ScopeRow icon={<Folder size={13} />} label={`${t('resources.targets.projects')} · ${resources.inSync.length - inSync.global.length}`}>
+                        <div className="flex flex-col gap-2">
+                          {inSync.projects.map(({ project, tools }) => (
+                            <div key={project} className="grid grid-cols-[120px_minmax(0,1fr)] items-center gap-2.5">
+                              <span className="truncate font-mono text-[12.5px] text-ink-2" title={project}>{project}</span>
+                              <div className="flex flex-wrap gap-2">{tools.map((tool) => <TargetChip key={tool} target={`${project}@${tool}`} label={tool} />)}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </ScopeRow>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          {outcome?.context_cost?.warnings?.map((w) => (
+            <div key={`${w.type}/${w.target}`} className="ss-note warn !items-center">
+              <Gauge size={16} />
+              <span className="flex-1">
+                <b>{t(w.type === 'always_loaded' ? 'sync.budget.always' : 'sync.budget.onDemand')}</b>{' '}
+                {t('sync.budget.detail', { actual: formatTokenK(w.actual), budget: formatTokenK(w.budget), target: w.target })}{' '}
+                {w.top_offenders.length > 0 && t('sync.budget.biggest', { names: w.top_offenders.slice(0, 3).map((o) => `${o.name} ${formatTokenK(o.tokens)}`).join(', ') })}
+              </span>
+              <Link to="/skills?tab=analyze" className="ss-btn sm">{t('sync.budget.analyze')}</Link>
+            </div>
+          ))}
+
+          {!loading && (ignored.length > 0 || skipped.length > 0 || local.length > 0) && (
+            <div className="ss-list">
+              {ignored.length > 0 && (
+                <>
+                  <div className="ss-r !min-h-11 text-[13px]">
+                    <button type="button" className="flex min-w-0 flex-1 items-center gap-2.5 text-left" aria-expanded={open.has('ignored')} onClick={() => setOpen((s) => toggle(s, 'ignored'))}>
+                      {open.has('ignored') ? <ChevronDown size={14} className="shrink-0 text-ink-3" /> : <ChevronRight size={14} className="shrink-0 text-ink-3" />}
+                      <EyeOff size={15} className="shrink-0 text-ink-3" />
+                      <span><b>{t(plural('sync.ignored', ignored.length), { count: ignored.length })}</b>{!open.has('ignored') && <> <span className="text-ink-2">{t('sync.ignored.by')}</span></>}</span>
+                    </button>
+                    <Link to="/config" className="shrink-0 font-semibold">{t('sync.ignored.edit')}</Link>
+                  </div>
+                  {open.has('ignored') && (
+                    <div className="flex flex-col gap-3.5 px-[18px] pb-[18px] pt-3.5 [border-top:var(--sep)]">
+                      {([['Skills', '.skillignore', skillIgnored], ['Agents', '.agentignore', agentIgnored]] as const).filter(([, , names]) => names.length > 0).map(([label, file, names]) => (
+                        <ScopeRow key={file} label={`${label} · ${names.length}`} sub={file}>
+                          <div className="flex flex-col gap-2">
+                            {groupByFolder(names).map(({ folder, items }) => (
+                              <div key={folder} className="flex flex-col gap-1.5">
+                                {folder && <div className="flex items-center gap-[7px] font-mono text-[12.5px] text-ink-2"><Folder size={14} className="shrink-0 text-ink-3" />{folder}</div>}
+                                <div className={`grid grid-cols-2 gap-x-6 gap-y-1.5 font-mono text-[12.5px] ${folder ? 'pl-[21px]' : ''}`}>
+                                  {items.map((name) => <span key={name} className="truncate" title={folder + name}>{name}</span>)}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </ScopeRow>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+              {skipped.map((d) => (
+                <div key={d.target} className="ss-r !min-h-11 text-[13px]">
+                  <TriangleAlert size={15} className="ml-6 shrink-0 text-warn" />
+                  <span className="min-w-0 flex-1">
+                    <b>{t(plural('sync.skipped', d.skippedCount ?? 0), { count: d.skippedCount ?? 0, name: d.target })}</b>{' '}
+                    <span className="text-ink-2">{skippedHintKeys(d).map((key) => t(key, { name: d.target })).join(' ')}</span>
+                  </span>
+                  <Link to={`/targets/${encodeURIComponent(d.target)}`} className="shrink-0 font-semibold">{t('sync.skipped.open')}</Link>
+                </div>
+              ))}
+              {local.length > 0 && (
+                <>
+                  <div className="ss-r !min-h-11 text-[13px]">
+                    <button type="button" className="flex min-w-0 flex-1 items-center gap-2.5 text-left" aria-expanded={open.has('local')} onClick={() => setOpen((s) => toggle(s, 'local'))}>
+                      {open.has('local') ? <ChevronDown size={14} className="shrink-0 text-ink-3" /> : <ChevronRight size={14} className="shrink-0 text-ink-3" />}
+                      <ArrowDownToLine size={15} className="shrink-0 text-ink-3" />
+                      <span><b>{t(plural('sync.local', local.length), { count: local.length })}</b> <span className="text-ink-2">{t('sync.local.hint')}</span></span>
+                    </button>
+                    <button type="button" className="shrink-0 font-semibold" onClick={() => setCollecting(true)}>{t('sync.local.collect')}</button>
+                  </div>
+                  {open.has('local') && (
+                    <div className="flex flex-col gap-3.5 px-[18px] pb-[18px] pt-3.5 [border-top:var(--sep)]">
+                      {localByTarget.map(({ target, items }) => (
+                        <div key={target} className="flex flex-col gap-2">
+                          <div className="flex items-center gap-2"><TargetChip target={target} label={target} /><span className="text-[12px] text-ink-3">{items.length}</span></div>
+                          <div className="grid grid-cols-2 gap-x-6 gap-y-1.5 pl-[5px] font-mono text-[12.5px]">
+                            {items.map((i) => {
+                              const name = i.kind === 'agent' ? formatAgentDisplayName(i.skill) : i.skill;
+                              return <span key={`${i.kind}:${i.skill}`} className="flex min-w-0 items-center gap-1.5" title={name}>{i.kind === 'agent' ? <Bot size={13} className="shrink-0 text-ink-3" /> : <Puzzle size={13} className="shrink-0 text-ink-3" />}<span className="truncate">{name}</span></span>;
+                            })}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+        </div>
+
+        {/* Sync sits on the card so it stays in reach while the changes scroll. */}
+        {/* Stuck at -21px so the buttons (centered 47px down) line up with the stuck bar's row (26px). */}
+        <aside className="sticky top-[-21px] flex flex-col gap-3">
+          {/* Sized so the card's top lines up with the Include row's, with the buttons resting just above it. */}
+          <div className="flex h-[64px] items-end justify-end gap-2" data-tour="sync-actions">
+            {toDiscard.length > 0 && (
+              <Button variant="secondary" disabled={running} onClick={() => setDiscarding(true)}>
+                {t('sync.discard')}
+              </Button>
+            )}
+            <Button variant="primary" onClick={sync} loading={running} disabled={loading || parts.size === 0}>
+              {!running && <RefreshCw size={16} />}
+              {count > 0 ? t(plural('sync.run', count), { count }) : t('sync.run.none')}
+            </Button>
+          </div>
+          <div className="ss-box flex flex-col gap-3.5">
+            <div className="flex items-center justify-between">
+              <h3 className="text-[15px] font-semibold">{t('sync.last.title')}</h3>
+              {last && <span className={`ss-st ${last.status === 'ok' ? 'ok' : last.status === 'partial' ? 'warn' : 'bad'}`}>{last.status === 'ok' ? 'OK' : last.status}</span>}
+            </div>
+            <p className="text-[12px] text-ink-3">{t('sync.last.scope')}</p>
+            {last ? (
+              <dl className="ss-kv !grid-cols-[80px_minmax(0,1fr)]">
+                <dt>{t('sync.last.when')}</dt>
+                <dd title={formatDateTime(last.ts, locale)}>{formatRelativeTime(last.ts, locale)}</dd>
+                {typeof last.args?.targets_total === 'number' && <><dt>{t('sync.last.targets')}</dt><dd>{last.args.targets_total}</dd></>}
+                {last.args?.targets_failed > 0 && (
+                  <>
+                    <dt>{t('sync.last.failed')}</dt>
+                    {/* Entries written before failed_targets existed only have the count. */}
+                    <dd className="break-words text-bad">{Array.isArray(last.args?.failed_targets) && last.args.failed_targets.length > 0 ? joinList(last.args.failed_targets, locale) : last.args?.targets_failed}</dd>
+                  </>
+                )}
+                {typeof last.ms === 'number' && <><dt>{t('sync.last.took')}</dt><dd className="font-mono">{(last.ms / 1000).toFixed(1)} s</dd></>}
+                {last.msg && <><dt>{t('sync.last.error')}</dt><dd className="min-w-0 text-bad"><SyncError error={last.msg} /></dd></>}
+              </dl>
+            ) : (
+              <p className="text-[13px] text-ink-2">{t('sync.last.never')}</p>
+            )}
+            <Link to="/log" className="ss-btn sm">{t('sync.last.openLog')}</Link>
+          </div>
+          <p className="mt-3.5 px-1 text-[13px] leading-relaxed text-ink-3">{t('sync.backupNote')} <Link to="/backup" className="font-semibold">{t('sync.backupLink')}</Link></p>
+        </aside>
+      </div>
+
+      {collecting && <CollectDialog onClose={() => setCollecting(false)} />}
+      {discarding && <UninstallDialog kind="skill" selection={toDiscard} all={skillList} onClose={() => setDiscarding(false)} />}
+      {stopTarget && (
+        <SkillsOffDialog
+          target={stopTarget}
+          readFrom={targetList.find((x) => x.name === stopConflict?.keep)}
+          managed={[...(stopTarget.agentPath ? ['Agents'] : []), ...(mcp.data?.paths[mcpClient(stopTarget.name)] ? ['MCP'] : [])]}
+          onClose={() => setStopping('')}
+          onStopped={(removed) => {
+            setStopping('');
+            void invalidate(queryClient, 'targetsChanged');
+            toast(t(plural('targetDetail.skillsOff.stopped', removed), { name: stopTarget.name, count: removed }), 'success');
+          }}
+        />
       )}
     </div>
   );
 }
-

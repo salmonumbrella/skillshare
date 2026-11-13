@@ -12,7 +12,9 @@ import (
 
 	"skillshare/internal/audit"
 	"skillshare/internal/install"
+	"skillshare/internal/sourcewalk"
 	ssync "skillshare/internal/sync"
+	"skillshare/internal/utils"
 )
 
 // Index is the private hub index document format (schema v1).
@@ -53,16 +55,19 @@ type SkillEntry struct {
 // name, description, source are populated.
 // If auditSkills is true, each skill is scanned with audit.ScanSkill
 // and risk fields are populated.
-func BuildIndex(sourcePath string, full bool, auditSkills bool) (*Index, error) {
+func BuildIndex(sourcePath string, full bool, auditSkills bool, walk ...sourcewalk.Options) (*Index, error) {
 	// Fail fast if source directory does not exist.
 	if _, err := os.Stat(sourcePath); err != nil {
 		return nil, fmt.Errorf("source directory: %w", err)
 	}
 
-	discovered, err := ssync.DiscoverSourceSkills(sourcePath)
+	discovered, err := ssync.DiscoverSourceSkills(sourcePath, walk...)
 	if err != nil {
 		return nil, err
 	}
+
+	// Load centralized metadata store once for all skills.
+	store := install.LoadMetadataOrNew(sourcePath)
 
 	entries := make([]SkillEntry, len(discovered))
 	for i, d := range discovered {
@@ -70,18 +75,18 @@ func BuildIndex(sourcePath string, full bool, auditSkills bool) (*Index, error) 
 			Name: filepath.Base(d.SourcePath),
 		}
 
-		// Determine source: prefer meta.Source (remote origin), fallback to relPath.
+		// Determine source: prefer entry.Source (remote origin), fallback to relPath.
 		source := d.RelPath
-		if meta, _ := install.ReadMeta(d.SourcePath); meta != nil {
-			if meta.Source != "" {
-				source = meta.Source
+		if entry := store.GetByPath(d.RelPath); entry != nil {
+			if entry.Source != "" {
+				source = install.RecordedSourceString(entry, install.ParseOptions{})
 			}
 			if full {
-				item.Type = meta.Type
-				item.RepoURL = meta.RepoURL
-				item.Version = meta.Version
-				if !meta.InstalledAt.IsZero() {
-					item.InstalledAt = meta.InstalledAt.UTC().Format(time.RFC3339)
+				item.Type = entry.Type
+				item.RepoURL = entry.RepoURL
+				item.Version = entry.Version
+				if !entry.InstalledAt.IsZero() {
+					item.InstalledAt = entry.InstalledAt.UTC().Format(time.RFC3339)
 				}
 			}
 		}
@@ -171,7 +176,7 @@ func readSkillTags(skillPath string) []string {
 	if err != nil {
 		return nil
 	}
-	lines := strings.Split(string(data), "\n")
+	lines := strings.Split(utils.TrimBOM(string(data)), "\n")
 	if len(lines) < 3 || strings.TrimSpace(lines[0]) != "---" {
 		return nil
 	}
@@ -206,7 +211,7 @@ func readSkillDescription(skillPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	lines := strings.Split(string(data), "\n")
+	lines := strings.Split(utils.TrimBOM(string(data)), "\n")
 	if len(lines) < 3 || strings.TrimSpace(lines[0]) != "---" {
 		return "", nil
 	}

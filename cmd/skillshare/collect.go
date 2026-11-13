@@ -3,34 +3,27 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
-	"github.com/pterm/pterm"
-
 	"skillshare/internal/config"
-	"skillshare/internal/oplog"
 	"skillshare/internal/sync"
 	"skillshare/internal/ui"
 )
 
-// collectJSONOutput is the JSON representation for collect --json output.
-type collectJSONOutput struct {
-	Pulled   []string          `json:"pulled"`
-	Skipped  []string          `json:"skipped"`
-	Failed   map[string]string `json:"failed"`
-	DryRun   bool              `json:"dry_run"`
-	Duration string            `json:"duration"`
-}
-
-// collectLocalSkills collects local skills from targets (non-symlinked)
-func collectLocalSkills(targets map[string]config.TargetConfig, source string) []sync.LocalSkillInfo {
+// collectLocalSkills collects local skills from targets (non-symlinked).
+func collectLocalSkills(targets map[string]config.TargetConfig, source, globalMode string, warn bool) []sync.LocalSkillInfo {
 	var allLocalSkills []sync.LocalSkillInfo
 	for name, target := range targets {
-		skills, err := sync.FindLocalSkills(target.Path, source)
+		sc := target.SkillsConfig()
+		mode := sync.EffectiveMode(sc.Mode)
+		if sc.Mode == "" && globalMode != "" {
+			mode = globalMode
+		}
+		skills, err := sync.FindLocalSkills(sc.Path, source, mode)
 		if err != nil {
-			ui.Warning("%s: %v", name, err)
+			if warn {
+				ui.Warning("%s: %v", name, err)
+			}
 			continue
 		}
 		for i := range skills {
@@ -41,15 +34,16 @@ func collectLocalSkills(targets map[string]config.TargetConfig, source string) [
 	return allLocalSkills
 }
 
-// displayLocalSkills shows the local skills found
-func displayLocalSkills(skills []sync.LocalSkillInfo) {
-	ui.Header(ui.WithModeLabel("Local skills found"))
-	for _, skill := range skills {
-		ui.ListItem("info", skill.Name, fmt.Sprintf("[%s] %s", skill.TargetName, skill.Path))
-	}
+func skillDisplayItem(s sync.LocalSkillInfo) collectDisplayItem {
+	return collectDisplayItem{Name: s.Name, TargetName: s.TargetName, Path: s.Path}
 }
 
 func cmdCollect(args []string) error {
+	if wantsHelp(args) {
+		printCollectHelp()
+		return nil
+	}
+
 	start := time.Now()
 
 	mode, rest, err := parseModeArgs(args)
@@ -62,135 +56,67 @@ func cmdCollect(args []string) error {
 		return fmt.Errorf("cannot determine working directory: %w", err)
 	}
 
-	if mode == modeAuto {
-		if projectConfigExists(cwd) {
-			mode = modeProject
-		} else {
-			mode = modeGlobal
-		}
-	}
+	mode = resolveAutoMode(mode, cwd)
 
 	applyModeLabel(mode)
 
+	kind, rest := parseKindArg(rest)
+	opts := parseCollectOptions(rest)
+	scope := "global"
+	cfgPath := config.ConfigPath()
 	if mode == modeProject {
-		err := cmdCollectProject(rest, cwd)
-		logCollectOp(config.ProjectConfigPath(cwd), start, err)
-		return err
+		scope = "project"
+		cfgPath = config.ProjectConfigPath(cwd)
 	}
 
-	dryRun := false
-	force := false
-	collectAll := false
-	jsonOutput := false
-	var targetName string
+	summary := newCollectLogSummary(kind, scope, opts)
 
-	for _, arg := range rest {
-		switch arg {
-		case "--dry-run", "-n":
-			dryRun = true
-		case "--force", "-f":
-			force = true
-		case "--all", "-a":
-			collectAll = true
-		case "--json":
-			jsonOutput = true
-		default:
-			if targetName == "" && !strings.HasPrefix(arg, "-") {
-				targetName = arg
-			}
+	switch mode {
+	case modeProject:
+		if kind == kindAgents {
+			summary, err = cmdCollectProjectAgents(cwd, opts, start)
+		} else {
+			summary, err = cmdCollectProject(opts, cwd, start)
+		}
+	default:
+		cfg, loadErr := config.LoadWithoutProjects()
+		if loadErr != nil {
+			err = collectCommandError(loadErr, opts.jsonOutput)
+			logCollectOp(cfgPath, start, err, summary)
+			return err
+		}
+		if kind == kindAgents {
+			summary, err = cmdCollectAgents(cfg, opts, start)
+		} else {
+			summary, err = cmdCollectGlobal(cfg, opts, start)
 		}
 	}
 
-	// --json implies --force (skip confirmation prompts)
-	if jsonOutput {
-		force = true
-	}
-
-	cfg, err := config.Load()
-	if err != nil {
-		if jsonOutput {
-			return writeJSONError(err)
-		}
-		return err
-	}
-
-	// Select targets to collect from
-	targets, err := selectCollectTargets(cfg, targetName, collectAll)
-	if err != nil {
-		return err
-	}
-	if targets == nil {
-		return nil // User needs to specify target
-	}
-
-	// Collect all local skills
-	var sp *ui.Spinner
-	if !jsonOutput {
-		ui.Header(ui.WithModeLabel("Collect"))
-		sp = ui.StartSpinner("Scanning for local skills...")
-	}
-
-	allLocalSkills := collectLocalSkills(targets, cfg.Source)
-
-	if len(allLocalSkills) == 0 {
-		if sp != nil {
-			sp.Success("No local skills found")
-		}
-		if jsonOutput {
-			return collectOutputJSON(nil, dryRun, start, nil)
-		}
-		return nil
-	}
-
-	if sp != nil {
-		sp.Success(fmt.Sprintf("Found %d local skill(s)", len(allLocalSkills)))
-		displayLocalSkills(allLocalSkills)
-	}
-
-	if dryRun {
-		if jsonOutput {
-			names := make([]string, len(allLocalSkills))
-			for i, s := range allLocalSkills {
-				names[i] = s.Name
-			}
-			logCollectOp(config.ConfigPath(), start, nil)
-			return collectOutputJSON(&sync.PullResult{Pulled: names}, true, start, nil)
-		}
-		ui.Info("Dry run - no changes made")
-		return nil
-	}
-
-	// Confirm unless --force (JSON implies force)
-	if !force {
-		if !confirmCollect() {
-			ui.Info("Cancelled")
-			return nil
-		}
-	}
-
-	if jsonOutput {
-		result, collectErr := sync.PullSkills(allLocalSkills, cfg.Source, sync.PullOptions{
-			DryRun: dryRun,
-			Force:  force,
-		})
-		logCollectOp(config.ConfigPath(), start, collectErr)
-		return collectOutputJSON(result, dryRun, start, collectErr)
-	}
-
-	err = executeCollect(allLocalSkills, cfg.Source, dryRun, force)
-	logCollectOp(config.ConfigPath(), start, err)
+	logCollectOp(cfgPath, start, err, summary)
 	return err
 }
 
-func logCollectOp(cfgPath string, start time.Time, cmdErr error) {
-	e := oplog.NewEntry("collect", statusFromErr(cmdErr), time.Since(start))
-	if cmdErr != nil {
-		e.Message = cmdErr.Error()
+func cmdCollectGlobal(cfg *config.Config, opts collectOptions, start time.Time) (collectLogSummary, error) {
+	summary := newCollectLogSummary(kindSkills, "global", opts)
+
+	targets, err := selectCollectTargets(cfg, opts.targetName, opts.collectAll, opts.jsonOutput)
+	if err != nil {
+		return summary, collectCommandError(err, opts.jsonOutput)
 	}
-	oplog.WriteWithLimit(cfgPath, oplog.OpsFile, e, logMaxEntries()) //nolint:errcheck
+	if targets == nil {
+		return summary, nil
+	}
+
+	return runCollectPlan(collectPlan{
+		kind: kindSkills, source: cfg.EffectiveSkillsSource(), walk: cfg.SkillsWalk(),
+		scan: func(warn bool) collectResources {
+			skills := collectLocalSkills(targets, cfg.EffectiveSkillsSource(), cfg.Mode, warn)
+			return toCollectResources(skills, cfg.EffectiveSkillsSource(), skillDisplayItem, sync.PullSkills)
+		},
+	}, opts, start, "global")
 }
 
-func selectCollectTargets(cfg *config.Config, targetName string, collectAll bool) (map[string]config.TargetConfig, error) {
+func selectCollectTargets(cfg *config.Config, targetName string, collectAll, jsonOutput bool) (map[string]config.TargetConfig, error) {
 	if targetName != "" {
 		if t, exists := cfg.Targets[targetName]; exists {
 			return map[string]config.TargetConfig{targetName: t}, nil
@@ -198,90 +124,45 @@ func selectCollectTargets(cfg *config.Config, targetName string, collectAll bool
 		return nil, fmt.Errorf("target '%s' not found", targetName)
 	}
 
+	if len(cfg.Targets) == 0 {
+		return cfg.Targets, nil
+	}
+
 	if collectAll || len(cfg.Targets) == 1 {
 		return cfg.Targets, nil
 	}
 
-	// If no target specified and multiple targets exist, ask or require --all
+	if jsonOutput {
+		return nil, fmt.Errorf("multiple targets found; specify a target name or use --all")
+	}
+
 	ui.Warning("Multiple targets found. Specify a target name or use --all")
-	fmt.Println("  Available targets:")
+	ui.Note("Available targets:")
 	for name := range cfg.Targets {
-		fmt.Printf("    - %s\n", name)
+		ui.Note("  - " + name)
 	}
 	return nil, nil
 }
 
-func confirmCollect() bool {
-	fmt.Println()
-	fmt.Print("Collect these skills to source? [y/N]: ")
-	var input string
-	fmt.Scanln(&input)
-	input = strings.ToLower(strings.TrimSpace(input))
-	return input == "y" || input == "yes"
-}
-
-func executeCollect(skills []sync.LocalSkillInfo, source string, dryRun, force bool) error {
-	ui.Header(ui.WithModeLabel("Collecting skills"))
-	result, err := sync.PullSkills(skills, source, sync.PullOptions{
-		DryRun: dryRun,
-		Force:  force,
-	})
-	if err != nil {
-		return err
-	}
-
-	// Display results
-	for _, name := range result.Pulled {
-		ui.StepDone(name, "copied to source")
-	}
-	for _, name := range result.Skipped {
-		ui.StepSkip(name, "already exists in source, use --force to overwrite")
-	}
-	for name, err := range result.Failed {
-		ui.StepFail(name, err.Error())
-	}
-
-	ui.OperationSummary("Collect", 0,
-		ui.Metric{Label: "collected", Count: len(result.Pulled), HighlightColor: pterm.Green},
-		ui.Metric{Label: "skipped", Count: len(result.Skipped), HighlightColor: pterm.Yellow},
-		ui.Metric{Label: "failed", Count: len(result.Failed), HighlightColor: pterm.Red},
+func printCollectHelp() {
+	printHelp("skillshare collect [agents] [target] [options]", "Collect local skills or agents from target(s) to the source directory.",
+		helpGroup{title: "Arguments", rows: []helpRow{
+			{"[target]", "Target name to collect from (optional)"},
+		}},
+		helpGroup{title: "Options", rows: []helpRow{
+			{"-a, --all", "Collect from all targets"},
+			{"-n, --dry-run", "Preview changes without applying"},
+			{"-f, --force", "Overwrite existing items in source and skip confirmation"},
+			{"--json", "Output results as JSON (implies --force)"},
+			{"-p, --project", "Use project-level config"},
+			{"-g, --global", "Use global config"},
+		}},
+		helpExamples(
+			helpRow{"skillshare collect claude", "Collect skills from the Claude target"},
+			helpRow{"skillshare collect --all", "Collect skills from all targets"},
+			helpRow{"skillshare collect --dry-run", "Preview what would be collected"},
+			helpRow{"skillshare collect agents claude", "Collect agents from the Claude target"},
+			helpRow{"skillshare collect agents --json", "Collect agents as JSON output"},
+		),
 	)
-
-	if len(result.Pulled) > 0 {
-		showCollectNextSteps(source)
-	}
-
-	return nil
-}
-
-// collectOutputJSON converts a collect result to JSON and writes to stdout.
-func collectOutputJSON(result *sync.PullResult, dryRun bool, start time.Time, collectErr error) error {
-	output := collectJSONOutput{
-		DryRun:   dryRun,
-		Duration: formatDuration(start),
-	}
-	output.Failed = make(map[string]string)
-	if result != nil {
-		output.Pulled = result.Pulled
-		output.Skipped = result.Skipped
-		for k, v := range result.Failed {
-			output.Failed[k] = v.Error()
-		}
-	}
-	return writeJSONResult(&output, collectErr)
-}
-
-func showCollectNextSteps(source string) {
-	fmt.Println()
-	if ui.ModeLabel == "project" {
-		ui.Info("Run 'skillshare sync -p' to distribute to all targets")
-		return
-	}
-	ui.Info("Run 'skillshare sync' to distribute to all targets")
-
-	// Check if source has git
-	gitDir := filepath.Join(source, ".git")
-	if _, err := os.Stat(gitDir); err == nil {
-		ui.Info("Commit changes: cd %s && git add . && git commit", source)
-	}
 }

@@ -1,0 +1,238 @@
+---
+sidebar_position: 3
+---
+
+# check
+
+檢查 tracked 儲存庫與已安裝 skills 是否有可用更新，但不套用任何變更。
+
+```bash
+skillshare check                      # 檢查所有儲存庫與 skills
+skillshare check my-skill             # 檢查單一 skill
+skillshare check a b c                # 檢查多個 skills
+skillshare check --group frontend     # 檢查 frontend/ 下所有 skills
+skillshare check x -G backend         # 混用名稱與群組
+skillshare check --json               # 機器可讀輸出
+skillshare check my-skill --diff      # 顯示安裝後你對 skill 所做的修改
+```
+
+## 使用時機
+
+### 更新前
+
+在執行 `update` 之前先預覽會有什麼變更：
+
+```bash
+skillshare check         # 查看有哪些更新
+skillshare update --all  # 套用更新
+skillshare sync          # 分發變更
+```
+
+### CI/CD Pipeline
+
+在 CI 中檢查過期的 skills：
+
+```bash
+result=$(skillshare check --json)
+# 解析 JSON 以偵測過期的 skills
+```
+
+## 結束狀態
+
+只要任一受檢項目的狀態為 `error`（例如無法連線遠端或本機來源不存在），`check` 就會以代碼 `1` 結束。僅有可用更新、過期項目或本機修改不會造成失敗。使用 `--json` 時，stdout 仍會包含完整結果；請查看各項目的 `status` 與 `message`。指定的名稱或群組沒有任何可檢查的對象時，`check` 以代碼 `1` 結束；使用 `--json` 時輸出 `{"error": "..."}` 而不是結果。使用 `--json` 且只有部分名稱被略過時，這些名稱會列在結果的 `warnings` 陣列中。使用 `--json` 時的其他失敗（例如無效的旗標組合或缺少設定檔）也以同樣的 `error` 物件回報。
+
+傳入 `--exit-code` 後，即使所有項目都能完成檢查，只要有項目不是最新，也會以結束代碼 `1` 結束：有可用更新、stale 或本地被修改的 skill，或者落後、有未提交變更、遺失的追蹤儲存庫。只有狀態為 `local`（沒有可比較的對象）的項目不計入；從本地路徑安裝的 skill 若來源已變更，屬於可用更新，會計入。`check agents` 與 `check --all` 同樣適用，安裝後檔案被修改的 agent 也計入。可與 `--json` 一起使用，不能與 `--diff` 同時使用。
+
+## 執行內容
+
+`check` 會檢查你的 source 目錄，並回報以下項目的更新狀態：
+
+1. **Tracked 儲存庫** — 從 origin fetch，顯示落後多少個 commits
+2. **已安裝的 skills（含 metadata）** — 比較已安裝版本與遠端 HEAD
+3. **過期的 skills** — 偵測上游儲存庫中已刪除的子目錄
+4. **本機修改過的 skills** — 將從儲存庫安裝的 skill 的檔案與安裝時記錄的檔案比對，若你編輯、新增或刪除了其中任何檔案，則回報 `"status": "modified"`
+5. **從本機路徑安裝的 skills** — 將安裝來源路徑中的檔案與安裝時記錄的檔案比對（參見[從本機路徑安裝](#local-path-installs)）
+6. **本機 skills** — 將沒有安裝 metadata 的 skill 標記為「local source」（沒有可比對的對象）
+7. **Skill 層級的 `targets` 驗證** — 對 SKILL.md `targets` frontmatter 欄位中未知的 target 名稱發出警告
+
+與 `update` 不同，`check` 絕不會修改任何檔案。
+
+## 從本機路徑安裝 {#local-path-installs}
+
+從磁碟目錄安裝的 skill（`skillshare install /path/to/skill`）會記錄該路徑，以及所複製每個檔案的 hash。`check` 會重新計算該路徑下檔案的 hash，並回報：
+
+- **up to date** — 檔案與安裝時一致
+- **update available** — 來源路徑中有檔案被修改、新增或刪除
+- **error** — 來源路徑已不存在（`local source not found: <path>`）
+
+這適用於由其他應用程式發布和更新的 skill，例如 App bundle 裡的 skill：
+
+```bash
+skillshare install /Applications/Surge.app/Contents/Resources/Skills/surge
+
+# App 更新後：
+skillshare check surge     # → Update available
+skillshare update surge    # 從該路徑重新複製，並執行安全稽核
+skillshare sync
+```
+
+在記錄檔案 hash 之前安裝的 skill，會維持「local source」狀態，直到執行 update 或重新安裝。在 project mode 中，相對路徑（如 `./vendor/my-skill`）以 project root 為基準解析。
+
+在 dashboard 中安裝一個還包含子 skill 的目錄的根時，只會複製該根目錄的 `SKILL.md`。此時 `check` 只比對 `SKILL.md`，`update` 也只重新複製 `SKILL.md`。
+
+## 輸出範例
+
+```
+$ skillshare check
+! _shared-rules   3 commits behind
+! _design-system  uncommitted changes
+! commit          update available · github.com/anthropics/skills
+! old-helper      stale — no longer in the upstream repository
+
+! Updates available for 1 repo, 1 skill, 2 up to date, 1 local skipped, 1 stale · 3.4s
+
+Next
+  skillshare update --all          pull the updates
+  skillshare update --all --prune  remove stale skills
+```
+
+## 檢查特定 Skills
+
+你可以指定一個或多個 skill 名稱來檢查，而不用掃描全部：
+
+```bash
+skillshare check my-skill                # 單一 skill
+skillshare check skill-a skill-b         # 多個 skills
+```
+
+設定 `follow_source_links: true` 後，也可以依連結名稱檢查被跟隨的 Git checkout，例如 `skillshare check _dev-skills`。
+
+使用 `--group` / `-G` 檢查群組目錄下所有可更新的 skills：
+
+```bash
+skillshare check --group frontend        # frontend/ 下所有 skills
+skillshare check -G frontend -G backend  # 多個群組
+skillshare check my-skill -G frontend    # 混用名稱與群組
+```
+
+若某個位置參數對應到一個群組目錄（而非儲存庫或 skill 本身），會自動展開：
+
+```bash
+skillshare check frontend               # 自動偵測為群組
+```
+
+沒有 metadata 的本機 skills 在展開群組時會被跳過。
+
+## 選項
+
+| Flag | 說明 |
+|------|-------------|
+| `--all` | 同時檢查 skills 與 agents。不能與名稱或 `--group` 同時使用 |
+| `--group`, `-G` `<name>` | 檢查群組中所有可更新的 skills（可重複指定） |
+| `--project`, `-p` | 檢查 project 層級的 skills（`.skillshare/`） |
+| `--global`, `-g` | 檢查 global skills（`~/.config/skillshare`） |
+| `--json` | 以 JSON 輸出（供 scripting/CI 使用） |
+| `--diff` | 針對指定的 skills，以行 diff 的形式顯示自安裝以來每個被修改的檔案（與已安裝版本比較）。需要指定名稱或 `--group`；不能與 `--json` 同時使用 |
+| `--exit-code` | 只要有任何項目不是最新，就以結束代碼 `1` 結束（供 CI 使用）。不能與 `--diff` 同時使用 |
+| `--help`, `-h` | 顯示說明 |
+
+:::tip 自動偵測
+若未指定 `--project` 或 `--global`，skillshare 會自動偵測：若目前目錄存在 `.skillshare/config.yaml`，預設使用 project 模式；否則使用 global 模式。
+:::
+
+## JSON 輸出
+
+```bash
+skillshare check --json
+```
+
+```json
+{
+  "tracked_repos": [
+    {"name": "_team-skills", "status": "up_to_date", "behind": 0, "branch": "main"},
+    {"name": "_shared-rules", "status": "behind", "behind": 3, "branch": "develop"}
+  ],
+  "skills": [
+    {"name": "pdf", "source": "anthropics/skills", "version": "a1b2c3d",
+     "status": "up_to_date", "installed_at": "2024-06-01T10:00:00Z"},
+    {"name": "commit", "source": "anthropics/skills", "version": "x9y8z7w",
+     "status": "update_available", "installed_at": "2024-05-15T08:30:00Z"},
+    {"name": "old-helper", "source": "anthropics/skills", "version": "d4e5f6g",
+     "status": "stale", "installed_at": "2024-03-10T09:00:00Z"},
+    {"name": "my-review", "source": "anthropics/skills", "version": "a1b2c3d",
+     "status": "modified", "installed_at": "2024-06-01T10:00:00Z",
+     "message": "local changes since install"},
+    {"name": "local-skill", "source": "", "version": "",
+     "status": "local", "installed_at": "2024-04-20T12:00:00Z"}
+  ]
+}
+```
+
+`"status": "error"` 的 skill 在已知原因時會包含 `message` 欄位，例如 `"message": "local source not found: /path/to/skill"`。
+
+## 狀態圖示
+
+| 圖示 | 意義 |
+|------|---------|
+| `✓` | 已是最新 |
+| `⬇` | 有可用更新（tracked 儲存庫：落後的 commits 數；skill：有新版本） |
+| `⚠` | 過期 — 上游子目錄已刪除或重新命名 |
+| `!` | 有未提交的變更（tracked 儲存庫）或安裝後有本機變更（skill） |
+| `•` | 本機來源（沒有安裝 metadata 可比對） |
+
+:::info 過期的 skills
+當某個 skill 的子目錄在上游被重新命名或刪除，`check` 會回報為 **stale（過期）**。使用 `update --prune` 清除過期的 skills。
+:::
+
+:::info 本機修改過的 skills
+安裝後被你編輯過的 skill 會被回報為 **modified**，即使 upstream 已有更新版本；此時其 `message` 以 `update available upstream` 結尾。在你執行 `skillshare update <name> --force` 之前，`update` 不會動它；該指令會捨棄你的變更並重新安裝。作業系統的 metadata 檔案（`.DS_Store`、`Thumbs.db`、`desktop.ini`）不算本機修改。
+
+如需先查看變更內容，請執行 `skillshare check <name> --diff`。它會取得該 skill 安裝時所在的 commit，因此即使 upstream 已經前進，diff 也只顯示你自己的修改：
+
+```
+! my-skill  2 files changed since install
+            modified SKILL.md
+                # My Skill
+              - Run the tests.
+              + Run the tests with -race.
+            added NOTES.md
+              + my notes
+```
+:::
+
+:::tip Monorepo 感知
+對於從子目錄安裝的 skills，`check` 只有在該特定目錄有變更時才回報「update available」— 而不是儲存庫其他不相關部分有新 commits 時。
+:::
+
+## Project 模式
+
+```bash
+skillshare check -p                    # 檢查所有 project skills
+skillshare check -p my-skill           # 檢查特定 project skill
+skillshare check -p --group frontend   # 檢查 project 群組
+skillshare check -p --json             # project 的 JSON 輸出
+```
+
+## Agent 支援
+
+`skillshare check agents` 會將檢查範圍限定於 agents，回報 agents source 目錄中 `.md` 檔案的漂移與更新狀態：
+
+```bash
+skillshare check agents              # 檢查所有 agents
+skillshare check agents --json       # agents 的 JSON 輸出
+skillshare check agents -p           # 檢查 project agents
+skillshare check --all               # 同時檢查 skills 與 agents
+```
+
+每個 agent 都會與安裝時的分支比對。記錄的 source 被先前的 `update agents` 弄丟的 agent 會回報 `error` 並提示重新安裝，請參閱[疑難排解](/docs/troubleshooting/common-errors#agent-source-lost)。
+
+若不加 `agents` 參數或 `--all`，`check` 僅針對 skills 運作（預設行為）。詳見 [Agents](/docs/understand/agents) 了解背景概念。
+
+傳入 `--all` 可一次檢查 skills 與 agents。文字輸出分為 Skills 與 Agents 兩個區塊，`--json` 會在 `tracked_repos` 與 `skills` 之外加上 `agents` 陣列，`--exit-code` 兩者都計入。`--all` 不能與名稱或 `--group` 同時使用。
+
+## 另請參閱
+
+- [update](/docs/reference/commands/update) — 套用更新
+- [list](/docs/reference/commands/list) — 檢視已安裝的 skills
+- [status](/docs/reference/commands/status) — 顯示同步狀態
+- [Agents](/docs/understand/agents) — Agent 概念

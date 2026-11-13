@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,10 +13,12 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"skillshare/internal/backup"
 	"skillshare/internal/config"
 	"skillshare/internal/oplog"
+	"skillshare/internal/theme"
 	"skillshare/internal/utils"
 )
 
@@ -23,6 +26,24 @@ import (
 // Restore TUI — interactive backup restore: target → version → confirm → run
 // Left-right split layout: list on left, detail panel on right.
 // ---------------------------------------------------------------------------
+
+// isAgentBackupEntry returns true if the backup entry name represents an agent backup.
+func isAgentBackupEntry(name string) bool {
+	return strings.HasSuffix(name, "-agents")
+}
+
+// agentBaseTarget returns the base target name by stripping the "-agents" suffix.
+func agentBaseTarget(name string) string {
+	return strings.TrimSuffix(name, "-agents")
+}
+
+// resolveAgentBackupPath resolves the agent target path for a backup entry name,
+// reusing the canonical resolveAgentTargetPath with builtin fallback.
+func resolveAgentBackupPath(targets map[string]config.TargetConfig, entryName string) string {
+	baseName := agentBaseTarget(entryName)
+	tc := targets[baseName] // zero-value is safe — AgentsConfig returns empty, falls through to builtin
+	return resolveAgentTargetPath(tc, config.DefaultAgentTargets(), baseName)
+}
 
 // restorePhase tracks which screen is active.
 type restorePhase int
@@ -45,11 +66,14 @@ type restoreTargetItem struct {
 }
 
 func (i restoreTargetItem) Title() string {
-	return fmt.Sprintf("  %s", i.summary.TargetName)
+	name := i.summary.TargetName
+	if isAgentBackupEntry(name) {
+		return agentBaseTarget(name) + theme.Dim().Render(" agents")
+	}
+	return name
 }
 func (i restoreTargetItem) Description() string {
-	return fmt.Sprintf("%d backup(s), latest: %s",
-		i.summary.BackupCount, i.summary.Latest.Format("2006-01-02"))
+	return countNoun(i.summary.BackupCount, "backup") + " · " + timeAgo(i.summary.Latest)
 }
 func (i restoreTargetItem) FilterValue() string { return i.summary.TargetName }
 
@@ -58,11 +82,40 @@ type restoreVersionItem struct {
 }
 
 func (i restoreVersionItem) Title() string {
-	return fmt.Sprintf("  %s", i.version.Label)
+	return i.version.Label
 }
 func (i restoreVersionItem) Description() string {
-	return fmt.Sprintf("%d skill(s), %s",
-		i.version.SkillCount, formatBytes(i.version.TotalSize))
+	if i.version.TotalSize < 0 {
+		return countNoun(i.version.SkillCount, "skill")
+	}
+	return countNoun(i.version.SkillCount, "skill") + " · " + formatBytes(i.version.TotalSize)
+}
+
+// restoreDelegate renders a target or backup row with its summary at the right.
+type restoreDelegate struct{}
+
+func (restoreDelegate) Height() int                             { return 1 }
+func (restoreDelegate) Spacing() int                            { return 0 }
+func (restoreDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
+
+func (restoreDelegate) Render(w io.Writer, m list.Model, index int, li list.Item) {
+	item, ok := li.(list.DefaultItem)
+	if !ok {
+		return
+	}
+	line := alignRow(item.Title(), theme.Dim().Render(item.Description()), m.Width()-rowIndent)
+	renderPrefixRow(w, line, m.Width(), index == m.Index())
+}
+
+// newRestoreList builds a list with the shared row style and no chrome.
+func newRestoreList(items []list.Item) list.Model {
+	l := list.New(items, restoreDelegate{}, 0, 0)
+	l.SetShowTitle(false)
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(false)
+	l.SetShowHelp(false)
+	l.SetShowPagination(false)
+	return l
 }
 func (i restoreVersionItem) FilterValue() string { return i.version.Label }
 
@@ -71,6 +124,18 @@ func (i restoreVersionItem) FilterValue() string { return i.version.Label }
 type restoreDoneMsg struct {
 	err    error
 	action string // "restore" or "delete"
+}
+
+// versionSizeMsg delivers an asynchronously computed directory size.
+type versionSizeMsg struct {
+	dir  string
+	size int64
+}
+
+func computeVersionSizeCmd(dir string) tea.Cmd {
+	return func() tea.Msg {
+		return versionSizeMsg{dir: dir, size: backup.DirSize(dir)}
+	}
 }
 
 // --- Model ---
@@ -105,6 +170,9 @@ type restoreTUIModel struct {
 	// Detail scroll (right panel)
 	detailScroll int
 
+	// Lazy size cache: version.Dir → computed size (populated on demand)
+	versionSizeCache map[string]int64
+
 	// Cached detail content — recomputed only on selection change or mutation
 	cachedDetailIdx   int
 	cachedDetailPhase restorePhase
@@ -116,6 +184,8 @@ type restoreTUIModel struct {
 	// Execution
 	opSpinner spinner.Model
 	resultMsg string
+
+	showKeys bool // ? swaps the detail panel for the full key list
 }
 
 func newRestoreTUIModel(summaries []backup.TargetBackupSummary, backupDir string, targets map[string]config.TargetConfig, cfgPath string) restoreTUIModel {
@@ -124,36 +194,25 @@ func newRestoreTUIModel(summaries []backup.TargetBackupSummary, backupDir string
 		listItems[i] = restoreTargetItem{summary: s}
 	}
 
-	delegate := list.NewDefaultDelegate()
-	configureDelegate(&delegate, true)
-
-	tl := list.New(listItems, delegate, 0, 0)
-	tl.Title = fmt.Sprintf("Backup Restore — %d target(s)", len(summaries))
-	tl.Styles.Title = tc.ListTitle
-	tl.SetShowStatusBar(false)
-	tl.SetFilteringEnabled(false)
-	tl.SetShowHelp(false)
-	tl.SetShowPagination(false)
+	tl := newRestoreList(listItems)
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
-	sp.Style = tc.SpinnerStyle
+	sp.Style = theme.Accent()
 
-	fi := textinput.New()
-	fi.Prompt = "/ "
-	fi.PromptStyle = tc.Filter
-	fi.Cursor.Style = tc.Filter
+	fi := newTUIFilterInput("type to match a name")
 
 	return restoreTUIModel{
-		phase:       phaseTargetList,
-		backupDir:   backupDir,
-		targets:     targets,
-		cfgPath:     cfgPath,
-		targetList:  tl,
-		targetItems: summaries,
-		matchCount:  len(summaries),
-		filterInput: fi,
-		opSpinner:   sp,
+		phase:            phaseTargetList,
+		backupDir:        backupDir,
+		targets:          targets,
+		cfgPath:          cfgPath,
+		targetList:       tl,
+		targetItems:      summaries,
+		matchCount:       len(summaries),
+		filterInput:      fi,
+		opSpinner:        sp,
+		versionSizeCache: make(map[string]int64),
 	}
 }
 
@@ -164,14 +223,14 @@ func (m restoreTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.termWidth = msg.Width
 		m.termHeight = msg.Height
-		lw := restoreListWidth(m.termWidth)
+		lw := m.listWidth()
 		h := m.restorePanelHeight()
 		m.targetList.SetSize(lw, h)
 		if m.phase == phaseVersionList {
 			m.versionList.SetSize(lw, h)
 		}
-		m.refreshDetailCache()
-		return m, nil
+		sizeCmd := m.refreshDetailCache()
+		return m, sizeCmd
 
 	case spinner.TickMsg:
 		if m.phase == phaseExecuting {
@@ -183,7 +242,7 @@ func (m restoreTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case restoreDoneMsg:
 		if msg.action == "delete" {
 			if msg.err != nil {
-				m.resultMsg = tc.Red.Render(fmt.Sprintf("Delete failed: %s", msg.err))
+				m.resultMsg = theme.Danger().Render("✗") + " Delete failed: " + msg.err.Error()
 				m.phase = phaseDone
 				return m, nil
 			}
@@ -192,16 +251,29 @@ func (m restoreTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.selectedVersion != nil {
 				label = m.selectedVersion.Label
 			}
-			m.resultMsg = tc.Green.Render(fmt.Sprintf("Deleted backup %s", label))
+			m.resultMsg = theme.Success().Render("✓") + " Deleted backup " + label
 			m.confirmAction = ""
 			m.selectedVersion = nil
 			return m.enterVersionPhase()
 		}
 		m.phase = phaseDone
 		if msg.err != nil {
-			m.resultMsg = tc.Red.Render(fmt.Sprintf("Error: %s", msg.err))
+			m.resultMsg = theme.Danger().Render("✗") + " " + msg.err.Error()
 		} else {
-			m.resultMsg = tc.Green.Render(fmt.Sprintf("Restored %s from %s", m.selectedTarget, m.selectedVersion.Label))
+			m.resultMsg = theme.Success().Render("✓") + fmt.Sprintf(" Restored %s from %s", m.selectedTarget, m.selectedVersion.Label)
+		}
+		return m, nil
+
+	case versionSizeMsg:
+		m.versionSizeCache[msg.dir] = msg.size
+		// Re-render detail if still viewing the version whose size just arrived
+		if m.phase == phaseVersionList {
+			if item, ok := m.versionList.SelectedItem().(restoreVersionItem); ok {
+				if item.version.Dir == msg.dir {
+					m.invalidateDetailCache()
+					m.refreshDetailCache() // size is cached now, won't dispatch another cmd
+				}
+			}
 		}
 		return m, nil
 
@@ -250,7 +322,7 @@ func (m restoreTUIModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.startDelete()
 			}
 			return m.startRestore()
-		case "n", "N", "esc":
+		case "n", "N", "esc", "q":
 			m.phase = phaseVersionList
 			m.confirmAction = ""
 			return m, nil
@@ -260,24 +332,7 @@ func (m restoreTUIModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Filter mode
 	if m.filtering {
-		switch key {
-		case "esc":
-			m.filtering = false
-			m.filterText = ""
-			m.filterInput.SetValue("")
-			m.applyRestoreFilter()
-			return m, nil
-		case "enter":
-			m.filtering = false
-			return m, nil
-		}
-		var cmd tea.Cmd
-		m.filterInput, cmd = m.filterInput.Update(msg)
-		newVal := m.filterInput.Value()
-		if newVal != m.filterText {
-			m.filterText = newVal
-			m.applyRestoreFilter()
-		}
+		cmd := handleTUIFilterKey(msg, &m.filtering, &m.filterText, &m.filterInput, m.applyRestoreFilter)
 		return m, cmd
 	}
 
@@ -287,8 +342,23 @@ func (m restoreTUIModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.quitting = true
 		return m, tea.Quit
 
+	case "?":
+		m.showKeys = !m.showKeys
+		return m, nil
+
 	case "esc":
+		if m.showKeys {
+			m.showKeys = false
+			return m, nil
+		}
+		if m.filterText != "" {
+			m.filterText = ""
+			m.filterInput.SetValue("")
+			m.applyRestoreFilter()
+			return m, m.refreshDetailCache()
+		}
 		if m.phase == phaseVersionList {
+			m.resultMsg = ""
 			m.phase = phaseTargetList
 			m.selectedTarget = ""
 			m.filterText = ""
@@ -325,7 +395,7 @@ func (m restoreTUIModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.confirmAction = "delete"
 			m.phase = phaseConfirm
 			m.resultMsg = ""
-			return m, nil
+			return m, computeVersionSizeCmd(item.version.Dir)
 		}
 
 	case "enter":
@@ -348,7 +418,8 @@ func (m restoreTUIModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.selectedVersion = &item.version
 			m.confirmAction = "restore"
 			m.phase = phaseConfirm
-			return m, nil
+			m.resultMsg = ""
+			return m, computeVersionSizeCmd(item.version.Dir)
 		}
 	}
 
@@ -367,7 +438,9 @@ func (m restoreTUIModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.activeListIndex() != prevIdx {
 		m.detailScroll = 0
 		m.invalidateDetailCache()
-		m.refreshDetailCache()
+		if sizeCmd := m.refreshDetailCache(); sizeCmd != nil {
+			return m, tea.Batch(cmd, sizeCmd)
+		}
 	}
 
 	return m, cmd
@@ -385,7 +458,7 @@ func (m restoreTUIModel) activeListIndex() int {
 }
 
 func (m restoreTUIModel) enterVersionPhase() (tea.Model, tea.Cmd) {
-	versions, err := backup.ListBackupVersions(m.backupDir, m.selectedTarget)
+	versions, err := backup.ListBackupVersionsLite(m.backupDir, m.selectedTarget)
 	if err != nil || len(versions) == 0 {
 		// No versions left — refresh target list and go back
 		m.refreshTargetList()
@@ -394,23 +467,15 @@ func (m restoreTUIModel) enterVersionPhase() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.versionItems = versions
+	m.versionSizeCache = make(map[string]int64) // reset for new target
 
 	listItems := make([]list.Item, len(versions))
 	for i, v := range versions {
 		listItems[i] = restoreVersionItem{version: v}
 	}
 
-	delegate := list.NewDefaultDelegate()
-	configureDelegate(&delegate, true)
-
-	lw := restoreListWidth(m.termWidth)
-	vl := list.New(listItems, delegate, 0, 0)
-	vl.Title = fmt.Sprintf("%s — select version", m.selectedTarget)
-	vl.Styles.Title = tc.ListTitle
-	vl.SetShowStatusBar(false)
-	vl.SetFilteringEnabled(false)
-	vl.SetShowHelp(false)
-	vl.SetShowPagination(false)
+	lw := m.listWidth()
+	vl := newRestoreList(listItems)
 	if m.termWidth > 0 {
 		vl.SetSize(lw, m.restorePanelHeight())
 	}
@@ -420,8 +485,8 @@ func (m restoreTUIModel) enterVersionPhase() (tea.Model, tea.Cmd) {
 	m.phase = phaseVersionList
 	m.detailScroll = 0
 	m.invalidateDetailCache()
-	m.refreshDetailCache()
-	return m, nil
+	sizeCmd := m.refreshDetailCache()
+	return m, sizeCmd
 }
 
 func (m restoreTUIModel) startRestore() (tea.Model, tea.Cmd) {
@@ -433,14 +498,22 @@ func (m restoreTUIModel) startRestore() (tea.Model, tea.Cmd) {
 
 	cmd := func() tea.Msg {
 		start := time.Now()
-		targetCfg, ok := targets[targetName]
-		if !ok {
+
+		var destPath string
+		if isAgentBackupEntry(targetName) {
+			destPath = resolveAgentBackupPath(targets, targetName)
+		} else {
+			if tc, ok := targets[targetName]; ok {
+				destPath = tc.SkillsConfig().Path
+			}
+		}
+		if destPath == "" {
 			return restoreDoneMsg{err: fmt.Errorf("target '%s' not found in config", targetName)}
 		}
 
 		backupPath := filepath.Dir(version.Dir)
 		opts := backup.RestoreOptions{Force: true}
-		err := backup.RestoreToPath(backupPath, targetName, targetCfg.Path, opts)
+		err := backup.RestoreToPath(backupPath, targetName, destPath, opts)
 
 		e := oplog.NewEntry("restore", statusFromErr(err), time.Since(start))
 		e.Args = map[string]any{"target": targetName, "from": version.Label, "via": "tui"}
@@ -464,7 +537,6 @@ func (m *restoreTUIModel) refreshTargetList() {
 	}
 	m.targetList.SetItems(items)
 	m.matchCount = len(summaries)
-	m.targetList.Title = fmt.Sprintf("Backup Restore — %d target(s)", len(summaries))
 	m.invalidateDetailCache()
 }
 
@@ -562,21 +634,25 @@ func restoreListWidth(_ int) int {
 
 // restoreDetailWidth returns right panel width.
 func restoreDetailWidth(termWidth int) int {
-	w := termWidth - restoreListWidth(termWidth) - 3 // 3 = border column
-	if w < 30 {
-		w = 30
-	}
-	return w
+	return max(termWidth-restoreListWidth(termWidth), 30)
 }
 
-// restorePanelHeight returns the panel height for the horizontal split.
-// Footer: filter(1) + gap(1) + help(1) + trailing(1) = 4
-func (m restoreTUIModel) restorePanelHeight() int {
-	h := m.termHeight - 4
-	if h < 10 {
-		h = 10
+// listWidth is the list's width: the left panel, or the full width when
+// the details sit below it.
+func (m restoreTUIModel) listWidth() int {
+	if m.termWidth < restoreMinSplitWidth {
+		return m.termWidth
 	}
-	return h
+	return restoreListWidth(m.termWidth)
+}
+
+// restorePanelHeight returns the list height.
+func (m restoreTUIModel) restorePanelHeight() int {
+	bodyHeight := max(m.termHeight-frameChrome, 6)
+	if m.termWidth < restoreMinSplitWidth {
+		return max(bodyHeight/2, 4) // narrow: the details sit below the list
+	}
+	return bodyHeight
 }
 
 // --- Views ---
@@ -585,112 +661,128 @@ func (m restoreTUIModel) View() string {
 	if m.quitting {
 		return ""
 	}
-
-	switch m.phase {
-	case phaseExecuting:
-		verb := "Restoring"
-		if m.confirmAction == "delete" {
-			verb = "Deleting"
-		}
-		return fmt.Sprintf("\n  %s %s %s from %s...\n",
-			m.opSpinner.View(), verb, m.selectedTarget, m.selectedVersion.Label)
-
-	case phaseDone:
-		return fmt.Sprintf("\n  %s\n\n  %s\n",
-			m.resultMsg, tc.Help.Render("Press any key to exit"))
-
-	case phaseConfirm:
-		return m.viewRestoreConfirm()
-	}
-
-	// Horizontal split layout (list left, detail right)
-	if m.termWidth >= restoreMinSplitWidth {
-		return m.viewHorizontal()
-	}
-	return m.viewVertical()
-}
-
-// viewHorizontal renders the left-right split layout.
-func (m restoreTUIModel) viewHorizontal() string {
-	var b strings.Builder
-
-	panelHeight := m.restorePanelHeight()
-	leftWidth := restoreListWidth(m.termWidth)
-	rightWidth := restoreDetailWidth(m.termWidth)
-
-	// Left panel: active list
-	var listView string
-	switch m.phase {
-	case phaseTargetList:
-		listView = m.targetList.View()
-	case phaseVersionList:
+	listView := m.targetList.View()
+	if m.phase != phaseTargetList && m.selectedTarget != "" {
 		listView = m.versionList.View()
 	}
-
-	// Right panel: detail (cached)
-	detailStr, scrollInfo := wrapAndScroll(m.buildDetailContent(), rightWidth-1, m.detailScroll, panelHeight)
-
-	body := renderHorizontalSplit(listView, detailStr, leftWidth, rightWidth, panelHeight)
-	b.WriteString(body)
-	b.WriteString("\n")
-
-	// Operation result message
-	if m.resultMsg != "" {
-		b.WriteString("  ")
-		b.WriteString(m.resultMsg)
-		b.WriteString("\n")
+	bodyHeight := max(m.termHeight-frameChrome, 6)
+	title := m.renderTitleLine()
+	if m.termWidth < restoreMinSplitWidth {
+		detailHeight := max(bodyHeight-m.restorePanelHeight()-1, 4)
+		detail := lipgloss.NewStyle().Height(detailHeight).MaxHeight(detailHeight).PaddingLeft(1).
+			Render(m.renderRight(m.termWidth-2, detailHeight))
+		return title + "\n\n" + listView + "\n\n" + detail + "\n" + m.renderBottom()
 	}
-
-	// Filter bar
-	b.WriteString(m.renderRestoreFilterBar())
-
-	// Help
-	b.WriteString(tc.Help.Render(appendScrollInfo(m.restoreHelpText(), scrollInfo)))
-	b.WriteString("\n")
-
-	return b.String()
+	leftWidth := restoreListWidth(m.termWidth)
+	rightWidth := restoreDetailWidth(m.termWidth)
+	return title + "\n\n" +
+		renderFrameSplit(listView, m.renderRight(rightWidth-2, bodyHeight), leftWidth, rightWidth, bodyHeight) + "\n" +
+		m.renderBottom()
 }
 
-// viewVertical renders the fallback vertical layout for narrow terminals.
-func (m restoreTUIModel) viewVertical() string {
-	var b strings.Builder
-
-	switch m.phase {
-	case phaseTargetList:
-		b.WriteString(m.targetList.View())
-	case phaseVersionList:
-		b.WriteString(m.versionList.View())
+// renderTitleLine renders the target count, or the chosen target and its
+// backup count.
+func (m restoreTUIModel) renderTitleLine() string {
+	if m.selectedTarget == "" {
+		return renderFrameTitle(m.termWidth, "restore", []string{countNoun(len(m.targetItems), "target")}, nil)
 	}
-	b.WriteString("\n")
+	name := m.selectedTarget
+	if isAgentBackupEntry(name) {
+		name = agentBaseTarget(name) + " agents"
+	}
+	return renderFrameTitle(m.termWidth, "restore", []string{name, countNoun(len(m.versionItems), "backup")}, nil)
+}
 
+// renderRight renders the detail panel, or the key list while ? is on.
+func (m restoreTUIModel) renderRight(width, height int) string {
+	if m.showKeys {
+		return renderKeysPanel(restoreKeyGroups)
+	}
+	detail, _ := wrapAndScroll(m.buildDetailContent(), width, m.detailScroll, height)
+	return detail
+}
+
+// renderBottom renders the note line and the key line. Confirmations, the
+// running operation, the filter input and the final result take over the
+// key line in place.
+func (m restoreTUIModel) renderBottom() string {
+	note := ""
 	if m.resultMsg != "" {
-		b.WriteString("  ")
-		b.WriteString(m.resultMsg)
-		b.WriteString("\n")
+		note = "  " + m.resultMsg
 	}
-
-	b.WriteString(m.renderRestoreFilterBar())
-
-	// Detail below list (limited height)
-	detailHeight := m.termHeight / 3
-	if detailHeight < 6 {
-		detailHeight = 6
+	var line string
+	switch {
+	case m.phase == phaseExecuting:
+		verb := "Restoring " + m.selectedTarget + " from "
+		if m.confirmAction == "delete" {
+			verb = "Deleting backup "
+		}
+		line = renderBusyLine(m.termWidth, m.opSpinner.View(), verb+m.selectedVersion.Label+"…")
+	case m.phase == phaseDone:
+		line = renderKeyLine(m.termWidth, []keyHint{{"any key", "quit"}}, "")
+	case m.phase == phaseConfirm:
+		note = theme.Dim().Render("  " + m.confirmNote())
+		if m.confirmAction == "delete" {
+			line = renderConfirmLine(m.termWidth, "Delete backup "+m.selectedVersion.Label+"?", true, "")
+		} else {
+			line = renderConfirmLine(m.termWidth, "Restore "+m.selectedTarget+" from "+m.selectedVersion.Label+"?", false, "")
+		}
+	case m.filtering:
+		line = renderFilterLine(m.termWidth, m.filterInput.View(), m.matchCount)
+	case m.showKeys:
+		line = renderKeyLine(m.termWidth, []keyHint{{"?/esc", "close"}}, "")
+	default:
+		filter := keyHint{"/", "filter"}
+		if m.filterText != "" {
+			filter = keyHint{"esc", "clear filter"}
+		}
+		hints := []keyHint{{"↑↓", "move"}, filter, {"enter", "backups"}, {"?", "keys"}}
+		if m.phase == phaseVersionList {
+			hints = []keyHint{{"↑↓", "move"}, filter, {"enter", "restore"}, {"d", "delete"}, {"esc", "back"}, {"?", "keys"}}
+		}
+		line = renderKeyLine(m.termWidth, hints, framePosition(m.activeListIndex()+1, m.matchCount))
 	}
-	detailStr, scrollInfo := wrapAndScroll(m.buildDetailContent(), m.termWidth, m.detailScroll, detailHeight)
-	b.WriteString(detailStr)
-	b.WriteString("\n")
+	return note + "\n" + line
+}
 
-	b.WriteString(tc.Help.Render(appendScrollInfo(m.restoreHelpText(), scrollInfo)))
-	b.WriteString("\n")
+// confirmNote says what the pending restore or delete covers.
+func (m restoreTUIModel) confirmNote() string {
+	v := m.selectedVersion
+	size := "size unknown"
+	if sz, ok := m.versionSizeCache[v.Dir]; ok {
+		size = formatBytes(sz)
+	} else if v.TotalSize >= 0 {
+		size = formatBytes(v.TotalSize)
+	}
+	what := countNoun(v.SkillCount, "skill") + " · " + size
+	if m.confirmAction == "delete" {
+		return what + " · cannot be undone"
+	}
+	return what + " · replaces what is in the target now"
+}
 
-	return b.String()
+// restoreKeyGroups lists every key for the ? panel.
+var restoreKeyGroups = []keyGroup{
+	{"Move", []keyHint{
+		{"↑↓", "move"},
+		{"←→", "page"},
+		{"/", "filter"},
+		{"enter", "open a target's backups, or restore a backup"},
+		{"ctrl+d/u", "scroll the details"},
+		{"esc", "clear the filter, go back, then quit"},
+		{"q", "quit"},
+	}},
+	{"Backups", []keyHint{
+		{"d", "delete the backup"},
+	}},
 }
 
 // refreshDetailCache recomputes the detail content only when the selection or phase changes.
-func (m *restoreTUIModel) refreshDetailCache() {
+// Returns a tea.Cmd if an async size computation is needed (nil otherwise).
+func (m *restoreTUIModel) refreshDetailCache() tea.Cmd {
 	idx := m.activeListIndex()
 	if idx == m.cachedDetailIdx && m.phase == m.cachedDetailPhase && m.cachedDetailStr != "" {
-		return
+		return nil
 	}
 	m.cachedDetailIdx = idx
 	m.cachedDetailPhase = m.phase
@@ -698,15 +790,26 @@ func (m *restoreTUIModel) refreshDetailCache() {
 	case phaseTargetList:
 		if item, ok := m.targetList.SelectedItem().(restoreTargetItem); ok {
 			m.cachedDetailStr = m.renderTargetDetail(item.summary)
-			return
+			return nil
 		}
 	case phaseVersionList:
 		if item, ok := m.versionList.SelectedItem().(restoreVersionItem); ok {
-			m.cachedDetailStr = m.renderVersionDetail(item.version)
-			return
+			v := item.version
+			if v.TotalSize < 0 {
+				if cached, ok := m.versionSizeCache[v.Dir]; ok {
+					v.TotalSize = cached
+				} else {
+					// Render now without size; dispatch async computation
+					m.cachedDetailStr = m.renderVersionDetail(v)
+					return computeVersionSizeCmd(v.Dir)
+				}
+			}
+			m.cachedDetailStr = m.renderVersionDetail(v)
+			return nil
 		}
 	}
 	m.cachedDetailStr = ""
+	return nil
 }
 
 // invalidateDetailCache forces the next refreshDetailCache call to recompute.
@@ -721,112 +824,75 @@ func (m restoreTUIModel) buildDetailContent() string {
 	return m.cachedDetailStr
 }
 
-func (m restoreTUIModel) viewRestoreConfirm() string {
-	var b strings.Builder
-	b.WriteString("\n")
-
-	if m.confirmAction == "delete" {
-		fmt.Fprintf(&b, "  %s\n\n",
-			tc.Red.Render(fmt.Sprintf("Delete backup %s for %s?", m.selectedVersion.Label, m.selectedTarget)))
-	} else {
-		fmt.Fprintf(&b, "  Restore %s from backup %s?\n\n", m.selectedTarget, m.selectedVersion.Label)
-	}
-
-	fmt.Fprintf(&b, "    Skills: %d\n", m.selectedVersion.SkillCount)
-	fmt.Fprintf(&b, "    Size:   %s\n", formatBytes(m.selectedVersion.TotalSize))
-
-	if len(m.selectedVersion.SkillNames) > 0 {
-		b.WriteString("\n    Contents:\n")
-		show := m.selectedVersion.SkillNames
-		if len(show) > 10 {
-			show = show[:10]
-		}
-		for _, name := range show {
-			fmt.Fprintf(&b, "      %s\n", name)
-		}
-		if len(m.selectedVersion.SkillNames) > 10 {
-			fmt.Fprintf(&b, "      ... and %d more\n", len(m.selectedVersion.SkillNames)-10)
-		}
-	}
-
-	b.WriteString("\n  ")
-	b.WriteString(tc.Help.Render("y confirm  n cancel"))
-	b.WriteString("\n")
-	return b.String()
-}
-
-func (m restoreTUIModel) renderRestoreFilterBar() string {
-	totalCount := len(m.targetItems)
-	noun := "targets"
-	var pag string
-
-	if m.phase == phaseVersionList {
-		totalCount = len(m.versionItems)
-		noun = "backups"
-		pag = renderPageInfoFromPaginator(m.versionList.Paginator)
-	} else {
-		pag = renderPageInfoFromPaginator(m.targetList.Paginator)
-	}
-
-	return renderTUIFilterBar(
-		m.filterInput.View(), m.filtering, m.filterText,
-		m.matchCount, totalCount, 0, noun, pag,
-	)
-}
-
-func (m restoreTUIModel) restoreHelpText() string {
-	help := "↑↓ navigate  / filter"
-	if m.phase == phaseTargetList {
-		help += "  enter select  esc quit"
-	} else {
-		help += "  enter restore  d delete  Ctrl+d/u scroll  esc back  q quit"
-	}
-	return help
-}
-
 // --- Detail renderers ---
 
 func (m restoreTUIModel) renderTargetDetail(s backup.TargetBackupSummary) string {
 	var b strings.Builder
 
 	row := func(label, value string) {
-		b.WriteString(tc.Label.Render(label))
-		b.WriteString(tc.Value.Render(value))
+		b.WriteString(theme.Dim().Width(10).Render(label))
+		b.WriteString(value)
 		b.WriteString("\n")
 	}
 
-	row("Target:  ", s.TargetName)
+	b.WriteString(theme.Primary().Bold(true).Render(s.TargetName))
+	b.WriteString("\n\n")
 
-	// Target path and current state
-	if t, ok := m.targets[s.TargetName]; ok {
-		row("Path:    ", t.Path)
-		if t.Mode != "" {
-			row("Mode:    ", t.Mode)
+	if isAgentBackupEntry(s.TargetName) {
+		agentPath := resolveAgentBackupPath(m.targets, s.TargetName)
+		if agentPath != "" {
+			row("Path", shortenPath(agentPath))
+			row("Status", describeTargetState(agentPath))
 		}
-		row("Status:  ", describeTargetState(t.Path))
+	} else if t, ok := m.targets[s.TargetName]; ok {
+		sc := t.SkillsConfig()
+		row("Path", shortenPath(sc.Path))
+		if sc.Mode != "" {
+			row("Mode", sc.Mode)
+		}
+		row("Status", describeTargetState(sc.Path))
 	}
 
 	b.WriteString("\n")
-	row("Backups: ", fmt.Sprintf("%d", s.BackupCount))
-	row("Latest:  ", fmt.Sprintf("%s (%s)", s.Latest.Format("2006-01-02 15:04:05"), timeAgo(s.Latest)))
-	row("Oldest:  ", fmt.Sprintf("%s (%s)", s.Oldest.Format("2006-01-02 15:04:05"), timeAgo(s.Oldest)))
+	row("Backups", fmt.Sprintf("%d", s.BackupCount))
+	row("Latest", s.Latest.Format("2006-01-02 15:04")+theme.Dim().Render(" · "+timeAgo(s.Latest)))
+	row("Oldest", s.Oldest.Format("2006-01-02 15:04")+theme.Dim().Render(" · "+timeAgo(s.Oldest)))
 
-	// Preview skills from latest backup
-	latestVersions, _ := backup.ListBackupVersions(m.backupDir, s.TargetName)
-	if len(latestVersions) > 0 {
-		latest := latestVersions[0]
-		b.WriteString("\n")
-		b.WriteString(tc.Separator.Render("── Latest backup skills ──────────────"))
-		b.WriteString("\n")
-		for _, name := range latest.SkillNames {
-			desc := readSkillDescription(filepath.Join(latest.Dir, name))
-			if desc != "" {
-				b.WriteString(tc.Value.Render("  " + name))
-				b.WriteString("\n")
-				b.WriteString(tc.Dim.Render("    " + truncateStr(desc, 60)))
-				b.WriteString("\n")
-			} else {
-				b.WriteString(tc.Value.Render("  " + name))
+	// Preview skills from latest backup — read directory directly instead of
+	// calling ListBackupVersions (which would walk all versions + dirSize).
+	latestDir := filepath.Join(m.backupDir, s.Latest.Format("2006-01-02_15-04-05"), s.TargetName)
+	if skillEntries, err := os.ReadDir(latestDir); err == nil {
+		var skillNames []string
+		for _, se := range skillEntries {
+			if se.IsDir() {
+				skillNames = append(skillNames, se.Name())
+			}
+		}
+		sort.Strings(skillNames)
+
+		if len(skillNames) > 0 {
+			b.WriteString("\n")
+			b.WriteString(theme.Primary().Bold(true).Render("In the latest backup"))
+			b.WriteString("\n")
+			const maxPreview = 20
+			show := skillNames
+			if len(show) > maxPreview {
+				show = show[:maxPreview]
+			}
+			for _, name := range show {
+				desc := readSkillDescription(filepath.Join(latestDir, name))
+				if desc != "" {
+					b.WriteString(lipgloss.NewStyle().Render("  " + name))
+					b.WriteString("\n")
+					b.WriteString(theme.Dim().Render("    " + truncateStr(desc, 60)))
+					b.WriteString("\n")
+				} else {
+					b.WriteString(lipgloss.NewStyle().Render("  " + name))
+					b.WriteString("\n")
+				}
+			}
+			if len(skillNames) > maxPreview {
+				b.WriteString(theme.Dim().Render(fmt.Sprintf("  ... and %d more", len(skillNames)-maxPreview)))
 				b.WriteString("\n")
 			}
 		}
@@ -839,68 +905,89 @@ func (m restoreTUIModel) renderVersionDetail(v backup.BackupVersion) string {
 	var b strings.Builder
 
 	row := func(label, value string) {
-		b.WriteString(tc.Label.Render(label))
-		b.WriteString(tc.Value.Render(value))
+		b.WriteString(theme.Dim().Width(10).Render(label))
+		b.WriteString(value)
 		b.WriteString("\n")
 	}
 
-	row("Date:    ", fmt.Sprintf("%s (%s)", v.Label, timeAgo(v.Timestamp)))
-	row("Skills:  ", fmt.Sprintf("%d", v.SkillCount))
-	row("Size:    ", formatBytes(v.TotalSize))
+	b.WriteString(theme.Primary().Bold(true).Render(v.Label))
+	b.WriteString("\n\n")
+	row("Taken", timeAgo(v.Timestamp))
+	row("Skills", fmt.Sprintf("%d", v.SkillCount))
+	if v.TotalSize >= 0 {
+		row("Size", formatBytes(v.TotalSize))
+	} else {
+		row("Size", theme.Dim().Render("calculating…"))
+	}
 
-	// Diff with current target
-	if t, ok := m.targets[m.selectedTarget]; ok {
-		added, removed, common := diffSkillSets(v.SkillNames, listDirNames(t.Path))
+	var diffPath string
+	if isAgentBackupEntry(m.selectedTarget) {
+		diffPath = resolveAgentBackupPath(m.targets, m.selectedTarget)
+	} else if t, ok := m.targets[m.selectedTarget]; ok {
+		diffPath = t.SkillsConfig().Path
+	}
+	if diffPath != "" {
+		added, removed, common := diffSkillSets(v.SkillNames, listDirNames(diffPath))
 		if len(added) > 0 || len(removed) > 0 {
 			b.WriteString("\n")
-			b.WriteString(tc.Separator.Render("── Diff vs current target ────────────"))
+			b.WriteString(theme.Primary().Bold(true).Render("Compared with the target now"))
 			b.WriteString("\n")
 			if len(common) > 0 {
-				row("Same:    ", fmt.Sprintf("%d skill(s)", len(common)))
+				row("Same", countNoun(len(common), "skill"))
 			}
 			if len(added) > 0 {
-				b.WriteString(tc.Label.Render("Restore: "))
-				b.WriteString(tc.Green.Render(fmt.Sprintf("+%d (in backup, not in target)", len(added))))
+				b.WriteString(theme.Dim().Width(10).Render("Brings"))
+				b.WriteString(theme.Success().Render(fmt.Sprintf("+%d", len(added))) + theme.Dim().Render(" in the backup, not in the target"))
 				b.WriteString("\n")
 				for _, name := range added {
-					b.WriteString(tc.Green.Render("  + " + name))
+					b.WriteString(theme.Success().Render("  + " + name))
 					b.WriteString("\n")
 				}
 			}
 			if len(removed) > 0 {
-				b.WriteString(tc.Label.Render("Remove:  "))
-				b.WriteString(tc.Red.Render(fmt.Sprintf("-%d (in target, not in backup)", len(removed))))
+				b.WriteString(theme.Dim().Width(10).Render("Removes"))
+				b.WriteString(theme.Danger().Render(fmt.Sprintf("-%d", len(removed))) + theme.Dim().Render(" in the target, not in the backup"))
 				b.WriteString("\n")
 				for _, name := range removed {
-					b.WriteString(tc.Red.Render("  - " + name))
+					b.WriteString(theme.Danger().Render("  - " + name))
 					b.WriteString("\n")
 				}
 			}
 		} else if len(common) > 0 {
 			b.WriteString("\n")
-			b.WriteString(tc.Dim.Render("  Backup matches current target"))
+			b.WriteString(theme.Success().Render("✓") + " Same skills as the target now")
 			b.WriteString("\n")
 		}
 	}
 
-	// Skill list with descriptions
+	// Skill list with descriptions (cap I/O at 20 skills)
 	if len(v.SkillNames) > 0 {
 		b.WriteString("\n")
-		b.WriteString(tc.Separator.Render("── Contents ──────────────────────────"))
+		b.WriteString(theme.Primary().Bold(true).Render("Contents"))
 		b.WriteString("\n")
-		for _, name := range v.SkillNames {
-			desc := readSkillDescription(filepath.Join(v.Dir, name))
-			files := listSkillFiles(filepath.Join(v.Dir, name))
-			b.WriteString(tc.Value.Render("  " + name))
+		const maxDetail = 20
+		for i, name := range v.SkillNames {
+			if i < maxDetail {
+				desc := readSkillDescription(filepath.Join(v.Dir, name))
+				files := listSkillFiles(filepath.Join(v.Dir, name))
+				b.WriteString(lipgloss.NewStyle().Render("  " + name))
+				b.WriteString("\n")
+				if desc != "" {
+					b.WriteString(theme.Dim().Render("    " + truncateStr(desc, 60)))
+					b.WriteString("\n")
+				}
+				if len(files) > 0 {
+					b.WriteString(theme.Dim().Render("    " + strings.Join(files, "  ")))
+					b.WriteString("\n")
+				}
+			} else {
+				b.WriteString(theme.Dim().Render("  " + name))
+				b.WriteString("\n")
+			}
+		}
+		if len(v.SkillNames) > maxDetail {
+			b.WriteString(theme.Dim().Render(fmt.Sprintf("  ... %d skill(s) above shown without details", len(v.SkillNames)-maxDetail)))
 			b.WriteString("\n")
-			if desc != "" {
-				b.WriteString(tc.Dim.Render("    " + truncateStr(desc, 60)))
-				b.WriteString("\n")
-			}
-			if len(files) > 0 {
-				b.WriteString(tc.Dim.Render("    " + strings.Join(files, "  ")))
-				b.WriteString("\n")
-			}
 		}
 	}
 
@@ -923,13 +1010,13 @@ func describeTargetState(path string) string {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return tc.Yellow.Render("not found")
+			return theme.Warning().Render("not found")
 		}
-		return tc.Red.Render("error")
+		return theme.Danger().Render("error")
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
+	if utils.IsLinkMode(path, info.Mode()) {
 		dest, _ := os.Readlink(path)
-		return tc.Cyan.Render("symlink → " + dest)
+		return theme.Accent().Render("symlink → " + dest)
 	}
 	entries, _ := os.ReadDir(path)
 	return fmt.Sprintf("directory (%d items)", len(entries))

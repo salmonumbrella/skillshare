@@ -10,6 +10,7 @@ type SkillEntryDTO struct {
 	Source  string
 	Tracked bool
 	Group   string
+	Branch  string
 }
 
 // FullName returns the full relative path for the skill entry.
@@ -55,12 +56,36 @@ type InstallContext interface {
 
 	// Mode returns "global" or "project".
 	Mode() string
+
+	// GitLabHosts returns extra hostnames to treat as GitLab instances.
+	GitLabHosts() []string
+
+	// AzureHosts returns extra hostnames to treat as Azure DevOps on-premises instances.
+	AzureHosts() []string
+
+	// CNBHosts returns extra hostnames to treat as CNB instances.
+	CNBHosts() []string
+
+	// GiteaHosts returns extra hostnames to treat as Gitea instances.
+	GiteaHosts() []string
 }
 
 // ConfigInstallResult summarises the outcome of InstallFromConfig.
 type ConfigInstallResult struct {
-	Installed       int
-	Skipped         int
-	InstalledSkills []string
-	FailedSkills    []string
+	Installed int
+	Skipped   int
+	// Tracked repos counted within Installed/Skipped, so the summary can tell
+	// a whole repo apart from a single skill.
+	InstalledRepos      int
+	InstalledRepoSkills int // skills inside InstalledRepos
+	SkippedRepos        int
+	InstalledSkills     []string
+	FailedSkills        []string
+	Failures            []SkillFailure // why each FailedSkills entry failed
+}
+
+// SkillFailure is one skill that failed to install and the reason.
+type SkillFailure struct {
+	Name string
+	Err  error
 }

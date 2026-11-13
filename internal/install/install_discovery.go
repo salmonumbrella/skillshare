@@ -6,12 +6,23 @@ import (
 	"path/filepath"
 	"strings"
 
+	"skillshare/internal/skillignore"
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/utils"
+	"skillshare/internal/validate"
 )
+
+// TargetDotDirs is the set of hidden directory names (e.g. ".claude", ".cursor")
+// to skip during skill discovery. Set by the CLI entrypoint from config data
+// to avoid a circular import between install and config packages.
+var TargetDotDirs map[string]bool
 
 func discoverFromGitWithProgressImpl(source *Source, onProgress ProgressCallback) (*DiscoveryResult, error) {
 	if !isGitInstalled() {
 		return nil, fmt.Errorf("git is not installed or not in PATH")
+	}
+	if err := resolveWebRef(source); err != nil {
+		return nil, err
 	}
 
 	// Clone to temp directory
@@ -21,20 +32,23 @@ func discoverFromGitWithProgressImpl(source *Source, onProgress ProgressCallback
 	}
 
 	repoPath := filepath.Join(tempDir, "repo")
-	if err := cloneRepo(source.CloneURL, repoPath, true, onProgress); err != nil {
-		os.RemoveAll(tempDir)
+	if err := cloneRepoForSource(source, repoPath, source.Branch, true, onProgress); err != nil {
+		cleanupTempRepo(tempDir)
 		return nil, fmt.Errorf("failed to clone repository: %w", err)
 	}
 
 	// Discover skills (include root to support single-skill-at-root repos)
-	skills := discoverSkills(repoPath, true)
+	skills := discoverSkillsByDirectory(repoPath, true)
 
-	// Fix root skill name: temp dir gives random name, use source.Name instead
-	for i := range skills {
-		if skills[i].Path == "." {
-			skills[i].Name = source.Name
-			break
-		}
+	// Use the source name rather than the temporary clone directory for the root.
+	applySkillInstallNames(skills, repoPath, source.Name)
+
+	// Discover agents (agents/ dir or pure agent repo fallback)
+	agents := discoverAgents(repoPath, len(skills) > 0)
+	skills, agents, err = constrainDiscoveryToExplicitSkill(source, skills, agents)
+	if err != nil {
+		cleanupTempRepo(tempDir)
+		return nil, err
 	}
 
 	commitHash, _ := getGitCommit(repoPath)
@@ -42,14 +56,49 @@ func discoverFromGitWithProgressImpl(source *Source, onProgress ProgressCallback
 	return &DiscoveryResult{
 		RepoPath:   tempDir,
 		Skills:     skills,
+		Agents:     agents,
 		Source:     source,
 		CommitHash: commitHash,
+		Warnings:   SubmoduleWarnings(repoPath, source.authEnv()),
 	}, nil
 }
 
 // discoverFromGitImpl is the non-progress variant used by the public facade.
 func discoverFromGitImpl(source *Source) (*DiscoveryResult, error) {
 	return discoverFromGitWithProgressImpl(source, nil)
+}
+
+func discoverLocalImpl(source *Source) (*DiscoveryResult, error) {
+	if source == nil {
+		return nil, fmt.Errorf("source is required")
+	}
+	if source.Type != SourceTypeLocalPath {
+		return nil, fmt.Errorf("source is not a local path")
+	}
+
+	info, err := os.Stat(source.Path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot access source path: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("source path is not a directory: %s", source.Path)
+	}
+
+	skills := discoverSkillsByDirectory(source.Path, true)
+	applySkillInstallNames(skills, source.Path, source.Name)
+
+	agents := discoverAgents(source.Path, len(skills) > 0)
+	skills, agents, err = constrainDiscoveryToExplicitSkill(source, skills, agents)
+	if err != nil {
+		return nil, err
+	}
+
+	return &DiscoveryResult{
+		RepoPath: source.Path,
+		Skills:   skills,
+		Agents:   agents,
+		Source:   source,
+	}, nil
 }
 
 // resolveSubdir resolves a subdirectory path within a cloned repo.
@@ -76,7 +125,7 @@ func resolveSubdir(repoPath, subdir string) (string, error) {
 	skills := discoverSkills(repoPath, false) // exclude root
 	var candidates []string
 	for _, sk := range skills {
-		if sk.Name == baseName {
+		if filepath.Base(sk.Path) == baseName {
 			candidates = append(candidates, sk.Path)
 		}
 	}
@@ -92,54 +141,122 @@ func resolveSubdir(repoPath, subdir string) (string, error) {
 	}
 }
 
-// readSkillIgnore reads a .skillignore file from the given directory.
-// Returns a list of patterns (exact names or trailing-wildcard like "prefix-*").
-// Lines starting with # and empty lines are skipped.
-func readSkillIgnore(dir string) []string {
-	data, err := os.ReadFile(filepath.Join(dir, ".skillignore"))
-	if err != nil {
-		return nil
+func constrainDiscoveryToExplicitSkill(source *Source, skills []SkillInfo, agents []AgentInfo) ([]SkillInfo, []AgentInfo, error) {
+	if source == nil || !source.TargetsExplicitSkill() {
+		return skills, agents, nil
 	}
-	var patterns []string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+
+	for _, skill := range skills {
+		if skill.Path == "." {
+			return []SkillInfo{skill}, nil, nil
 		}
-		patterns = append(patterns, line)
 	}
-	return patterns
+
+	return nil, nil, fmt.Errorf("explicit skill target does not resolve to a root SKILL.md: %s", source.Raw)
 }
 
-// matchSkillIgnore returns true if skillPath matches any pattern.
-// Matching is path-based: exact path, group prefix (pattern matches a
-// directory prefix of skillPath), and trailing wildcard ("prefix-*").
-func matchSkillIgnore(skillPath string, patterns []string) bool {
-	for _, p := range patterns {
-		if strings.HasSuffix(p, "*") {
-			if strings.HasPrefix(skillPath, strings.TrimSuffix(p, "*")) {
-				return true
-			}
-		} else if skillPath == p || strings.HasPrefix(skillPath, p+"/") {
-			return true
+// DefaultSkillName gives generic container directories a meaningful name,
+// while preserving established directory names and rejecting unsafe frontmatter.
+func DefaultSkillName(dir, fallback string) string {
+	if !validate.IsLikelySkillsPath(fallback) {
+		return fallback
+	}
+	name, err := utils.ParseSkillName(dir)
+	if err != nil {
+		return fallback
+	}
+	name = strings.ToLower(strings.Join(strings.Fields(name), "-"))
+	if validate.SkillName(name) != nil {
+		return fallback
+	}
+	return name
+}
+
+// ExistingSkillInstallName preserves a recorded destination for source-based updates.
+func ExistingSkillInstallName(sourceDir string, source *Source, skill SkillInfo, opts InstallOptions) (string, error) {
+	if !opts.Update || opts.Name != "" {
+		return skill.Name, nil
+	}
+	fullSource := buildDiscoverySkillSource(source, skill.Path)
+	store := LoadMetadataOrNew(sourceDir)
+	var existing string
+	for _, key := range store.List() {
+		entry := store.Get(key)
+		if entry.Tracked || entry.EffectiveKind() != "skill" || !isDiscoverySkillSource(entry, source, skill.Path) {
+			continue
+		}
+		rel := KeyToRelPath(key, entry)
+		if filepath.Dir(rel) != filepath.Clean(opts.Into) {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(sourceDir, rel, "SKILL.md")); err != nil {
+			continue
+		}
+		if existing != "" {
+			return "", fmt.Errorf("multiple installed skills match source %s; use --name to choose the update destination", fullSource)
+		}
+		existing = filepath.Base(rel)
+	}
+	if existing != "" {
+		return existing, nil
+	}
+	destPath := filepath.Join(sourceDir, opts.Into, skill.Name)
+	if !opts.Force {
+		if _, err := os.Stat(destPath); err == nil && !dirIsEmpty(destPath) {
+			return "", fmt.Errorf("already exists at %s; use --force to overwrite", destPath)
 		}
 	}
-	return false
+	return skill.Name, nil
 }
 
 // discoverSkills finds directories containing SKILL.md
 // If includeRoot is true, root-level SKILL.md is also included (with Path=".")
 func discoverSkills(repoPath string, includeRoot bool) []SkillInfo {
+	skills := discoverSkillsByDirectory(repoPath, includeRoot)
+	applySkillInstallNames(skills, repoPath, filepath.Base(repoPath))
+	return skills
+}
+
+func applySkillInstallNames(skills []SkillInfo, repoPath, rootName string) {
+	directoryNames := make(map[string]int)
+	installNames := make(map[string]int)
+	fallbacks := make([]string, len(skills))
+	for i := range skills {
+		name := filepath.Base(skills[i].Path)
+		if skills[i].Path == "." {
+			name = rootName
+		}
+		fallbacks[i] = name
+		directoryNames[strings.ToLower(name)]++
+		skills[i].Name = DefaultSkillName(filepath.Join(repoPath, skills[i].Path), name)
+		installNames[strings.ToLower(skills[i].Name)]++
+	}
+	for i := range skills {
+		name := skills[i].Name
+		// A new frontmatter name must not overwrite another discovered skill.
+		if name != fallbacks[i] && (directoryNames[strings.ToLower(name)] > 0 || installNames[strings.ToLower(name)] > 1) {
+			skills[i].Name = fallbacks[i]
+		}
+	}
+}
+
+func discoverSkillsByDirectory(repoPath string, includeRoot bool) []SkillInfo {
 	var skills []SkillInfo
 
-	filepath.Walk(repoPath, func(path string, info os.FileInfo, err error) error {
+	visit := func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
 
-		// Skip .git directory
-		if info.IsDir() && info.Name() == ".git" {
-			return filepath.SkipDir
+		// Skip .git and known target dotdirs (.claude, .cursor, .skillshare, etc.)
+		// to avoid counting target-synced copies as source skills. The walk root
+		// is exempt: it was requested explicitly (e.g. `install repo/.claude`),
+		// so filtering it would discover nothing at all.
+		if info.IsDir() {
+			name := info.Name()
+			if name == ".git" || (path != repoPath && TargetDotDirs[name]) {
+				return filepath.SkipDir
+			}
 		}
 
 		// Check if this is a SKILL.md file
@@ -169,14 +286,21 @@ func discoverSkills(repoPath string, includeRoot bool) []SkillInfo {
 		}
 
 		return nil
-	})
+	}
+	filepath.Walk(repoPath, visit)
+	if len(skills) == 0 {
+		if dir, ok := sourcewalk.AgentsSkillsDir(repoPath, TargetDotDirs); ok {
+			filepath.Walk(dir, visit)
+		}
+	}
 
-	// Apply .skillignore filtering
-	patterns := readSkillIgnore(repoPath)
-	if len(patterns) > 0 {
+	// Apply .skillignore filtering.
+	// Skill paths are directories (they contain SKILL.md), so pass isDir=true.
+	matcher := skillignore.ReadMatcher(repoPath)
+	if matcher.HasRules() {
 		filtered := skills[:0]
 		for _, s := range skills {
-			if !matchSkillIgnore(s.Path, patterns) {
+			if !matcher.Match(s.Path, true) {
 				filtered = append(filtered, s)
 			}
 		}
@@ -184,6 +308,89 @@ func discoverSkills(repoPath string, includeRoot bool) []SkillInfo {
 	}
 
 	return skills
+}
+
+// discoverAgents finds .md files in an agents/ convention directory.
+// Also detects "pure agent repos" — repos with no SKILL.md and no agents/ dir
+// but with .md files at root (per D5 rule 4).
+func discoverAgents(repoPath string, hasSkills bool) []AgentInfo {
+	var agents []AgentInfo
+
+	// Rule 2: Check agents/ convention directory
+	agentsDir := filepath.Join(repoPath, "agents")
+	if info, err := os.Stat(agentsDir); err == nil && info.IsDir() {
+		agents = append(agents, scanAgentDir(repoPath, agentsDir)...)
+		return agents
+	}
+
+	// Rule 4: Pure agent repo fallback — no skills, no agents/ dir, root has .md files
+	if !hasSkills {
+		agents = append(agents, scanAgentDir(repoPath, repoPath)...)
+	}
+
+	return agents
+}
+
+// scanAgentDir scans a directory for .md agent files, excluding conventional files.
+func scanAgentDir(repoRoot, dir string) []AgentInfo {
+	var agents []AgentInfo
+
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+
+		if info.IsDir() {
+			name := info.Name()
+			// Same walk-root exemption as discoverSkills: an explicitly
+			// requested dot-dir must still be scanned.
+			if name == ".git" || (path != dir && TargetDotDirs[name]) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if !strings.HasSuffix(strings.ToLower(info.Name()), ".md") {
+			return nil
+		}
+
+		// Skip conventional excludes
+		if conventionalAgentExcludes[info.Name()] {
+			return nil
+		}
+
+		// Skip hidden files
+		if strings.HasPrefix(info.Name(), ".") {
+			return nil
+		}
+
+		relPath, relErr := filepath.Rel(repoRoot, path)
+		if relErr != nil {
+			return nil
+		}
+		relPath = strings.ReplaceAll(relPath, "\\", "/")
+
+		name := strings.TrimSuffix(info.Name(), ".md")
+
+		agents = append(agents, AgentInfo{
+			Name:     name,
+			Path:     relPath,
+			FileName: info.Name(),
+		})
+
+		return nil
+	})
+
+	return agents
+}
+
+var conventionalAgentExcludes = map[string]bool{
+	"README.md":    true,
+	"CHANGELOG.md": true,
+	"LICENSE.md":   true,
+	"HISTORY.md":   true,
+	"SECURITY.md":  true,
+	"SKILL.md":     true,
 }
 
 // DiscoverFromGitSubdir clones a repo and discovers skills within a subdirectory
@@ -197,6 +404,13 @@ func discoverFromGitSubdirWithProgressImpl(source *Source, onProgress ProgressCa
 	if !source.HasSubdir() {
 		return nil, fmt.Errorf("source has no subdirectory specified")
 	}
+	if err := resolveWebRef(source); err != nil {
+		return nil, err
+	}
+	if !source.HasSubdir() {
+		// The whole path was the ref, e.g. tree/feature/x.
+		return discoverFromGitWithProgressImpl(source, onProgress)
+	}
 
 	// Prepare temporary repo directory
 	tempDir, err := os.MkdirTemp("", "skillshare-discover-*")
@@ -208,68 +422,150 @@ func discoverFromGitSubdirWithProgressImpl(source *Source, onProgress ProgressCa
 	var commitHash string
 	var subdirPath string
 
+	// The Contents API paths below ignore any branch, tag or commit.
+	hasRef := source.ref() != ""
+
 	// Fast path 1: sparse checkout (preferred for speed if git is modern)
 	// Works for GitHub and non-GitHub hosts.
 	if gitSupportsSparseCheckout() {
-		if err := sparseCloneSubdir(source.CloneURL, source.Subdir, repoPath, authEnv(source.CloneURL), onProgress); err == nil {
+		if err := sparseCloneSubdir(source.CloneURL, source.Subdir, repoPath, source.ref(), source.authEnv(), onProgress); err == nil {
+			if err := submoduleError(repoPath, source.Subdir, source.authEnv()); err != nil {
+				cleanupTempRepo(tempDir)
+				return nil, err
+			}
 			subdirPath = filepath.Join(repoPath, source.Subdir)
 			if info, statErr := os.Stat(subdirPath); statErr == nil && info.IsDir() {
+				source.recordCommit(repoPath)
 				if hash, hashErr := getGitCommit(repoPath); hashErr == nil {
 					commitHash = hash
 				}
 				skills := discoverSkills(subdirPath, true)
+				agents := discoverAgents(subdirPath, len(skills) > 0)
+				skills, agents, err = constrainDiscoveryToExplicitSkill(source, skills, agents)
+				if err != nil {
+					cleanupTempRepo(tempDir)
+					return nil, err
+				}
 				return &DiscoveryResult{
 					RepoPath:   tempDir,
 					Skills:     skills,
+					Agents:     agents,
 					Source:     source,
 					CommitHash: commitHash,
 					Warnings:   warnings,
 				}, nil
 			}
 			warnings = append(warnings, "sparse checkout discovery fallback: subdirectory missing after checkout")
-			_ = os.RemoveAll(repoPath)
+			cleanupTempRepo(repoPath)
 			subdirPath = ""
 		} else {
 			warnings = append(warnings, fmt.Sprintf("sparse checkout discovery fallback: %v", err))
-			_ = os.RemoveAll(repoPath)
+			cleanupTempRepo(repoPath)
 			subdirPath = ""
 		}
 	}
 
 	// Fast path 2: GitHub/GHE Contents API
 	// Fallback for when sparse checkout is unavailable or fails.
-	if subdirPath == "" && isGitHubAPISource(source) {
+	if subdirPath == "" && !hasRef && isGitHubAPISource(source) {
 		owner, repo := source.GitHubOwner(), source.GitHubRepo()
 		subdirPath = filepath.Join(repoPath, source.Subdir)
 		hash, dlErr := downloadGitHubDir(owner, repo, source.Subdir, subdirPath, source, onProgress)
 		if dlErr == nil {
 			commitHash = hash
 			skills := discoverSkills(subdirPath, true)
+			agents := discoverAgents(subdirPath, len(skills) > 0)
+			skills, agents, err = constrainDiscoveryToExplicitSkill(source, skills, agents)
+			if err != nil {
+				cleanupTempRepo(tempDir)
+				return nil, err
+			}
 			return &DiscoveryResult{
 				RepoPath:   tempDir,
 				Skills:     skills,
+				Agents:     agents,
 				Source:     source,
 				CommitHash: commitHash,
 			}, nil
 		}
 		warnings = append(warnings, fmt.Sprintf("GitHub API discovery fallback: %v", dlErr))
+		cleanupTempRepo(repoPath)
+		subdirPath = ""
+	}
+
+	// Fast path 2b: CNB Contents API
+	if subdirPath == "" && !hasRef && isCNBAPISource(source) {
+		repo := cnbRepoPath(source.CloneURL)
+		subdirPath = filepath.Join(repoPath, source.Subdir)
+		hash, dlErr := downloadCNBDir(repo, source.Subdir, subdirPath, source, onProgress)
+		if dlErr == nil {
+			commitHash = hash
+			skills := discoverSkills(subdirPath, true)
+			agents := discoverAgents(subdirPath, len(skills) > 0)
+			skills, agents, err = constrainDiscoveryToExplicitSkill(source, skills, agents)
+			if err != nil {
+				_ = os.RemoveAll(tempDir)
+				return nil, err
+			}
+			return &DiscoveryResult{
+				RepoPath:   tempDir,
+				Skills:     skills,
+				Agents:     agents,
+				Source:     source,
+				CommitHash: commitHash,
+				Warnings:   warnings,
+			}, nil
+		}
+		warnings = append(warnings, fmt.Sprintf("CNB API discovery fallback: %v", dlErr))
+		_ = os.RemoveAll(repoPath)
+		subdirPath = ""
+	}
+
+	// Fast path 2b: Gitea Contents API
+	if subdirPath == "" && !hasRef && isGiteaAPISource(source) {
+		owner, repo := giteaOwnerRepo(source.CloneURL)
+		subdirPath = filepath.Join(repoPath, source.Subdir)
+		hash, dlErr := downloadGiteaDir(owner, repo, source.Subdir, subdirPath, source, onProgress)
+		if dlErr == nil {
+			commitHash = hash
+			skills := discoverSkills(subdirPath, true)
+			agents := discoverAgents(subdirPath, len(skills) > 0)
+			skills, agents, err = constrainDiscoveryToExplicitSkill(source, skills, agents)
+			if err != nil {
+				_ = os.RemoveAll(tempDir)
+				return nil, err
+			}
+			return &DiscoveryResult{
+				RepoPath:   tempDir,
+				Skills:     skills,
+				Agents:     agents,
+				Source:     source,
+				CommitHash: commitHash,
+				Warnings:   warnings,
+			}, nil
+		}
+		warnings = append(warnings, fmt.Sprintf("Gitea API discovery fallback: %v", dlErr))
 		_ = os.RemoveAll(repoPath)
 		subdirPath = ""
 	}
 
 	// Fallback: full clone + fuzzy subdir resolution
-	_ = os.RemoveAll(repoPath)
+	cleanupTempRepo(repoPath)
 	if onProgress != nil {
 		onProgress("Cloning repository...")
 	}
-	if err := cloneRepo(source.CloneURL, repoPath, true, onProgress); err != nil {
-		os.RemoveAll(tempDir)
+	if err := cloneRepoForSource(source, repoPath, source.Branch, true, onProgress); err != nil {
+		cleanupTempRepo(tempDir)
 		return nil, fmt.Errorf("failed to clone repository: %w", err)
+	}
+	if err := submoduleError(repoPath, source.Subdir, source.authEnv()); err != nil {
+		cleanupTempRepo(tempDir)
+		return nil, err
 	}
 
 	resolved, err := resolveSubdir(repoPath, source.Subdir)
 	if err != nil {
-		os.RemoveAll(tempDir)
+		cleanupTempRepo(tempDir)
 		return nil, err
 	}
 	if resolved != source.Subdir {
@@ -282,9 +578,16 @@ func discoverFromGitSubdirWithProgressImpl(source *Source, onProgress ProgressCa
 	}
 
 	skills := discoverSkills(subdirPath, true)
+	agents := discoverAgents(subdirPath, len(skills) > 0)
+	skills, agents, err = constrainDiscoveryToExplicitSkill(source, skills, agents)
+	if err != nil {
+		cleanupTempRepo(tempDir)
+		return nil, err
+	}
 	return &DiscoveryResult{
 		RepoPath:   tempDir,
 		Skills:     skills,
+		Agents:     agents,
 		Source:     source,
 		CommitHash: commitHash,
 		Warnings:   warnings,
@@ -296,12 +599,20 @@ func discoverFromGitSubdirImpl(source *Source) (*DiscoveryResult, error) {
 	return discoverFromGitSubdirWithProgressImpl(source, nil)
 }
 
-// CleanupDiscovery removes the temporary directory from discovery
+// CleanupDiscovery removes the temporary directory created for git-based
+// discovery (clone under RepoPath). It only runs when Source is known to be
+// a git remote; local paths, missing source metadata, and other types are
+// skipped so RepoPath is never treated as disposable unless it came from a
+// git clone.
 
 func cleanupDiscoveryImpl(result *DiscoveryResult) {
-	if result != nil && result.RepoPath != "" {
-		os.RemoveAll(result.RepoPath)
+	if result == nil || result.RepoPath == "" || result.Source == nil {
+		return
 	}
+	if !result.Source.IsGit() {
+		return
+	}
+	cleanupTempRepo(result.RepoPath)
 }
 
 // InstallFromDiscovery installs a skill from a discovered repository

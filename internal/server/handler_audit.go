@@ -1,15 +1,18 @@
 package server
 
 import (
-	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"skillshare/internal/audit"
+	"skillshare/internal/install"
+	"skillshare/internal/resource"
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/sync"
-	"skillshare/internal/utils"
 )
 
 type auditFindingResponse struct {
@@ -26,9 +29,15 @@ type auditFindingResponse struct {
 	Category    string  `json:"category,omitempty"`
 	Confidence  float64 `json:"confidence,omitempty"`
 	Fingerprint string  `json:"fingerprint,omitempty"`
+
+	SeverityContext string `json:"severityContext,omitempty"`
+	Acknowledged    bool   `json:"acknowledged,omitempty"` // accepted earlier with --force; does not block
 }
 
 type auditResultResponse struct {
+	BinaryFiles    int                    `json:"binaryFiles"`
+	SkippedFiles   int                    `json:"skippedFiles"`
+	OversizedFiles int                    `json:"oversizedFiles"`
 	SkillName      string                 `json:"skillName"`
 	Findings       []auditFindingResponse `json:"findings"`
 	RiskScore      int                    `json:"riskScore"`
@@ -40,9 +49,13 @@ type auditResultResponse struct {
 	AuditableBytes int64                  `json:"auditableBytes"`
 	Analyzability  float64                `json:"analyzability"`
 	TierProfile    audit.TierProfile      `json:"tierProfile"`
+	Kind           string                 `json:"kind,omitempty"`
 }
 
 type auditSummary struct {
+	BinaryFiles      int            `json:"binaryFiles"`
+	SkippedFiles     int            `json:"skippedFiles"`
+	OversizedFiles   int            `json:"oversizedFiles"`
 	Total            int            `json:"total"`
 	Passed           int            `json:"passed"`
 	Warning          int            `json:"warning"`
@@ -52,6 +65,7 @@ type auditSummary struct {
 	Medium           int            `json:"medium"`
 	Low              int            `json:"low"`
 	Info             int            `json:"info"`
+	Accepted         int            `json:"accepted,omitempty"` // accepted earlier with --force; left out of the severity counts
 	Threshold        string         `json:"threshold"`
 	RiskScore        int            `json:"riskScore"`
 	RiskLabel        string         `json:"riskLabel"`
@@ -67,10 +81,46 @@ type skillEntry struct {
 	path string
 }
 
-// discoverAuditSkills discovers and deduplicates skills for audit scanning.
-func discoverAuditSkills(source string) ([]skillEntry, error) {
-	discovered, err := sync.DiscoverSourceSkills(source)
+// discoverAuditAgents discovers agents (individual .md files) for audit scanning.
+func discoverAuditAgents(source string) ([]skillEntry, error) {
+	if source == "" {
+		return []skillEntry{}, nil
+	}
+	if _, err := os.Stat(source); err != nil {
+		if os.IsNotExist(err) {
+			return []skillEntry{}, nil
+		}
+		return nil, err
+	}
+
+	discovered, err := resource.AgentKind{}.Discover(source)
 	if err != nil {
+		return nil, err
+	}
+	var agents []skillEntry
+	for _, d := range discovered {
+		agents = append(agents, skillEntry{name: d.FlatName, path: d.AbsPath})
+	}
+	return agents, nil
+}
+
+// discoverAuditSkills discovers and deduplicates skills for audit scanning.
+func discoverAuditSkills(source string, walk sourcewalk.Options) ([]skillEntry, error) {
+	if source == "" {
+		return []skillEntry{}, nil
+	}
+	if _, err := os.Stat(source); err != nil {
+		if os.IsNotExist(err) {
+			return []skillEntry{}, nil
+		}
+		return nil, err
+	}
+
+	discovered, err := sync.DiscoverSourceSkills(source, walk)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []skillEntry{}, nil
+		}
 		return nil, err
 	}
 
@@ -83,18 +133,6 @@ func discoverAuditSkills(source string) ([]skillEntry, error) {
 		}
 		seen[d.SourcePath] = true
 		skills = append(skills, skillEntry{d.FlatName, d.SourcePath})
-	}
-
-	entries, _ := os.ReadDir(source)
-	for _, e := range entries {
-		if !e.IsDir() || utils.IsHidden(e.Name()) {
-			continue
-		}
-		p := filepath.Join(source, e.Name())
-		if !seen[p] {
-			seen[p] = true
-			skills = append(skills, skillEntry{e.Name(), p})
-		}
 	}
 
 	return skills, nil
@@ -110,7 +148,10 @@ type auditAggregation struct {
 }
 
 // processAuditResults aggregates scan outputs into results, summary, and log args.
-func processAuditResults(skills []skillEntry, scanned []audit.ScanOutput, policy audit.Policy) auditAggregation {
+// projectRoot selects which audit-rules.yaml layers apply to cross-skill findings
+// ("" = global mode). source is the root whose .metadata.json records the
+// findings accepted earlier with --force.
+func processAuditResults(skills []skillEntry, scanned []audit.ScanOutput, policy audit.Policy, projectRoot, source string) auditAggregation {
 	threshold := policy.Threshold
 	var results []auditResultResponse
 	var rawResults []*audit.Result
@@ -141,6 +182,7 @@ func processAuditResults(skills []skillEntry, scanned []audit.ScanOutput, policy
 		}
 		result := se.Result
 		result.Threshold = threshold
+		install.ApplyAcceptedFindings(source, result.ScanTarget, result)
 		result.IsBlocked = result.HasSeverityAtOrAbove(threshold)
 
 		rawResults = append(rawResults, result)
@@ -157,7 +199,8 @@ func processAuditResults(skills []skillEntry, scanned []audit.ScanOutput, policy
 			warningSkills = append(warningSkills, result.SkillName)
 		}
 
-		c, h, m, l, i := result.CountBySeverityAll()
+		c, h, m, l, i, accepted := result.CountOpenBySeverity()
+		summary.Accepted += accepted
 		criticalCount += c
 		highCount += h
 		mediumCount += m
@@ -181,6 +224,9 @@ func processAuditResults(skills []skillEntry, scanned []audit.ScanOutput, policy
 			}
 		}
 		sumAnalyzability += result.Analyzability
+		summary.BinaryFiles += result.BinaryFiles
+		summary.SkippedFiles += result.SkippedFiles
+		summary.OversizedFiles += result.OversizedFiles
 	}
 
 	status := "ok"
@@ -223,6 +269,9 @@ func processAuditResults(skills []skillEntry, scanned []audit.ScanOutput, policy
 		"risk_label":  summary.RiskLabel,
 		"scan_errors": scanErrors,
 	}
+	if summary.Accepted > 0 {
+		args["accepted"] = summary.Accepted
+	}
 	if len(failedSkills) > 0 {
 		args["failed_skills"] = failedSkills
 	}
@@ -236,7 +285,11 @@ func processAuditResults(skills []skillEntry, scanned []audit.ScanOutput, policy
 		args["info_skills"] = infoSkills
 	}
 	// Cross-skill analysis (after summary so counts are unaffected).
-	if xr := audit.CrossSkillAnalysis(rawResults); xr != nil {
+	disabled := audit.DisabledRuleIDs()
+	if projectRoot != "" {
+		disabled = audit.DisabledRuleIDsForProject(projectRoot)
+	}
+	if xr := audit.CrossSkillAnalysis(rawResults, disabled); xr != nil {
 		results = append(results, toAuditResponse(xr))
 	}
 
@@ -249,51 +302,139 @@ func processAuditResults(skills []skillEntry, scanned []audit.ScanOutput, policy
 	}
 }
 
-func (s *Server) handleAuditAll(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	policy := s.auditPolicy()
+// resolveAuditSource returns the source directory, result kind label, and whether agents are being scanned.
+func (s *Server) resolveAuditSource(r *http.Request) (string, string, bool) {
+	kind := r.URL.Query().Get("kind")
+	if kind == "agents" {
+		return s.agentsSource(), "agent", true
+	}
+	return s.cfg.EffectiveSkillsSource(), "skill", false
+}
 
-	skills, err := discoverAuditSkills(s.cfg.Source)
+func (s *Server) handleAuditAll(w http.ResponseWriter, r *http.Request) {
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
+	source, resultKind, isAgents := s.resolveAuditSource(r)
+	policy := s.auditPolicy()
+	projectRoot := s.projectRoot
+	cfgPath := s.configPath()
+	s.mu.RUnlock()
+
+	isProjectMode := projectRoot != ""
+
+	start := time.Now()
+
+	walk := s.skillsWalk()
+	var skills []skillEntry
+	var err error
+	if isAgents {
+		skills, err = discoverAuditAgents(source)
+	} else {
+		skills, err = discoverAuditSkills(source, walk)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	projectRoot := s.projectRoot
-	if !s.IsProjectMode() {
-		projectRoot = ""
+	auditProjectRoot := projectRoot
+	if !isProjectMode {
+		auditProjectRoot = ""
 	}
-	scanned := audit.ParallelScan(skillsToAuditInputs(skills), projectRoot, nil, nil)
+	var inputs []audit.SkillInput
+	if isAgents {
+		inputs = make([]audit.SkillInput, len(skills))
+		for i, s := range skills {
+			inputs[i] = audit.SkillInput{Name: s.name, Path: s.path, IsFile: true}
+		}
+	} else {
+		inputs = skillsToAuditInputs(skills)
+	}
+	scanned := audit.ParallelScan(inputs, auditProjectRoot, nil, nil, walk.Follow)
 
-	agg := processAuditResults(skills, scanned, policy)
-	s.writeAuditLog(agg.Status, start, agg.LogArgs, agg.Message)
+	agg := processAuditResults(skills, scanned, policy, auditProjectRoot, source)
+	for i := range agg.Results {
+		agg.Results[i].Kind = resultKind
+	}
+	writeAuditLogTo(cfgPath, agg.Status, start, agg.LogArgs, agg.Message)
 
-	writeJSON(w, map[string]any{
+	writeJSON(w, withSourceLinkStatus(map[string]any{
 		"results": agg.Results,
 		"summary": agg.Summary,
-	})
+	}, walk))
+}
+
+// withSourceLinkStatus adds the source links walk did not follow, as
+// `skillshare audit --format json` does, so the dashboard does not show a
+// partial scan as a full one.
+func withSourceLinkStatus(payload map[string]any, walk sourcewalk.Options) map[string]any {
+	if warnings := sync.SourceLinkWarnings(walk, false); len(warnings) > 0 {
+		payload["warnings"] = warnings
+	}
+	if walk.Follow.Incomplete() {
+		payload["incomplete"] = true
+	}
+	return payload
 }
 
 func (s *Server) handleAuditSkill(w http.ResponseWriter, r *http.Request) {
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
+	source := s.cfg.EffectiveSkillsSource()
+	agentsSource := s.agentsSource()
+	policy := s.auditPolicy()
+	projectRoot := s.projectRoot
+	cfgPath := s.configPath()
+	s.mu.RUnlock()
+
+	isProjectMode := projectRoot != ""
+
 	start := time.Now()
 	name := r.PathValue("name")
-	policy := s.auditPolicy()
+	kind := r.URL.Query().Get("kind")
 	threshold := policy.Threshold
-	skillPath := filepath.Join(s.cfg.Source, name)
-
-	if _, err := os.Stat(skillPath); os.IsNotExist(err) {
-		writeError(w, http.StatusNotFound, "skill not found: "+name)
-		return
-	}
 
 	var (
 		result *audit.Result
 		err    error
 	)
-	if s.IsProjectMode() {
-		result, err = audit.ScanSkillForProject(skillPath, s.projectRoot)
+
+	if kind == "agent" {
+		// Resolve agent file path via discovery
+		var agentPath string
+		if agentsSource != "" {
+			discovered, _ := resource.AgentKind{}.Discover(agentsSource)
+			for _, d := range discovered {
+				if d.FlatName == name || d.Name == name {
+					agentPath = d.AbsPath
+					break
+				}
+			}
+		}
+		if agentPath == "" {
+			writeError(w, http.StatusNotFound, "agent not found: "+name)
+			return
+		}
+		if isProjectMode {
+			result, err = audit.ScanFileForProject(agentPath, projectRoot)
+		} else {
+			result, err = audit.ScanFile(agentPath)
+		}
 	} else {
-		result, err = audit.ScanSkill(skillPath)
+		if !validSourceName(name) {
+			writeError(w, http.StatusBadRequest, "invalid skill name: "+name)
+			return
+		}
+		skillPath := filepath.Join(source, name)
+		if _, statErr := os.Stat(skillPath); os.IsNotExist(statErr) {
+			writeError(w, http.StatusNotFound, "skill not found: "+name)
+			return
+		}
+		if isProjectMode {
+			result, err = audit.ScanSkillForProject(skillPath, projectRoot, s.skillsWalk().Follow)
+		} else {
+			result, err = audit.ScanSkillWithFollow(skillPath, s.skillsWalk().Follow)
+		}
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -301,9 +442,14 @@ func (s *Server) handleAuditSkill(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result.Threshold = threshold
+	if kind == "agent" {
+		install.ApplyAcceptedFindings(agentsSource, result.ScanTarget, result)
+	} else {
+		install.ApplyAcceptedFindings(source, result.ScanTarget, result)
+	}
 	result.IsBlocked = result.HasSeverityAtOrAbove(threshold)
 
-	c, h, m, l, i := result.CountBySeverityAll()
+	c, h, m, l, i, accepted := result.CountOpenBySeverity()
 	warningCount := 0
 	failedCount := 0
 	failedSkills := []string{}
@@ -349,6 +495,9 @@ func (s *Server) handleAuditSkill(w http.ResponseWriter, r *http.Request) {
 		"risk_score": result.RiskScore,
 		"risk_label": result.RiskLabel,
 	}
+	if accepted > 0 {
+		args["accepted"] = accepted
+	}
 	if len(failedSkills) > 0 {
 		args["failed_skills"] = failedSkills
 	}
@@ -361,7 +510,7 @@ func (s *Server) handleAuditSkill(w http.ResponseWriter, r *http.Request) {
 	if len(infoSkills) > 0 {
 		args["info_skills"] = infoSkills
 	}
-	s.writeAuditLog(status, start, args, msg)
+	writeAuditLogTo(cfgPath, status, start, args, msg)
 
 	singleCats := result.CountByCategory()
 	var byCat map[string]int
@@ -380,10 +529,14 @@ func (s *Server) handleAuditSkill(w http.ResponseWriter, r *http.Request) {
 			Medium:           m,
 			Low:              l,
 			Info:             i,
+			Accepted:         accepted,
 			Threshold:        threshold,
 			RiskScore:        result.RiskScore,
 			RiskLabel:        result.RiskLabel,
 			AvgAnalyzability: result.Analyzability,
+			BinaryFiles:      result.BinaryFiles,
+			SkippedFiles:     result.SkippedFiles,
+			OversizedFiles:   result.OversizedFiles,
 			ByCategory:       byCat,
 			PolicyProfile:    string(policy.Profile),
 			PolicyDedupe:     string(policy.DedupeMode),
@@ -396,6 +549,69 @@ func boolToInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+var auditProfiles = []string{string(audit.ProfileDefault), string(audit.ProfileStrict), string(audit.ProfilePermissive)}
+
+// handleAuditPolicy — PATCH /api/audit/policy
+// Sets the severity at which install and sync refuse a resource, and the profile
+// that presets how strict a scan is. Each field is optional; only what is sent changes.
+func (s *Server) handleAuditPolicy(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
+	var body struct {
+		BlockThreshold string `json:"blockThreshold"`
+		Profile        string `json:"profile"`
+	}
+	if err := decodeJSON(w, r, &body, defaultJSONBodyLimit); err != nil {
+		if !errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		}
+		return
+	}
+	if body.BlockThreshold == "" && body.Profile == "" {
+		writeError(w, http.StatusBadRequest, "blockThreshold or profile is required")
+		return
+	}
+	var threshold string
+	if body.BlockThreshold != "" {
+		var err error
+		if threshold, err = audit.NormalizeThreshold(body.BlockThreshold); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid blockThreshold: "+err.Error())
+			return
+		}
+	}
+	if body.Profile != "" && !slices.Contains(auditProfiles, body.Profile) {
+		writeError(w, http.StatusBadRequest, "invalid profile: "+body.Profile)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg := &s.cfg.Audit
+	if s.IsProjectMode() {
+		cfg = &s.projectCfg.Audit
+	}
+	if threshold != "" {
+		cfg.BlockThreshold = threshold
+	}
+	if body.Profile != "" {
+		cfg.Profile = body.Profile
+	}
+	if err := s.saveConfig(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to save config: "+err.Error())
+		return
+	}
+
+	args := map[string]any{"scope": "ui"}
+	if threshold != "" {
+		args["block_threshold"] = threshold
+	}
+	if body.Profile != "" {
+		args["profile"] = body.Profile
+	}
+	s.writeOpsLog("audit-policy", "ok", start, args, "")
+	writeJSON(w, map[string]any{"threshold": cfg.BlockThreshold, "profile": cfg.Profile})
 }
 
 func (s *Server) auditPolicy() audit.Policy {
@@ -434,7 +650,10 @@ func (s *Server) auditRulesPath() string {
 }
 
 func (s *Server) handleGetAuditRules(w http.ResponseWriter, r *http.Request) {
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
 	path := s.auditRulesPath()
+	s.mu.RUnlock()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -463,8 +682,10 @@ func (s *Server) handlePutAuditRules(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Raw string `json:"raw"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if err := decodeJSON(w, r, &body, defaultJSONBodyLimit); err != nil {
+		if !errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+		}
 		return
 	}
 
@@ -512,11 +733,23 @@ func (s *Server) handleInitAuditRules(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetCompiledRules(w http.ResponseWriter, r *http.Request) {
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
+	projectRoot := s.projectRoot
+	auditCfg := s.cfg.Audit
+	if s.IsProjectMode() {
+		auditCfg = s.projectCfg.Audit
+	}
+	s.mu.RUnlock()
+
+	isProjectMode := projectRoot != ""
+	policy := audit.ResolvePolicy(audit.PolicyInputs{ConfigProfile: auditCfg.Profile, ConfigThreshold: auditCfg.BlockThreshold, ConfigDedupe: auditCfg.DedupeMode})
+
 	var rules []audit.CompiledRule
 	var err error
 
-	if s.IsProjectMode() {
-		rules, err = audit.ListRulesWithProject(s.projectRoot)
+	if isProjectMode {
+		rules, err = audit.ListRulesWithProject(projectRoot)
 	} else {
 		rules, err = audit.ListRules()
 	}
@@ -529,6 +762,7 @@ func (s *Server) handleGetCompiledRules(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, map[string]any{
 		"rules":    rules,
 		"patterns": patterns,
+		"profile":  string(policy.Profile),
 	})
 }
 
@@ -542,8 +776,10 @@ func (s *Server) handleToggleRule(w http.ResponseWriter, r *http.Request) {
 		Enabled  bool   `json:"enabled"`
 		Severity string `json:"severity,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if err := decodeJSON(w, r, &req, defaultJSONBodyLimit); err != nil {
+		if !errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+		}
 		return
 	}
 
@@ -604,21 +840,27 @@ func toAuditResponse(result *audit.Result) auditResultResponse {
 	findings := make([]auditFindingResponse, 0, len(result.Findings))
 	for _, f := range result.Findings {
 		findings = append(findings, auditFindingResponse{
-			Severity:    f.Severity,
-			Pattern:     f.Pattern,
-			Message:     f.Message,
-			File:        f.File,
-			Line:        f.Line,
-			Snippet:     f.Snippet,
-			RuleID:      f.RuleID,
-			Analyzer:    f.Analyzer,
-			Category:    f.Category,
-			Confidence:  f.Confidence,
-			Fingerprint: f.Fingerprint,
+			Severity:        f.Severity,
+			Pattern:         f.Pattern,
+			Message:         f.Message,
+			File:            f.File,
+			Line:            f.Line,
+			Snippet:         f.Snippet,
+			RuleID:          f.RuleID,
+			Analyzer:        f.Analyzer,
+			Category:        f.Category,
+			Confidence:      f.Confidence,
+			Fingerprint:     f.Fingerprint,
+			SeverityContext: f.SeverityContext,
+			Acknowledged:    f.Acknowledged,
 		})
 	}
 	return auditResultResponse{
+		BinaryFiles:    result.BinaryFiles,
+		SkippedFiles:   result.SkippedFiles,
+		OversizedFiles: result.OversizedFiles,
 		SkillName:      result.SkillName,
+		Kind:           result.Kind,
 		Findings:       findings,
 		RiskScore:      result.RiskScore,
 		RiskLabel:      result.RiskLabel,

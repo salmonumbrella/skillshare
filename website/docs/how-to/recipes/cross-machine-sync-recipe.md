@@ -33,15 +33,14 @@ skillshare push
 ```bash
 # Install skillshare
 curl -fsSL https://raw.githubusercontent.com/runkids/skillshare/main/install.sh | sh
+```
 
-# Initialize
+If the installer prints PATH setup instructions, follow them before running the commands below. If it prints no PATH warning, no extra setup is needed.
+
+```bash
+# Choose "Connect my existing skillshare repo" and paste the repo URL.
+# init pulls your skills and offers a first sync.
 skillshare init
-
-# Pull from remote
-skillshare pull
-
-# Sync to local targets
-skillshare sync
 ```
 
 ### Daily Sync Workflow
@@ -57,6 +56,9 @@ skillshare sync
 
 # After making changes locally
 skillshare push
+
+# Or do both directions in one step: merge, push, then sync
+skillshare push --pull
 ```
 
 ## Verification
@@ -69,8 +71,9 @@ skillshare push
 ## Variations
 
 - **Auto-sync on login**: Add `skillshare pull && skillshare sync` to your shell profile (`.bashrc` / `.zshrc`)
-- **Conflict resolution**: If two machines modify the same skill, `pull` uses git merge — resolve conflicts in the source directory
+- **Conflict resolution**: `pull` merges commits from both machines and resolves `.metadata.json` conflicts on its own. If both machines edited the same skill file, `pull` stops, undoes the merge, and names the file — resolve it with git in the source directory
 - **Selective sync**: Use per-target `include` / `exclude` filters in `config.yaml` to control which skills sync to each machine
+- **Plugins, MCP and hooks**: These live in `config.yaml`, which `push` / `pull` never carry. See [Plugins, MCP and hooks](/docs/how-to/sharing/cross-machine-sync#plugins-mcp-hooks)
 
 ## Related
 

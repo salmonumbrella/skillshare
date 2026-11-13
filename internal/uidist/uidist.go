@@ -2,19 +2,18 @@ package uidist
 
 import (
 	"archive/tar"
-	"bufio"
 	"compress/gzip"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"skillshare/internal/config"
+	"skillshare/internal/utils"
 	"skillshare/internal/version"
 )
 
@@ -39,25 +38,27 @@ func IsCached(ver string) (string, bool) {
 
 // Download fetches the UI dist tarball for the given version, verifies its
 // checksum, extracts it to the cache directory, and cleans up old versions.
-func Download(ver string) error {
+// onProgress (may be nil) receives tarball download progress.
+// keepVersions preserves additional cached versions that a running UI may use.
+func Download(ver string, onProgress utils.ProgressFunc, keepVersions ...string) error {
 	dir := CacheDir(ver)
 
 	// Fetch expected checksum
-	expectedHash, err := fetchChecksum(ver)
+	expectedHash, err := version.FetchChecksum(version.BuildChecksumsURL(ver), AssetName)
 	if err != nil {
 		return fmt.Errorf("failed to fetch checksum: %w", err)
 	}
 
 	// Download tarball to temp file
 	tarballURL := version.BuildUIDistURL(ver)
-	tmpFile, err := downloadToTemp(tarballURL)
+	tmpFile, err := downloadToTemp(tarballURL, onProgress)
 	if err != nil {
 		return fmt.Errorf("failed to download UI assets: %w", err)
 	}
 	defer os.Remove(tmpFile)
 
 	// Verify checksum
-	actualHash, err := fileSHA256(tmpFile)
+	actualHash, err := utils.FileHash(tmpFile)
 	if err != nil {
 		return fmt.Errorf("failed to compute checksum: %w", err)
 	}
@@ -76,7 +77,7 @@ func Download(ver string) error {
 	}
 
 	// Clean old versions (best-effort)
-	_ = cleanOldVersions(ver)
+	_ = cleanOldVersions(append(keepVersions, ver)...)
 
 	return nil
 }
@@ -99,105 +100,39 @@ func ClearVersion(ver string) error {
 	return os.RemoveAll(dir)
 }
 
-// cleanOldVersions removes cached UI dist versions other than currentVer.
-func cleanOldVersions(currentVer string) error {
+// cleanOldVersions removes cached UI dist versions not in keep.
+func cleanOldVersions(keep ...string) error {
 	uiDir := filepath.Join(config.CacheDir(), "ui")
 	entries, err := os.ReadDir(uiDir)
 	if err != nil {
 		return err
 	}
 	for _, e := range entries {
-		if e.IsDir() && e.Name() != currentVer {
+		if e.IsDir() && !slices.Contains(keep, e.Name()) {
 			os.RemoveAll(filepath.Join(uiDir, e.Name()))
 		}
 	}
 	return nil
 }
 
-// fetchChecksum downloads checksums.txt and parses the SHA256 for AssetName.
-func fetchChecksum(ver string) (string, error) {
-	url := version.BuildChecksumsURL(ver)
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("checksums.txt returned HTTP %d", resp.StatusCode)
-	}
-
-	return parseChecksum(resp.Body, AssetName)
-}
-
-// parseChecksum reads a checksums.txt (format: "hash  filename\n") and returns
-// the hash for the given target filename.
-func parseChecksum(r io.Reader, target string) (string, error) {
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		line := scanner.Text()
-		// GoReleaser format: "<sha256>  <filename>"
-		parts := strings.Fields(line)
-		if len(parts) == 2 && parts[1] == target {
-			return parts[0], nil
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	return "", fmt.Errorf("checksum for %s not found in checksums.txt", target)
-}
-
 // maxDownloadSize limits the UI dist download to prevent unexpected disk usage.
 const maxDownloadSize = 100 * 1024 * 1024 // 100 MB
 
 // downloadToTemp downloads a URL to a temporary file and returns its path.
-func downloadToTemp(url string) (string, error) {
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download returned HTTP %d", resp.StatusCode)
-	}
-
+func downloadToTemp(url string, onProgress utils.ProgressFunc) (string, error) {
 	tmp, err := os.CreateTemp("", "skillshare-ui-dist-*.tar.gz")
 	if err != nil {
 		return "", err
 	}
 	defer tmp.Close()
 
-	limited := io.LimitReader(resp.Body, maxDownloadSize+1)
-	n, err := io.Copy(tmp, limited)
-	if err != nil {
+	client := &http.Client{Timeout: 120 * time.Second}
+	if err := utils.DownloadToFile(client, url, tmp, maxDownloadSize, onProgress); err != nil {
+		tmp.Close()
 		os.Remove(tmp.Name())
 		return "", err
 	}
-	if n > maxDownloadSize {
-		os.Remove(tmp.Name())
-		return "", fmt.Errorf("download exceeds maximum size (%d MB)", maxDownloadSize/(1024*1024))
-	}
-
 	return tmp.Name(), nil
-}
-
-// fileSHA256 computes the SHA-256 hex digest of a file.
-func fileSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // maxFileSize limits individual file extraction to prevent decompression bombs.

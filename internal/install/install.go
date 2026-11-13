@@ -3,19 +3,24 @@ package install
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
+
+	"skillshare/internal/sourcewalk"
 )
 
 // InstallOptions configures the install behavior
 type InstallOptions struct {
 	Name             string // Override skill name
+	Kind             string // "skill", "agent", or "" (auto-detect)
 	Force            bool   // Overwrite existing
 	DryRun           bool   // Preview only
 	Update           bool   // Update existing installation
 	Track            bool   // Install as tracked repository (preserves .git)
 	OnProgress       ProgressCallback
 	Skills           []string // Select specific skills from multi-skill repo (comma-separated)
+	AgentNames       []string // Select specific agents from repo (comma-separated)
 	Exclude          []string // Skills to exclude from installation (comma-separated)
 	All              bool     // Install all discovered skills without prompting
 	Yes              bool     // Auto-accept all prompts (equivalent to --all for multi-skill repos)
@@ -25,7 +30,50 @@ type InstallOptions struct {
 	AuditThreshold   string   // Block threshold: CRITICAL/HIGH/MEDIUM/LOW/INFO
 	AuditProjectRoot string   // Project root for project-mode audit rule resolution
 	Quiet            bool     // Suppress per-skill output in InstallFromConfig
+	Branch           string   // Git branch to clone from (empty = remote default)
+	SourceDir        string   // Skills root dir for centralized metadata (set by caller)
+	Lock             *Lock    // Pinned commits for InstallFromConfig (project mode); nil = follow the branch
+
+	ParseOptions ParseOptions // Explicit credential host policy for existing checkouts
+
+	// AuditOverride lets an install proceed despite audit findings at/above the
+	// block threshold. Deliberately separate from Force, which only means
+	// "overwrite what is already there" and is set unconditionally by update and
+	// --json paths — routing the audit gate through Force would disable it there.
+	AuditOverride bool
+	// Reinstall makes a batch update copy every skill again even when its
+	// recorded commit or tree hash already matches upstream (update --force).
+	// A git-installed skill is reset to upstream instead of pulled, discarding
+	// local edits.
+	Reinstall bool
+	// AuditAcceptRoot/AuditAcceptPath override where accepted audit findings
+	// are looked up and recorded. Staged installs audit a temp directory, so
+	// they point these at the final destination to keep metadata keys stable.
+	AuditAcceptRoot string
+	AuditAcceptPath string
+	// skillFileOnly makes a local install copy only SKILL.md. Updates set it
+	// to keep the shape of a collection root installed that way.
+	skillFileOnly bool
+
+	// SourceFollow is the operation's follow policy for SourceDir, so writes
+	// pass through followed first-level links; nil follows none.
+	SourceFollow *sourcewalk.Follow
 }
+
+// auditAcceptTarget returns the (sourceDir, path) pair used to key accepted
+// audit findings for an install landing at path.
+func (o InstallOptions) auditAcceptTarget(path string) (string, string) {
+	if o.AuditAcceptPath != "" {
+		return o.AuditAcceptRoot, o.AuditAcceptPath
+	}
+	return o.SourceDir, path
+}
+
+// IsAgentMode returns true if explicitly installing agents.
+func (o InstallOptions) IsAgentMode() bool { return o.Kind == "agent" }
+
+// HasAgentFilter returns true if specific agents were requested via -a flag.
+func (o InstallOptions) HasAgentFilter() bool { return len(o.AgentNames) > 0 }
 
 // ShouldInstallAll returns true if all discovered skills should be installed without prompting.
 func (o InstallOptions) ShouldInstallAll() bool { return o.All || o.Yes }
@@ -48,19 +96,42 @@ type InstallResult struct {
 
 // SkillInfo represents a discovered skill in a repository
 type SkillInfo struct {
-	Name        string // Skill name (directory name)
+	Name        string // Install name (directory name, or frontmatter for generic containers)
 	Path        string // Relative path from repo root
 	License     string // License from SKILL.md frontmatter (if any)
 	Description string // Description from SKILL.md frontmatter (if any)
 }
 
-// DiscoveryResult contains discovered skills from a repository
+// AgentInfo represents a discovered agent (.md file) in a repository
+type AgentInfo struct {
+	Name     string // Agent name (filename without .md)
+	Path     string // Relative path from repo root (e.g. "agents/tutor.md")
+	FileName string // Filename (e.g. "tutor.md")
+}
+
+// DiscoveryResult contains discovered skills and agents from a repository
 type DiscoveryResult struct {
 	RepoPath   string      // Temp directory where repo was cloned
 	Skills     []SkillInfo // Discovered skills
+	Agents     []AgentInfo // Discovered agents
 	Source     *Source     // Original source
 	CommitHash string      // Source commit hash when available
 	Warnings   []string    // Non-fatal warnings during discovery
+}
+
+// HasAgents reports whether the discovery found any agents.
+func (d *DiscoveryResult) HasAgents() bool {
+	return len(d.Agents) > 0
+}
+
+// HasSkills reports whether the discovery found any skills.
+func (d *DiscoveryResult) HasSkills() bool {
+	return len(d.Skills) > 0
+}
+
+// IsMixed reports whether the discovery found both skills and agents.
+func (d *DiscoveryResult) IsMixed() bool {
+	return d.HasSkills() && d.HasAgents()
 }
 
 // TrackedRepoResult reports the outcome of a tracked repo installation
@@ -69,6 +140,8 @@ type TrackedRepoResult struct {
 	RepoPath       string   // Full path to the repo
 	SkillCount     int      // Number of skills discovered
 	Skills         []string // Names of discovered skills
+	AgentCount     int      // Number of agents discovered
+	Agents         []string // Names of discovered agents
 	Action         string   // "cloned", "updated", "skipped"
 	Warnings       []string
 	AuditThreshold string
@@ -133,9 +206,9 @@ func normalizeCloneURL(u string) string {
 	u = strings.TrimSpace(u)
 	u = strings.TrimSuffix(u, ".git")
 	u = strings.TrimSuffix(u, "/")
-	// git@github.com:owner/repo → github.com/owner/repo
-	if strings.HasPrefix(u, "git@") {
-		u = strings.TrimPrefix(u, "git@")
+	// user@github.com:owner/repo → github.com/owner/repo
+	if at := strings.Index(u, "@"); at > 0 && !strings.Contains(u, "://") {
+		u = u[at+1:]
 		u = strings.Replace(u, ":", "/", 1)
 	}
 	// https://github.com/owner/repo → github.com/owner/repo
@@ -157,6 +230,17 @@ func buildForceHint(rawSource, into string) string {
 
 // removeAll is a test hook used by audit/install paths.
 var removeAll = os.RemoveAll
+
+var removeTempRepoPath = os.RemoveAll
+
+func cleanupTempRepo(path string) {
+	if path == "" {
+		return
+	}
+	if err := removeTempRepoPath(path); err != nil {
+		slog.Warn("failed to clean up temp repo", "path", path, "error", err)
+	}
+}
 
 // Install executes the installation from source to destination.
 // This file is intentionally a thin facade; implementation lives in split files.
@@ -186,6 +270,64 @@ func DiscoverFromGitSubdirWithProgress(source *Source, onProgress ProgressCallba
 	return discoverFromGitSubdirWithProgressImpl(source, onProgress)
 }
 
+// TrackKindAmbiguousError is returned by InferTrackedKind when a tracked
+// install targets a repository that contains both skills and agents and the
+// caller did not pass an explicit kind. It carries the discovered counts so
+// the UI can present a kind picker without re-cloning.
+type TrackKindAmbiguousError struct {
+	Skills int
+	Agents int
+}
+
+func (e *TrackKindAmbiguousError) Error() string {
+	return "tracked install is ambiguous for mixed repositories; pass --kind skill or --kind agent"
+}
+
+// InferTrackedKind determines which resource kind a tracked install should use.
+// Pure-agent repositories resolve to "agent". Mixed repositories must specify
+// the kind explicitly to avoid ambiguous install roots; in that case the
+// returned error is a *TrackKindAmbiguousError carrying the discovered counts.
+func InferTrackedKind(source *Source, explicitKind string) (string, error) {
+	if err := normalizeTrackSource(source); err != nil {
+		return "", err
+	}
+
+	if explicitKind == "skill" || explicitKind == "agent" {
+		return explicitKind, nil
+	}
+
+	var (
+		discovery *DiscoveryResult
+		err       error
+	)
+	if source.HasSubdir() {
+		discovery, err = DiscoverFromGitSubdir(source)
+	} else {
+		discovery, err = DiscoverFromGit(source)
+	}
+	if err != nil {
+		return "", err
+	}
+	defer CleanupDiscovery(discovery)
+
+	switch {
+	case discovery.HasSkills() && discovery.HasAgents():
+		return "", &TrackKindAmbiguousError{
+			Skills: len(discovery.Skills),
+			Agents: len(discovery.Agents),
+		}
+	case discovery.HasAgents() && !discovery.HasSkills():
+		return "agent", nil
+	default:
+		return "skill", nil
+	}
+}
+
+// DiscoverLocal inspects a local directory and discovers skills and agents.
+func DiscoverLocal(source *Source) (*DiscoveryResult, error) {
+	return discoverLocalImpl(source)
+}
+
 // CleanupDiscovery removes temporary resources created by discovery.
 func CleanupDiscovery(result *DiscoveryResult) {
 	cleanupDiscoveryImpl(result)
@@ -206,7 +348,19 @@ func GetUpdatableSkills(sourceDir string) ([]string, error) {
 	return getUpdatableSkillsImpl(sourceDir)
 }
 
-// GetTrackedRepos returns tracked repositories in the source directory.
-func GetTrackedRepos(sourceDir string) ([]string, error) {
-	return getTrackedReposImpl(sourceDir)
+// GetTrackedRepos returns tracked repositories in the source directory as
+// slash paths relative to it (org/_team), on every OS. An optional walk policy
+// follows first-level source links; omitted, none are.
+func GetTrackedRepos(sourceDir string, walk ...sourcewalk.Options) ([]string, error) {
+	var opts sourcewalk.Options
+	if len(walk) > 0 {
+		opts = walk[0]
+	}
+	return getTrackedReposImpl(sourceDir, opts)
+}
+
+// GetMissingTrackedRepos returns tracked metadata entries whose repo clone is absent.
+// An optional walk policy recognizes existing followed source checkouts.
+func GetMissingTrackedRepos(sourceDir string, walks ...sourcewalk.Options) ([]TrackedRepoMeta, error) {
+	return getMissingTrackedReposImpl(sourceDir, walks...)
 }

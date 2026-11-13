@@ -13,7 +13,10 @@ Each recipe follows the same structure: **Scenario** (when/why), **Solution** (s
 | Recipe | Scenario |
 |--------|----------|
 | [CI/CD Skill Validation](ci-cd-skill-validation) | Audit + sync in GitHub Actions / GitLab CI |
+| [Git Hooks](git-hooks) | Portable Git config hooks with executable helpers |
 | [Private Enterprise Skills](private-enterprise-skills) | Private repo install with token auth |
 | [Project Mode Workflow](skill-per-project-workflow) | Full project-scoped skill lifecycle |
 | [Cross-Machine Sync](cross-machine-sync-recipe) | Push/pull skills across machines |
 | [Team Onboarding](team-onboarding-recipe) | New hire skill environment setup |
+| [Centralized Skills Repo](centralized-skills-repo) | One repo for skills, targets in each developer's config |
+| [Many Projects, One Config](many-projects-one-config) | Send skills and MCP servers into several project folders from the global config |

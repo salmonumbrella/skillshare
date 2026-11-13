@@ -18,6 +18,11 @@ skillshare maintains a single source directory and syncs to all your targets wit
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/runkids/skillshare/main/install.sh | sh
+```
+
+If the installer prints PATH setup instructions, follow them before running the commands below. If it prints no PATH warning, no extra setup is needed.
+
+```bash
 skillshare init
 ```
 
@@ -34,9 +39,11 @@ Example output:
 ```
   claude       ~/.claude/skills (merge)
   cursor       ~/.cursor/skills (merge)
-  codex        ~/.codex/skills (merge)
   opencode     ~/.config/opencode/skills (merge)
+  universal    ~/.agents/skills (merge)
 ```
+
+Codex has no row of its own: it reads the shared `~/.agents/skills` directory, so the `universal` target covers it.
 
 ## Step 3: Install Skills
 

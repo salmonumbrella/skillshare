@@ -56,7 +56,7 @@ func TestRenderInstallWarnings_CompactSuppressesExtraDetails(t *testing.T) {
 	})
 	output = stripANSIWarnings(output)
 
-	if !strings.Contains(output, "demo-skill: 6 finding(s): HIGH=2, LOW=4") {
+	if !strings.Contains(output, "demo-skill: 6 findings: HIGH=2, LOW=4") {
 		t.Fatalf("expected compact summary in output, got:\n%s", output)
 	}
 	if !strings.Contains(output, "+1 more finding type(s); use --audit-verbose for full details") {
@@ -146,7 +146,7 @@ func TestRenderBatchInstallWarningsCompact_PrintsAggregateNotPerFinding(t *testi
 	})
 	output = stripANSIWarnings(output)
 
-	if !strings.Contains(output, "audit findings across 2 skill(s): HIGH=3, LOW=1") {
+	if !strings.Contains(output, "audit findings across 2 skills: HIGH=3, LOW=1") {
 		t.Fatalf("expected aggregate finding summary, got:\n%s", output)
 	}
 	if !strings.Contains(output, "skills with HIGH/CRITICAL findings: 2") {
@@ -238,7 +238,7 @@ func TestPrintSkillListCompact_SmallList(t *testing.T) {
 			t.Fatalf("expected skill %q in output, got:\n%s", s.Name, output)
 		}
 	}
-	if strings.Contains(output, "more skill(s)") {
+	if strings.Contains(output, "more skills") {
 		t.Fatalf("should not contain truncation message for small list, got:\n%s", output)
 	}
 }
@@ -265,8 +265,8 @@ func TestPrintSkillListCompact_LargeList(t *testing.T) {
 	if strings.Contains(output, "skill-10") && !strings.Contains(output, "20 more") {
 		t.Fatalf("expected truncation for large list, got:\n%s", output)
 	}
-	if !strings.Contains(output, "... and 20 more skill(s)") {
-		t.Fatalf("expected '... and 20 more skill(s)' in output, got:\n%s", output)
+	if !strings.Contains(output, "... and 20 more skills") {
+		t.Fatalf("expected '... and 20 more skills' in output, got:\n%s", output)
 	}
 }
 
@@ -282,7 +282,7 @@ func TestPrintSkillListCompact_ExactThreshold(t *testing.T) {
 	output = stripANSIWarnings(output)
 
 	// All 20 should appear (≤20 threshold)
-	if strings.Contains(output, "more skill(s)") {
+	if strings.Contains(output, "more skills") {
 		t.Fatalf("should not truncate at exactly 20 skills, got:\n%s", output)
 	}
 }
@@ -381,8 +381,24 @@ func TestDisplayInstallResults_VerboseLargeBatch_ShowsCompactThenHighCritical(t 
 		t.Fatalf("expected verbose detail header, got:\n%s", output)
 	}
 	// Should mention remaining skills
-	if !strings.Contains(output, "more skill(s) with findings") {
+	if !strings.Contains(output, "more with findings") {
 		t.Fatalf("expected remaining count, got:\n%s", output)
+	}
+}
+
+func TestCaptureStdoutLargeOutput(t *testing.T) {
+	want := strings.Repeat("captured output\n", 1<<16)
+	old := os.Stdout
+	got := captureStdout(t, func() {
+		if _, err := io.WriteString(os.Stdout, want); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if got != want {
+		t.Fatalf("captured output differs: got %d bytes, want %d", len(got), len(want))
+	}
+	if os.Stdout != old {
+		t.Fatal("stdout was not restored after capture")
 	}
 }
 
@@ -390,20 +406,21 @@ func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 
 	old := os.Stdout
-	r, w, err := os.Pipe()
+	f, err := os.CreateTemp(t.TempDir(), "stdout-")
 	if err != nil {
-		t.Fatalf("failed to create pipe: %v", err)
+		t.Fatalf("failed to create capture file: %v", err)
 	}
-	os.Stdout = w
+	defer f.Close()
+	os.Stdout = f
+	defer func() { os.Stdout = old }()
 
 	fn()
 
-	if err := w.Close(); err != nil {
-		t.Fatalf("failed to close write pipe: %v", err)
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatalf("failed to rewind captured output: %v", err)
 	}
-	os.Stdout = old
 
-	data, err := io.ReadAll(r)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		t.Fatalf("failed to read captured output: %v", err)
 	}
@@ -524,5 +541,27 @@ func TestDisplayInstallResults_SkippedFallbackLabel(t *testing.T) {
 
 	if !strings.Contains(output, "Skipped (same repo)") {
 		t.Errorf("expected fallback 'same repo' label, got:\n%s", output)
+	}
+}
+
+func TestBuildConfigInstallSummary(t *testing.T) {
+	tests := []struct {
+		name string
+		in   install.ConfigInstallResult
+		want string
+	}{
+		{"skills only", install.ConfigInstallResult{Installed: 3, Skipped: 1}, "Installed 3 skills, 1 skipped"},
+		{"tracked repo", install.ConfigInstallResult{Installed: 1, InstalledRepos: 1, InstalledRepoSkills: 12, Skipped: 9, SkippedRepos: 1},
+			"Installed 1 tracked repo (12 skills), 9 skipped (1 repo, 8 skills)"},
+		{"repo and skills", install.ConfigInstallResult{Installed: 3, InstalledRepos: 1, InstalledRepoSkills: 5, FailedSkills: []string{"x"}},
+			"Installed 1 tracked repo (5 skills), 2 skills, 1 failed"},
+		{"only repos skipped", install.ConfigInstallResult{Skipped: 2, SkippedRepos: 2}, "Installed 0 skills, 2 skipped (2 repos)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := buildConfigInstallSummary(tt.in); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

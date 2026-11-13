@@ -104,6 +104,24 @@ func TestGroupConfigSkillsByRepo(t *testing.T) {
 		}
 	})
 
+	t.Run("web URLs with a recorded branch share one clone", func(t *testing.T) {
+		recorded := func(raw string) *Source {
+			s := mustParse(raw)
+			s.ApplyRecordedBranch("main")
+			return s
+		}
+		entries := []configSkillEntry{
+			{dto: SkillEntryDTO{Name: "a"}, source: recorded("github.com/org/repo/tree/main/skills/a")},
+			{dto: SkillEntryDTO{Name: "b"}, source: recorded("github.com/org/repo/tree/main/skills/b")},
+		}
+
+		groups, singles := groupConfigSkillsByRepo(entries)
+
+		if len(groups) != 1 || len(singles) != 0 {
+			t.Errorf("got %d groups and %d singles, want 1 group and 0 singles", len(groups), len(singles))
+		}
+	})
+
 	t.Run("empty input returns empty results", func(t *testing.T) {
 		groups, singles := groupConfigSkillsByRepo(nil)
 

@@ -1,10 +1,12 @@
 package server
 
 import (
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
 
+	"skillshare/internal/config"
 	ssync "skillshare/internal/sync"
 	"skillshare/internal/utils"
 )
@@ -23,20 +25,27 @@ func (s *Server) handleDiffStream(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	safeSend("discovering", map[string]string{"phase": "scanning source directory"})
-
+	// Snapshot config under RLock, then release before slow I/O.
+	s.mu.RLock()
+	source := s.cfg.EffectiveSkillsSource()
+	agentsSource := s.agentsSource()
 	globalMode := s.cfg.Mode
+	ignorePatterns := ssync.EffectiveFileIgnorePatterns(s.cfg.Ignore)
+	targets := s.cloneTargets()
+	s.mu.RUnlock()
+
 	if globalMode == "" {
 		globalMode = "merge"
 	}
 
-	discovered, err := ssync.DiscoverSourceSkills(s.cfg.Source)
+	safeSend("discovering", map[string]string{"phase": "scanning source directory"})
+
+	discovered, ignoreStats, err := ssync.DiscoverSourceSkillsWithStats(source, s.skillsWalk())
 	if err != nil {
 		safeSend("error", map[string]string{"error": err.Error()})
 		return
 	}
 
-	targets := s.cfg.Targets
 	safeSend("start", map[string]int{"total": len(targets)})
 
 	var diffs []diffTarget
@@ -49,7 +58,7 @@ func (s *Server) handleDiffStream(w http.ResponseWriter, r *http.Request) {
 		default:
 		}
 
-		dt := s.computeTargetDiff(name, target, discovered, globalMode)
+		dt := s.computeTargetDiff(name, target, discovered, globalMode, source, ignorePatterns)
 		diffs = append(diffs, dt)
 		checked++
 
@@ -59,96 +68,122 @@ func (s *Server) handleDiffStream(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	safeSend("done", map[string]any{"diffs": diffs})
+	diffs = s.appendAgentDiffs(diffs, targets, agentsSource, "")
+
+	donePayload := map[string]any{"diffs": diffs}
+	maps.Copy(donePayload, ignorePayload(ignoreStats))
+	maps.Copy(donePayload, agentIgnorePayload(agentsSource, nil))
+	safeSend("done", donePayload)
 }
 
 // computeTargetDiff computes the diff for a single target.
 // Extracted from handleDiff to share logic with the stream handler.
-func (s *Server) computeTargetDiff(name string, target struct {
-	Path    string   `yaml:"path"`
-	Mode    string   `yaml:"mode,omitempty"`
-	Include []string `yaml:"include,omitempty"`
-	Exclude []string `yaml:"exclude,omitempty"`
-}, discovered []ssync.DiscoveredSkill, globalMode string) diffTarget {
-	mode := target.Mode
+func (s *Server) computeTargetDiff(name string, target config.TargetConfig, discovered []ssync.DiscoveredSkill, globalMode, source string, ignorePatterns []string) diffTarget {
+	sc := target.SkillsConfig()
+	mode := sc.Mode
 	if mode == "" {
 		mode = globalMode
 	}
 
 	dt := diffTarget{Target: name, Items: make([]diffItem, 0)}
+	if !sc.IsEnabled() {
+		return dt // skills off: nothing is synced, so nothing differs
+	}
 
 	if mode == "symlink" {
-		status := ssync.CheckStatus(target.Path, s.cfg.Source)
+		status := ssync.CheckStatus(sc.Path, source)
 		if status != ssync.StatusLinked {
-			dt.Items = append(dt.Items, diffItem{Skill: "(entire directory)", Action: "link", Reason: "source only"})
+			dt.Items = append(dt.Items, diffItem{Skill: "(entire directory)", Action: "link", Reason: "source only", Kind: kindSkill})
 		}
 		return dt
 	}
 
-	filtered, err := ssync.FilterSkills(discovered, target.Include, target.Exclude)
+	resolution, err := ssync.ResolveTargetSkillsForTarget(name, sc, discovered)
 	if err != nil {
+		dt.Items = append(dt.Items, diffItem{Skill: "(target naming)", Action: "skip", Reason: err.Error(), Kind: kindSkill})
 		return dt
 	}
+	// Surface collision/validation stats so the UI can show why skills were skipped
+	dt.CollisionCount = len(resolution.Collisions)
+	dt.SkippedCount = resolution.SkippedCount
+	dt.NamingSkippedCount = resolution.NamingSkippedCount
+	dt.Warnings = resolution.Warnings
+	for _, warning := range resolution.SelectionWarnings {
+		dt.Items = append(dt.Items, diffItem{Skill: "(skill selection)", Action: "skip", Reason: warning, Kind: kindSkill})
+	}
+	validNames := resolution.ValidTargetNames()
+	manifest, _ := ssync.ReadManifest(sc.Path)
+	legacyNames := resolution.LegacyNames(mode, sc.Path, manifest)
+	renamedFrom := ssync.RenamedFrom(legacyNames)
 
 	if mode == "copy" {
-		manifest, _ := ssync.ReadManifest(target.Path)
-		for _, skill := range filtered {
-			oldChecksum, isManaged := manifest.Managed[skill.FlatName]
-			targetSkillPath := filepath.Join(target.Path, skill.FlatName)
+		for _, resolved := range resolution.Skills {
+			skill := resolved.Skill
+			oldChecksum, isManaged := manifest.Managed[resolved.TargetName]
+			targetSkillPath := filepath.Join(sc.Path, resolved.TargetName)
 			if !isManaged {
 				if info, statErr := os.Stat(targetSkillPath); statErr == nil {
-					if info.IsDir() {
-						dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "skip", Reason: "local copy (sync --force to replace)"})
+					if old, ok := renamedFrom[resolved.TargetName]; ok {
+						dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "kept", Reason: ssync.KeptLegacyReason(old), Kind: kindSkill})
+					} else if info.IsDir() {
+						dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "skip", Reason: "local copy (sync --force to replace)", Kind: kindSkill})
 					} else {
-						dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "update", Reason: "target entry is not a directory"})
+						dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: "target entry is not a directory", Kind: kindSkill})
 					}
+				} else if old, ok := renamedFrom[resolved.TargetName]; ok && os.IsNotExist(statErr) {
+					dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: ssync.RenameReason(old), Kind: kindSkill})
 				} else if os.IsNotExist(statErr) {
-					dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "link", Reason: "source only"})
+					dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "link", Reason: "source only", Kind: kindSkill})
 				} else {
-					dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "update", Reason: "cannot access target entry"})
+					dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: "cannot access target entry", Kind: kindSkill})
 				}
 			} else {
 				targetInfo, statErr := os.Stat(targetSkillPath)
 				if os.IsNotExist(statErr) {
-					dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "link", Reason: "missing (deleted from target)"})
+					dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "link", Reason: "missing (deleted from target)", Kind: kindSkill})
 				} else if statErr != nil {
-					dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "update", Reason: "cannot access target entry"})
+					dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: "cannot access target entry", Kind: kindSkill})
 				} else if !targetInfo.IsDir() {
-					dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "update", Reason: "target entry is not a directory"})
+					dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: "target entry is not a directory", Kind: kindSkill})
+				} else if recorded := manifest.Naming[resolved.TargetName]; recorded != "" && recorded != resolution.Naming {
+					// A copy made under another naming carries another name:, so sync re-copies it.
+					dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: ssync.NamingChangedReason, Kind: kindSkill})
 				} else {
-					oldMtime := manifest.Mtimes[skill.FlatName]
-					currentMtime, mtimeErr := ssync.DirMaxMtime(skill.SourcePath)
+					oldMtime := manifest.Mtimes[resolved.TargetName]
+					currentMtime, mtimeErr := ssync.DirMaxMtimeWithIgnore(skill.SourcePath, ignorePatterns)
 					if mtimeErr == nil && oldMtime > 0 && currentMtime == oldMtime {
-						return dt // unchanged, but continue loop below
+						continue
 					}
-					srcChecksum, checksumErr := ssync.DirChecksum(skill.SourcePath)
+					srcChecksum, checksumErr := ssync.DirChecksumWithIgnore(skill.SourcePath, ignorePatterns)
 					if checksumErr != nil {
-						dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "update", Reason: "cannot compute checksum"})
+						dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: "cannot compute checksum", Kind: kindSkill})
 					} else if srcChecksum != oldChecksum {
-						dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "update", Reason: "content changed"})
+						dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: "content changed", Kind: kindSkill})
 					}
 				}
 			}
 		}
-		validNames := make(map[string]bool)
-		for _, skill := range filtered {
-			validNames[skill.FlatName] = true
-		}
 		for managedName := range manifest.Managed {
+			if _, keepLegacy := legacyNames[managedName]; keepLegacy {
+				continue
+			}
 			if !validNames[managedName] {
-				dt.Items = append(dt.Items, diffItem{Skill: managedName, Action: "prune", Reason: "orphan copy"})
+				dt.Items = append(dt.Items, diffItem{Skill: managedName, Action: "prune", Reason: "orphan copy", Kind: kindSkill})
 			}
 		}
 		return dt
 	}
 
 	// Merge mode
-	for _, skill := range filtered {
-		targetSkillPath := filepath.Join(target.Path, skill.FlatName)
+	for _, resolved := range resolution.Skills {
+		skill := resolved.Skill
+		targetSkillPath := filepath.Join(sc.Path, resolved.TargetName)
 		_, err := os.Lstat(targetSkillPath)
 		if err != nil {
-			if os.IsNotExist(err) {
-				dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "link", Reason: "source only"})
+			if old, ok := renamedFrom[resolved.TargetName]; ok && os.IsNotExist(err) {
+				dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: ssync.RenameReason(old), Kind: kindSkill})
+			} else if os.IsNotExist(err) {
+				dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "link", Reason: "source only", Kind: kindSkill})
 			}
 			continue
 		}
@@ -156,49 +191,33 @@ func (s *Server) computeTargetDiff(name string, target struct {
 		if utils.IsSymlinkOrJunction(targetSkillPath) {
 			absLink, linkErr := utils.ResolveLinkTarget(targetSkillPath)
 			if linkErr != nil {
-				dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "update", Reason: "link target unreadable"})
+				dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: "link target unreadable", Kind: kindSkill})
 				continue
 			}
 			absSource, _ := filepath.Abs(skill.SourcePath)
 			if !utils.PathsEqual(absLink, absSource) {
-				dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "update", Reason: "symlink points elsewhere"})
+				dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: "symlink points elsewhere", Kind: kindSkill})
 			}
+		} else if old, ok := renamedFrom[resolved.TargetName]; ok {
+			dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "kept", Reason: ssync.KeptLegacyReason(old), Kind: kindSkill})
+		} else if manifest.OwnsCopy(resolved.TargetName, targetSkillPath) {
+			dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "update", Reason: ssync.CopyToLinkReason, Kind: kindSkill})
 		} else {
-			dt.Items = append(dt.Items, diffItem{Skill: skill.FlatName, Action: "skip", Reason: "local copy (sync --force to replace)"})
+			dt.Items = append(dt.Items, diffItem{Skill: resolved.TargetName, Action: "skip", Reason: "local copy (sync --force to replace)", Kind: kindSkill})
 		}
 	}
 
 	// Orphan check
-	entries, _ := os.ReadDir(target.Path)
-	validNames := make(map[string]bool)
-	for _, skill := range filtered {
-		validNames[skill.FlatName] = true
-	}
-	manifest, _ := ssync.ReadManifest(target.Path)
+	entries, _ := os.ReadDir(sc.Path)
 	for _, entry := range entries {
 		eName := entry.Name()
-		if utils.IsHidden(eName) {
+		if manifest.SkipsHidden(eName) {
 			continue
 		}
-		managed, filterErr := ssync.ShouldSyncFlatName(eName, target.Include, target.Exclude)
-		if filterErr != nil {
+		if _, keepLegacy := legacyNames[eName]; keepLegacy {
 			continue
 		}
-		entryPath := filepath.Join(target.Path, eName)
-		if !managed {
-			if utils.IsSymlinkOrJunction(entryPath) {
-				absLink, linkErr := utils.ResolveLinkTarget(entryPath)
-				if linkErr == nil {
-					absSource, _ := filepath.Abs(s.cfg.Source)
-					if utils.PathHasPrefix(absLink, absSource+string(filepath.Separator)) {
-						dt.Items = append(dt.Items, diffItem{Skill: eName, Action: "prune", Reason: "excluded by filter"})
-					}
-				}
-			} else if _, inManifest := manifest.Managed[eName]; inManifest {
-				dt.Items = append(dt.Items, diffItem{Skill: eName, Action: "prune", Reason: "excluded managed directory"})
-			}
-			continue
-		}
+		entryPath := filepath.Join(sc.Path, eName)
 		if !validNames[eName] {
 			info, statErr := os.Lstat(entryPath)
 			if statErr != nil {
@@ -209,15 +228,19 @@ func (s *Server) computeTargetDiff(name string, target struct {
 				if linkErr != nil {
 					continue
 				}
-				absSource, _ := filepath.Abs(s.cfg.Source)
+				absSource, _ := filepath.Abs(source)
 				if utils.PathHasPrefix(absLink, absSource+string(filepath.Separator)) {
-					dt.Items = append(dt.Items, diffItem{Skill: eName, Action: "prune", Reason: "orphan symlink"})
+					dt.Items = append(dt.Items, diffItem{Skill: eName, Action: "prune", Reason: "orphan symlink", Kind: kindSkill})
 				}
 			} else if info.IsDir() {
 				if _, inManifest := manifest.Managed[eName]; inManifest {
-					dt.Items = append(dt.Items, diffItem{Skill: eName, Action: "prune", Reason: "orphan managed directory (manifest)"})
+					dt.Items = append(dt.Items, diffItem{Skill: eName, Action: "prune", Reason: "orphan managed directory (manifest)", Kind: kindSkill})
 				} else {
-					dt.Items = append(dt.Items, diffItem{Skill: eName, Action: "local", Reason: "local only"})
+					if resolution.Naming == "flat" && (utils.HasNestedSeparator(eName) || utils.IsTrackedRepoDir(eName)) {
+						dt.Items = append(dt.Items, diffItem{Skill: eName, Action: "prune", Reason: "orphan managed directory", Kind: kindSkill})
+					} else {
+						dt.Items = append(dt.Items, diffItem{Skill: eName, Action: "local", Reason: "local only", Kind: kindSkill})
+					}
 				}
 			}
 		}

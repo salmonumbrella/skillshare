@@ -1,14 +1,17 @@
 import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import llmsTxtPlugin from './plugins/llms-txt';
 
 const config: Config = {
   title: 'skillshare',
-  tagline: 'One source of truth for AI CLI skills. Sync everywhere with one command.',
-  favicon: 'img/favicon.png',
+  tagline: 'Your AI coding setup, everywhere. Manage skills, agents, rules, MCP connections and hooks in one place, with the desktop app or CLI.',
+  favicon: 'img/skillshare-favicon.png',
 
   future: {
     v4: true,
+    // Rspack and SWC instead of webpack and Babel: the build takes a sixth of the time.
+    experimental_faster: true,
   },
 
   url: 'https://skillshare.runkids.cc',
@@ -21,7 +24,15 @@ const config: Config = {
 
   i18n: {
     defaultLocale: 'en',
-    locales: ['en'],
+    // Sorted by language code after the source language, so the order needs no judgement.
+    locales: ['en', 'ja', 'ko', 'zh-Hans', 'zh-Hant'],
+    localeConfigs: {
+      en: {label: 'English'},
+      ja: {label: '日本語', htmlLang: 'ja'},
+      ko: {label: '한국어', htmlLang: 'ko'},
+      'zh-Hans': {label: '简体中文', htmlLang: 'zh-Hans'},
+      'zh-Hant': {label: '繁體中文', htmlLang: 'zh-Hant'},
+    },
   },
 
   markdown: {
@@ -35,6 +46,9 @@ const config: Config = {
       {
         hashed: true,
         indexBlog: true,
+        // Docs content is still English in every locale, so an English index is
+        // all there is to index. Add 'zh' / 'ja' when those docs get translated —
+        // note that adding 'ko' alongside them breaks lunr.multi's trimmer regex.
         language: ['en'],
         highlightSearchTermsOnTargetPage: true,
         searchResultLimits: 8,
@@ -72,6 +86,7 @@ const config: Config = {
   ],
 
   plugins: [
+    llmsTxtPlugin,
     [
       '@docusaurus/plugin-client-redirects',
       {
@@ -156,9 +171,14 @@ const config: Config = {
       title: 'skillshare',
       logo: {
         alt: 'skillshare',
-        src: 'img/logo.png',
+        src: 'img/skillshare-logo.png',
       },
       items: [
+        {
+          to: '/docs/getting-started/desktop-app',
+          label: 'Desktop App',
+          position: 'left',
+        },
         {
           type: 'docSidebar',
           sidebarId: 'docsSidebar',
@@ -176,18 +196,31 @@ const config: Config = {
           position: 'left',
         },
         {
+          to: '/features',
+          label: 'Feature map',
+          className: 'navbar-secondary',
+          position: 'left',
+        },
+        {
           to: '/blog',
           label: 'Blog',
+          className: 'navbar-secondary',
           position: 'left',
         },
         {
           to: '/changelog',
           label: 'Changelog',
+          className: 'navbar-secondary',
           position: 'left',
+        },
+        {
+          type: 'localeDropdown',
+          position: 'right',
         },
         {
           href: 'https://github.com/runkids/skillshare',
           label: 'GitHub',
+          className: 'navbar-secondary',
           position: 'right',
         },
       ],
@@ -217,6 +250,10 @@ const config: Config = {
             {label: 'Targets', to: '/docs/reference/targets'},
             {label: 'Environment Variables', to: '/docs/reference/appendix/environment-variables'},
             {label: 'Troubleshooting', to: '/docs/troubleshooting'},
+            // Emitted by plugins/llms-txt.ts at the site root only; a full URL keeps
+            // translated pages from prefixing their locale.
+            {label: 'llms.txt', href: 'https://skillshare.runkids.cc/llms.txt'},
+            {label: 'llms-full.txt', href: 'https://skillshare.runkids.cc/llms-full.txt'},
           ],
         },
         {

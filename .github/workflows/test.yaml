@@ -3,32 +3,70 @@ name: Test
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "website/**"
+      - "README.md"
+      - "CHANGELOG.md"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "website/**"
+      - "README.md"
+      - "CHANGELOG.md"
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
   workflow_call:
+    inputs:
+      ref:
+        description: Exact commit to verify for a release
+        type: string
+        default: ""
+
+# A newer push to a pull request supersedes its running tests; other events keep their own run.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('test-pr-{0}', github.event.pull_request.number) || format('test-{0}', github.run_id) }}
+  cancel-in-progress: true
 
 jobs:
   unit-test:
+    # Release Please tests a merged Release PR at its exact SHA (inputs.ref) before tagging,
+    # so the push run for that same commit is skipped. Release PR runs stay: they are required checks.
+    if: &not-release-duplicate "${{ !(github.event_name == 'push' && !inputs.ref && startsWith(github.event.head_commit.message, 'chore(main): release ')) }}"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Check AI context routes
+        run: python3 scripts/ai-context.py check
+
+      - name: Herdr mod tests
+        run: make test-herdr
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
 
       - name: Build
         run: make build
 
+      - name: Formatting, lint and release metadata tests
+        run: |
+          make fmt-check lint
+          python3 -B -m unittest discover -s scripts/release -p '*_test.py'
+          python3 -B -m unittest discover -s scripts/design -p '*_test.py'
+
       - name: Unit Tests
-        run: go test -v -race ./internal/...
+        run: go test -v -race ./cmd/skillshare/... ./internal/...
+        env:
+          SKILLSHARE_TEST_BINARY: ${{ github.workspace }}/bin/skillshare
 
   integration-test:
+    if: *not-release-duplicate
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -36,11 +74,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
 
       - name: Build Binary
         run: make build
@@ -50,50 +90,128 @@ jobs:
         env:
           SKILLSHARE_TEST_BINARY: ${{ github.workspace }}/bin/skillshare
 
+  windows-test:
+    # Releases publish windows_amd64 and windows_arm64 archives, and `_windows.go` files are compiled
+    # only on Windows, yet every job above runs on Linux or macOS: a Windows-only regression reaches
+    # users at release time instead of at review.
+    # This job starts with the packages that already pass on windows-latest, so it is green on
+    # arrival. #344 lists the packages that do not pass there and the failures behind them; each fix
+    # adds its package back to this list.
+    # No -race: the race detector needs a C toolchain on Windows, and ubuntu and macOS cover it.
+    # -count=1 so that a cached result cannot report a pass for a package that never ran.
+    if: *not-release-duplicate
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Unit Tests
+        shell: bash
+        run: |
+          go test -v -count=1 \
+            ./cmd/skillshare \
+            ./internal/audit \
+            ./internal/backup \
+            ./internal/check \
+            ./internal/childproc \
+            ./internal/config \
+            ./internal/hub \
+            ./internal/install \
+            ./internal/instructions \
+            ./internal/mcp \
+            ./internal/memory \
+            ./internal/projectdir \
+            ./internal/projects \
+            ./internal/resource \
+            ./internal/search \
+            ./internal/skill \
+            ./internal/skillignore \
+            ./internal/sourcewalk \
+            ./internal/sync \
+            ./internal/theme \
+            ./internal/trash \
+            ./internal/ui \
+            ./internal/uidist \
+            ./internal/utils \
+            ./internal/validate \
+            ./internal/version
+
+      # Run this Windows-only regression; the rest of oplog still has failures tracked in #344.
+      - name: Windows legacy config log regression
+        shell: bash
+        run: go test -v -count=1 ./internal/oplog -run "^TestLogDir_WindowsLegacySelectedGlobal$"
+      - name: Native project registration smoke
+        shell: pwsh
+        env:
+          SKILLSHARE_TEST_BINARY: ${{ github.workspace }}/bin/skillshare.exe
+        run: |
+          $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
+          Write-Output "Architecture=$env:PROCESSOR_ARCHITECTURE elevated=$($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+          go build -o bin/skillshare.exe ./cmd/skillshare
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test -v -count=1 ./tests/integration -run '^TestProject_NativeLinksSmoke$'
+
   docker-sandbox-offline:
+    if: *not-release-duplicate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Docker Sandbox Tests (Offline)
         run: ./scripts/test_docker.sh
 
   docker-sandbox-online:
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: "${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !(github.event_name == 'push' && !inputs.ref && startsWith(github.event.head_commit.message, 'chore(main): release ')) }}"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Docker Sandbox Tests (Online)
         run: ./scripts/test_docker_online.sh
 
   redteam:
+    if: *not-release-duplicate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
 
       - name: Red Team Test
         run: make test-redteam
 
   redteam-signal:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: "${{ (github.event_name == 'push' && (inputs.ref || !startsWith(github.event.head_commit.message, 'chore(main): release '))) || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version-file: go.mod
 
       - name: Red Team Signal (Code Mutation)
         run: make test-redteam-signal

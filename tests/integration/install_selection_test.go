@@ -153,8 +153,8 @@ func TestInstall_SkillFlag_DryRun(t *testing.T) {
 	result := sb.RunCLI("install", "file://"+gitRepoPath, "-s", "skill-one", "--dry-run")
 	result.AssertSuccess(t)
 	result.AssertOutputContains(t, "skill-one")
-	result.AssertOutputContains(t, "dry-run")
-	result.AssertOutputContains(t, "1 skill(s)")
+	result.AssertOutputContains(t, "Would install 1 skill")
+	result.AssertOutputContains(t, "Dry run — nothing was written")
 
 	// skill-two and skill-three should NOT appear in output
 	result.AssertOutputNotContains(t, "skill-two")
@@ -187,7 +187,3 @@ func TestInstall_SkillAndTrackConflict(t *testing.T) {
 	result.AssertFailure(t)
 	result.AssertAnyOutputContains(t, "--skill cannot be used with --track")
 }
-
-// TestInstall_SubdirFuzzyResolve tests that when a subdir doesn't exist at the
-// exact path, the installer scans the repo for a matching skill by basename.
-// e.g. "owner/repo/pdf" where "pdf" lives at "skills/pdf/SKILL.md".

@@ -46,10 +46,11 @@ skillshare sync
 ```
 
 **What happens:**
-1. Repo is cloned to `~/.config/skillshare/skills/_team-skills/`
+1. Repo is cloned to `~/.config/skillshare/skills/_team-shared-skills/`
 2. `.git` directory is preserved
-3. Entire repo is security-audited using active install threshold (`audit.block_threshold` or `--threshold`)
-4. Nested skills are flattened for AI CLIs
+3. The clone directory is added to the managed `.gitignore` block so it stays machine-local and is not committed as a nested git repository
+4. Entire repo is security-audited using active install threshold (`audit.block_threshold` or `--threshold`)
+5. Nested skills are flattened for AI CLIs
 
 If findings hit the threshold, install is blocked unless `--force` is used. On block, skillshare removes the cloned repo automatically; if cleanup fails, the command reports the exact path for manual cleanup.
 
@@ -66,9 +67,13 @@ Tracked repos are prefixed with `_` to distinguish them from regular skills:
 └── _team-skills/       # Tracked repo (underscore prefix)
 ```
 
+The directory name comes from the owner and repo (`_<owner>-<repo>`), so `alice/skills` and `bob/skills` install as `_alice-skills` and `_bob-skills` instead of colliding. Use `--name` to pick a different name. Repos you installed earlier keep their current names.
+
+A tracked repo installed with `--into` sits inside a folder, such as `devops/_team-skills/`. It is still treated as one repo: its skills are grouped under it, `status` counts them, and you update or uninstall it as `devops/_team-skills`. Below the top level, an `_` folder counts as a tracked repo only when it is a git clone, so a plain folder like `devops/_drafts/` stays a regular folder.
+
 ---
 
-## Nested Skills & Auto-Flattening
+## Nested Skills & Auto-Flattening {#nested-skills--auto-flattening}
 
 Skill repos often organize skills in folders. skillshare automatically flattens them for AI CLIs:
 
@@ -104,6 +109,30 @@ _team-skills/
 Auto-flattening works for **all skills**, not just tracked repos. You can organize your personal skills in folders too. See [Organize with Folders](/docs/understand/source-and-targets#organize-with-folders-auto-flattening).
 :::
 
+Target directories inside a tracked repo, such as `.claude/skills/` or `.agents/skills/`, usually hold copies of the repo's skills, so sync skips them. The exception is a repo whose only skills are in its root `.agents/skills/`: those skills are discovered, so `_psychopomp/.agents/skills/explainer-motion/` syncs as `_psychopomp__.agents__skills__explainer-motion`.
+
+---
+
+## Rehydrating After a Fresh Clone {#rehydrating-after-a-fresh-clone}
+
+Tracked repo clone directories are intentionally ignored by git because they contain their own `.git` directory. If you clone or pull your skillshare source repo on a new machine, `.metadata.json` may already declare tracked repos while the `_team-skills/` clone directory is still missing.
+
+Run no-argument install to recreate missing tracked repo clones from metadata:
+
+```bash
+skillshare install
+skillshare sync
+```
+
+For project mode, run:
+
+```bash
+skillshare install -p
+skillshare sync -p
+```
+
+`status`, `check`, `update --all`, and `doctor` report missing tracked repo clones and suggest `skillshare install` instead of silently ignoring them.
+
 ---
 
 ## Updating Tracked Repos
@@ -123,17 +152,17 @@ skillshare sync
 ```
 
 **What happens:**
-```
-cd ~/.config/skillshare/skills/_team-skills
-git pull origin main
+```text
+Isolated candidate → git pull → audit → publish approved commit
 ```
 
 **Security behavior during updates:**
-- Updated content is audited after pull.
+- Pull and audit run in an isolated candidate; existing target links keep reading the active checkout.
+- Sparse-checkout selection and existing integrity hashes are preserved. Unresolvable symlinks or links escaping the candidate reject the update as a scan error.
 - Blocking uses the active threshold (`audit.block_threshold` by default, or per-command `--threshold`/`-T` override).
-- In TTY mode, `skillshare update` prompts for confirmation when findings hit threshold; in non-TTY mode it rolls back automatically (unless `--skip-audit` is used).
-- On rejection, tracked repos roll back to the previous commit to preserve local state.
-- If rollback baseline capture fails, update aborts for safety (fail-closed).
+- In TTY mode, `skillshare update` prompts when findings hit threshold; in non-TTY mode it rejects the candidate unless overridden.
+- Rejection or a scan error leaves the active checkout and metadata unchanged. `--force` cannot override scan errors; `--skip-audit` disables scanning.
+- Approval publishes the exact audited commit without another upstream pull. Publication is not an atomic multi-file switch.
 
 ---
 
@@ -143,21 +172,28 @@ git pull origin main
 skillshare uninstall _team-skills
 ```
 
+For existing checkouts (including links to Git checkouts):
+
 **What happens:**
-1. Checks for uncommitted changes (warns if found)
-2. Removes the directory
+1. Checks for uncommitted changes and stops if it finds any, or if it cannot read the git status (`--force` overrides)
+2. Moves the directory to trash (kept 7 days)
 3. Next `sync` removes the symlinks from targets
+
+In global mode, an explicitly named tracked declaration with no checkout here (absent, a plain folder, or a link to a non-checkout) can be removed without contacting its source, even if the source is unreachable. Only its record and audit acceptances are removed: the occupant and `.gitignore` stay untouched, no Git check runs, and nothing goes to trash. `trash restore` cannot undo this removal. Use the canonical `_` name or full recorded path, such as `skillshare uninstall devops/_team-skills -g`; shorthand can select an existing skill or folder. Globs, `--all`, and `--group` do not select declarations without checkouts.
+
+Deleting a checkout by hand leaves its global declaration. To restore missing checkouts instead of dropping their declarations, run `skillshare install -g` with reachable sources and free destinations. If a later `install` or reconcile walks a plain folder or followed link to a non-checkout at a declared path, it normalizes the entry to an ordinary record (`Tracked=false`); ordinary uninstall then moves the occupant to trash. Absent paths and unfollowed or unavailable links are not normalized this way.
+
+In global mode, `unlink` also forgets the tracked-repository record and audit acceptances kept for that link name; its target remains untouched.
 
 ---
 
 ## Project Mode
 
-Tracked repos also work in project mode. The repo is cloned into `.skillshare/skills/` and added to `.skillshare/.gitignore` (so the tracked repo's git history doesn't conflict with your project's git). Project logs (`.skillshare/logs/`) are also ignored by default.
+Tracked repos also work in project mode. The repo is cloned into `.skillshare/skills/` and added to `.skillshare/.gitignore` (so the tracked repo's git history doesn't conflict with your project's git). Project logs (`.skillshare/logs/`), trash (`.skillshare/trash/`), backups (`.skillshare/backups/`), and install metadata (`.skillshare/skills/.metadata.json`) are also ignored by default.
 
-Installing a tracked repo auto-records `tracked: true` in `.skillshare/registry.yaml`, so new team members get the correct clone behavior via `skillshare install -p`:
+Installing a tracked repo auto-records `tracked: true` in `.skillshare/config.yaml`, so new team members get the correct clone behavior via `skillshare install -p`:
 
 ```yaml
-# .skillshare/registry.yaml (auto-updated after install --track -p)
 skills:
   - name: _team-shared-skills
     source: github.com/team/shared-skills
@@ -185,7 +221,7 @@ skillshare uninstall team-skills -p
 ```
 <project-root>/
 └── .skillshare/
-    ├── .gitignore           # Contains: logs/ and skills/_team-skills
+    ├── .gitignore           # Contains: logs/, trash/, skills/.metadata.json, and skills/_team-skills
     └── skills/
         └── _team-skills/    # Tracked repo with .git/ preserved
             ├── .git/
@@ -213,25 +249,58 @@ Name constraints for `--track --name`:
 
 ---
 
+## Branch Tracking
+
+You can track a specific branch of a repository:
+
+```bash
+skillshare install github.com/team/skills --track --branch frontend
+```
+
+The tracked repo clones and follows the specified branch. Updates via `skillshare update` pull from that branch automatically.
+
+To install the same repo on multiple branches, use `--name` to avoid name collisions:
+
+```bash
+skillshare install github.com/team/skills --track --branch frontend --name team-frontend
+skillshare install github.com/team/skills --track --branch backend --name team-backend
+```
+
+Branch also works with regular (non-tracked) installs:
+
+```bash
+skillshare install github.com/team/skills --branch develop --all
+```
+
+The branch is persisted in skill metadata, so `skillshare update` and `skillshare check` use the correct branch automatically.
+
+For reproducible installs, `--branch` also accepts a tag or a commit SHA:
+
+```bash
+skillshare install github.com/team/skills --branch v1.2.0 --all
+skillshare install github.com/team/skills --branch 8f14e45 --all
+```
+
+Tags and commit SHAs cannot be combined with `--track`: a tracked repo pulls from a branch, and a detached checkout has nothing to pull. Pin tags or SHAs with regular installs instead.
+
+---
+
 ## Collision Detection
 
 When multiple skills share the same `name` field, sync checks whether they actually land on the same target after `include`/`exclude` filters are applied.
 
-**Filters isolate the collision** — informational only:
-
-```
-ℹ Duplicate skill names exist but are isolated by target filters:
-  'ui' (2 definitions)
-```
+**Filters isolate the collision** — nothing is printed; the skills never reach the same target.
 
 **Collision reaches the same target** — actionable warning:
 
 ```
-⚠ Target 'claude': skill name 'ui' is defined in multiple places:
-  - _team-a/frontend/ui
-  - _team-b/components/ui
-Rename one in SKILL.md or adjust include/exclude filters
+! 1 duplicate skill names detected
+  ui                              _team-a/ vs _team-b/
+  Rename one in SKILL.md or adjust include/exclude filters
+  1 name collision(s) excluded
 ```
+
+With `target_naming: prefixed`, a tracked skill can also collide with a skill that already has its prefixed name (`_alpha/prototype` becomes `alpha-prototype`). A tracked skill cannot be renamed in `SKILL.md`, so sync suggests renaming the other skill or re-tracking the repo with `--name`.
 
 **Best practice** — namespace your skills or use filters:
 

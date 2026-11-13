@@ -13,9 +13,9 @@ flowchart LR
     SRC["Source"]
     TGT_CLAUDE["claude &nbsp; ~/.claude/skills"]
     TGT_CURSOR["cursor &nbsp; ~/.cursor/skills"]
-    TGT_CODEX["codex &nbsp; ~/.codex/skills"]
+    TGT_CODEX["codex &nbsp; ~/.agents/skills"]
     TGT_GEMINI["gemini &nbsp; ~/.gemini/skills"]
-    TGT_MORE["... &nbsp; 55+ supported"]
+    TGT_MORE["... &nbsp; 79 supported"]
 
     SRC -->|sync| TGT_CLAUDE
     SRC -->|sync| TGT_CURSOR
@@ -36,7 +36,7 @@ flowchart LR
 
 | Topic | Description |
 |-------|-------------|
-| [Supported Targets](./supported-targets.md) | Complete list of 55+ supported AI CLIs |
+| [Supported Targets](./supported-targets.md) | Complete list of 79 supported AI CLIs |
 | [Adding Custom Targets](./adding-custom-targets.md) | Add any tool with a skills directory |
 | [Configuration](./configuration.md) | Config file reference |
 
@@ -49,6 +49,10 @@ flowchart LR
 ```bash
 skillshare target list
 ```
+
+The dashboard's **Targets** page shows the same list with each target's status:
+
+![Targets page listing each Agent with status and MCP server count](/img/targets-list.png)
 
 ### Show target details
 

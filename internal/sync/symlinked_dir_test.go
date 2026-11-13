@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"skillshare/internal/config"
+	"skillshare/internal/utils"
 )
 
 // --- Discover tests: source dir is a symlink ---
@@ -111,7 +112,7 @@ func TestSyncTargetMerge_SourceIsSymlink(t *testing.T) {
 	}
 
 	target := config.TargetConfig{Path: tgt, Mode: "merge"}
-	result, err := SyncTargetMerge("test", target, symlinkSource, false, false)
+	result, err := SyncTargetMerge("test", target, symlinkSource, false, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +152,7 @@ func TestSyncTargetMerge_TargetIsSymlink(t *testing.T) {
 	}
 
 	target := config.TargetConfig{Path: symlinkTarget, Mode: "merge"}
-	result, err := SyncTargetMerge("test", target, src, false, false)
+	result, err := SyncTargetMerge("test", target, src, false, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +166,7 @@ func TestSyncTargetMerge_TargetIsSymlink(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected symlink at %q: %v", linkPath, err)
 	}
-	if info.Mode()&os.ModeSymlink == 0 {
+	if !utils.IsLinkMode(linkPath, info.Mode()) {
 		t.Fatal("expected a symlink")
 	}
 
@@ -207,7 +208,7 @@ func TestSyncTargetMerge_BothSourceAndTargetAreSymlinks(t *testing.T) {
 	}
 
 	target := config.TargetConfig{Path: symlinkTarget, Mode: "merge"}
-	result, err := SyncTargetMerge("test", target, symlinkSource, false, false)
+	result, err := SyncTargetMerge("test", target, symlinkSource, false, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +251,7 @@ func TestSyncTargetMerge_ChainedSourceSymlink(t *testing.T) {
 	}
 
 	target := config.TargetConfig{Path: tgt, Mode: "merge"}
-	result, err := SyncTargetMerge("test", target, link2, false, false)
+	result, err := SyncTargetMerge("test", target, link2, false, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +283,7 @@ func TestSyncTargetMerge_ChainedTargetSymlink(t *testing.T) {
 	}
 
 	target := config.TargetConfig{Path: link2, Mode: "merge"}
-	result, err := SyncTargetMerge("test", target, src, false, false)
+	result, err := SyncTargetMerge("test", target, src, false, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +318,7 @@ func TestSyncTargetMerge_IdempotentWithSymlinkedSource(t *testing.T) {
 	target := config.TargetConfig{Path: tgt, Mode: "merge"}
 
 	// First sync
-	r1, err := SyncTargetMerge("test", target, symlinkSource, false, false)
+	r1, err := SyncTargetMerge("test", target, symlinkSource, false, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +327,7 @@ func TestSyncTargetMerge_IdempotentWithSymlinkedSource(t *testing.T) {
 	}
 
 	// Second sync — should detect already-linked
-	r2, err := SyncTargetMerge("test", target, symlinkSource, false, false)
+	r2, err := SyncTargetMerge("test", target, symlinkSource, false, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +358,7 @@ func TestPruneOrphanLinks_TargetIsSymlink(t *testing.T) {
 
 	// Sync two skills
 	writeSkillMD(t, filepath.Join(src, "gone"), "---\nname: gone\n---\n# Gone")
-	if _, err := SyncTargetMerge("test", target, src, false, false); err != nil {
+	if _, err := SyncTargetMerge("test", target, src, false, false, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -365,7 +366,7 @@ func TestPruneOrphanLinks_TargetIsSymlink(t *testing.T) {
 	os.RemoveAll(filepath.Join(src, "gone"))
 
 	// Prune through symlinked target path
-	result, err := PruneOrphanLinks(symlinkTarget, src, nil, nil, "test", false, false)
+	result, err := PruneOrphanLinks(symlinkTarget, src, nil, nil, "test", "", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +436,7 @@ func TestFindLocalSkills_TargetIsSymlink(t *testing.T) {
 	os.MkdirAll(localSkill, 0755)
 	os.WriteFile(filepath.Join(localSkill, "SKILL.md"), []byte("# Local"), 0644)
 
-	skills, err := FindLocalSkills(symlinkTarget, src)
+	skills, err := FindLocalSkills(symlinkTarget, src, "merge")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +464,7 @@ func TestSyncTargetMerge_ManifestCorrectThroughSymlink(t *testing.T) {
 	}
 
 	target := config.TargetConfig{Path: symlinkTarget, Mode: "merge"}
-	if _, err := SyncTargetMerge("test", target, src, false, false); err != nil {
+	if _, err := SyncTargetMerge("test", target, src, false, false, ""); err != nil {
 		t.Fatal(err)
 	}
 

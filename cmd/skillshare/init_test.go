@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"skillshare/internal/install"
 )
 
 func envValue(env []string, key string) (string, bool) {
@@ -50,7 +52,7 @@ func TestCommitSourceFiles_CommitFailureIsReturned(t *testing.T) {
 		t.Fatalf("write SKILL.md: %v", err)
 	}
 
-	err := commitSourceFiles(repo)
+	err := commitSourceFiles(repo, repo)
 	if err == nil {
 		t.Fatal("expected commitSourceFiles to return error when git commit fails")
 	}
@@ -72,14 +74,14 @@ func TestCommitSourceFiles_NoChangesReturnsNil(t *testing.T) {
 	runGit(t, repo, "add", ".")
 	runGit(t, repo, "commit", "-m", "initial")
 
-	if err := commitSourceFiles(repo); err != nil {
+	if err := commitSourceFiles(repo, repo); err != nil {
 		t.Fatalf("expected nil error when nothing to commit, got: %v", err)
 	}
 }
 
 func TestRemoteFetchEnv_DisablesInteractivePrompts(t *testing.T) {
 	t.Setenv("GIT_SSH_COMMAND", "")
-	env := remoteFetchEnv("https://github.com/org/repo.git")
+	env := remoteFetchEnv("https://github.com/org/repo.git", install.ParseOptions{})
 
 	if v, ok := envValue(env, "GIT_TERMINAL_PROMPT"); !ok || v != "0" {
 		t.Fatalf("expected GIT_TERMINAL_PROMPT=0, got %q (present=%v)", v, ok)
@@ -102,8 +104,50 @@ func TestRemoteFetchEnv_RespectsExistingSSHCommand(t *testing.T) {
 	custom := "ssh -i /tmp/custom-key"
 	t.Setenv("GIT_SSH_COMMAND", custom)
 
-	env := remoteFetchEnv("https://github.com/org/repo.git")
+	env := remoteFetchEnv("https://github.com/org/repo.git", install.ParseOptions{})
 	if v, ok := envValue(env, "GIT_SSH_COMMAND"); !ok || v != custom {
 		t.Fatalf("expected existing GIT_SSH_COMMAND to be preserved, got %q (present=%v)", v, ok)
+	}
+}
+
+// A skillshare folder that is a link (here a dangling one, which
+// hasBuiltinSkill does not count) is refused before the download, so neither
+// the install nor the fallback writes into its target.
+func TestInstallBuiltinSkill_RefusesLinkedFolder(t *testing.T) {
+	source := t.TempDir()
+	external := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.Symlink(external, filepath.Join(source, "skillshare")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installBuiltinSkill(source); err == nil || !strings.Contains(err.Error(), "is a link") {
+		t.Fatalf("installBuiltinSkill = %v, want a link refusal", err)
+	}
+	if _, err := os.Lstat(external); !os.IsNotExist(err) {
+		t.Fatalf("link target was created: %v", err)
+	}
+}
+
+func TestCommitSourceFiles_WarnsSourceLinkAtConfigRoot(t *testing.T) {
+	repo := t.TempDir()
+	skills := filepath.Join(repo, "skills")
+	if err := os.Mkdir(skills, 0755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "init", "-q")
+	runGit(t, repo, "config", "user.email", "test@example.com")
+	runGit(t, repo, "config", "user.name", "Test User")
+	if err := os.Symlink(t.TempDir(), filepath.Join(skills, "_dev-skills")); err != nil {
+		t.Fatal(err)
+	}
+	output := captureStdout(t, func() {
+		if err := commitSourceFiles(repo, skills); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.Count(output, "init will stage source link") != 1 || !strings.Contains(output, "/skills/_dev-skills") {
+		t.Fatalf("warning: %s", output)
+	}
+	if got := runGit(t, repo, "ls-tree", "--name-only", "HEAD", "skills/_dev-skills"); got != "skills/_dev-skills" {
+		t.Fatalf("link was not committed: %s", got)
 	}
 }

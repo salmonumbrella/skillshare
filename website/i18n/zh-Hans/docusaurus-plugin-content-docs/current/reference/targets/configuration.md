@@ -1,0 +1,1241 @@
+---
+sidebar_position: 4
+---
+
+# Configuration
+
+skillshare 的配置文件参考。
+
+## 概览
+
+```text
+~/.config/skillshare/
+├── config.yaml          ← 配置文件
+├── skills/              ← Source 目录（你的 Skill）
+│   ├── .metadata.json   ← Skill 元数据（自动管理）
+│   ├── my-skill/
+│   ├── another/
+│   └── _team-repo/      ← 已 track 的仓库
+├── extras/              ← Extras Source 根目录
+│   └── rules/           ← Extra 资源（例如 rules）
+
+~/.local/share/skillshare/
+└── backups/             ← 自动备份
+    └── 2026-01-20.../
+```
+
+---
+
+## IDE 支持（JSON Schema） {#ide-support}
+
+配置文件包含一个 YAML Language Server 指令，可在支持的编辑器中启用**自动补全**、**校验**和**悬浮文档**。
+
+`skillshare init` 创建的新配置会自动包含此项：
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/runkids/skillshare/main/schemas/config.schema.json
+source: ~/.config/skillshare/skills
+targets:
+  claude:
+    path: ~/.claude/skills
+```
+
+### 添加到现有配置
+
+如果你的配置是在此功能出现之前创建的，将该注释添加为**第一行**：
+
+**全局配置**（`~/.config/skillshare/config.yaml`）：
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/runkids/skillshare/main/schemas/config.schema.json
+```
+
+**项目配置**（`.skillshare/config.yaml`）：
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/runkids/skillshare/main/schemas/project-config.schema.json
+```
+
+或者直接重新运行 `skillshare init --force`（全局）或 `skillshare init -p --force`（项目），以带上 schema 注释重新生成配置。
+
+### 支持的编辑器
+
+| 编辑器 | 所需扩展 |
+|--------|-------------------|
+| VS Code | Red Hat 的 [YAML](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml) 扩展 |
+| JetBrains IDEs | 内置 YAML 支持 |
+| Neovim | 通过 LSP 使用 [yaml-language-server](https://github.com/redhat-developer/yaml-language-server) |
+
+---
+
+## 配置文件
+
+**位置：** `~/.config/skillshare/config.yaml`
+
+### 完整示例
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/runkids/skillshare/main/schemas/config.schema.json
+# Source 目录（你编辑 Skill 的地方）
+source: ~/.config/skillshare/skills
+
+# 跟随 Skill Source 根目录下第一层的目录链接（需显式开启）
+# follow_source_links: true
+
+# 新 Target 的默认 Sync 模式
+mode: merge
+
+# 默认 Target 命名方式（flat、standard 或 prefixed）
+# target_naming: flat
+
+# Targets（AI CLI Skill 目录）
+targets:
+  claude:
+    path: ~/.claude/skills
+    # mode: merge（继承自默认值）
+
+  codex:
+    path: ~/.codex/skills
+    mode: symlink  # 覆盖默认模式
+    include: [codex-*] # 仅 merge/copy 模式
+
+  cursor:
+    path: ~/.cursor/skills
+    mode: copy  # 为 Cursor 提供真实文件
+    exclude: [experimental-*] # 仅 merge/copy 模式
+
+  # 自定义 Target
+  myapp:
+    path: ~/apps/myapp/skills
+
+# 远程 Skill —— 由 install/uninstall 自动管理
+skills:
+  - name: pdf
+    source: anthropics/skills/skills/pdf
+  - name: _team-skills
+    source: github.com/team/skills
+    tracked: true
+
+# 保存时将 $HOME 折叠为 ~（对 dotfiles 友好）
+# preserve_tilde_on_save: true
+
+# commit/push/pull 所使用的目录（skills 为默认值，此外还有 agents、extras、root）
+# git_root: skills
+
+# 自定义 agents Source（可选，覆盖默认位置）
+agents_source: ~/my-agents
+
+# 自定义 extras Source（可选，覆盖默认位置）
+extras_source: ~/my-extras
+
+# 需要 sync 的非 Skill 资源
+extras:
+  - name: rules
+    source: ~/company-shared/rules   # 可选，针对该 extra 的覆盖设置
+    targets:
+      - path: ~/.claude/rules
+      - path: ~/.cursor/rules
+        mode: copy
+
+# Sync 时要忽略的文件
+ignore:
+  - "**/.DS_Store"
+  - "**/.git/**"
+  - "**/node_modules/**"
+  - "**/*.log"
+```
+
+---
+
+## 字段
+
+### `source`
+
+指向你的 Skill 目录的路径（唯一的 Source）。
+
+```yaml
+source: ~/.config/skillshare/skills
+```
+
+**默认值：** `~/.config/skillshare/skills`
+
+### `follow_source_links` {#follow_source_links}
+
+显式开启后，可以通过直接放在 Skill Source 根目录下的 symlink（Unix）或 junction（Windows）来发现 Skill。
+
+| 字段 | 类型 | 默认值 | 作用范围 |
+|-------|------|---------|-------|
+| `follow_source_links` | boolean | `false` | 全局配置和项目配置 |
+
+```yaml title="~/.config/skillshare/config.yaml"
+follow_source_links: true
+```
+
+默认值为 `false` 时，发现阶段会忽略第一层的链接，`skillshare doctor` 会将它们报告为未跟随。设为 `true` 后，第一层指向目录的链接会被当作以链接名命名的目录来处理。树中更深层的链接在发现阶段不会被跟随。这个设置与把 Source 根目录本身做成链接是两回事，后者无需开启即已支持。
+
+例如，用 [`skillshare link`](../commands/link.md) 把一个现有的 checkout 链接到 Source 中：
+
+```bash
+skillshare link ~/code/dev-skills --enable
+skillshare sync
+```
+
+这会创建 `~/.config/skillshare/skills/_dev-skills`，加上 `--enable` 还会设置 `follow_source_links: true`。该命令会拒绝下方安全防护会跳过的目标；[`skillshare unlink _dev-skills`](../commands/unlink.md) 可再次移除该链接。
+
+:::note 手动链接
+自己创建的链接（`ln -s ~/code/dev-skills ~/.config/skillshare/skills/_dev-skills`）也会以同样方式被跟随；此时安全防护只会在创建之后由 `skillshare doctor` 报告。
+:::
+
+如果 `~/code/dev-skills` 包含 `.git` 条目，`_dev-skills` 就会成为一个 tracked repo 分组，其子目录会被发现为 Skill。Sync 会像对待其他 Skill 一样链接或复制它们。在 symlink 模式下，在真实 checkout 中编辑文件会立即反映到 Target；copy 模式则需要再执行一次 sync。
+
+使用 `.git` 文件的 Git worktree 和 submodule 也是 checkout：`update --all` 会跳过它们，dashboard 会拒绝更新它们。
+
+:::warning update 会修改真实的 checkout
+`skillshare update _dev-skills` 会准备并审计隔离的候选副本，再将获准的 revision 发布到 `~/code/dev-skills`。拒绝时实际 checkout 保持不变。`skillshare update _dev-skills --force` 只会在发布候选副本时丢弃其本地修改。`skillshare update --all`（即使加上 `--force`）会跳过被跟随的链接并给出警告；请按名称单独更新它们。`skillshare install <url> --track --update` 仍会拒绝存在未提交修改的链接 checkout；请先 commit 或 stash。dashboard 永远不会更新链接指向的 Git checkout，包括强制重试；这些 checkout 由你管理。
+:::
+
+#### 安全防护 {#safety-guards}
+
+- 指向 Source 根目录或其任一上级目录的链接会被跳过。
+- 与某个 Sync Target 重叠的链接会被跳过。这是根据链接文本判断的，因此即使 Target 目录尚不存在也同样适用。
+- 目标缺失或不可读的链接会被跳过并给出警告。遍历目标或其子目录时读取失败，也会将该链接标记为不可用，即使已经发现部分 Skill。该次运行**不会执行任何清理（prune）、孤立副本删除或元数据删除**。未挂载的外置硬盘是安全的：重新挂载后再执行一次 sync 即可。`skillshare doctor` 会把该 Source 链接背后的失效 Target 链接列为正在等待它，而不是列为需要清理的损坏链接。 这个分类依据链接保存的目标路径，因此也适用于 `target_naming: standard`。
+- 指向文件的链接（例如共享的 `.skillignore`）不是目录链接。它仍是普通条目，从不影响清理。
+
+#### 发现阶段如何判断 {#how-discovery-decides}
+
+所有读取 Source 的命令（`list`、`sync`、`update`、`status`、dashboard）都通过同一个共享的遍历器来遍历它。对于每个第一层条目，判断流程如下：
+
+```mermaid
+flowchart TD
+    A[Skill Source 根目录下的第一层条目] --> B{是 symlink 或 junction？}
+    B -- 否 --> C[普通目录或文件]
+    B -- 是 --> D{follow_source_links 已开启？}
+    D -- 否 --> E[忽略；doctor 报告为未跟随]
+    D -- 是 --> H{链接指向 Source 根目录或其上级目录？}
+    H -- 是 --> I[跳过并警告：循环]
+    H -- 否 --> J{链接指向某个 Sync Target 内部或其外围？}
+    J -- 是 --> K[跳过并警告：与 Target 重叠]
+    J -- 否 --> F{目标存在？}
+    F -- 否 --> G[跳过并警告；该次运行不删除任何内容]
+    F -- 是 --> N{目标是目录？}
+    N -- 否 --> O[普通条目，例如指向共享文件的链接]
+    N -- 是 --> R{目标可读？}
+    R -- 否 --> G
+    R -- 是 --> L[当作以链接名命名的目录处理，仅限一层]
+    L --> M[Skill 保留逻辑路径，例如 source/_dev-skills/foo]
+```
+
+#### 外置硬盘上的 Skills {#skills-on-an-external-drive}
+
+把 checkout 放在外置硬盘上，并把它链接到 Source 中：
+
+```bash
+skillshare link /Volumes/Work/dev-skills --enable
+skillshare sync
+```
+
+硬盘挂载期间，`_dev-skills` 的行为与其他 tracked repo 分组相同。未挂载时：
+
+- `list`、`sync`、`status`、`update --all`、`audit` 和 dashboard 会跳过该链接，并打印一条点名该链接的警告。`sync --json` 会将其列在 `warnings` 下；`audit --format json` 会将其列在 `warnings` 下并设置 `incomplete: true`，这样自动化流程就能区分部分运行和完整运行。
+- 该次运行**不会删除任何内容**：来自该硬盘的 Target 链接和副本保持原样，孤立副本不会被清理，其 Skill 的安装元数据也会保留，因为链接不可用意味着清单不完整，而不是 Skill 已被移除。
+- 在 symlink 模式下，Target 链接指向未挂载的路径，因此在硬盘回来之前，AI 工具无法读取这些 Skill。在 copy 模式下，副本仍可正常使用。
+- `skillshare doctor` 会以警告形式把这些 Target 链接显示为正在等待 Source 链接，且不会建议清理它们。
+- 无需重新注册任何内容：挂载硬盘后再执行一次 `skillshare sync` 即可。
+
+挂载路径在各次会话之间必须保持不变。在 macOS 上是 `/Volumes/<name>`，因此请固定卷名。在 Windows 上，每次插拔后变化的盘符会让 junction 指向错误的位置；请在磁盘管理中分配固定盘符，或改用挂载文件夹路径。
+
+#### 经由链接的写入 {#writes-through-the-link}
+
+对链接背后的 Skill 的写入会落到真实的 checkout 中：在 dashboard 中编辑内容、`skillshare install --into _dev-skills`，以及替换链接目录内的普通 Skill，都会修改 `~/code/dev-skills`。`skillshare uninstall _dev-skills/<child>` 会把该子目录从真实 checkout 移到 trash。`skillshare unlink _dev-skills` 只移除链接条目，从不移除真实的 checkout；trash 会列出该链接，`restore` 会重新创建它。`skillshare trash restore _dev-skills/<child>` 会按同样的策略把子目录放回真实 checkout；如果 checkout 下存在指向别处的嵌套链接，restore 会失败并保留 trash 条目。会逃出 checkout 的路径（`..`，或指向其外部的嵌套链接）仍会被拒绝。
+
+链接文件夹的根目录包含 `SKILL.md` 时也适用；`uninstall` 会拒绝移除该根级 skill。请使用 dashboard 的 **Unlink** 或 `skillshare unlink _dev-skills`，只移除链接而不改变目标文件夹。
+
+dashboard 的 Target 分配写入 frontmatter 时，也遵守这个写入边界：嵌套的 `SKILL.md` 链接会被拒绝，不会修改链接目标。批量分配会报告该 Skill 的拒绝原因，并继续处理普通 Skill。
+
+替换被跟随链接内的 Skill 时，会保留旧 Skill 直到替换成功；复制失败会恢复旧内容。传入内容中的链接会复制为实际文件或目录，目标不存在的链接会跳过。
+
+跨文件系统将 Skill 移入 trash 时，内部文件和目录链接会保留为链接，并保持原始目标文本；不会复制或删除链接目标。在 Windows 上，junction 仍会保持为 junction，因此不需要开发者模式。
+
+`update` 和 `check` 的 `--group` 接受链接名（`skillshare update --group _dev-skills`）。链接之下嵌套的分组（例如 `_dev-skills/sub`）不被 `--group` 接受；请改为指定其 Skill 的名称。`skillshare uninstall --group _dev-skills` 会被拒绝，因为它会清空真实的 checkout：移除链接请用 `skillshare unlink _dev-skills`，或按名称指定要移到 trash 的 Skill。
+
+在 Unix 上，提交 Source 仓库时暂存的是链接条目本身，也就是它的目标文本（通常是本机的绝对路径），而不是 checkout 中的文件。请把 `/_dev-skills` 加到 skills 目录的 `.gitignore` 中。`skillshare commit`、`push` 和 `init` 在链接将被暂存时会打印警告。
+
+#### Windows
+
+目录 junction 是预期的做法。`skillshare link D:\code\dev-skills` 会创建 junction，不需要开发者模式或管理员权限；只有在无法创建 junction 时才退而使用目录 symlink。若要手动创建 junction：
+
+```powershell
+cmd /c mklink /J "%APPDATA%\skillshare\skills\_dev-skills" "D:\code\dev-skills"
+```
+
+盘符必须保持稳定。已通过 `ai_docs/tests/windows_follow_source_links_runbook.md` 在 Windows 11 ARM64 上验证。
+
+### `mode`
+
+所有 Target 的默认 Sync 模式。
+
+```yaml
+mode: merge
+```
+
+| 值 | 行为 |
+|-------|----------|
+| `merge` | 每个 Skill 单独建立符号链接。本地 Skill 会被保留。**（默认）** |
+| `copy` | 每个 Skill 以真实文件形式复制。适用于无法跟随符号链接的 AI CLI。 |
+| `symlink` | 整个 Target 目录作为一个符号链接。 |
+
+### `target_naming`
+
+Merge/copy Sync 的默认 Target 命名策略。
+
+```yaml
+target_naming: flat
+```
+
+| 值 | 行为 |
+|-------|----------|
+| `flat` | 嵌套 Skill 用 `__` 分隔符扁平化（例如 `frontend__dev`）。**（默认）** |
+| `standard` | 直接使用 SKILL.md 的 `name` 字段（例如 `dev`）。遵循 [Agent Skills 规范](https://agentskills.io/specification)。 |
+| `prefixed` | 仅限 copy 模式。与 `standard` 类似，但 `name:` 不必与文件夹名称相同，且 tracked repo 内的 Skill 会命名为 `<repo>-<name>`，副本的文件夹名和 `name:` 都是如此（例如 `_mattpocock-skills` 中的 `prototype` → `mattpocock-skills-prototype`）。其他 Skill 保持原名。见 [Target 命名](/docs/understand/sync-modes#target-naming)。 |
+
+在 merge 或 symlink 模式下解析为 `prefixed` 的 target 会校验失败，并被 sync 跳过，因为链接指向 source，而 source 中的 `name:` 不能被修改。
+
+无论哪种命名方式，`include` / `exclude` 都始终匹配扁平化名称（`frontend__dev`），所以在 `standard` 下 filter 用的名称和 `sync` 创建的目录名不同——见 [include / exclude](#include--exclude-target-filters)。
+
+### `targets`
+
+需要 sync 到的 AI CLI Skill 目录。
+
+```yaml
+targets:
+  <name>:
+    path: <path>
+    mode: <mode>  # 可选，覆盖默认值
+    include: [<glob>, ...]  # 可选，仅 merge/copy 模式
+    exclude: [<glob>, ...]  # 可选，仅 merge/copy 模式
+```
+
+**示例：**
+```yaml
+targets:
+  claude:
+    path: ~/.claude/skills
+
+  codex:
+    path: ~/.codex/skills
+    mode: symlink
+
+  custom:
+    path: ~/my-app/skills
+```
+
+#### 某个 Agent 的另一个账号 {#agent-config-dir}
+
+一个 Target 可以是某个内置 Agent 的第二个配置目录：通过 `CLAUDE_CONFIG_DIR` 启动的 Claude Code、通过 `CODEX_HOME` 启动的 Codex、通过 `OPENCODE_CONFIG_DIR` 启动的 OpenCode，或通过 `PI_CODING_AGENT_DIR` 启动的 Pi。指定 Agent 和该目录即可；skills 和 agents 路径会随之确定。
+
+```yaml
+targets:
+  claude-work:
+    agent: claude
+    config_dir: ~/.claude-work   # skills 写入 ~/.claude-work/skills，agents 写入 ~/.claude-work/agents
+  codex-work:
+    agent: codex
+    config_dir: ~/.codex-work    # skills 写入 ~/.codex-work/skills
+```
+
+Codex 也会读取共享的 `~/.agents/skills`，但一个账号只拥有它自己的目录，因此它的 skills 会写入 `<config_dir>/skills`。Pi 和 OMP 的行为相同。Claude 和 OpenCode 也有 agents 目录。
+
+| 字段 | 说明 |
+|-------|-------------|
+| `agent` | 内置 Agent：`claude`（`CLAUDE_CONFIG_DIR`）、`codex`（`CODEX_HOME`）、`opencode`（`OPENCODE_CONFIG_DIR`）、`pi` 或 `omp`（两者都使用 `PI_CODING_AGENT_DIR`） |
+| `config_dir` | 该账号的配置目录。绝对路径或以 `~` 开头，不能是该 Agent 的默认目录，且只能被一个 Target 使用 |
+| `cli` | 可选。用兼容的 CLI 代替 Agent 本身来运行这个账号的 [plugin 命令](/docs/reference/commands/plugin#accounts)，例如 Pi 用 `omo`。填写 `PATH` 中的名称，或绝对路径（可以以 `~` 开头）。只能是一个可执行文件、不带参数；shell alias 不会生效 |
+
+沿用 Agent 命令的兼容 CLI 可以运行这个账号的 plugin。例如 omo 基于 Pi：
+
+```yaml
+targets:
+  omo:
+    agent: pi
+    config_dir: ~/.omo/agent
+    cli: omo
+```
+
+`cli` 只改变由哪个程序安装和移除 plugin。Skills、agents 和 MCP server 仍照常写入 `config_dir`。
+
+`mode`、`include`、`exclude` 以及其他 Target 设置的用法与任何 Target 相同。你自己写的 `skills.path` 或 `agents.path` 优先于推导出的路径。Target 名称也可以用作 [MCP target](/docs/reference/commands/mcp#accounts)。对于支持这些资源的 Agent，它也可以作为 [plugin target](/docs/reference/commands/plugin#accounts) 或 [hooks target](/docs/reference/commands/hooks#accounts)。OMP 账号支持 skills、指示文件、files、MCP 和原生 code hooks，但不支持 plugin sync。它的 Extensions 标签页会盘点原生模块，只有在原生版本、文件身份和设置作用域都经过验证时才提供[选择编辑](/docs/reference/commands/plugin#omp)；它不是运行时状态监视器。
+
+#### 指示文件 {#target-instructions}
+
+skillshare 知道许多内置 target 的指示文件（`CLAUDE.md`、`AGENTS.md`、`GEMINI.md` 等）。
+对于其他工具，`instructions` 告诉 skillshare 该工具读取哪个文件，这样控制台就能显示和编辑它，
+并接上[共享 AGENTS.md](../../how-to/daily-tasks/sharing-instructions.md)。这里设置的值会取代内置的文件。
+
+```yaml
+targets:
+  myagent:
+    path: ~/.myagent/skills
+    instructions:
+      path: ~/.myagent/AGENTS.md
+      import: true        # 该工具会展开 @path 行
+```
+
+| 字段 | 说明 |
+|-------|-------------|
+| `instructions.path` | 该工具读取的文件。在全局配置中，是绝对路径或以 `~/` 开头的路径。在项目配置中，是相对于项目根目录的路径，例如 `.myagent/AGENTS.md`。必须指向文件，不能是目录 |
+| `instructions.import` | 该工具会展开 `@path` 行时设为 `true`。此时它可以同时使用多份共享文件，每份以一行 import 加入。默认为 `false`：该工具只使用一份共享文件，以链接取代它自己的文件 |
+
+控制台会在添加 target 时从 **自定义目标** 对话框写入这个字段，之后也可以在 target 的文件标签页中修改。当 target 正在使用共享文件时，控制台会拒绝更改或移除它。
+移除它不会删除文件。
+
+#### 其他文件 {#target-files}
+
+除了指示文件，工具还可能读取其他普通文件，例如 Pi 的 `APPEND_SYSTEM.md`。控制台会在 target 页面上
+为每个文件显示一个标签页。skillshare 会为 `pi` 和 `omp` 加上 `APPEND_SYSTEM.md`；`files` 列出你自己添加的文件。
+
+```yaml
+targets:
+  pi:
+    files:
+      - SYSTEM.md
+      - prompts/review.md
+```
+
+每个条目都相对于该工具的文件夹：在全局配置中，pi 是 `~/.pi/agent`；在项目中是 `.pi`。条目可以指定子文件夹，
+但不能离开该文件夹：绝对路径、`..` 以及链接到外部的文件夹都会被拒绝。这个文件夹是该工具自己的配置文件夹，
+例如 codex 的 `~/.codex`，或某个账号的 [`config_dir`](#agent-config-dir)；当 skillshare 不知道时，
+则是 skills 文件夹的上一层。如果 target 的文件夹会是你的主目录或项目根目录，就不会有 **+** 按钮。
+
+控制台会在你添加或移除标签页时写入这个字段。移除标签页不会删除文件。
+
+#### 关闭 Skills {#skills-enabled}
+
+`skills.enabled: false` 会停止向某个 target 同步 skills，同时 skillshare 仍继续管理它的 agents、MCP server 和指示文件。适用于已经会读取另一个 target 的 skills 文件夹的工具，避免它找到每个 skill 两次。
+
+```yaml
+targets:
+  pi:
+    skills:
+      path: ~/.pi/agent/skills
+      enabled: false
+```
+
+路径、模式和过滤器都会保留在配置中，以便之后重新开启 skills。可以用 `skillshare target <name> --skills=false` 设置它（这也会移除该文件夹中指向 source 的链接），或在添加 target 时使用 `--no-skills`。参见 [开启或关闭 Skills](/docs/reference/commands/target#skills-off)。
+
+### `include` / `exclude`（Target 过滤器） {#include--exclude-target-filters}
+
+使用逐 Target 的过滤器，控制在 **merge 和 copy 模式**下哪些 Skill 会被 sync。
+
+```yaml
+targets:
+  codex:
+    path: ~/.codex/skills
+    include: [codex-*]
+  claude:
+    path: ~/.claude/skills
+    exclude: [codex-*]
+```
+
+规则：
+- 匹配对象是 Target 的扁平化名称（例如 `team__frontend__ui`）
+- 匹配不到任何 skill 的 `include` 模式会被报告出来，因为这样的 target 什么都不会同步，还会删掉之前由正确模式链接的条目。即使 `target_naming: standard` 让 target 目录显示 SKILL.md 的裸名称，filters 用的仍是扁平化名称
+- `include` 先被应用
+- `exclude` 在 include 之后应用
+- Pattern 语法使用 Go `filepath.Match`（`*`、`?`、`[...]`）
+- 在 `symlink` 模式下，include/exclude 会被忽略
+- 如果一个先前已 sync 的 Source 链接变为被排除状态，`sync` 会移除该 Target 条目
+- Target 中原本已存在的本地非符号链接文件夹会被保留
+
+#### Pattern 速查表
+
+| Pattern | 匹配 | 典型用途 |
+|---------|---------|-------------|
+| `codex-*` | `codex-agent`、`codex-rag` | 基于前缀分组 |
+| `team__*` | `team__frontend__ui` | 仓库 / 组命名空间 |
+| `*-experimental` | `rag-experimental` | 基于后缀清理 |
+| `core-?` | `core-a`、`core-1` | 单字符变体 |
+| `[ab]-tool` | `a-tool`、`b-tool` | 少量明确指定的集合 |
+
+#### 场景 A：仅 include
+
+当某个 Target 应只接收一个专注的子集时使用 `include`。
+
+```yaml
+targets:
+  codex:
+    path: ~/.codex/skills
+    include: [codex-*, shared-*]
+```
+
+用例：
+- 让 Codex 只专注于编码相关的工作流
+- 避免向该 Target 发送仅用于写作 / 研究的 Skill
+
+#### 场景 B：仅 exclude
+
+当某个 Target 应接收几乎所有内容、只排除已知子集时使用 `exclude`。
+
+```yaml
+targets:
+  claude:
+    path: ~/.claude/skills
+    exclude: [*-experimental, codex-*]
+```
+
+用例：
+- 让主要 Target 保持宽泛
+- 隐藏不稳定或特定于其他 Target 的 Skill
+
+#### 场景 C：include + exclude
+
+当你想要先大范围 include，再挖出例外情况时，两者一起使用。
+
+```yaml
+targets:
+  cursor:
+    path: ~/.cursor/skills
+    include: [core-*, team__*]
+    exclude: [*-deprecated, team__legacy__*]
+```
+
+评估顺序：
+1. 只保留匹配 `include` 的名称
+2. 从中移除匹配 `exclude` 的项
+
+给定以下 Source Skill：
+- `core-auth`
+- `core-deprecated`
+- `team__frontend__ui`
+- `team__legacy__docs`
+- `misc-tool`
+
+`cursor` 的结果：
+- 被 sync：`core-auth`、`team__frontend__ui`
+- 未被 sync：`core-deprecated`、`team__legacy__docs`、`misc-tool`
+
+#### 通过 CLI 管理过滤器
+
+除了手动编辑 YAML，也可以使用 `target` 命令：
+
+```bash
+# Skill
+skillshare target claude --add-include "team-*"
+skillshare target claude --add-exclude "_legacy*"
+skillshare target claude --remove-include "team-*"
+
+# Agent（仅适用于拥有 agents 路径的 Target）
+skillshare target claude --add-agent-include "team-*"
+skillshare target claude --add-agent-exclude "draft-*"
+skillshare target claude --remove-agent-include "team-*"
+
+skillshare sync  # 应用更改
+```
+
+重复的 pattern 会被静默忽略。无效的 glob pattern 会返回错误。Agent 过滤器使用与 Skill 过滤器相同的 glob 语法，但只在 `merge` 和 `copy` 模式下生效。在 `symlink` 模式下，Agent 过滤器会被忽略，因为整个 agents 目录会作为一个整体被链接。
+
+完整参考参见 [target 命令](/docs/reference/commands/target#target-filters-includeexclude)。
+
+#### Skill 级别的 targets {#skill-level-targets}
+
+Skill 可以在 SKILL.md 中通过 `metadata.targets` 声明它们兼容哪些 Target。为兼容旧版 Skill，仍支持顶层的 `targets` 字段作为回退，但当两者同时存在时，`metadata.targets` 优先：
+
+```yaml
+---
+name: claude-prompts
+metadata:
+  targets: [claude]
+---
+```
+
+这是与配置层面 include/exclude 并行工作的**第二层**过滤：
+
+```
+Source Skills
+  │
+  ├─ Config include/exclude    ← 按 Target，由使用者设置
+  │
+  └─ Skill targets 字段        ← 按 Skill，由作者设置
+      │
+      ▼
+  Sync 到 Target 的 Skill
+```
+
+**评估顺序：**
+1. `include` —— 只保留匹配的名称
+2. `exclude` —— 移除匹配的名称
+3. `targets` 字段 —— 移除 targets 列表中不包含该 Target 的 Skill
+
+两层都必须通过（AND 关系）。配置过滤器始终优先——即使某个 Skill 声明了 `targets: [claude]`，配置中的 `exclude: [claude-*]` 仍会将其排除。
+
+**跨模式匹配：** `targets: [claude]` 会同时匹配全局 Target `claude` 和项目 Target `claude`，因为它们指的是同一个 AI CLI。参见 [supported targets](/docs/reference/targets/supported-targets)。
+
+:::tip
+当**使用者**想要控制什么内容去到哪里时，使用配置过滤器（`include`/`exclude`）。当**作者**知道某个 Skill 只适用于特定 AI CLI 时，使用 Skill 级别的 `targets`。
+:::
+
+#### 过滤器变更时已有的 Target 条目
+
+当你添加或更改过滤器，然后运行 `skillshare sync` 时：
+
+| Target 中已有的项目 | 会发生什么 |
+|-------------------------|--------------|
+| 现在被过滤掉的 Source 链接符号链接 / junction | 被移除（取消链接） |
+| 现在被过滤掉的受管副本（copy 模式） | 被移除 |
+| 在 Target 中创建的本地非符号链接目录 | 被保留 |
+| 无关的本地内容 | 被保留 |
+
+### `skills`
+
+追踪远程安装的 Skill。由 `skillshare install` 和 `skillshare uninstall` 自动管理。
+
+```yaml
+skills:
+  - name: pdf
+    source: anthropics/skills/skills/pdf
+  - name: _team-skills
+    source: github.com/team/skills
+    tracked: true
+```
+
+| 字段 | 是否必填 | 说明 |
+|-------|----------|-------------|
+| `name` | 是 | Skill 目录名称 |
+| `source` | 是 | GitHub URL 或本地路径 |
+| `tracked` | 否 | 若以 `--track` 安装则为 `true`（默认：`false`） |
+
+当你不带任何参数运行 `skillshare install` 时，所有列出但尚未安装的 Skill 都会被安装。这使得 `config.yaml` 成为一份可移植的 Skill 清单——将其复制到另一台机器上，运行 `skillshare install && skillshare sync` 即可重现相同设置。
+
+`skills:` 列表会在每次 `install` 和 `uninstall` 操作后自动更新。你不需要手动编辑它。
+
+:::note 已迁移到 .metadata.json
+从 v0.16.2 开始，已安装的 Skill 条目从 `config.yaml` 移动到了一个独立文件。在当前版本中，所有安装元数据都集中存储在 `skills/` 目录内的 `.metadata.json` 中。从旧格式（`registry.yaml`、逐 Skill 的 `.skillshare-meta.json`）迁移是首次运行时自动完成的。
+:::
+
+### `agents_source` {#agents-source}
+
+Agent 的自定义 Source 目录。覆盖默认的 `~/.config/skillshare/agents/`。
+
+```yaml
+agents_source: ~/my-agents
+```
+
+设置后，所有 Agent 都会从此目录读取，而不是默认位置。支持 `~` 展开。
+
+默认值：`~/.config/skillshare/agents/`（自动检测，除非需要自定义位置，否则无需显式设置）。
+
+:::note 仅限 Global mode
+Project mode 始终使用 `.skillshare/agents/`，不支持 `agents_source`。
+:::
+
+关于 Agent 文件格式、Sync 行为和支持的 Target 的详情，参见 [Agents](/docs/understand/agents)。
+
+### `projects` {#projects}
+
+从这份 global 配置获取 Skill 和 Agent 的项目文件夹。这些文件夹不需要自己的 `.skillshare/`，在任意目录下运行一次 `skillshare sync` 就能写入所有项目。
+
+`skillshare project add` 和仪表板的 **添加项目** 会把新项目保存在这里，因此使用该配置的每台机器都会获得它。项目也可以只保存在本机、不写入此文件：传入 `project add --machine-local`、在仪表板的 **添加项目** 底部的 **保存到** 选择 **只存在这台机器**，或设置 [`projects_storage`](#projects-storage)。编辑和移除都在项目所保存的位置进行。本机项目会完整替换这里相同规范化根目录的条目，不同根目录的名称必须唯一。`project list/show` 包含 `origin` 和 `originPath`。参见[项目的保存位置](/docs/reference/commands/project#local-registrations)。
+
+当项目需要拿到不同的 Skill 时使用它。全局 Target 已经能让每个项目看到相同的一套内容，而 [Project mode](/docs/understand/project-skills) 把设置保留在项目仓库中，方便队友使用。[Many Projects, One Config](/docs/how-to/recipes/many-projects-one-config#scenario) 比较了这三种方式。
+
+```yaml
+projects:
+  <folder>:                  # 绝对路径，或以 ~ 开头
+    name: <name>             # 可选，默认为文件夹名
+    targets: [<target>, ...] # 该项目所用的工具
+    skills:                  # 存在即 sync Skill；留空则同步全部
+      mode: <mode>
+      target_naming: <flat|standard|prefixed>
+      include: [<glob>, ...]
+      exclude: [<glob>, ...]
+    agents:                  # 存在即 sync Agent；留空则同步全部
+      mode: <mode>
+      include: [<glob>, ...]
+      exclude: [<glob>, ...]
+```
+
+**示例：**
+```yaml
+projects:
+  ~/work/shop-web:
+    targets: [claude, cursor, codex]
+    skills:
+      mode: copy
+      include: ["frontend-*"]
+    agents: {}
+  ~/work/api-server:
+    targets: [claude]
+    skills: {}
+```
+
+`targets` 中的每一项都是一个[受支持的 Target](./supported-targets.md)名称。Skillshare 会写入该工具在这个文件夹内的 project 路径，例如 `claude` 对应 `.claude/skills` 和 `.claude/agents`。不需要设置 `path`。
+
+- **共享的文件夹只会被写入一次。** 多个工具会读取同一个 project 文件夹（`cursor` 和 `codex` 都读取 `.agents/skills`），它们会合并成同一个 Sync Target。
+- **输出中的名称。** `sync`、`status`、`diff`、`doctor` 和 `backup` 会把一个项目的 targets 显示为 `<name>@<target>`，例如 `shop-web@claude`。`name` 不能包含 `@`、`/` 或 `\`，且两个项目不能共用同一个名称。
+- **Agent** 只会写入拥有 project Agent 目录的工具。只设置了 `agents`、没有设置 `skills` 的项目只会 sync Agent。
+- **缺失的文件夹会被跳过。** 全局 Skill 同步只用一条警告汇总缺失的项目文件夹数量，不会重新创建你已经移动或删除的项目。运行 `skillshare project list` 查看完整列表，或用 `skillshare project list --json` 读取各项的 `missing` 字段。
+- **`target` 和 `collect` 不会改动 projects。** `skillshare target` 只列出并编辑 `targets` 部分，`collect` 也不会把项目自己的 Skill 拉回 Source。使用 [`skillshare project`](/docs/reference/commands/project) 添加、编辑、同步或移除项目，也可以使用仪表盘的 **Projects** 页面。
+- 带有 `targets` frontmatter 字段的 Skill 会与工具进行匹配，因此 `targets: [claude]` 能到达 `shop-web@claude`。
+
+同样，这些文件夹下的 MCP server 列在 [`mcp.projects`](/docs/reference/commands/mcp#manage-several-projects-from-the-global-config) 中，以相同的文件夹作为 key。完整的分步设置参见 [Many Projects, One Config](/docs/how-to/recipes/many-projects-one-config)。
+
+### `projects_storage` {#projects-storage}
+
+新项目的保存位置。
+
+| 值 | 效果 |
+|-------|--------|
+| `shared`（默认） | 保存在此文件的 `projects` 下。使用该配置的每台机器都会获得该项目。 |
+| `machine-local` | 保存在本机的项目注册表中，位于配置目录之外。其他机器看不到。 |
+
+```yaml
+projects_storage: machine-local
+```
+
+当你添加的文件夹很少存在于其他机器上时，请使用 `machine-local`。`skillshare project add --shared` 或 `--machine-local` 可为单个项目覆盖该设置，仪表板的 **添加项目** 对话框也以该设置作为初始值。已有的项目保持原位；用 `skillshare project share` 或 `skillshare project localize` 移动。参见[项目的保存位置](/docs/reference/commands/project#local-registrations)。
+
+### `extras` {#extras}
+
+将非 Skill 资源（rules、commands、prompts 等）sync 到任意目录。
+
+```yaml
+extras_source: ~/my-extras            # 可选，全局默认 Source
+extras:
+  - name: rules
+    source: ~/company-shared/rules    # 可选，针对该 extra 的覆盖设置
+    targets:
+      - path: ~/.claude/rules
+      - path: ~/.cursor/rules
+        mode: copy
+  - name: agents
+    targets:
+      - path: ~/.claude/agents
+        flatten: true                 # 将子目录文件扁平化 sync
+  - name: commands
+    targets:
+      - path: ~/.claude/commands
+```
+
+| 字段 | 是否必填 | 说明 |
+|-------|----------|-------------|
+| `name` | 是 | Extra 标识符 |
+| `source` | 否 | 该 extra 的自定义 Source 目录（覆盖 `extras_source` 和默认值） |
+| `file` | 否 | 只同步 source 目录中的这个文件：单纯的文件名，例如 `system.md` 或 `AGENTS.md`。参见[单文件 extras](../commands/extras.md#single-file-extras) |
+| `targets` | 是 | Target 路径列表 |
+| `targets[].path` | 是 | 目标目录 |
+| `targets[].mode` | 否 | `merge`（默认）、`copy` 或 `symlink`；`import` 仅用于单文件 extras |
+| `targets[].as` | 否 | 单文件 extra 在 target 中的文件名（默认：`file` 的名称） |
+| `targets[].flatten` | 否 | 为 `true` 时，将子目录文件直接 sync 到 Target 根目录（不能与 `symlink` 或 `file` 同时使用） |
+| `targets[].include` | 否 | 只同步匹配这些 `.gitignore` 风格 pattern 的 source 文件（不能与 `symlink` 或 `file` 同时使用）。参见[选择文件](../commands/extras.md#choosing-files) |
+| `targets[].exclude` | 否 | 跳过匹配这些 pattern 的 source 文件，在 `include` 之后应用（不能与 `symlink` 或 `file` 同时使用） |
+
+`extras_source` 会在 `skillshare init` 或首次 `extras init` 时自动填充为默认路径（`~/.config/skillshare/extras/`）。可覆盖它以对所有 extras 使用自定义位置。
+
+**Source 解析**（三级优先级）：
+1. 逐 extra 的 `source` → 精确路径（例如 `~/company-shared/rules`）
+2. `extras_source` → `<extras_source>/<name>/`（例如 `~/my-extras/rules/`）
+3. 默认值 → `~/.config/skillshare/extras/<name>/`
+
+**Sync 模式：**
+- `merge`（默认）—— 逐文件符号链接
+- `copy` —— 逐文件复制
+- `symlink` —— 整个目录符号链接
+
+运行 `skillshare sync extras` 进行 sync，或运行 `skillshare sync --all` 一起 sync Skill 和 extras。
+
+:::info 两种模式均支持
+Extras 在 Global mode 和 Project mode 下都可用。在 Project mode 下，Source 为 `.skillshare/extras/<name>/`。
+:::
+
+用法详情参见 [sync extras](/docs/reference/commands/sync#sync-extras)。
+
+### `ignore`
+
+Sync 时要跳过的文件 glob pattern。
+
+```yaml
+ignore:
+  - "**/.DS_Store"
+  - "**/.git/**"
+  - "**/node_modules/**"
+```
+
+**默认 pattern：**
+- `**/.DS_Store`
+- `**/.git/**`
+
+### `gitlab_hosts`
+
+使用嵌套子群组的自建 GitLab 实例的主机名。名称中包含 `gitlab` 或 `jihulab` 的主机会被自动检测——此字段仅在使用其他自定义域名时才需要。
+
+```yaml
+gitlab_hosts:
+  - git.company.com
+  - code.internal.io
+```
+
+当某个主机名列在这里时，`skillshare install` 会将完整的 URL 路径视为仓库（支持最多 20 层的嵌套子群组），而不是假定标准的 `owner/repo` 两段式拆分。
+
+**不使用 `gitlab_hosts` 时：**
+```bash
+# git.company.com/team/frontend/ui → 克隆 "team/frontend"，子目录 "ui"
+skillshare install git.company.com/team/frontend/ui
+```
+
+**使用 `gitlab_hosts: [git.company.com]` 时：**
+```bash
+# git.company.com/team/frontend/ui → 克隆 "team/frontend/ui"（完整路径）
+skillshare install git.company.com/team/frontend/ui
+```
+
+**无需配置的变通方法：** 在末尾附加 `.git` 以标记仓库路径的结束：
+```bash
+skillshare install git.company.com/team/frontend/ui.git
+```
+
+条目必须是裸主机名（不含 scheme、路径或端口）。它们会被标准化为小写。
+
+#### 环境变量
+
+对于没有配置文件的 CI/CD 流水线，使用 `SKILLSHARE_GITLAB_HOSTS`（逗号分隔）：
+
+```bash
+SKILLSHARE_GITLAB_HOSTS=git.company.com,code.internal.io skillshare install git.company.com/team/frontend/ui
+```
+
+当配置文件和环境变量都设置了值时，两者会被**合并**（去重）。环境变量中的无效条目会被静默跳过。
+
+### `azure_hosts`
+
+自建 Azure DevOps Server 实例的主机名。针对 `dev.azure.com` 和 `*.visualstudio.com` 的内置 pattern 始终生效——此字段仅在使用自定义域名的本地部署 Azure DevOps Server 时才需要。
+
+```yaml
+azure_hosts:
+  - azuredevops.mycompany.com
+```
+
+当某个主机名列在这里时，包含 `/_git/` 的 URL 会通过 Azure DevOps 解析逻辑处理，正确提取 org、project 和 repo，而不会在克隆 URL 末尾附加 `.git`。
+
+**不使用 `azure_hosts` 时：**
+
+```bash
+# 回退到通用 HTTPS 解析——克隆 URL 会变成
+# https://azuredevops.mycompany.com/Org/Project.git（错误）
+skillshare install https://azuredevops.mycompany.com/Org/Project/_git/Repo
+```
+
+**使用 `azure_hosts: [azuredevops.mycompany.com]` 时：**
+
+```bash
+# 正确解析——克隆 URL 为
+# https://azuredevops.mycompany.com/Org/Project/_git/Repo
+skillshare install https://azuredevops.mycompany.com/Org/Project/_git/Repo
+```
+
+条目必须是裸主机名（不含 scheme、路径或端口）。它们会被标准化为小写。
+
+#### 环境变量
+
+对于 CI/CD 流水线，使用 `SKILLSHARE_AZURE_HOSTS`（逗号分隔）：
+
+```bash
+SKILLSHARE_AZURE_HOSTS=azuredevops.mycompany.com skillshare install \
+  https://azuredevops.mycompany.com/Org/Project/_git/Repo
+```
+
+### `gitea_hosts`
+
+自建 Gitea 即使名称包含 `gitea`，也必须在 [`gitea_hosts`](/docs/reference/targets/configuration#gitea_hosts) 中配置准确主机名才能发送 `GITEA_TOKEN`。平台认证仅支持 HTTPS 默认端口或 443。
+
+```yaml
+gitea_hosts:
+  - git.company.com
+```
+
+当某个主机名列在这里时：
+
+- `install` 和 `update` 会在该主机上使用 [`GITEA_TOKEN`](/docs/reference/appendix/environment-variables#gitea_token) 进行 HTTPS 身份验证
+- 当 sparse checkout 不可用或失败时，`install` 会通过 Gitea Contents API 下载子目录，而不是克隆整个仓库。如果该 API 调用也失败，则回退到完整克隆。
+
+条目必须是裸主机名（不含 scheme、路径或端口）。它们会被标准化为小写。
+
+#### 环境变量
+
+对于 CI/CD 流水线，使用 `SKILLSHARE_GITEA_HOSTS`（逗号分隔）：
+
+```bash
+SKILLSHARE_GITEA_HOSTS=git.company.com skillshare install https://git.company.com/team/skills/review
+```
+
+当配置文件和环境变量都设置了值时，两者会被**合并**（去重）。
+
+### `cnb_hosts`
+
+自建 [CNB](https://cnb.cool) 实例的主机名。`cnb.cool` 会被自动检测。此字段仅在其他域名上的私有部署时才需要。
+
+```yaml
+cnb_hosts:
+  - cnb.company.com
+```
+
+列出的主机会使用 [`CNB_TOKEN`](/docs/reference/appendix/environment-variables#cnb_token) 进行 HTTPS 身份验证，子目录安装也可以通过 CNB contents API，并采用相同的回退到完整克隆的机制。
+
+条目必须是裸主机名（不含 scheme、路径或端口）。它们会被标准化为小写。
+
+#### 环境变量
+
+```bash
+SKILLSHARE_CNB_HOSTS=cnb.company.com skillshare install https://cnb.company.com/team/skills/review
+```
+
+### `audit`
+
+安全审计配置。
+
+```yaml
+audit:
+  block_threshold: CRITICAL
+  profile: default
+  dedupe_mode: global
+  enabled_analyzers: [static, dataflow, tier, integrity]
+```
+
+| 字段 | 取值 | 默认值 | 说明 |
+|-------|--------|---------|-------------|
+| `block_threshold` | `CRITICAL`、`HIGH`、`MEDIUM`、`LOW`、`INFO` | `CRITICAL` | 阻止 `skillshare install` 的最低严重级别 |
+| `profile` | `default`、`strict`、`permissive` | `default` | 审计 profile 预设（设置 threshold 和 dedupe 的默认值） |
+| `dedupe_mode` | `legacy`、`global` | `global` | 结果去重模式 |
+| `enabled_analyzers` | Analyzer ID 数组 | *(全部)* | 允许运行的 Analyzer 白名单（省略表示全部运行） |
+
+**Profile** 设置合理的默认值，可被显式字段值覆盖：
+
+| Profile | Threshold | Dedupe | 说明 |
+|---------|-----------|--------|-------------|
+| `default` | `CRITICAL` | `global` | 与当前行为相同 |
+| `strict` | `HIGH` | `global` | 为注重安全的团队提供更严格的阻止 |
+| `permissive` | `CRITICAL` | `legacy` | 仅提示，最小化阻止 |
+
+**Analyzer ID：** `static`、`dataflow`、`tier`、`integrity`、`structure`、`cross-skill`
+
+**优先级：** CLI flag → 项目配置 → 全局配置 → profile 默认值。
+
+- `block_threshold` 只控制何时**阻止** install——扫描始终会运行
+- 使用 `--skip-audit` 可为单次 install 跳过扫描
+- 使用 `--force` 可覆盖阻止（结果仍会被显示）
+
+### `context_budget`
+
+Token 预算警告阈值。当 token 数量超过预算时，会在 `sync` 和 `analyze` 之后出现警告。
+
+```yaml
+context_budget:
+  warn_always_loaded_tokens: 10000
+  warn_on_demand_tokens: 100000
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|-------|------|---------|-------------|
+| `warn_always_loaded_tokens` | integer | `10000` | 当始终加载的 token 超过此值时警告。`0` 表示禁用 |
+| `warn_on_demand_tokens` | integer | `100000` | 当按需加载的 token 超过此值时警告。`0` 表示禁用 |
+
+省略时，采用默认值（10K / 100K）。使用 `skillshare sync --quiet` 可抑制警告。输出格式参见 [sync — Context Cost](/docs/reference/commands/sync#context-cost)。
+
+### `preserve_tilde_on_save`
+
+为 `true` 时，会在写入 `config.yaml` 之前将 `$HOME` 前缀折叠回 `~`。这使磁盘上的配置在多台机器之间保持可移植——当配置通过 dotfiles（stow、chezmoi、yadm、裸 git 仓库）共享时非常有用。
+
+```yaml
+preserve_tilde_on_save: true
+```
+
+**默认值：** `false`（现有行为不变——路径以绝对形式保存）。
+
+如果没有此 flag，每次保存都会将 `~/...` 路径重写为 `/home/alice/...`（展开形式）。当配置被版本控制并跨机器共享时，这会产生噪声很大的 diff 并破坏可移植性。
+
+启用该 flag 后，序列化的 YAML 会对 `$HOME` 下的任何路径使用 `~`：
+
+```yaml
+# 之前（默认）：绝对路径，与机器绑定
+source: /home/alice/.config/skillshare/skills
+targets:
+  claude:
+    skills:
+      path: /home/alice/.claude/skills
+
+# 之后（preserve_tilde_on_save: true）：可移植
+source: ~/.config/skillshare/skills
+targets:
+  claude:
+    skills:
+      path: ~/.claude/skills
+```
+
+内存中的配置不受影响——`Load()` 仍会照常展开 `~`。非 home 的绝对路径（例如 `/opt/shared/skills`）会原样保留。
+
+:::note 仅限 Global mode
+此选项仅适用于全局 `config.yaml`。项目配置（`.skillshare/config.yaml`）通常使用相对路径，不需要 tilde 折叠。
+:::
+
+### `git_root` {#git-root}
+
+选择 `skillshare commit`、`push` 和 `pull` 所操作的目录。
+
+```yaml
+git_root: skills
+```
+
+| 值 | 被版本控制的目录 |
+|-------|---------------------|
+| `skills`（默认） | Skill Source（`~/.config/skillshare/skills/`） |
+| `agents` | Agent Source（`~/.config/skillshare/agents/`） |
+| `extras` | Extras Source（`~/.config/skillshare/extras/`） |
+| `root` | 配置根目录（`~/.config/skillshare/`）—— Skill + Agent + Extras 在同一个仓库中；`config.yaml` 会被自动忽略 |
+
+**默认值：** `skills`
+
+在 init 期间通过 `skillshare init --git-root <scope>` 设置，或在 init 摘要中选择 **Change settings** 修改。
+
+#### init 之后更改 scope
+
+在已初始化的设置上，以非交互方式切换 scope：
+
+```bash
+skillshare init --git-root <scope>   # global mode；如果你的 cwd 是一个项目，加上 -g
+```
+
+这会在新的 scope 目录下初始化一个 git 仓库（如果那里已经有一个则复用），将 `git_root` 持久化到配置中，且不会提示或要求 `--remote`。不过它**不会**移动现有仓库——切换 scope 意味着"开始对一个不同的目录进行版本控制"，而不是"迁移历史记录"：
+
+- **全新历史** —— `skillshare init --git-root <scope>` 会在新 scope 处初始化一个空仓库。
+- **保留历史** —— 先执行 `mv <old-scope>/.git <new-scope>/.git`，然后运行 `skillshare init --git-root <scope>` 以记录该 scope。
+
+你也可以直接在 `config.yaml` 中编辑 `git_root`。如果 `git_root` 指向一个没有仓库的目录，而另一个 scope 目录有仓库，`commit`/`push`/`pull` 会打印一条 "Git root mismatch" 错误，其中包含用于解决问题的确切 `skillshare init` / `mv` 命令。
+
+:::note 仅限 Global mode
+`git_root` 仅适用于 Global mode。Project mode 使用 `.skillshare/` 目录，不支持此字段。
+:::
+
+---
+
+## 项目配置
+
+**位置：** `.skillshare/config.yaml`（位于项目根目录）
+
+项目配置使用与全局配置不同的格式。
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/runkids/skillshare/main/schemas/project-config.schema.json
+# 跟随项目 Skill Source 根目录下第一层的目录链接（需显式开启）
+# follow_source_links: true
+
+# Targets —— 字符串或对象形式
+targets:
+  - claude                    # 字符串：带默认值的已知 Target
+  - cursor
+  - name: custom-ide               # 对象：自定义路径和模式
+    path: ./tools/ide/skills
+    mode: symlink
+  - name: codex                    # 带过滤器的对象
+    include: [codex-*]
+    exclude: [codex-experimental-*]
+
+# 远程 Skill —— 由 install/uninstall 自动管理
+skills:
+  - name: pdf
+    source: anthropic/skills/pdf
+  - name: _team-skills
+    source: github.com/team/skills
+    tracked: true                  # 带 git 历史克隆
+
+# Audit —— 字段与全局配置相同
+audit:
+  block_threshold: HIGH
+  profile: strict
+```
+
+### `follow_source_links`（项目）
+
+| 字段 | 类型 | 默认值 | 作用范围 |
+|-------|------|---------|-------|
+| `follow_source_links` | boolean | `false` | 项目配置（`.skillshare/config.yaml`） |
+
+```yaml title=".skillshare/config.yaml"
+follow_source_links: true
+```
+
+跟随项目 Skill Source（通常是 `.skillshare/skills/`）根目录下第一层的目录链接，仅限一层。[发现行为、安全防护和当前限制](#follow_source_links)与 Global mode 相同。
+
+### `targets`（项目）
+
+支持两种 YAML 形式：
+
+| 形式 | 示例 | 适用场景 |
+|------|---------|-------------|
+| **字符串** | `- claude` | 已知 Target，使用默认路径和 merge 模式 |
+| **对象** | `- name: x, path: ..., mode: ..., include: [...], exclude: [...]` | 自定义路径、模式覆盖，或逐 Target 过滤器 |
+
+对象形式的条目也可以设置 [`instructions`](#target-instructions)，路径相对于项目根目录。
+
+### `skills`（项目）
+
+与[全局 `skills` 字段](#skills)相同的 schema。由 `skillshare install -p` 和 `skillshare uninstall -p` 自动管理。
+
+:::tip 可移植清单
+`config.yaml` 在 Global mode 和 Project mode 下都是一份可移植的 Skill 清单——在新机器上运行 `skillshare install && skillshare sync`（在项目中运行 `skillshare install -p`）即可重现相同设置。
+:::
+
+---
+
+## 管理配置
+
+### 查看当前配置
+
+```bash
+skillshare status
+# 显示 source、targets、模式
+```
+
+### 直接编辑配置
+
+```bash
+# 在编辑器中打开
+$EDITOR ~/.config/skillshare/config.yaml
+
+# 然后 sync 以应用更改
+skillshare sync
+```
+
+### 重置配置
+
+```bash
+rm ~/.config/skillshare/config.yaml
+skillshare init
+```
+
+---
+
+## 自定义 Audit 规则
+
+**位置：**
+
+| 模式 | 路径 |
+|------|------|
+| Global | `~/.config/skillshare/audit-rules.yaml` |
+| Project | `.skillshare/audit-rules.yaml` |
+
+规则按以下顺序合并：**内置 → 全局 → 项目**。你可以添加新规则、禁用内置规则，或覆盖严重级别。
+
+```yaml
+rules:
+  # 添加自定义规则
+  - id: flag-todo
+    severity: MEDIUM
+    pattern: todo-comment
+    message: "TODO comment found"
+    regex: '(?i)\bTODO\b'
+
+  # 禁用一条内置规则
+  - id: insecure-http-0
+    enabled: false
+```
+
+| 字段 | 是否必填 | 说明 |
+|-------|----------|-------------|
+| `id` | 是 | 唯一规则标识符 |
+| `severity` | 是 | `CRITICAL`、`HIGH`、`MEDIUM`、`LOW`、`INFO` |
+| `pattern` | 是 | Pattern 分类名称 |
+| `message` | 是 | 可读的结果描述 |
+| `regex` | 是 | 用于匹配的正则表达式 |
+| `exclude` | 否 | 当该行也匹配此正则表达式时抑制匹配 |
+| `enabled` | 否 | 设为 `false` 可禁用一条内置规则 |
+
+生成一个初始文件：
+
+```bash
+skillshare audit --init-rules       # 全局
+skillshare audit --init-rules -p    # 项目
+```
+
+完整详情参见 [audit 命令](/docs/reference/commands/audit)。
+
+---
+
+## 环境变量
+
+| 变量 | 说明 |
+|----------|-------------|
+| `SKILLSHARE_CONFIG` | 覆盖配置文件路径 |
+| `GITHUB_TOKEN` | 用于 API 速率限制问题 |
+
+**示例：**
+```bash
+SKILLSHARE_CONFIG=~/custom-config.yaml skillshare status
+```
+
+---
+
+## Skill 元数据
+
+当你安装一个 Skill 时，skillshare 会将其元数据记录在集中式的 `.metadata.json` 文件中：
+
+```json
+{
+  "version": 1,
+  "entries": {
+    "pdf": {
+      "source": "anthropics/skills/skills/pdf",
+      "type": "github-subdir",
+      "installed_at": "2026-01-20T15:30:00Z",
+      "repo_url": "https://github.com/anthropics/skills.git",
+      "subdir": "skills/pdf",
+      "version": "abc1234"
+    }
+  }
+}
+```
+
+每个 Skill 条目包含：
+
+| 字段 | 说明 |
+|-------|-------------|
+| 条目 key | Skill 相对于来源目录的路径（例如 `pdf`、`frontend/react-skill`） |
+| `source` | 原始安装来源输入 |
+| `type` | Source 类型（`github`、`local` 等） |
+| `installed_at` | 安装时间戳 |
+| `repo_url` | Git 克隆 URL（仅 git Source） |
+| `subdir` | 子目录路径（仅 monorepo Source） |
+| `version` | 安装时的 git commit hash |
+
+`skillshare update` 和 `skillshare check` 使用它来判断从何处获取更新。
+
+**请勿手动编辑此文件。**
+
+---
+
+## 平台差异
+
+### macOS / Linux
+
+```yaml
+source: ~/.config/skillshare/skills
+targets:
+  claude:
+    path: ~/.claude/skills
+```
+
+使用符号链接。
+
+### Windows
+
+```yaml
+source: %AppData%\skillshare\skills
+targets:
+  claude:
+    path: %USERPROFILE%\.claude\skills
+```
+
+文件夹通过 NTFS junction 链接（无需管理员权限）。单个文件——`merge` mode 下的 agents 和目录类 extras，以及单文件 extras——需要文件 symlink，而这需要 Developer Mode；没有开启时会改为复制。参见 [Windows 疑难解答](/docs/troubleshooting/windows#file-links-need-windows-developer-mode-copying-instead)。
+
+---
+
+## 相关内容
+
+- [Source & Targets](/docs/understand/source-and-targets) — 核心概念
+- [Sync Modes](/docs/understand/sync-modes) — Merge vs copy vs symlink
+- [Environment Variables](/docs/reference/appendix/environment-variables) — 所有变量

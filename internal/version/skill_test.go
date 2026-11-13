@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestReadLocalSkillVersion(t *testing.T) {
@@ -13,13 +14,15 @@ func TestReadLocalSkillVersion(t *testing.T) {
 		expected string
 	}{
 		{
-			name: "reads version from SKILL.md",
+			name: "reads metadata.version",
 			content: `---
 name: skillshare
-version: 0.4.5
+description: test
+metadata:
+  version: v0.17.11
 ---
 # Skillshare Skill`,
-			expected: "0.4.5",
+			expected: "0.17.11",
 		},
 		{
 			name: "returns empty when no version field",
@@ -61,5 +64,44 @@ func TestReadLocalSkillVersion_NoSkillDir(t *testing.T) {
 	got := ReadLocalSkillVersion(sourceDir)
 	if got != "" {
 		t.Errorf("expected empty string for missing skillshare dir, got %q", got)
+	}
+}
+
+func TestSkillOutdated(t *testing.T) {
+	tests := []struct {
+		local, remote string
+		want          bool
+	}{
+		{"0.23.4", "0.23.5", true},
+		{"0.23.5", "0.23.5", false},
+		{"0.24.0", "0.23.5", false}, // a local skill ahead of main is not outdated
+		{"0.23.5", "", false},       // offline
+		{"", "0.23.5", false},
+		{"custom", "0.23.5", false},
+	}
+	for _, tt := range tests {
+		if got := SkillOutdated(tt.local, tt.remote); got != tt.want {
+			t.Errorf("SkillOutdated(%q, %q) = %v, want %v", tt.local, tt.remote, got, tt.want)
+		}
+	}
+}
+
+func TestCachedRemoteSkillVersion_FreshCacheSkipsFetch(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	// A version GitHub will never serve, so a fetch would be visible.
+	SaveRemoteSkillVersion("9.9.9")
+
+	if got := CachedRemoteSkillVersion(); got != "9.9.9" {
+		t.Fatalf("CachedRemoteSkillVersion() = %q, want the cached 9.9.9", got)
+	}
+}
+
+func TestCachedRemoteSkillVersion_RefetchesWhenCLIReleaseIsNewer(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	SaveRemoteSkillVersion("1.0.0")
+	_ = saveCache(&Cache{LastChecked: time.Now(), LatestVersion: "9.9.9"})
+
+	if got := CachedRemoteSkillVersion(); got == "1.0.0" {
+		t.Fatal("CachedRemoteSkillVersion() kept a skill cache older than the cached CLI release")
 	}
 }

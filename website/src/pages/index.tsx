@@ -1,394 +1,372 @@
-import type {ReactNode} from 'react';
-import {useState} from 'react';
+import type {ReactNode, RefObject} from 'react';
+import {useEffect, useRef, useState} from 'react';
 import Link from '@docusaurus/Link';
-import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
-import {Copy, Check, Apple, Terminal, GitBranch, FolderSync, ArrowLeftRight, Globe, ShieldCheck, LayoutDashboard, Compass, Users, PenTool} from 'lucide-react';
+import Translate, {translate} from '@docusaurus/Translate';
+import {Copy, Check, Monitor, ShieldCheck} from 'lucide-react';
 
+import {FEATURE_GROUPS, TARGET_COUNT} from '../data/featureMap';
 import styles from './index.module.css';
 
-type InstallMethod = 'curl' | 'powershell' | 'homebrew';
+// ---------------------------------------------------------------------------
+// Board scaling: boards are laid out at a fixed design size and scaled to fit.
+// ---------------------------------------------------------------------------
 
-const INSTALL_COMMANDS: Record<InstallMethod, {command: string; label: string; icon: ReactNode}> = {
-  curl: {
-    command: 'curl -fsSL https://raw.githubusercontent.com/runkids/skillshare/main/install.sh | sh',
-    label: 'macOS / Linux',
-    icon: <Terminal size={14} />,
-  },
-  powershell: {
-    command: 'irm https://raw.githubusercontent.com/runkids/skillshare/main/install.ps1 | iex',
-    label: 'Windows',
-    icon: <span style={{fontSize: '12px'}}>PS</span>,
-  },
-  homebrew: {
-    command: 'brew install skillshare',
-    label: 'Homebrew',
-    icon: <Apple size={14} />,
-  },
-};
+function useBoardScale(ref: RefObject<HTMLDivElement | null>, baseWidth: number): number {
+  const [scale, setScale] = useState(1);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    const ro = new ResizeObserver(([entry]) => {
+      setScale(Math.min(1, entry.contentRect.width / baseWidth));
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [ref, baseWidth]);
+  return scale;
+}
 
-// Slight random rotations for hand-drawn card feel
-const CARD_ROTATIONS = [
-  'rotate(-0.8deg)',
-  'rotate(0.5deg)',
-  'rotate(-0.3deg)',
-  'rotate(0.7deg)',
-  'rotate(-0.5deg)',
-  'rotate(0.4deg)',
-];
-
-function WavyDivider({color = 'var(--color-muted-dark)'}: {color?: string}) {
+function ScaledBoard({
+  width,
+  height,
+  className,
+  children,
+}: {
+  width: number;
+  height: number;
+  className?: string;
+  children: ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const scale = useBoardScale(ref, width);
   return (
-    <div className={styles.wavyDivider} aria-hidden="true">
-      <svg viewBox="0 0 1200 40" preserveAspectRatio="none">
-        <path
-          d="M0,20 Q150,0 300,20 T600,20 T900,20 T1200,20"
-          fill="none"
-          stroke={color}
-          strokeWidth="2"
-          strokeDasharray="8,6"
-        />
-      </svg>
+    <div ref={ref} className={styles.scaleWrap} style={{height: height * scale}}>
+      <div
+        className={`${styles.board} ${className ?? ''}`}
+        style={{width, height, transform: `scale(${scale})`}}
+      >
+        {children}
+      </div>
     </div>
   );
 }
 
+// ---------------------------------------------------------------------------
+// Product demo and CLI preview.
+// ---------------------------------------------------------------------------
+
+function HeroVideo() {
+  const ref = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    const video = ref.current;
+    if (!video) return undefined;
+    const motion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const update = () => {
+      if (motion.matches) {
+        video.pause();
+      } else {
+        // Native controls remain available if the browser blocks autoplay.
+        void video.play().catch(() => {});
+      }
+    };
+    update();
+    motion.addEventListener('change', update);
+    return () => motion.removeEventListener('change', update);
+  }, []);
+
+  return (
+    <video
+      ref={ref}
+      className={styles.heroVideo}
+      controls
+      muted
+      loop
+      playsInline
+      preload="metadata"
+      poster="/img/skillshare-demo-poster.jpg"
+      aria-label={translate({id: 'home.demo.label', message: 'Skillshare demo: edit once, sync across AI coding tools'})}
+    >
+      <source src="/video/skillshare-demo.mp4" type="video/mp4" />
+      <track kind="captions" src="/video/skillshare-demo.en.vtt" srcLang="en" label="English" />
+      <a href="/video/skillshare-demo.mp4"><Translate id="home.demo.download">Download the demo video</Translate></a>
+    </video>
+  );
+}
+
+const SYNC_TARGETS = [
+  {id: 'claude', local: 3},
+  {id: 'cursor', local: 1},
+  {id: 'codex', local: 2},
+  {id: 'gemini', local: 0},
+  {id: 'opencode', local: 0},
+];
+const SKILL_COUNT = 14;
+
+function SyncTerminal() {
+  return (
+    <div className={styles.termWrap}>
+      <div className={styles.tape} style={{top: -14, left: 40, transform: 'rotate(-5deg)'}} aria-hidden="true" />
+      <div className={styles.term}>
+        <div className={styles.termBar}>
+          <span style={{background: '#ff4d4d'}} />
+          <span style={{background: '#fff3a0'}} />
+          <span style={{background: '#7bd88f'}} />
+          <span className={styles.termBarText}><Translate id="home.board.preview">skill sync preview</Translate></span>
+        </div>
+        <pre className={styles.termBody}>
+          <span className={styles.ok}>$</span> skillshare sync{'\n\n'}
+          <span className={styles.termHead}>Syncing skills</span>{'\n'}
+          {SYNC_TARGETS.map((t) => (
+            <span key={t.id}>
+              <span className={styles.ok}>✓</span> {t.id}: merged ({SKILL_COUNT} linked, {t.local} local, 0 updated, 0 pruned){'\n'}
+            </span>
+          ))}
+          {'\n'}
+          <span className={styles.dim}>{SYNC_TARGETS.length} targets · {SKILL_COUNT} skills</span>
+        </pre>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Install
+// ---------------------------------------------------------------------------
+
+const DESKTOP_INSTALL = 'brew tap runkids/tap\nbrew install --cask skillshare-app';
+
 function CopyButton({text}: {text: string}) {
   const [copied, setCopied] = useState(false);
-
   const handleCopy = async () => {
     await navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
-
   return (
-    <button
-      className={styles.copyButton}
-      onClick={handleCopy}
-      aria-label="Copy to clipboard"
-    >
+    <button className={styles.copyButton} onClick={handleCopy} aria-label="Copy to clipboard">
       {copied ? <Check size={16} /> : <Copy size={16} />}
     </button>
   );
 }
 
-function InstallTabs() {
-  const [method, setMethod] = useState<InstallMethod>('curl');
-  const current = INSTALL_COMMANDS[method];
-
-  return (
-    <div className={styles.installSection}>
-      <div className={styles.installTabs}>
-        {(Object.keys(INSTALL_COMMANDS) as InstallMethod[]).map((key) => (
-          <button
-            key={key}
-            className={`${styles.installTab} ${method === key ? styles.installTabActive : ''}`}
-            onClick={() => setMethod(key)}
-          >
-            {INSTALL_COMMANDS[key].icon}
-            <span>{INSTALL_COMMANDS[key].label}</span>
-          </button>
-        ))}
-      </div>
-      <div className={styles.installCommand}>
-        <code>
-          <span className={styles.prompt}>$</span> {current.command}
-        </code>
-        <CopyButton text={current.command} />
-      </div>
-    </div>
-  );
-}
+// ---------------------------------------------------------------------------
+// Sections
+// ---------------------------------------------------------------------------
 
 function HeroSection() {
   return (
     <header className={styles.hero}>
       <div className="container">
-        {/* Logo + title group: acts as a cohesive visual unit */}
-        <div className={styles.heroGroup}>
-          <div className={styles.heroLogoWrapper}>
-            <div className={styles.heroLogoRing} aria-hidden="true" />
-            <div className={styles.heroLogoShadow} aria-hidden="true" />
-            <span className={styles.heroLogoSparkle} aria-hidden="true">*</span>
-            <span className={styles.heroLogoSparkle} aria-hidden="true">+</span>
-            <span className={styles.heroLogoSparkle} aria-hidden="true">*</span>
-            <img
-              src="/img/logo.png"
-              alt="skillshare"
-              className={styles.heroLogo}
-            />
+        <div className={styles.heroHead}>
+          <div>
+            <Heading as="h1" className={styles.heroTitle}>
+              <Translate id="home.hero.title">Your AI coding setup,</Translate><br />
+              <span className={styles.mark}><Translate id="home.hero.everywhere">everywhere.</Translate></span>
+            </Heading>
+            <p className={styles.heroSubtitle}>
+              <Translate id="home.hero.summary">Manage skills, agents, rules, MCP connections and hooks in one place.</Translate>{' '}
+              <Translate id="home.hero.tools">For Claude Code, Codex, Pi, OpenCode and more.</Translate>
+            </p>
+            <div className={`${styles.buttons} ${styles.heroActions}`}>
+              <Link className="button button--primary button--lg" to="/docs/getting-started/desktop-app">
+                <Monitor size={18} aria-hidden="true" />{' '}
+                <Translate id="home.desktop.get">Get Desktop App</Translate>
+              </Link>
+              <Link className="button button--secondary button--lg" to="/docs/getting-started/first-sync">
+                <Translate id="home.desktop.cliGuide">CLI quick start</Translate>
+              </Link>
+            </div>
+            <p className={styles.desktopPlatforms}>
+              <Translate id="home.desktop.platforms">macOS (Apple Silicon) · Windows · Linux</Translate>
+            </p>
           </div>
-
-          {/* Hand-drawn connector line between logo and title */}
-          <svg
-            className={styles.heroConnector}
-            viewBox="0 0 120 24"
-            aria-hidden="true"
-          >
-            <path
-              d="M60,2 C58,8 54,12 52,16 C50,20 56,20 60,22 C64,20 70,20 68,16 C66,12 62,8 60,2"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeDasharray="4,3"
-              strokeLinecap="round"
-            />
-          </svg>
-
-          <Heading as="h1" className={styles.heroTitle}>
-            One source of truth for{' '}
-            <span className={styles.heroTitleAccent}>AI CLI skills</span>
-          </Heading>
-
-          {/* Hand-drawn underline beneath the title */}
-          <svg
-            className={styles.heroUnderline}
-            viewBox="0 0 400 12"
-            preserveAspectRatio="none"
-            aria-hidden="true"
-          >
-            <path
-              d="M8,8 C50,3 100,6 150,5 C200,4 250,7 300,5 C350,3 380,6 392,7"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
-            />
-          </svg>
+          <img className={styles.heroLogo} src="/img/skillshare-logo-card.png" alt="skillshare" />
         </div>
 
-        <p className={styles.heroSubtitle}>
-          Sync everywhere with one command. Claude Code, OpenCode, Cursor & 50+ more.
-        </p>
+        <HeroVideo />
 
-        <InstallTabs />
-
-        <div className={styles.heroButtons}>
-          <Link className="button button--primary button--lg" to="/docs/">
-            Get Started
-          </Link>
-          <Link
-            className="button button--secondary button--lg"
-            href="https://github.com/runkids/skillshare"
-          >
-            View on GitHub
-          </Link>
+        <div className={styles.heroBottom}>
+          <SyncTerminal />
+          <div className={styles.installCol}>
+            <Heading as="h2" className={styles.h2}>
+              <Translate id="home.desktop.title">Start with the desktop app.</Translate>
+            </Heading>
+            <p className={styles.lead}>
+              <Translate id="home.desktop.summary">Manage skills, agents, MCP and hooks in one desktop window. First launch helps you set up the CLI, choose your AI tools and run your first sync.</Translate>
+            </p>
+            <p className={styles.desktopPlatforms}>
+              <Translate id="home.desktop.homebrew">Install on macOS with Homebrew:</Translate>
+            </p>
+            <div className={`${styles.installCommand} ${styles.desktopCommand}`}>
+              <code>{DESKTOP_INSTALL}</code>
+              <CopyButton text={DESKTOP_INSTALL} />
+            </div>
+            <div className={styles.buttons}>
+              <Link className="button button--primary button--lg" href="https://github.com/runkids/skillshare-app/releases/latest">
+                <Translate id="home.desktop.download">Download installers</Translate>
+              </Link>
+              <Link className="button button--secondary button--lg" to="/docs/getting-started/desktop-app">
+                <Translate id="home.desktop.installGuide">Installation guide</Translate>
+              </Link>
+            </div>
+            <p className={styles.cliAlternative}>
+              <Link to="/docs/getting-started/first-sync">
+                <Translate id="home.desktop.cliAlternative">Prefer the terminal? Install the CLI.</Translate>
+              </Link>
+            </p>
+          </div>
         </div>
       </div>
     </header>
   );
 }
 
-const SCENARIOS = [
-  {
-    icon: <Compass size={28} />,
-    title: 'New to AI Tools',
-    description: '5 minutes from install to first sync',
-    link: '/docs/getting-started',
-  },
-  {
-    icon: <FolderSync size={28} />,
-    title: 'Multi-Tool Sync',
-    description: 'Claude + Cursor + Codex — one source of truth',
-    link: '/docs/learn/with-multiple-tools',
-  },
-  {
-    icon: <Users size={28} />,
-    title: 'Team Sharing',
-    description: "Standardize your team's AI workflow",
-    link: '/docs/how-to/sharing/organization-sharing',
-  },
-  {
-    icon: <PenTool size={28} />,
-    title: 'Write Skills',
-    description: 'Create and publish your own skill set',
-    link: '/docs/understand/philosophy/skill-design',
-  },
-  {
-    icon: <ArrowLeftRight size={28} />,
-    title: 'Migrating',
-    description: 'Coming from another tool or manual setup',
-    link: '/docs/how-to/advanced/migration',
-  },
+const MOVES = [
+  {cmd: 'skillshare install', color: 'var(--color-success)', text: 'Repo or local path → audit gate → source. Critical findings block it.'},
+  {cmd: 'skillshare sync', color: 'var(--color-blue)', text: 'Source → every target, as per-skill symlinks.'},
+  {cmd: 'skillshare collect', color: 'var(--color-danger)', text: 'A skill born inside a tool → back to the source.'},
+  {cmd: 'skillshare push · pull', color: 'var(--color-pencil)', text: 'Source ↔ any git remote, so every machine has the same folder.'},
 ];
 
-function ScenarioSection() {
+function Card({left, top, width, height, rotate, pinLeft, bg, children}: {
+  left: number; top: number; width: number; height: number; rotate: number; pinLeft: number; bg?: string; children: ReactNode;
+}) {
   return (
-    <section className={styles.scenarioSection}>
-      <div className="container">
-        <Heading as="h2" className={styles.sectionTitle}>
-          Where would you like to start?
-        </Heading>
-        <div className={styles.scenarioGrid}>
-          {SCENARIOS.map((scenario, idx) => (
-            <Link
-              key={idx}
-              to={scenario.link}
-              className={styles.scenarioCard}
-              style={{transform: CARD_ROTATIONS[idx % CARD_ROTATIONS.length]}}
-            >
-              <div className={styles.scenarioIcon}>{scenario.icon}</div>
-              <h3>{scenario.title}</h3>
-              <p>{scenario.description}</p>
-            </Link>
-          ))}
-        </div>
-      </div>
-    </section>
+    <div className={styles.card} style={{left, top, width, height, transform: `rotate(${rotate}deg)`, background: bg}}>
+      <span className={`${styles.pin} ${bg ? styles.pinBlue : ''}`} style={{left: pinLeft, top: -8}} />
+      {children}
+    </div>
   );
 }
 
-const whyFeatures = [
-  {
-    Icon: FolderSync,
-    title: 'Non-destructive Merge',
-    description: 'Sync shared skills while preserving CLI-specific ones. Per-skill symlinks keep local skills untouched.',
-  },
-  {
-    Icon: ArrowLeftRight,
-    title: 'Bidirectional Sync',
-    description: 'Created a skill in Claude? Collect it back to source and share with OpenClaw, OpenCode, and others.',
-  },
-  {
-    Icon: Globe,
-    title: 'Cross-machine Sync',
-    description: 'One git push/pull syncs skills across all your machines. Works with any Git host — GitHub, GitLab, Bitbucket, or self-hosted.',
-  },
-  {
-    Icon: ShieldCheck,
-    title: 'Security Audit',
-    description: 'Scan skills for prompt injection, data exfiltration, and destructive commands. Critical threats block install automatically.',
-  },
-  {
-    Icon: GitBranch,
-    title: 'Dual-Level Skills',
-    description: 'Organization-wide standards via tracked repos, plus project-scoped skills shared via git. Both auto-detected.',
-  },
-  {
-    Icon: LayoutDashboard,
-    title: 'Web Dashboard',
-    description: 'Visual skill browsing, sync status, and management. Run skillshare ui — single binary, no setup.',
-  },
-];
-
-const uiHighlights = [
-  {
-    title: 'One-Click Install',
-    description: 'Install a selected skill directly from the web flow without switching to terminal.',
-    image: '/img/web-install-demo.png',
-    alt: 'Web install flow for a selected skill',
-  },
-  {
-    title: 'Dashboard Overview',
-    description: 'Quickly check total skills, targets, and current sync mode.',
-    image: '/img/web-dashboard-demo.png',
-    alt: 'Web dashboard overview page',
-  },
-  {
-    title: 'Skills Explorer',
-    description: 'Browse installed skills and search your local catalog instantly.',
-    image: '/img/web-skills-demo.png',
-    alt: 'Web skills page listing installed skills',
-  },
-  {
-    title: 'Skill Detail',
-    description: 'Open SKILL.md content with metadata and repository source in one view.',
-    image: '/img/web-skill-detail-demo.png',
-    alt: 'Web skill detail page showing SKILL.md content',
-  },
-  {
-    title: 'Sync Control',
-    description: 'Run sync with dry-run and force options from a single control panel.',
-    image: '/img/web-sync-demo.png',
-    alt: 'Web sync page with dry-run and force controls',
-  },
-  {
-    title: 'GitHub Search',
-    description: 'Search remote skills and install to your source directory in one flow.',
-    image: '/img/web-search-skills-demo.png',
-    alt: 'Web search page for GitHub skills',
-  },
-  {
-    title: 'Security Audit',
-    description: 'Scan all installed skills for prompt injection, credential theft, and other threats.',
-    image: '/img/web-audit-demo.png',
-    alt: 'Web security audit page showing scan results',
-  },
-];
-
-function WhySection() {
+function FourMovesSection() {
   return (
-    <section className={styles.why}>
+    <section className={styles.section}>
       <div className="container">
-        <Heading as="h2" className={styles.sectionTitle}>
-          Why skillshare?
-        </Heading>
-        <p className={styles.sectionSubtitle}>
-          Install tools get skills onto agents. <strong>skillshare keeps them in sync.</strong>
-        </p>
-        <div className={styles.whyGrid}>
-          {whyFeatures.map((item, idx) => (
-            <div
-              key={idx}
-              className={styles.whyCard}
-              style={{transform: CARD_ROTATIONS[idx]}}
-            >
-              <div className={styles.whyIconWrapper}>
-                <item.Icon size={22} strokeWidth={1.5} />
-              </div>
-              <Heading as="h3" className={styles.whyCardTitle}>
-                {item.title}
-              </Heading>
-              <p className={styles.whyCardDescription}>{item.description}</p>
+        <div className={styles.sectionHead}>
+          <Heading as="h2" className={styles.h2Big}>Four moves. One board.</Heading>
+          <span className={`${styles.hand} ${styles.aside}`}>everything else is a flag</span>
+        </div>
+
+        <div className={styles.onlyWide}>
+          <ScaledBoard width={1168} height={560}>
+            <svg width="1168" height="560" viewBox="0 0 1168 560" className={styles.strings} aria-hidden="true">
+              <path className={`${styles.str} ${styles.strOn}`} d="M714 300 Q820 250 930 152" style={{animationDelay: '0.1s'}} />
+              <path className={`${styles.str} ${styles.strOn}`} d="M714 300 Q820 300 930 300" style={{animationDelay: '0.2s'}} />
+              <path className={`${styles.str} ${styles.strOn}`} d="M714 300 Q820 350 930 448" style={{animationDelay: '0.3s'}} />
+              <path d="M930 330 Q810 380 714 330" className={styles.arrowCollect} strokeDasharray="7 6" />
+              <path d="M728 318 L714 330 L730 340" className={styles.arrowCollect} />
+              <path d="M570 220 Q560 140 560 92" className={styles.arrowGit} />
+              <path d="M552 108 L560 90 L570 108" className={styles.arrowGit} />
+              <path d="M604 92 Q604 140 604 220" className={styles.arrowGit} strokeDasharray="7 6" />
+              <path d="M594 204 L604 222 L614 204" className={styles.arrowGit} />
+              <path d="M200 300 Q250 300 296 300" className={styles.arrowInstall} />
+              <path d="M392 300 Q420 300 454 300" className={styles.arrowInstall} />
+              <path d="M440 288 L456 300 L440 312" className={styles.arrowInstall} />
+            </svg>
+
+            <Card left={476} top={28} width={216} height={62} rotate={0.8} pinLeft={100}>
+              <span className={styles.cardTitle}>Any git remote</span>
+              <span className={styles.cardSub}>GitHub · GitLab · self-hosted</span>
+            </Card>
+            <span className={styles.note} style={{left: 630, top: 130}}>
+              push ↑ pull ↓<br /><span className={styles.noteCmd}>skillshare push · pull</span>
+            </span>
+
+            <Card left={40} top={268} width={160} height={64} rotate={-1.2} pinLeft={72}>
+              <span className={styles.cardTitle}>owner/repo</span>
+              <span className={styles.cardSub}>or a local path</span>
+            </Card>
+            <div className={styles.stamp}>
+              <ShieldCheck size={26} strokeWidth={2} />
+              <span>AUDITED</span>
             </div>
-          ))}
+            <span className={styles.note} style={{left: 236, top: 352, width: 220}}>
+              every install is scanned first.<br />critical findings block it.<br />
+              <span className={styles.noteCmd}>skillshare install · audit</span>
+            </span>
+
+            <Card left={454} top={220} width={260} height={160} rotate={-0.6} pinLeft={122} bg="var(--color-postit)">
+              <span className={styles.cardKicker}>Source</span>
+              <span className={styles.cardCode}>~/.config/skillshare/skills/</span>
+              <span className={styles.cardText}>One folder. Yours, your team's tracked repos, and project skills, side by side.</span>
+            </Card>
+
+            <Card left={930} top={120} width={190} height={60} rotate={1} pinLeft={86}>
+              <span className={styles.cardTitle}>Claude Code</span>
+              <span className={styles.cardSub}>pr-review → source</span>
+            </Card>
+            <Card left={930} top={270} width={190} height={60} rotate={-0.8} pinLeft={86}>
+              <span className={styles.cardTitle}>Pi</span>
+              <span className={styles.cardSub}>+ 1 local skill kept</span>
+            </Card>
+            <Card left={930} top={418} width={190} height={60} rotate={1.3} pinLeft={86}>
+              <span className={styles.cardTitle}>Codex</span>
+              <span className={styles.cardSub}>… {TARGET_COUNT - 3} more</span>
+            </Card>
+            <span className={styles.note} style={{left: 790, top: 196, color: 'var(--color-blue)'}}>
+              sync →<br /><span className={styles.noteCmd}>skillshare sync</span>
+            </span>
+            <span className={styles.note} style={{left: 760, top: 372, color: 'var(--color-danger)'}}>
+              ← collect<br /><span className={styles.noteCmd}>skillshare collect pi</span>
+            </span>
+            <span className={styles.note} style={{left: 40, top: 470, width: 300}}>
+              merge mode never overwrites a skill the tool already had. that's the whole trick.
+            </span>
+          </ScaledBoard>
         </div>
+
+        <ul className={`${styles.onlyNarrow} ${styles.moveList}`}>
+          {MOVES.map((m) => (
+            <li key={m.cmd} className={styles.moveItem}>
+              <code className={styles.cmd} style={{borderColor: m.color}}>{m.cmd}</code>
+              <span>{m.text}</span>
+            </li>
+          ))}
+        </ul>
       </div>
     </section>
   );
 }
 
-function DemoSection() {
-  return (
-    <section className={styles.demo}>
-      <div className="container">
-        <div className={styles.demoContainer}>
-          <div className={styles.tapeDecoration} aria-hidden="true" />
-          <img src="/img/demo.gif" alt="skillshare demo" />
-        </div>
-      </div>
-    </section>
-  );
-}
+const IDX_POSITIONS = [
+  {left: 40, top: 40, rotate: -2},
+  {left: 250, top: 70, rotate: 1.5},
+  {left: 460, top: 36, rotate: -1},
+  {left: 90, top: 220, rotate: 1.2},
+  {left: 300, top: 250, rotate: -1.6},
+  {left: 510, top: 226, rotate: 0.8},
+];
 
-function UIHighlightsSection() {
+function FeatureMapTeaser() {
   return (
-    <section className={styles.uiHighlights}>
+    <section className={styles.section}>
       <div className="container">
-        <Heading as="h2" className={styles.sectionTitle}>
-          Web UI Highlights
-        </Heading>
-        <p className={styles.sectionSubtitle}>
-          v0.10.0 delivers a complete visual workflow across dashboard, skills, install, targets, sync, collect, backup, git sync, and search.
-        </p>
-        <div className={styles.uiHighlightsGrid}>
-          {uiHighlights.map((item) => (
-            <article key={item.title} className={styles.uiHighlightCard}>
-              <img src={item.image} alt={item.alt} loading="lazy" />
-              <div className={styles.uiHighlightContent}>
-                <Heading as="h3" className={styles.uiHighlightTitle}>
-                  {item.title}
-                </Heading>
-                <p className={styles.uiHighlightDescription}>{item.description}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-        <div className={styles.uiHighlightsAction}>
-          <Link className="button button--primary button--lg" to="/docs/reference/commands/ui">
-            Explore Web UI Docs
+        <div className={styles.teaser}>
+          <div className={styles.teaserText}>
+            <Heading as="h2" className={styles.h2Big}><Translate id="home.features.title">More than skills.</Translate></Heading>
+            <span className={styles.teaserTitle}><Translate id="home.features.subtitle">The rest of your AI coding setup.</Translate></span>
+            <p className={styles.lead}>
+              <Translate id="home.features.summary">Manage agents, rules, MCP connections, hooks and plugins alongside your skills. Find the command for the job.</Translate>
+            </p>
+            <Link className="button button--primary button--lg" to="/features">
+              <Translate id="home.features.open">Explore the features</Translate>
+            </Link>
+          </div>
+          <Link to="/features" className={`${styles.board} ${styles.teaserBoard}`}>
+            {FEATURE_GROUPS.map((g, i) => (
+              <span
+                key={g.id}
+                className={styles.idx}
+                style={{left: IDX_POSITIONS[i].left, top: IDX_POSITIONS[i].top, transform: `rotate(${IDX_POSITIONS[i].rotate}deg)`}}
+              >
+                <span className={styles.pin} style={{left: 66, top: -8}} />
+                <span className={styles.idxTitle}>{g.title}</span>
+                <span className={styles.idxCmds}>{g.teaser}</span>
+              </span>
+            ))}
+            <span className={`${styles.note} ${styles.teaserNote}`}>open the full board →</span>
           </Link>
         </div>
       </div>
@@ -396,24 +374,24 @@ function UIHighlightsSection() {
   );
 }
 
-const supportedCLIs = [
-  'Claude Code',
-  'OpenCode',
-  'Cursor',
-  'Gemini CLI',
-  'Codex',
-  '55+ more',
-];
-
-function SupportedSection() {
+function CtaSection() {
   return (
-    <section className={styles.supported}>
+    <section className={styles.ctaSection}>
       <div className="container">
-        <p className={styles.supportedTitle}>Works with</p>
-        <div className={styles.cliLogos}>
-          {supportedCLIs.map((cli, idx) => (
-            <span key={idx}>{cli}</span>
-          ))}
+        <div className={styles.cta}>
+          <div className={styles.tape} style={{top: -14, left: 60, transform: 'rotate(-4deg)'}} aria-hidden="true" />
+          <div>
+            <Heading as="h2" className={`${styles.hand} ${styles.ctaTitle}`}><Translate id="home.cta.title">Switch tools. Keep your setup.</Translate></Heading>
+            <p className={styles.lead}><Translate id="home.cta.summary">Free and open source. Manage your setup locally, with the desktop app or CLI.</Translate></p>
+          </div>
+          <div className={styles.buttons}>
+            <Link className="button button--primary button--lg" to="/docs/getting-started/desktop-app">
+              <Translate id="home.desktop.get">Get Desktop App</Translate>
+            </Link>
+            <Link className="button button--secondary button--lg" href="https://github.com/runkids/skillshare">
+              Star on GitHub
+            </Link>
+          </div>
         </div>
       </div>
     </section>
@@ -421,24 +399,19 @@ function SupportedSection() {
 }
 
 export default function Home(): ReactNode {
-  const {siteConfig} = useDocusaurusContext();
   return (
     <Layout
-      title="AI CLI Skills Sync Tool"
-      description={siteConfig.tagline}
+      title={translate({id: 'home.meta.title', message: 'AI Coding Setup Manager — Skills, Agents, MCP & Hooks'})}
+      description={translate({id: 'home.meta.description', message: 'Your AI coding setup, everywhere. Manage skills, agents, rules, MCP connections and hooks in one place, with the desktop app or CLI.'})}
     >
-      <HeroSection />
-      <ScenarioSection />
-      <WavyDivider />
-      <main>
-        <WhySection />
-        <WavyDivider />
-        <DemoSection />
-        <WavyDivider />
-        <UIHighlightsSection />
-        <WavyDivider />
-        <SupportedSection />
-      </main>
+      <div className={styles.homePage}>
+        <HeroSection />
+        <main>
+          <FeatureMapTeaser />
+          <FourMovesSection />
+          <CtaSection />
+        </main>
+      </div>
     </Layout>
   );
 }

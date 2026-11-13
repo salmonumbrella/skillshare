@@ -13,8 +13,29 @@ func createSkillWithMeta(t *testing.T, baseDir, name string, meta *SkillMeta) {
 	os.MkdirAll(dir, 0755)
 	os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("---\nname: "+name+"\n---\n"), 0644)
 	if meta != nil {
-		if err := WriteMeta(dir, meta); err != nil {
-			t.Fatalf("write meta for %s: %v", name, err)
+		// Write to centralized .metadata.json
+		store, _ := LoadMetadata(baseDir)
+		key := name
+		group := ""
+		if idx := strings.LastIndex(name, "/"); idx >= 0 {
+			group = name[:idx]
+			key = name[idx+1:]
+		}
+		store.Set(key, &MetadataEntry{
+			Source:      meta.Source,
+			Kind:        meta.Kind,
+			Type:        meta.Type,
+			Group:       group,
+			InstalledAt: meta.InstalledAt,
+			RepoURL:     meta.RepoURL,
+			Subdir:      meta.Subdir,
+			Version:     meta.Version,
+			TreeHash:    meta.TreeHash,
+			FileHashes:  meta.FileHashes,
+			Branch:      meta.Branch,
+		})
+		if err := store.Save(baseDir); err != nil {
+			t.Fatalf("save metadata for %s: %v", name, err)
 		}
 	}
 }
@@ -45,6 +66,12 @@ func TestGetUpdatableSkills_SkipsTrackedRepos(t *testing.T) {
 		Source: "github.com/team/repo",
 		Type:   "github",
 	})
+	// Mark as tracked in the store
+	store, _ := LoadMetadata(src)
+	if e := store.Get("_team-repo"); e != nil {
+		e.Tracked = true
+		store.Save(src)
+	}
 	// Also create a nested skill inside tracked repo
 	nestedDir := filepath.Join(src, "_team-repo", "sub-skill")
 	os.MkdirAll(nestedDir, 0755)
@@ -86,7 +113,9 @@ func TestGetUpdatableSkills_Nested(t *testing.T) {
 	nestedDir := filepath.Join(src, "group", "my-skill")
 	os.MkdirAll(nestedDir, 0755)
 	os.WriteFile(filepath.Join(nestedDir, "SKILL.md"), []byte("nested"), 0644)
-	WriteMeta(nestedDir, &SkillMeta{Source: "github.com/u/r", Type: "github"})
+	store, _ := LoadMetadata(src)
+	store.Set("my-skill", &MetadataEntry{Source: "github.com/u/r", Type: "github", Group: "group"})
+	store.Save(src)
 
 	skills, err := GetUpdatableSkills(src)
 	if err != nil {
@@ -95,8 +124,8 @@ func TestGetUpdatableSkills_Nested(t *testing.T) {
 	if len(skills) != 1 {
 		t.Fatalf("expected 1 nested updatable skill, got %d", len(skills))
 	}
-	// relPath should be "group/my-skill"
-	if skills[0] != filepath.Join("group", "my-skill") {
+	// Metadata keys are slash-form on every OS.
+	if skills[0] != "group/my-skill" {
 		t.Errorf("expected 'group/my-skill', got %q", skills[0])
 	}
 }
@@ -146,7 +175,7 @@ func TestGetTrackedRepos_FindsNested(t *testing.T) {
 	if len(repos) != 1 {
 		t.Fatalf("expected 1 nested tracked repo, got %d", len(repos))
 	}
-	if repos[0] != filepath.Join("frontend", "_ui-skills") {
+	if repos[0] != "frontend/_ui-skills" {
 		t.Errorf("expected 'frontend/_ui-skills', got %q", repos[0])
 	}
 }
@@ -174,17 +203,20 @@ func TestFindRepoInstalls_MatchesByRepoURL(t *testing.T) {
 
 func TestFindRepoInstalls_MatchesNested(t *testing.T) {
 	src := t.TempDir()
+	store, _ := LoadMetadata(src)
 	// Skills under group/
 	for _, name := range []string{"scan", "learn", "archive"} {
 		dir := filepath.Join(src, "feature-radar", name)
 		os.MkdirAll(dir, 0755)
 		os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte("# "+name), 0644)
-		WriteMeta(dir, &SkillMeta{
+		store.Set(name, &MetadataEntry{
 			Source:  "https://github.com/runkids/feature-radar",
 			Type:    "github",
 			RepoURL: "https://github.com/runkids/feature-radar.git",
+			Group:   "feature-radar",
 		})
 	}
+	store.Save(src)
 
 	matches := FindRepoInstalls(src, "git@github.com:runkids/feature-radar.git")
 	if len(matches) != 3 {
@@ -213,10 +245,13 @@ func TestCheckCrossPathDuplicate_BlocksDifferentPath(t *testing.T) {
 	// Existing install under group/
 	dir := filepath.Join(src, "my-group", "skill-a")
 	os.MkdirAll(dir, 0755)
-	WriteMeta(dir, &SkillMeta{
+	store, _ := LoadMetadata(src)
+	store.Set("skill-a", &MetadataEntry{
 		Source: "https://github.com/owner/repo", Type: "github",
 		RepoURL: "https://github.com/owner/repo.git",
+		Group:   "my-group",
 	})
+	store.Save(src)
 
 	// Root install (no --into) should be blocked
 	err := CheckCrossPathDuplicate(src, "https://github.com/owner/repo.git", "")
@@ -277,5 +312,29 @@ func TestFindRepoInstalls_EmptyCloneURL(t *testing.T) {
 	matches := FindRepoInstalls(src, "")
 	if len(matches) != 0 {
 		t.Errorf("expected 0 matches for empty cloneURL, got %v", matches)
+	}
+}
+
+// An entry the old dashboard update rewrote as a regular install over a
+// tracked checkout, top-level or --into, is the repo itself (#473).
+func TestGetUpdatableSkills_SkipsRewrittenTrackedCheckouts(t *testing.T) {
+	src := t.TempDir()
+	store := NewMetadataStore()
+	for _, rel := range []string{"_team", "org/_team", "org/solo"} {
+		if err := os.MkdirAll(filepath.Join(src, rel, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		store.Set(rel, &MetadataEntry{Source: "github.com/example/repo", Type: "github"})
+	}
+	if err := store.Save(src); err != nil {
+		t.Fatal(err)
+	}
+
+	skills, err := GetUpdatableSkills(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skills) != 1 || skills[0] != "org/solo" {
+		t.Errorf("got %v, want only the untracked checkout org/solo", skills)
 	}
 }

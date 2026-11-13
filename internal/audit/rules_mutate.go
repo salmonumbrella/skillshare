@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"gopkg.in/yaml.v3"
+	"skillshare/internal/utils"
 )
 
 // rulesFileHeader is prepended when writing audit-rules.yaml.
@@ -65,7 +65,7 @@ func writeRulesFile(path string, rules []yamlRule) error {
 	}
 
 	f := rulesFile{Rules: rules}
-	data, err := yaml.Marshal(&f)
+	data, err := utils.MarshalYAML(&f)
 	if err != nil {
 		return fmt.Errorf("marshal YAML: %w", err)
 	}
@@ -81,9 +81,13 @@ func writeRulesFile(path string, rules []yamlRule) error {
 func removeEntryByID(rules []yamlRule, id string) []yamlRule {
 	result := make([]yamlRule, 0, len(rules))
 	for _, r := range rules {
-		if r.ID != id {
-			result = append(result, r)
+		if r.ID == id {
+			r.Enabled = nil
+			if r.Severity == "" && r.Confidence == nil && r.Regex == "" && r.Pattern == "" && r.Message == "" && r.Exclude == "" && r.Files == nil {
+				continue
+			}
 		}
+		result = append(result, r)
 	}
 	return result
 }
@@ -105,7 +109,10 @@ func removePatternEntry(rules []yamlRule, pattern string) []yamlRule {
 	result := make([]yamlRule, 0, len(rules))
 	for _, r := range rules {
 		if isPatternLevel(r) && r.Pattern == pattern {
-			continue
+			r.Enabled = nil
+			if r.Severity == "" && r.Confidence == nil && r.Files == nil {
+				continue
+			}
 		}
 		result = append(result, r)
 	}
@@ -217,7 +224,7 @@ func clearDisableForPattern(rules []yamlRule, pattern string) []yamlRule {
 		if belongsToPattern && r.Enabled != nil && !*r.Enabled {
 			r.Enabled = nil
 			// Drop entry if it has no other overrides.
-			if r.Severity == "" && r.Regex == "" {
+			if r.Severity == "" && r.Regex == "" && r.Confidence == nil && r.Files == nil {
 				continue
 			}
 		}

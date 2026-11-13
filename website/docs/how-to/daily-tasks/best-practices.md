@@ -204,6 +204,15 @@ wip-feature
 
 This ensures external contributors or automation running `skillshare install <repo> --all` won't pick up internal skills.
 
+**Local override with `.skillignore.local`**: If a shared repo's `.skillignore` blocks a skill you need locally, create a `.skillignore.local` in the same directory to override it without modifying the shared file:
+
+```text title="_team-skills/.skillignore.local"
+# Un-ignore my own private skill
+!private-mine
+```
+
+Add `.skillignore.local` to your `.gitignore` — it's meant to stay local.
+
 ### Ownership
 
 - Assign owners to skill categories
@@ -237,7 +246,7 @@ team-skills/
 # Weekly
 skillshare update --all     # Update tracked repos
 skillshare doctor           # Check for issues
-skillshare backup --cleanup # Remove old backups
+skillshare backup --cleanup # Remove old snapshots and abandoned incomplete directories
 
 # Monthly
 skillshare list             # Review installed skills

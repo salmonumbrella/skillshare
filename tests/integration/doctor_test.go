@@ -3,11 +3,16 @@
 package integration
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"skillshare/internal/install"
 	"skillshare/internal/testutil"
 )
 
@@ -17,9 +22,19 @@ func TestDoctor_AllGood_PassesAll(t *testing.T) {
 
 	sb.CreateSkill("skill1", map[string]string{
 		"SKILL.md": "# Skill 1",
-		// Include meta with correct file hash so integrity check passes
-		".skillshare-meta.json": `{"source":"test","type":"local","installed_at":"2026-01-01T00:00:00Z","file_hashes":{"SKILL.md":"sha256:c90671f17f3b99f87d8fe1a542ee2d6829d2b2cfb7684d298e44c7591d8b0712"}}`,
 	})
+	// The built-in skill, at a version no release will pass, so the check
+	// stays clean online and offline.
+	builtin := "---\nname: skillshare\nmetadata:\n  version: 999.0.0\n---\n"
+	sb.CreateSkill("skillshare", map[string]string{"SKILL.md": builtin})
+
+	// Write metadata to centralized store with correct file hashes so integrity check passes
+	metaStore := fmt.Sprintf(`{"version":1,"entries":{`+
+		`"skill1":{"source":"test","type":"local","installed_at":"2026-01-01T00:00:00Z","file_hashes":{"SKILL.md":"sha256:c90671f17f3b99f87d8fe1a542ee2d6829d2b2cfb7684d298e44c7591d8b0712"}},`+
+		`"skillshare":{"source":"test","type":"local","installed_at":"2026-01-01T00:00:00Z","file_hashes":{"SKILL.md":"sha256:%x"}}}}`,
+		sha256.Sum256([]byte(builtin)))
+	os.WriteFile(filepath.Join(sb.SourcePath, install.MetadataFileName), []byte(metaStore), 0644)
+
 	targetPath := sb.CreateTarget("claude")
 
 	// Initialize git and commit to avoid warnings
@@ -47,6 +62,7 @@ func TestDoctor_AllGood_PassesAll(t *testing.T) {
 
 	// Create synced state
 	os.Symlink(filepath.Join(sb.SourcePath, "skill1"), filepath.Join(targetPath, "skill1"))
+	os.Symlink(filepath.Join(sb.SourcePath, "skillshare"), filepath.Join(targetPath, "skillshare"))
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
 targets:
@@ -54,7 +70,8 @@ targets:
     path: ` + targetPath + `
 `)
 
-	result := sb.RunCLI("doctor")
+	// Pin the theme so doctor doesn't warn about no-TTY fallback in CI.
+	result := sb.RunCLIEnv(map[string]string{"SKILLSHARE_THEME": "dark"}, "doctor")
 
 	result.AssertSuccess(t)
 	result.AssertOutputContains(t, "All checks passed")
@@ -86,7 +103,7 @@ targets: {}
 	result := sb.RunCLI("doctor")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Source not found")
+	result.AssertRowContains(t, "Source", "not found")
 }
 
 func TestDoctor_ChecksSymlinkSupport(t *testing.T) {
@@ -100,7 +117,7 @@ targets: {}
 	result := sb.RunCLI("doctor")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Symlink")
+	result.AssertOutputContains(t, "Links")
 }
 
 func TestDoctor_ShowsSymlinkCompatHint(t *testing.T) {
@@ -141,6 +158,25 @@ targets:
   codex:
     path: ` + codexPath + `
     mode: copy
+`)
+
+	result := sb.RunCLI("doctor")
+
+	result.AssertSuccess(t)
+	result.AssertOutputNotContains(t, "Symlink compatibility")
+}
+
+func TestDoctor_NoSymlinkCompatHint_WhenNoKnownIncompatTarget(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	claudePath := sb.CreateTarget("claude")
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+mode: merge
+targets:
+  claude:
+    path: ` + claudePath + `
 `)
 
 	result := sb.RunCLI("doctor")
@@ -317,7 +353,7 @@ targets: {}
 	result := sb.RunCLI("doctor")
 
 	result.AssertSuccess(t)
-	result.AssertOutputNotContains(t, "Skills without SKILL.md")
+	result.AssertOutputNotContains(t, "without SKILL.md")
 }
 
 func TestDoctor_BrokenSymlink_ShowsError(t *testing.T) {
@@ -439,7 +475,7 @@ func TestDoctor_ProjectMode_AutoDetectsProjectConfig(t *testing.T) {
 	result.AssertOutputContains(t, "(project)")
 	result.AssertOutputContains(t, ".skillshare/config.yaml")
 	result.AssertOutputContains(t, ".skillshare/skills")
-	result.AssertOutputContains(t, "Backups: not used in project mode")
+	result.AssertOutputContains(t, "not used in project mode")
 }
 
 func TestDoctor_ProjectMode_WithFlagUsesProjectConfig(t *testing.T) {
@@ -503,4 +539,500 @@ func TestDoctor_CustomTarget_ProjectMode_NoUnknownWarning(t *testing.T) {
 
 	result.AssertSuccess(t)
 	result.AssertOutputNotContains(t, "unknown target")
+}
+
+// --- JSON output tests ---
+
+// doctorJSON mirrors the JSON structure emitted by `doctor --json`.
+type doctorJSON struct {
+	Checks  []doctorJSONCheck  `json:"checks"`
+	Summary doctorJSONSummary  `json:"summary"`
+	Version *doctorJSONVersion `json:"version,omitempty"`
+}
+
+type doctorJSONCheck struct {
+	Name        string   `json:"name"`
+	Status      string   `json:"status"`
+	Message     string   `json:"message"`
+	Details     []string `json:"details,omitempty"`
+	Suggestions []string `json:"suggestions,omitempty"`
+}
+
+type doctorJSONSummary struct {
+	Total    int `json:"total"`
+	Pass     int `json:"pass"`
+	Warnings int `json:"warnings"`
+	Errors   int `json:"errors"`
+	Info     int `json:"info"`
+}
+
+type doctorJSONVersion struct {
+	Current         string `json:"current"`
+	Latest          string `json:"latest,omitempty"`
+	UpdateAvailable bool   `json:"update_available"`
+}
+
+func parseDoctorJSON(t *testing.T, stdout string) doctorJSON {
+	t.Helper()
+	var out doctorJSON
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("failed to parse doctor JSON: %v\nraw output:\n%s", err, stdout)
+	}
+	return out
+}
+
+func TestDoctor_JSON_AllGood(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("skill1", map[string]string{
+		"SKILL.md": "# Skill 1",
+	})
+
+	// Write metadata to centralized store with correct file hash so integrity check passes
+	metaStore := `{"version":1,"entries":{"skill1":{"source":"test","type":"local","installed_at":"2026-01-01T00:00:00Z","file_hashes":{"SKILL.md":"sha256:c90671f17f3b99f87d8fe1a542ee2d6829d2b2cfb7684d298e44c7591d8b0712"}}}}`
+	os.WriteFile(filepath.Join(sb.SourcePath, install.MetadataFileName), []byte(metaStore), 0644)
+
+	targetPath := sb.CreateTarget("claude")
+
+	// Initialize git and commit to avoid warnings
+	cmd := exec.Command("git", "init")
+	cmd.Dir = sb.SourcePath
+	if err := cmd.Run(); err != nil {
+		t.Skip("git not available")
+	}
+
+	cmd = exec.Command("git", "config", "user.email", "test@test.com")
+	cmd.Dir = sb.SourcePath
+	cmd.Run()
+
+	cmd = exec.Command("git", "config", "user.name", "Test")
+	cmd.Dir = sb.SourcePath
+	cmd.Run()
+
+	cmd = exec.Command("git", "add", "-A")
+	cmd.Dir = sb.SourcePath
+	cmd.Run()
+
+	cmd = exec.Command("git", "commit", "-m", "initial")
+	cmd.Dir = sb.SourcePath
+	cmd.Run()
+
+	// Create synced symlink
+	os.Symlink(filepath.Join(sb.SourcePath, "skill1"), filepath.Join(targetPath, "skill1"))
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+`)
+
+	result := sb.RunCLI("doctor", "--json")
+
+	result.AssertSuccess(t)
+	out := parseDoctorJSON(t, result.Stdout)
+	if out.Summary.Errors != 0 {
+		t.Errorf("expected 0 errors, got %d", out.Summary.Errors)
+	}
+	if out.Summary.Pass == 0 {
+		t.Error("expected at least one passing check")
+	}
+	if out.Version == nil || out.Version.Current == "" {
+		t.Error("expected non-empty version.current")
+	}
+}
+
+func TestDoctor_JSON_WithErrors(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("skill1", map[string]string{"SKILL.md": "# Skill 1"})
+
+	// Point target to non-existent path with non-existent parent
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  broken:
+    path: /nonexistent/path/skills
+`)
+
+	result := sb.RunCLI("doctor", "--json")
+
+	if result.ExitCode == 0 {
+		t.Error("expected non-zero exit code when errors are present")
+	}
+	out := parseDoctorJSON(t, result.Stdout)
+	if out.Summary.Errors == 0 {
+		t.Error("expected summary.errors > 0")
+	}
+}
+
+func TestDoctor_JSON_WithWarnings(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	// Create a directory without SKILL.md to trigger skills_validity warning
+	invalidSkill := filepath.Join(sb.SourcePath, "no-skillmd")
+	os.MkdirAll(invalidSkill, 0755)
+	os.WriteFile(filepath.Join(invalidSkill, "README.md"), []byte("# No SKILL.md"), 0644)
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+
+	result := sb.RunCLI("doctor", "--json")
+
+	// Warnings don't cause failure
+	result.AssertSuccess(t)
+	out := parseDoctorJSON(t, result.Stdout)
+	if out.Summary.Warnings == 0 {
+		t.Error("expected summary.warnings > 0")
+	}
+}
+
+func TestDoctor_SharedDiscoveryShowsSuggestion(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	os.MkdirAll(filepath.Join(sb.Home, ".agents", "skills"), 0755)
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  codex:
+    path: ~/.codex/skills
+  universal:
+    path: ~/.agents/skills
+`)
+
+	result := sb.RunCLI("doctor")
+
+	result.AssertSuccess(t)
+	result.AssertOutputContains(t, "codex will see content from: universal")
+	result.AssertOutputContains(t, "suggestion: Choose one authoritative route for codex")
+	result.AssertOutputContains(t, "skillshare target remove <name> --global --dry-run")
+}
+
+func TestDoctor_JSON_SharedDiscoveryIncludesSuggestion(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	os.MkdirAll(filepath.Join(sb.Home, ".agents", "skills"), 0755)
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  codex:
+    path: ~/.codex/skills
+  universal:
+    path: ~/.agents/skills
+`)
+
+	result := sb.RunCLI("doctor", "--json")
+
+	result.AssertSuccess(t)
+	out := parseDoctorJSON(t, result.Stdout)
+	for _, check := range out.Checks {
+		if check.Name != "cross_target_discovery" {
+			continue
+		}
+		if len(check.Suggestions) == 0 {
+			t.Fatalf("cross_target_discovery suggestions are empty: %+v", check)
+		}
+		suggestion := check.Suggestions[0]
+		if !strings.Contains(suggestion, "authoritative route") {
+			t.Fatalf("cross_target_discovery suggestion = %q, want authoritative route guidance", suggestion)
+		}
+		if !strings.Contains(suggestion, "skillshare target remove <name> --global --dry-run") {
+			t.Fatalf("cross_target_discovery suggestion = %q, want target remove dry-run guidance", suggestion)
+		}
+		return
+	}
+	t.Fatal("missing cross_target_discovery check")
+}
+
+func TestDoctor_GlobalModeInsideProjectShowsGlobalTargetRemoveSuggestion(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectRoot := sb.SetupProjectDir("claude")
+	os.MkdirAll(filepath.Join(sb.Home, ".agents", "skills"), 0755)
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  codex:
+    path: ~/.codex/skills
+  universal:
+    path: ~/.agents/skills
+`)
+
+	result := sb.RunCLIInDir(projectRoot, "doctor", "--global")
+
+	result.AssertSuccess(t)
+	result.AssertOutputNotContains(t, "(project)")
+	result.AssertOutputContains(t, "skillshare target remove <name> --global --dry-run")
+	result.AssertOutputNotContains(t, "skillshare target remove <name> --project --dry-run")
+}
+
+func TestDoctor_JSON_ProjectMode(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectRoot := sb.SetupProjectDir("claude")
+	sb.CreateProjectSkill(projectRoot, "project-skill", map[string]string{"SKILL.md": "# Project Skill"})
+
+	result := sb.RunCLIInDir(projectRoot, "doctor", "--json")
+
+	result.AssertSuccess(t)
+	out := parseDoctorJSON(t, result.Stdout)
+
+	// Project mode should not include git_status check
+	for _, c := range out.Checks {
+		if c.Name == "git_status" {
+			t.Error("expected no git_status check in project mode")
+		}
+	}
+}
+
+func TestDoctor_JSON_HasBackupTrash(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("skill1", map[string]string{"SKILL.md": "# Skill 1"})
+	targetPath := sb.CreateTarget("claude")
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    path: ` + targetPath + `
+`)
+
+	result := sb.RunCLI("doctor", "--json")
+
+	result.AssertSuccess(t)
+	out := parseDoctorJSON(t, result.Stdout)
+
+	hasBackup := false
+	hasTrash := false
+	for _, c := range out.Checks {
+		if c.Name == "backup" {
+			hasBackup = true
+		}
+		if c.Name == "trash" {
+			hasTrash = true
+		}
+	}
+	if !hasBackup {
+		t.Error("expected checks to contain an entry with name \"backup\"")
+	}
+	if !hasTrash {
+		t.Error("expected checks to contain an entry with name \"trash\"")
+	}
+}
+
+func TestDoctor_JSON_SkillignorePresent(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("visible-skill", map[string]string{"SKILL.md": "# Visible"})
+	sb.CreateSkill("hidden-skill", map[string]string{"SKILL.md": "# Hidden"})
+
+	// Create .skillignore that hides one skill
+	os.WriteFile(filepath.Join(sb.SourcePath, ".skillignore"), []byte("hidden-skill\n"), 0644)
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+
+	result := sb.RunCLI("doctor", "--json")
+
+	result.AssertSuccess(t)
+	out := parseDoctorJSON(t, result.Stdout)
+
+	found := false
+	for _, c := range out.Checks {
+		if c.Name == "skillignore" {
+			found = true
+			if c.Status != "pass" {
+				t.Errorf("expected skillignore status \"pass\", got %q", c.Status)
+			}
+			if c.Message == "" {
+				t.Error("expected non-empty message for skillignore check")
+			}
+			// Message should mention patterns and ignored count
+			if !strings.Contains(c.Message, "1 patterns") || !strings.Contains(c.Message, "1 skills ignored") {
+				t.Errorf("expected message to mention pattern/ignored counts, got: %s", c.Message)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Error("expected checks to contain an entry with name \"skillignore\"")
+	}
+}
+
+func TestDoctor_JSON_SkillignoreAbsent(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("skill1", map[string]string{"SKILL.md": "# Skill 1"})
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+
+	result := sb.RunCLI("doctor", "--json")
+
+	result.AssertSuccess(t)
+	out := parseDoctorJSON(t, result.Stdout)
+
+	found := false
+	for _, c := range out.Checks {
+		if c.Name == "skillignore" {
+			found = true
+			if c.Status != "info" {
+				t.Errorf("expected skillignore status \"info\", got %q", c.Status)
+			}
+			if c.Message == "" {
+				t.Error("expected non-empty message for skillignore check")
+			}
+			// Info count should be reflected in summary
+			break
+		}
+	}
+	if !found {
+		t.Error("expected checks to contain an entry with name \"skillignore\"")
+	}
+	if out.Summary.Info == 0 {
+		t.Error("expected summary.info > 0 when .skillignore is absent")
+	}
+}
+
+// Regression for issue #251: doctor -p must resolve relative symlinks against
+// the link's parent directory, not the current working directory.
+func TestDoctorProject_RelativeSymlink_NoFalsePositives(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectDir := sb.SetupProjectDir()
+	sb.CreateProjectSkill(projectDir, "my-skill", map[string]string{
+		"SKILL.md": "---\nname: my-skill\n---\n# Content",
+	})
+	sb.WriteProjectConfig(projectDir, `targets:
+  - name: claude
+    skills:
+      path: .claude/skills
+      mode: symlink
+  - name: codex
+    skills:
+      path: .agents/skills
+      mode: symlink
+`)
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	sb.RunCLIInDir(projectDir, "sync", "-p").AssertSuccess(t)
+
+	link := filepath.Join(projectDir, ".claude", "skills")
+	if target := sb.SymlinkTarget(link); filepath.IsAbs(target) {
+		t.Fatalf("expected relative symlink, got %q", target)
+	}
+
+	result := sb.RunCLIInDir(projectDir, "doctor", "-p")
+	result.AssertSuccess(t)
+	if out := result.Output(); strings.Contains(out, "wrong location") || strings.Contains(out, "Duplicate skills") {
+		t.Errorf("doctor -p misreported valid relative symlinks:\n%s", out)
+	}
+}
+
+func TestDoctor_CopyModeExternalSymlink_ChecksDuplicateSkills(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("duplicate-skill", map[string]string{"SKILL.md": "# Source"})
+
+	realTarget := sb.CreateTarget("real-copy-target")
+	localSkill := filepath.Join(realTarget, "duplicate-skill")
+	if err := os.MkdirAll(localSkill, 0755); err != nil {
+		t.Fatal(err)
+	}
+	sb.WriteFile(filepath.Join(localSkill, "SKILL.md"), "# Local")
+
+	linkedTarget := filepath.Join(sb.Home, "linked-copy-target")
+	if err := os.Symlink(realTarget, linkedTarget); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  copilot:
+    path: ` + linkedTarget + `
+    mode: copy
+`)
+
+	result := sb.RunCLI("doctor", "-g")
+	result.AssertSuccess(t)
+	result.AssertOutputContains(t, "Duplicate skills")
+	result.AssertOutputContains(t, "duplicate-skill")
+}
+
+func TestDoctor_MergeMode_HiddenSourceSkill_NoSyncDrift(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("skill-a", map[string]string{"SKILL.md": "---\nname: skill-a\n---\n# A"})
+	sb.CreateNestedSkill(".system/example", map[string]string{"SKILL.md": "---\nname: example\n---\n# Example"})
+	targetPath := sb.CreateTarget("claude")
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+target_naming: flat
+targets:
+  claude:
+    path: ` + targetPath + `
+    mode: merge
+`)
+
+	sb.RunCLI("sync").AssertSuccess(t)
+
+	result := sb.RunCLI("doctor")
+	result.AssertSuccess(t)
+	result.AssertOutputNotContains(t, "not synced")
+}
+
+func TestDoctorBundledReferencesCleanJSON(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.CreateSkill("clean-reference", map[string]string{"SKILL.md": "---\nname: clean-reference\n---\n# Clean\n"})
+	sb.WriteConfig("source: " + sb.SourcePath + "\ntargets: {}\n")
+	got := sb.RunCLI("doctor", "--json")
+	checks := parseDoctorJSON(t, got.Stdout).Checks
+	for _, check := range checks {
+		if check.Name == "bundled_references" && check.Status == "pass" {
+			return
+		}
+	}
+	t.Fatalf("clean bundled references pass missing: %+v", checks)
+}
+
+// The dashboard asks doctor to print each check as it is found, so it can show
+// checks while slower ones run; the full result must still follow.
+func TestDoctor_JSON_StreamPrintsEachCheckBeforeResult(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.CreateSkill("skill1", map[string]string{"SKILL.md": "# Skill 1"})
+	sb.WriteConfig("source: " + sb.SourcePath + "\ntargets:\n  claude:\n    path: " + sb.CreateTarget("claude") + "\n")
+
+	stdout := sb.RunCLIEnv(map[string]string{"_SKILLSHARE_DOCTOR_STREAM": "1"}, "doctor", "--json").Stdout
+
+	var streamed []string
+	rest := stdout
+	for strings.HasPrefix(rest, `{"check":`) {
+		line, after, _ := strings.Cut(rest, "\n")
+		var l struct{ Check doctorJSONCheck }
+		if err := json.Unmarshal([]byte(line), &l); err != nil {
+			t.Fatalf("bad check line %q: %v", line, err)
+		}
+		streamed = append(streamed, l.Check.Name)
+		rest = after
+	}
+	var final []string
+	for _, c := range parseDoctorJSON(t, rest).Checks {
+		final = append(final, c.Name)
+	}
+	if strings.Join(streamed, ",") != strings.Join(final, ",") {
+		t.Fatalf("streamed checks %v, want the result's checks %v", streamed, final)
+	}
 }

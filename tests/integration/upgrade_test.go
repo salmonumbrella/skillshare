@@ -35,8 +35,8 @@ targets: {}
 
 	skillPath := filepath.Join(sb.SourcePath, "skillshare", "SKILL.md")
 
-	// Create existing skill with frontmatter version
-	skillContent := "---\nname: skillshare\nversion: 0.1.0\n---\n# Old Content"
+	// Create existing skill with metadata version
+	skillContent := "---\nname: skillshare\nmetadata:\n  version: 0.1.0\n---\n# Old Content"
 	os.MkdirAll(filepath.Dir(skillPath), 0755)
 	os.WriteFile(skillPath, []byte(skillContent), 0644)
 
@@ -44,7 +44,7 @@ targets: {}
 	result := sb.RunCLI("upgrade", "--skill", "--force", "--dry-run")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Would re-download")
+	result.AssertOutputContains(t, "would download again")
 
 	// Verify file was not changed
 	content, _ := os.ReadFile(skillPath)
@@ -64,9 +64,9 @@ targets: {}
 
 	skillPath := filepath.Join(sb.SourcePath, "skillshare", "SKILL.md")
 
-	// Create existing skill with frontmatter version
+	// Create existing skill with metadata version
 	os.MkdirAll(filepath.Dir(skillPath), 0755)
-	os.WriteFile(skillPath, []byte("---\nname: skillshare\nversion: 0.1.0\n---\n# Old Content"), 0644)
+	os.WriteFile(skillPath, []byte("---\nname: skillshare\nmetadata:\n  version: 0.1.0\n---\n# Old Content"), 0644)
 
 	// Force upgrade skill only (don't upgrade CLI during tests!)
 	result := sb.RunCLI("upgrade", "--skill", "--force")
@@ -74,7 +74,7 @@ targets: {}
 	// Should either succeed (if network available) or fail with download error
 	// But should NOT ask for confirmation
 	if result.ExitCode == 0 {
-		result.AssertOutputContains(t, "Upgraded")
+		result.AssertOutputContains(t, "✓ Skill")
 	} else {
 		result.AssertAnyOutputContains(t, "download")
 	}
@@ -106,22 +106,6 @@ targets: {}
 	}
 }
 
-func TestUpgrade_ShowsSourceURL(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	// Create config
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets: {}
-`)
-
-	result := sb.RunCLI("upgrade", "--skill", "--force", "--dry-run")
-
-	result.AssertSuccess(t)
-	// Source URL appears in the logo banner
-	result.AssertOutputContains(t, "github.com/runkids/skillshare")
-}
-
 func TestUpgrade_NoSkill_PromptDeclined(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
@@ -140,7 +124,7 @@ targets: {}
 	result := sb.RunCLI("upgrade", "--skill")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "skipped")
+	result.AssertOutputContains(t, "not installed")
 
 	// Verify skill was NOT created
 	if sb.FileExists(skillPath) {

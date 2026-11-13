@@ -1,0 +1,852 @@
+package server
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"skillshare/internal/config"
+	"skillshare/internal/testutil"
+)
+
+// setServerGitRoot rewrites the test server's config file with a given git_root
+// scope. The auto-reload middleware reloads config from disk on every /api/*
+// request, so persisting to the file (not mutating s.cfg) is what the handlers
+// actually see. src is the skills source preserved from newTestServer.
+func setServerGitRoot(t *testing.T, scope, src string) {
+	t.Helper()
+	content := "git_root: " + scope + "\nsource: " + src + "\nmode: merge\ntargets: {}\n"
+	if err := os.WriteFile(config.ConfigPath(), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHandleGitCommit_NoRemote_CreatesLocalCommit(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	addSkill(t, src, "local-skill")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/git/commit", strings.NewReader(`{"message":"local checkpoint"}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp pushResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected success response: %+v", resp)
+	}
+
+	message := testutil.RunGit(t, src, "log", "-1", "--pretty=%s")
+	if message != "local checkpoint" {
+		t.Fatalf("commit message = %q, want %q", message, "local checkpoint")
+	}
+
+	status := testutil.RunGit(t, src, "status", "--porcelain")
+	if status != "" {
+		t.Fatalf("expected clean working tree, got %q", status)
+	}
+}
+
+func TestHandleGitCommit_DryRun_DoesNotCreateCommit(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	addSkill(t, src, "dry-run-skill")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/git/commit", strings.NewReader(`{"message":"dry run checkpoint","dryRun":true}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	count := testutil.RunGit(t, src, "rev-list", "--count", "HEAD")
+	if count != "1" {
+		t.Fatalf("commit count = %q, want 1", count)
+	}
+}
+
+func TestHandleGitCommit_NoChanges(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/git/commit", strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp pushResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Message != "nothing to commit (working tree clean)" {
+		t.Fatalf("message = %q, want nothing to commit", resp.Message)
+	}
+}
+
+func initServerGitRepo(t *testing.T, dir string) {
+	t.Helper()
+
+	testutil.RunGit(t, dir, "init")
+	testutil.ConfigureGitUser(t, dir)
+	testutil.RunGit(t, dir, "commit", "--allow-empty", "-m", "initial")
+}
+
+func addFailingOriginRemote(t *testing.T, dir string) {
+	t.Helper()
+	missingRemote := "file://" + filepath.Join(t.TempDir(), "missing.git")
+	testutil.RunGit(t, dir, "remote", "add", "origin", missingRemote)
+}
+
+func TestHandleGitBranches_FetchFailureReturnsError(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	addFailingOriginRemote(t, src)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/git/branches?fetch=true", nil)
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "git fetch failed") {
+		t.Fatalf("response %q does not mention fetch failure", rr.Body.String())
+	}
+}
+
+func TestHandleGitCheckout_FetchFailureStopsCheckout(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	base := testutil.RunGit(t, src, "branch", "--show-current")
+	testutil.RunGit(t, src, "checkout", "-b", "feature")
+	testutil.RunGit(t, src, "checkout", base)
+	addFailingOriginRemote(t, src)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/git/checkout", strings.NewReader(`{"branch":"feature"}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "git fetch failed") {
+		t.Fatalf("response %q does not mention fetch failure", rr.Body.String())
+	}
+	if current := testutil.RunGit(t, src, "branch", "--show-current"); current != base {
+		t.Fatalf("current branch = %q, want %q", current, base)
+	}
+}
+
+// POST /api/git/root with a non-default scope initializes a repo at that scope
+// directory and persists git_root to config.
+func TestHandleSetGitRoot_SwitchToAgents_InitsAndPersists(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/git/root", strings.NewReader(`{"scope":"agents"}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["scope"] != "agents" {
+		t.Fatalf("scope = %v, want agents", resp["scope"])
+	}
+	dir, _ := resp["gitRoot"].(string)
+	if dir == "" {
+		t.Fatalf("missing gitRoot in response: %+v", resp)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		t.Errorf("expected .git initialized at agents scope %s: %v", dir, err)
+	}
+	if s.cfg.GitRoot != "agents" {
+		t.Errorf("cfg.GitRoot = %q, want agents (persisted)", s.cfg.GitRoot)
+	}
+}
+
+// POST /api/git/root with a remoteURL initializes the scope repo and wires the
+// "origin" remote on it in one request (UI parity with the CLI's
+// `init --git-root <scope> --remote <url>`).
+func TestHandleSetGitRoot_WithRemote_WiresOrigin(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	const remote = "https://example.com/skills.git"
+	body := `{"scope":"agents","remoteURL":"` + remote + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/git/root", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	dir, _ := resp["gitRoot"].(string)
+	if dir == "" {
+		t.Fatalf("missing gitRoot in response: %+v", resp)
+	}
+
+	got := testutil.RunGit(t, dir, "remote", "get-url", "origin")
+	if got != remote {
+		t.Errorf("origin = %q, want %q", got, remote)
+	}
+}
+
+// POST /api/git/root rejects unknown or empty scopes with 400.
+func TestHandleSetGitRoot_InvalidScope_Rejected(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	for _, scope := range []string{`"bogus"`, `""`} {
+		req := httptest.NewRequest(http.MethodPost, "/api/git/root", strings.NewReader(`{"scope":`+scope+`}`))
+		rr := httptest.NewRecorder()
+		s.handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("scope %s: expected 400, got %d: %s", scope, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+// git_root is global-only; project mode must reject the request.
+func TestHandleSetGitRoot_ProjectMode_Rejected(t *testing.T) {
+	s, _ := newProjectTargetServer(t, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/git/root", strings.NewReader(`{"scope":"root"}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 in project mode, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// GET /api/git/status reports a scope mismatch when the configured root has no
+// repo but a sibling scope directory does.
+func TestHandleGitStatus_ScopeMismatch(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	// git_root defaults to skills (the source). Plant a stray repo at the agents
+	// scope dir so the configured root lacks .git but agents has one.
+	agentsDir := s.cfg.EffectiveAgentsSource()
+	if err := os.MkdirAll(filepath.Join(agentsDir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/git/status", nil)
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp gitStatusResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.ScopeMismatch {
+		t.Fatalf("expected scopeMismatch=true, got: %+v", resp)
+	}
+	if resp.MismatchScope != "agents" {
+		t.Errorf("mismatchScope = %q, want agents", resp.MismatchScope)
+	}
+	if resp.MismatchDir != agentsDir {
+		t.Errorf("mismatchDir = %q, want %q", resp.MismatchDir, agentsDir)
+	}
+}
+
+// An invalid (hand-edited) git_root must not silently fall back to the skills
+// scope — git operations reject it with a 400, mirroring the CLI's resolveGitRoot.
+func TestHandleGitCommit_InvalidGitRoot_Rejected(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	setServerGitRoot(t, "agnets", src) // typo for "agents" — not a valid scope
+
+	req := httptest.NewRequest(http.MethodPost, "/api/git/commit", strings.NewReader(`{"message":"x"}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid git_root, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "invalid git_root") {
+		t.Errorf("expected 'invalid git_root' in error, got: %s", rr.Body.String())
+	}
+}
+
+// A nested git repo at the root scope blocks commit with a 400 — committing it
+// would record an empty submodule and silently drop its files.
+func TestHandleGitCommit_NestedRepo_Blocked(t *testing.T) {
+	s, src := newTestServer(t)
+	setServerGitRoot(t, "root", src)
+	base := config.BaseDir() // root scope operates on BaseDir
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initServerGitRepo(t, base)
+	if err := os.MkdirAll(filepath.Join(base, "vendored", ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/git/commit", strings.NewReader(`{"message":"x"}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 nested-repo block, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "nested git repositories") {
+		t.Errorf("expected nested-repo error, got: %s", rr.Body.String())
+	}
+}
+
+// A root-scope dry-run must be strictly read-only — it must not untrack
+// config.yaml (no `git rm --cached`). Regression for the guard mutating the
+// repo before the dry-run branch.
+func TestHandleGitCommit_DryRun_DoesNotUntrackConfig(t *testing.T) {
+	s, src := newTestServer(t)
+	setServerGitRoot(t, "root", src)
+	base := config.BaseDir() // root scope operates on BaseDir
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	testutil.RunGit(t, base, "init")
+	testutil.ConfigureGitUser(t, base)
+	// A repo that (wrongly) tracks config.yaml: the real run would untrack it,
+	// but a dry-run must leave it alone.
+	if err := os.WriteFile(filepath.Join(base, "config.yaml"), []byte("x: 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testutil.RunGit(t, base, "add", "config.yaml")
+	testutil.RunGit(t, base, "commit", "-m", "initial with config")
+	// A stageable change so the request reaches the dry-run branch.
+	if err := os.WriteFile(filepath.Join(base, "note.md"), []byte("# n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/git/commit", strings.NewReader(`{"message":"x","dryRun":true}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	tracked := testutil.RunGit(t, base, "ls-files", "--", "config.yaml")
+	if !strings.Contains(tracked, "config.yaml") {
+		t.Error("dry-run must not untrack config.yaml, but it is no longer tracked")
+	}
+}
+
+func TestHandlePush_CleanTreePushesUnpushedCommits(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, src, "remote", "add", "origin", remote)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/push", strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	branch := testutil.RunGit(t, src, "rev-parse", "--abbrev-ref", "HEAD")
+	if got, want := testutil.RunGit(t, remote, "rev-parse", branch), testutil.RunGit(t, src, "rev-parse", "HEAD"); got != want {
+		t.Fatalf("remote %s = %s, want local HEAD %s", branch, got, want)
+	}
+}
+
+func TestHandlePush_RefusesUnpushedConfigHistory(t *testing.T) {
+	for _, upstream := range []bool{true, false} {
+		for _, body := range []string{`{}`, `{"dryRun":true}`} {
+			t.Run(fmt.Sprintf("upstream=%t/%s", upstream, body), func(t *testing.T) {
+				s, src := newTestServer(t)
+				setServerGitRoot(t, "root", src)
+				base := config.BaseDir()
+				if err := os.MkdirAll(base, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(base, "config.yaml"), []byte("local: config\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				initServerGitRepo(t, base)
+				if err := os.WriteFile(filepath.Join(base, ".gitignore"), []byte("config.yaml\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				testutil.RunGit(t, base, "add", ".gitignore")
+				testutil.RunGit(t, base, "commit", "-m", "ignore config")
+				remote := testutil.SetupBareRemoteRepo(t, t.TempDir())
+				testutil.RunGit(t, base, "remote", "add", "origin", remote)
+				if upstream {
+					testutil.RunGit(t, base, "push", "-u", "origin", "HEAD")
+				}
+				testutil.RunGit(t, base, "add", "-f", "config.yaml")
+				testutil.RunGit(t, base, "commit", "-m", "oops")
+				head := testutil.RunGit(t, base, "rev-parse", "HEAD")
+				badCommit := testutil.RunGit(t, base, "rev-parse", "--short", "HEAD")
+				status := testutil.RunGit(t, base, "status", "--porcelain")
+				refs := testutil.RunGit(t, remote, "for-each-ref", "--format=%(refname) %(objectname)")
+
+				req := httptest.NewRequest(http.MethodPost, "/api/push", strings.NewReader(body))
+				rr := httptest.NewRecorder()
+				s.handler.ServeHTTP(rr, req)
+				if rr.Code != http.StatusConflict {
+					t.Fatalf("expected 409, got %d: %s", rr.Code, rr.Body.String())
+				}
+				var resp struct {
+					Code  string `json:"error_code"`
+					Error string `json:"error"`
+				}
+				if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+					t.Fatal(err)
+				}
+				if resp.Code != "unpushed_config_history" || !strings.Contains(resp.Error, badCommit) || !strings.Contains(resp.Error, "git rebase -i") {
+					t.Errorf("missing stable code, commit, or remediation: %s", rr.Body.String())
+				}
+				if got := testutil.RunGit(t, base, "rev-parse", "HEAD"); got != head {
+					t.Errorf("refused push changed HEAD: %s -> %s", head, got)
+				}
+				if got := testutil.RunGit(t, base, "status", "--porcelain"); got != status {
+					t.Errorf("refused push changed status: %q -> %q", status, got)
+				}
+				if got := testutil.RunGit(t, remote, "for-each-ref", "--format=%(refname) %(objectname)"); got != refs {
+					t.Errorf("refused push changed remote refs: %q -> %q", refs, got)
+				}
+				if got := testutil.RunGit(t, remote, "log", "--all", "--format=%h", "--", "config.yaml"); got != "" {
+					t.Errorf("remote received config.yaml history: %s", got)
+				}
+			})
+		}
+	}
+}
+
+func TestHandlePull_ReportsPulledCommits(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, src, "remote", "add", "origin", remote)
+	testutil.RunGit(t, src, "push", "-u", "origin", "HEAD")
+
+	other := filepath.Join(t.TempDir(), "other")
+	testutil.RunGit(t, "", "clone", remote, other)
+	testutil.ConfigureGitUser(t, other)
+	addSkill(t, other, "remote-skill")
+	testutil.RunGit(t, other, "add", "-A")
+	testutil.RunGit(t, other, "commit", "-m", "add remote skill")
+	testutil.RunGit(t, other, "push", "origin", "HEAD")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/pull", strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Commits []map[string]string `json:"commits"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(resp.Commits) != 1 || resp.Commits[0]["message"] != "add remote skill" {
+		t.Fatalf("expected the pulled commit with lowercase JSON keys, got %s", rr.Body.String())
+	}
+}
+
+// pushRemoteFile commits a file from a separate clone of remote, as another machine would.
+func pushRemoteFile(t *testing.T, remote, rel, content string) {
+	t.Helper()
+	other := filepath.Join(t.TempDir(), "other")
+	testutil.RunGit(t, "", "clone", remote, other)
+	testutil.ConfigureGitUser(t, other)
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(other, rel)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, rel), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testutil.RunGit(t, other, "add", "-A")
+	testutil.RunGit(t, other, "commit", "-m", "add "+rel)
+	testutil.RunGit(t, other, "push", "origin", "HEAD")
+}
+
+func postPull(s *Server, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/api/pull", strings.NewReader(body))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+	return rr
+}
+
+func TestHandleGitStatus_ReportsBehindAfterFetch(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, src, "remote", "add", "origin", remote)
+	testutil.RunGit(t, src, "push", "-u", "origin", "HEAD")
+	pushRemoteFile(t, remote, "remote-skill/SKILL.md", "# remote\n")
+	testutil.RunGit(t, src, "fetch")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/git/status", nil)
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	var resp struct {
+		Behind int `json:"behind"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rr.Body.String())
+	}
+	if resp.Behind != 1 {
+		t.Fatalf("expected behind=1, got %d: %s", resp.Behind, rr.Body.String())
+	}
+}
+
+func TestHandlePush_RemoteAheadReportsPushRejected(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, src, "remote", "add", "origin", remote)
+	testutil.RunGit(t, src, "push", "-u", "origin", "HEAD")
+	pushRemoteFile(t, remote, "remote-skill/SKILL.md", "# remote\n")
+	addSkill(t, src, "local-skill")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/push", strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+	s.handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), `"push_rejected"`) {
+		t.Fatalf("expected 409 push_rejected, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandlePull_PermissionDeniedLeavesTreeCleanAndNamesPath(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("test requires non-root user")
+	}
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	addSkill(t, src, "skillshare")
+	testutil.RunGit(t, src, "add", "-A")
+	testutil.RunGit(t, src, "commit", "-m", "add skillshare")
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, src, "remote", "add", "origin", remote)
+	testutil.RunGit(t, src, "push", "-u", "origin", "HEAD")
+	pushRemoteFile(t, remote, ".metadata.json", "{}\n")
+	pushRemoteFile(t, remote, "skillshare/SKILL.md", "# newer\n")
+	// As left by a sudo upgrade: this user can no longer replace files here.
+	locked := filepath.Join(src, "skillshare")
+	if err := os.Chmod(locked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+
+	rr := postPull(s, `{}`)
+	if !strings.Contains(rr.Body.String(), `"permission_denied"`) || !strings.Contains(rr.Body.String(), src) {
+		t.Fatalf("expected permission_denied naming %s, got %d: %s", src, rr.Code, rr.Body.String())
+	}
+	if status := testutil.RunGit(t, src, "status", "--porcelain", "-uall"); status != "" {
+		t.Fatalf("expected no pull residue to block the next pull, got:\n%s", status)
+	}
+}
+
+func TestHandlePull_FirstPullConflictCanBeForced(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	addSkill(t, src, "shared")
+	testutil.RunGit(t, src, "add", "-A")
+	testutil.RunGit(t, src, "commit", "-m", "local skill")
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	pushRemoteFile(t, remote, "shared/SKILL.md", "# remote version\n")
+	testutil.RunGit(t, src, "remote", "add", "origin", remote)
+
+	if rr := postPull(s, `{}`); rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), `"merge_failed"`) {
+		t.Fatalf("expected 409 merge_failed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := postPull(s, `{"force":true}`); rr.Code != http.StatusOK {
+		t.Fatalf("expected force pull to succeed, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got, _ := os.ReadFile(filepath.Join(src, "shared", "SKILL.md")); string(got) != "# remote version\n" {
+		t.Fatalf("expected the remote file after force pull, got %q", got)
+	}
+}
+
+func TestHandlePull_RootScopeRemoteTracksConfig_Refused(t *testing.T) {
+	s, src := newTestServer(t)
+	setServerGitRoot(t, "root", src)
+	base := config.BaseDir()
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initServerGitRepo(t, base)
+	if err := os.WriteFile(filepath.Join(base, ".gitignore"), []byte("config.yaml\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testutil.RunGit(t, base, "add", ".gitignore")
+	testutil.RunGit(t, base, "commit", "-m", "scaffold")
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	pushRemoteFile(t, remote, "config.yaml", "sources: {}\n")
+	pushRemoteFile(t, remote, "skills/test/SKILL.md", "# test\n")
+	testutil.RunGit(t, base, "remote", "add", "origin", remote)
+
+	rr := postPull(s, `{}`)
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), `"remote_tracks_config"`) {
+		t.Fatalf("expected 400 remote_tracks_config, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandlePull_ExtrasScopeSyncsExtras(t *testing.T) {
+	s, src := newTestServer(t)
+	extrasDir := filepath.Join(filepath.Dir(src), "extras")
+	targetDir := t.TempDir()
+	cfg := "git_root: extras\nsource: " + src + "\nmode: merge\ntargets: {}\nextras:\n  - name: rules\n    targets:\n      - path: " + targetDir + "\n"
+	if err := os.WriteFile(config.ConfigPath(), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(extrasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initServerGitRepo(t, extrasDir)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, extrasDir, "remote", "add", "origin", remote)
+	testutil.RunGit(t, extrasDir, "push", "-u", "origin", "HEAD")
+	pushRemoteFile(t, remote, "rules/team.md", "# team rule\n")
+
+	if rr := postPull(s, `{}`); rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Lstat(filepath.Join(targetDir, "team.md")); err != nil {
+		t.Fatalf("expected the pulled extra synced to its target: %v", err)
+	}
+}
+
+// setupExtrasScopePull makes an extras-scope repo tracking a bare remote, with
+// one extra named "rules" synced to the returned target directory.
+func setupExtrasScopePull(t *testing.T) (s *Server, extrasDir, remote, targetDir string) {
+	t.Helper()
+	s, src := newTestServer(t)
+	extrasDir = filepath.Join(filepath.Dir(src), "extras")
+	targetDir = t.TempDir()
+	cfg := "git_root: extras\nsource: " + src + "\nmode: merge\ntargets: {}\nextras:\n  - name: rules\n    targets:\n      - path: " + targetDir + "\n"
+	if err := os.WriteFile(config.ConfigPath(), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(extrasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initServerGitRepo(t, extrasDir)
+	remote = filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, extrasDir, "remote", "add", "origin", remote)
+	testutil.RunGit(t, extrasDir, "push", "-u", "origin", "HEAD")
+	return s, extrasDir, remote, targetDir
+}
+
+func TestHandlePull_AlwaysSyncSyncsWhenUpToDate(t *testing.T) {
+	s, extrasDir, _, targetDir := setupExtrasScopePull(t)
+	if err := os.MkdirAll(filepath.Join(extrasDir, "rules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extrasDir, "rules", "local.md"), []byte("# local rule\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testutil.RunGit(t, extrasDir, "add", "-A")
+	testutil.RunGit(t, extrasDir, "commit", "-m", "local rule")
+
+	if rr := postPull(s, `{"alwaysSync":true}`); rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Lstat(filepath.Join(targetDir, "local.md")); err != nil {
+		t.Fatalf("expected an up-to-date pull with alwaysSync to sync targets: %v", err)
+	}
+}
+
+func TestHandlePull_EmptyRemoteReturnsCode(t *testing.T) {
+	s, src := newTestServer(t)
+	initServerGitRepo(t, src)
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, src, "remote", "add", "origin", remote)
+
+	rr := postPull(s, `{}`)
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), `"error_code":"remote_empty"`) {
+		t.Fatalf("expected 400 with remote_empty, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandlePull_ReportsUnmatchedIncludeFromItsSync(t *testing.T) {
+	s, src := newTestServer(t)
+	addSkill(t, src, "alpha")
+	s.cfg.Targets["claude"] = config.TargetConfig{Skills: &config.ResourceTargetConfig{Path: filepath.Join(t.TempDir(), "claude-skills"), Include: []string{"missing"}}}
+	if err := s.cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	initServerGitRepo(t, src)
+	testutil.RunGit(t, src, "add", "-A")
+	testutil.RunGit(t, src, "commit", "-m", "alpha")
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, src, "remote", "add", "origin", remote)
+	testutil.RunGit(t, src, "push", "-u", "origin", "HEAD")
+
+	rr := postPull(s, `{"alwaysSync":true}`)
+	var resp struct {
+		Unmatched []unmatchedInclude `json:"unmatched"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Code != http.StatusOK || len(resp.Unmatched) != 1 || resp.Unmatched[0].Target != "claude" {
+		t.Fatalf("expected the unmatched include for claude, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandlePull_ReportsExtrasSyncWarnings(t *testing.T) {
+	s, _, remote, _ := setupExtrasScopePull(t)
+	pushRemoteFile(t, remote, "other/readme.md", "# other\n")
+
+	rr := postPull(s, `{}`)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "Source directory does not exist") {
+		t.Fatalf("expected the missing extra source reported as a warning, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandlePull_RootScopeSyncsExtras(t *testing.T) {
+	s, _ := newTestServer(t)
+	root := config.BaseDir()
+	if err := os.MkdirAll(filepath.Join(root, "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SKILLSHARE_CONFIG", filepath.Join(root, "config.yaml"))
+	targetDir := t.TempDir()
+	cfg := "git_root: root\nsource: " + filepath.Join(root, "skills") + "\nmode: merge\ntargets: {}\nextras:\n  - name: rules\n    targets:\n      - path: " + targetDir + "\n"
+	if err := os.WriteFile(config.ConfigPath(), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	initServerGitRepo(t, root)
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("config.yaml\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testutil.RunGit(t, root, "add", ".gitignore")
+	testutil.RunGit(t, root, "commit", "-m", "ignore config")
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, root, "remote", "add", "origin", remote)
+	testutil.RunGit(t, root, "push", "-u", "origin", "HEAD")
+	pushRemoteFile(t, remote, "extras/rules/team.md", "# team rule\n")
+
+	if rr := postPull(s, `{}`); rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Lstat(filepath.Join(targetDir, "team.md")); err != nil {
+		t.Fatalf("expected the pulled extra synced to its target: %v", err)
+	}
+}
+
+func TestHandlePull_RootScopeKeepsLocalConfig(t *testing.T) {
+	s, _ := newTestServer(t)
+	root := config.BaseDir()
+	if err := os.MkdirAll(filepath.Join(root, "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SKILLSHARE_CONFIG", filepath.Join(root, "config.yaml"))
+	setServerGitRoot(t, "root", filepath.Join(root, "skills"))
+	localConfig, err := os.ReadFile(config.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	initServerGitRepo(t, root)
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("config.yaml\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testutil.RunGit(t, root, "add", ".gitignore")
+	testutil.RunGit(t, root, "commit", "-m", "ignore config")
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	testutil.RunGit(t, "", "init", "--bare", remote)
+	testutil.RunGit(t, root, "remote", "add", "origin", remote)
+	testutil.RunGit(t, root, "push", "-u", "origin", "HEAD")
+
+	other := filepath.Join(t.TempDir(), "other")
+	testutil.RunGit(t, "", "clone", remote, other)
+	testutil.ConfigureGitUser(t, other)
+	if err := os.WriteFile(filepath.Join(other, "config.yaml"), []byte("source: /other/machine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testutil.RunGit(t, other, "add", "-f", "config.yaml")
+	testutil.RunGit(t, other, "commit", "-m", "track config by mistake")
+	testutil.RunGit(t, other, "push", "origin", "HEAD")
+
+	rr := postPull(s, `{}`)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "remote tracks config.yaml") {
+		t.Fatalf("expected 200 with a config.yaml warning, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got, err := os.ReadFile(config.ConfigPath()); err != nil || string(got) != string(localConfig) {
+		t.Fatalf("config.yaml = %q, %v; want this machine's copy kept", got, err)
+	}
+}
+
+func TestHandleGitCommit_SourceLinkWarning(t *testing.T) {
+	for _, operation := range []string{"commit", "push"} {
+		for _, dryRun := range []bool{true, false} {
+			t.Run(operation+fmt.Sprint(dryRun), func(t *testing.T) {
+				s, src := newTestServer(t)
+				initServerGitRepo(t, src)
+				if operation == "push" {
+					remote := t.TempDir()
+					testutil.RunGit(t, remote, "init", "--bare")
+					testutil.RunGit(t, src, "remote", "add", "origin", remote)
+				}
+				if err := os.Symlink(t.TempDir(), filepath.Join(src, "_dev-skills")); err != nil {
+					t.Fatal(err)
+				}
+				endpoint := "/api/git/commit"
+				if operation == "push" {
+					endpoint = "/api/push"
+				}
+				req := httptest.NewRequest(http.MethodPost, endpoint, strings.NewReader(fmt.Sprintf(`{"dryRun":%t}`, dryRun)))
+				rr := httptest.NewRecorder()
+				s.handler.ServeHTTP(rr, req)
+				if rr.Code != http.StatusOK {
+					t.Fatalf("status %d: %s", rr.Code, rr.Body.String())
+				}
+				var response pushResponse
+				if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if strings.Count(response.Message, operation+" will stage source link") != 1 || !strings.Contains(response.Message, "/_dev-skills") {
+					t.Fatalf("missing or duplicate warning: %s", response.Message)
+				}
+			})
+		}
+	}
+
+}

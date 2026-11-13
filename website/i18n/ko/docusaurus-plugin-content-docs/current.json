@@ -1,0 +1,82 @@
+{
+  "version.label": {
+    "message": "Next",
+    "description": "The label for version current"
+  },
+  "sidebar.docsSidebar.category.Learn": {
+    "message": "학습",
+    "description": "The label for category 'Learn' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Quickstarts": {
+    "message": "빠른 시작",
+    "description": "The label for category 'Quickstarts' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.How-To": {
+    "message": "사용 방법",
+    "description": "The label for category 'How-To' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Daily Tasks": {
+    "message": "일상 작업",
+    "description": "The label for category 'Daily Tasks' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Sharing & Teams": {
+    "message": "공유와 팀",
+    "description": "The label for category 'Sharing & Teams' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Advanced": {
+    "message": "고급",
+    "description": "The label for category 'Advanced' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Recipes": {
+    "message": "레시피",
+    "description": "The label for category 'Recipes' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Understand": {
+    "message": "이해하기",
+    "description": "The label for category 'Understand' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Design Philosophy": {
+    "message": "설계 철학",
+    "description": "The label for category 'Design Philosophy' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Reference": {
+    "message": "레퍼런스",
+    "description": "The label for category 'Reference' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Commands": {
+    "message": "명령어",
+    "description": "The label for category 'Commands' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Core": {
+    "message": "핵심",
+    "description": "The label for category 'Core' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Skill Management": {
+    "message": "Skill 관리",
+    "description": "The label for category 'Skill Management' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Target Management": {
+    "message": "Target 관리",
+    "description": "The label for category 'Target Management' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Sync Operations": {
+    "message": "Sync 작업",
+    "description": "The label for category 'Sync Operations' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Security & Utilities": {
+    "message": "보안과 유틸리티",
+    "description": "The label for category 'Security & Utilities' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Targets": {
+    "message": "Targets",
+    "description": "The label for category 'Targets' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Appendix": {
+    "message": "부록",
+    "description": "The label for category 'Appendix' in sidebar 'docsSidebar'"
+  },
+  "sidebar.docsSidebar.category.Troubleshooting": {
+    "message": "문제 해결",
+    "description": "The label for category 'Troubleshooting' in sidebar 'docsSidebar'"
+  }
+}

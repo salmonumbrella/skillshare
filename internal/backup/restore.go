@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"skillshare/internal/utils"
 )
 
 // RestoreOptions holds options for restore operation
@@ -28,7 +30,7 @@ func ValidateRestore(backupPath, targetName, destPath string, opts RestoreOption
 	// Check if destination exists
 	info, err := os.Lstat(destPath)
 	if err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
+		if utils.IsLinkMode(destPath, info.Mode()) {
 			return nil
 		}
 		if info.IsDir() {
@@ -62,9 +64,9 @@ func RestoreToPath(backupPath, targetName, destPath string, opts RestoreOptions)
 	targetBackupPath := filepath.Join(backupPath, targetName)
 
 	// Check if destination exists
-	info, err := os.Stat(destPath)
+	info, err := os.Lstat(destPath)
 	if err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
+		if utils.IsLinkMode(destPath, info.Mode()) {
 			// It's a symlink - remove it
 			if err := os.Remove(destPath); err != nil {
 				return fmt.Errorf("failed to remove existing symlink: %w", err)
@@ -85,10 +87,15 @@ func RestoreToPath(backupPath, targetName, destPath string, opts RestoreOptions)
 	return copyDir(targetBackupPath, destPath)
 }
 
-// RestoreLatest restores the most recent backup for a target.
-// Returns the timestamp of the restored backup.
+// RestoreLatest restores the most recent backup for a target from the global backup dir.
 func RestoreLatest(targetName, destPath string, opts RestoreOptions) (string, error) {
-	backups, err := List()
+	return RestoreLatestInDir(BackupDir(), targetName, destPath, opts)
+}
+
+// RestoreLatestInDir restores the most recent backup for a target from the specified dir.
+// Returns the timestamp of the restored backup.
+func RestoreLatestInDir(backupDir, targetName, destPath string, opts RestoreOptions) (string, error) {
+	backups, err := ListInDir(backupDir)
 	if err != nil {
 		return "", err
 	}
@@ -108,9 +115,14 @@ func RestoreLatest(targetName, destPath string, opts RestoreOptions) (string, er
 	return "", fmt.Errorf("no backup found for target '%s'", targetName)
 }
 
-// FindBackupsForTarget returns all backups that contain the specified target
+// FindBackupsForTarget returns all backups that contain the specified target from the global dir.
 func FindBackupsForTarget(targetName string) ([]BackupInfo, error) {
-	allBackups, err := List()
+	return FindBackupsForTargetInDir(BackupDir(), targetName)
+}
+
+// FindBackupsForTargetInDir returns all backups that contain the specified target.
+func FindBackupsForTargetInDir(backupDir, targetName string) ([]BackupInfo, error) {
+	allBackups, err := ListInDir(backupDir)
 	if err != nil {
 		return nil, err
 	}
@@ -128,9 +140,14 @@ func FindBackupsForTarget(targetName string) ([]BackupInfo, error) {
 	return result, nil
 }
 
-// GetBackupByTimestamp finds a backup by its timestamp
+// GetBackupByTimestamp finds a backup by its timestamp from the global dir.
 func GetBackupByTimestamp(timestamp string) (*BackupInfo, error) {
-	backups, err := List()
+	return GetBackupByTimestampInDir(BackupDir(), timestamp)
+}
+
+// GetBackupByTimestampInDir finds a backup by its timestamp in the specified dir.
+func GetBackupByTimestampInDir(backupDir, timestamp string) (*BackupInfo, error) {
+	backups, err := ListInDir(backupDir)
 	if err != nil {
 		return nil, err
 	}
@@ -157,6 +174,23 @@ type BackupVersion struct {
 // ListBackupVersions returns all backup versions for a target, newest first.
 // Returns nil, nil for a non-existent directory.
 func ListBackupVersions(backupDir, targetName string) ([]BackupVersion, error) {
+	return listBackupVersions(backupDir, targetName, true)
+}
+
+// ListBackupVersionsLite is like ListBackupVersions but skips the expensive
+// dirSize() walk. Versions will have TotalSize = -1. Use this for TUI list
+// population where size is computed lazily on demand.
+func ListBackupVersionsLite(backupDir, targetName string) ([]BackupVersion, error) {
+	return listBackupVersions(backupDir, targetName, false)
+}
+
+// DirSize calculates the total size of a directory by walking all files.
+// Exported so callers (e.g. TUI) can compute size on demand for a single version.
+func DirSize(path string) int64 {
+	return dirSize(path)
+}
+
+func listBackupVersions(backupDir, targetName string, computeSize bool) ([]BackupVersion, error) {
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -196,12 +230,17 @@ func ListBackupVersions(backupDir, targetName string) ([]BackupVersion, error) {
 		}
 		sort.Strings(skillNames)
 
+		var totalSize int64 = -1
+		if computeSize {
+			totalSize = dirSize(targetDir)
+		}
+
 		versions = append(versions, BackupVersion{
 			Timestamp:  ts,
 			Label:      ts.Format("2006-01-02 15:04:05"),
 			Dir:        targetDir,
 			SkillCount: len(skillNames),
-			TotalSize:  dirSize(targetDir),
+			TotalSize:  totalSize,
 			SkillNames: skillNames,
 		})
 	}

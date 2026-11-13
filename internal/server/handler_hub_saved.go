@@ -1,7 +1,7 @@
 package server
 
 import (
-	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -21,7 +21,10 @@ type hubEntryJSON struct {
 }
 
 func (s *Server) handleGetHubSaved(w http.ResponseWriter, r *http.Request) {
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
 	hub := s.hubConfig()
+	s.mu.RUnlock()
 	resp := hubConfigResponse{
 		Default: hub.Default,
 		Hubs:    make([]hubEntryJSON, 0, len(hub.Hubs)),
@@ -43,8 +46,10 @@ func (s *Server) handlePutHubSaved(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	var req hubConfigResponse
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if err := decodeJSON(w, r, &req, defaultJSONBodyLimit); err != nil {
+		if !errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		}
 		return
 	}
 
@@ -61,11 +66,7 @@ func (s *Server) handlePutHubSaved(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.setHubConfig(hubCfg)
-	if err := s.saveConfig(); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := s.reloadConfig(); err != nil {
+	if err := s.saveAndReloadConfig(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -84,8 +85,10 @@ func (s *Server) handlePostHubSaved(w http.ResponseWriter, r *http.Request) {
 		Label string `json:"label"`
 		URL   string `json:"url"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+	if err := decodeJSON(w, r, &req, defaultJSONBodyLimit); err != nil {
+		if !errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		}
 		return
 	}
 
@@ -96,11 +99,7 @@ func (s *Server) handlePostHubSaved(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.setHubConfig(*hubCfg)
-	if err := s.saveConfig(); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := s.reloadConfig(); err != nil {
+	if err := s.saveAndReloadConfig(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -128,11 +127,7 @@ func (s *Server) handleDeleteHubSaved(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.setHubConfig(*hubCfg)
-	if err := s.saveConfig(); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := s.reloadConfig(); err != nil {
+	if err := s.saveAndReloadConfig(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

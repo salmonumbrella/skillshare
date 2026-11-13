@@ -6,47 +6,89 @@ import (
 	"path/filepath"
 	"strings"
 
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/utils"
 )
 
 func getUpdatableSkillsImpl(sourceDir string) ([]string, error) {
-	var skills []string
-
-	walkRoot := utils.ResolveSymlink(sourceDir)
-	err := filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if path == walkRoot {
-			return nil
-		}
-		// Skip .git directories
-		if info.IsDir() && info.Name() == ".git" {
-			return filepath.SkipDir
-		}
-		// Skip tracked repo directories (start with _)
-		if info.IsDir() && len(info.Name()) > 0 && info.Name()[0] == '_' {
-			return filepath.SkipDir
-		}
-		// Look for metadata files
-		if !info.IsDir() && info.Name() == MetaFileName {
-			skillDir := filepath.Dir(path)
-			relPath, relErr := filepath.Rel(walkRoot, skillDir)
-			if relErr != nil || relPath == "." {
-				return nil
-			}
-			meta, metaErr := ReadMeta(skillDir)
-			if metaErr != nil || meta == nil || meta.Source == "" {
-				return nil
-			}
-			skills = append(skills, relPath)
-		}
-		return nil
-	})
+	store, err := LoadMetadata(sourceDir)
 	if err != nil {
 		return nil, err
 	}
+
+	var skills []string
+	for _, name := range store.List() {
+		entry := store.Get(name)
+		if entry == nil || entry.Source == "" {
+			continue
+		}
+		// Skip tracked repos (they are handled separately), including an entry
+		// the old dashboard update rewrote as a regular install (#473).
+		rel := KeyToRelPath(name, entry)
+		if entry.Tracked || IsTrackedCheckout(filepath.Join(sourceDir, rel)) {
+			continue
+		}
+		skills = append(skills, rel)
+	}
 	return skills, nil
+}
+
+// TrackedRepoMeta describes a tracked repository declared in metadata.
+type TrackedRepoMeta struct {
+	Name   string
+	Source string
+	Branch string
+}
+
+// getMissingTrackedReposImpl returns tracked repositories declared in .metadata.json
+// whose clone directories are absent or no longer contain a git checkout.
+func getMissingTrackedReposImpl(sourceDir string, walks ...sourcewalk.Options) ([]TrackedRepoMeta, error) {
+	store, err := LoadMetadata(sourceDir)
+	if err != nil {
+		return nil, err
+	}
+
+	existingRepos, err := GetTrackedRepos(sourceDir, walks...)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]bool, len(existingRepos))
+	for _, repo := range existingRepos {
+		existing[repo] = true
+	}
+
+	var missing []TrackedRepoMeta
+	for _, key := range store.List() {
+		entry := store.Get(key)
+		if entry == nil || !entry.Tracked {
+			continue
+		}
+
+		relPath := filepath.ToSlash(KeyToRelPath(key, entry))
+		if !strings.HasPrefix(filepath.Base(relPath), "_") {
+			continue
+		}
+		if existing[relPath] {
+			continue
+		}
+
+		missing = append(missing, TrackedRepoMeta{
+			Name:   relPath,
+			Source: entry.Source,
+			Branch: entry.Branch,
+		})
+	}
+	return missing, nil
+}
+
+// splitTrackedRelPath splits a tracked repo's relative path into its parent
+// group directory and base name (the base retains its leading "_").
+func splitTrackedRelPath(relPath string) (group, name string) {
+	relPath = strings.Trim(relPath, "/")
+	if idx := strings.LastIndex(relPath, "/"); idx >= 0 {
+		return relPath[:idx], relPath[idx+1:]
+	}
+	return "", relPath
 }
 
 // FindRepoInstalls scans sourceDir for skills whose meta repo_url matches
@@ -56,35 +98,22 @@ func FindRepoInstalls(sourceDir, cloneURL string) []string {
 	if cloneURL == "" {
 		return nil
 	}
-	var matches []string
 
-	walkRoot := utils.ResolveSymlink(sourceDir)
-	filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
-		if err != nil || path == walkRoot {
-			return nil
-		}
-		if info.IsDir() && info.Name() == ".git" {
-			return filepath.SkipDir
-		}
-		if info.IsDir() && len(info.Name()) > 0 && info.Name()[0] == '_' {
-			return filepath.SkipDir
-		}
-		if !info.IsDir() && info.Name() == MetaFileName {
-			skillDir := filepath.Dir(path)
-			relPath, relErr := filepath.Rel(walkRoot, skillDir)
-			if relErr != nil || relPath == "." {
-				return nil
-			}
-			meta, metaErr := ReadMeta(skillDir)
-			if metaErr != nil || meta == nil {
-				return nil
-			}
-			if repoURLsMatch(meta.RepoURL, cloneURL) {
-				matches = append(matches, relPath)
-			}
-		}
+	store, err := LoadMetadata(sourceDir)
+	if err != nil {
 		return nil
-	})
+	}
+
+	var matches []string
+	for _, name := range store.List() {
+		entry := store.Get(name)
+		if entry == nil || entry.Tracked {
+			continue
+		}
+		if repoURLsMatch(entry.RepoURL, cloneURL) {
+			matches = append(matches, KeyToRelPath(name, entry))
+		}
+	}
 	return matches
 }
 
@@ -126,11 +155,11 @@ func CheckCrossPathDuplicate(sourceDir, cloneURL, targetPrefix string) error {
 // It walks subdirectories recursively so repos nested in organizational
 // directories (e.g. category/_team-repo/) are found.
 
-func getTrackedReposImpl(sourceDir string) ([]string, error) {
+func getTrackedReposImpl(sourceDir string, walk sourcewalk.Options) ([]string, error) {
 	var repos []string
 
 	walkRoot := utils.ResolveSymlink(sourceDir)
-	err := filepath.Walk(walkRoot, func(path string, info os.FileInfo, err error) error {
+	err := sourcewalk.Walk(walkRoot, walk, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -142,15 +171,12 @@ func getTrackedReposImpl(sourceDir string) ([]string, error) {
 			return filepath.SkipDir
 		}
 		// Look for _-prefixed directories that are git repos
-		if info.IsDir() && len(info.Name()) > 0 && info.Name()[0] == '_' {
-			gitDir := filepath.Join(path, ".git")
-			if _, statErr := os.Stat(gitDir); statErr == nil {
-				relPath, relErr := filepath.Rel(walkRoot, path)
-				if relErr == nil {
-					repos = append(repos, relPath)
-				}
-				return filepath.SkipDir // Don't recurse into tracked repos
+		if info.IsDir() && IsTrackedCheckout(path) {
+			relPath, relErr := filepath.Rel(walkRoot, path)
+			if relErr == nil {
+				repos = append(repos, filepath.ToSlash(relPath))
 			}
+			return filepath.SkipDir // Don't recurse into tracked repos
 		}
 		return nil
 	})

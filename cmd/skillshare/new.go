@@ -4,21 +4,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 
 	"skillshare/internal/config"
+	"skillshare/internal/skill"
 	"skillshare/internal/ui"
+	"skillshare/internal/utils"
 )
 
 func cmdNew(args []string) error {
-	mode, rest, err := parseModeArgs(args)
+	mode, rest, err := parseModeArgs(args, "--pattern", "-P")
 	if err != nil {
 		return err
 	}
 
 	var skillName string
 	var dryRun bool
+	var patternFlag string
 
 	// Parse arguments
 	i := 0
@@ -30,6 +32,19 @@ func cmdNew(args []string) error {
 		case arg == "--help" || arg == "-h":
 			printNewHelp()
 			return nil
+		case arg == "--pattern" || arg == "-P":
+			i++
+			if i >= len(rest) {
+				return fmt.Errorf("--pattern requires a value")
+			}
+			patternFlag = rest[i]
+			if findPattern(patternFlag) == nil {
+				validNames := make([]string, len(skillPatterns))
+				for j, p := range skillPatterns {
+					validNames[j] = p.Name
+				}
+				return fmt.Errorf("unknown pattern: %s (valid: %s)", patternFlag, strings.Join(validNames, ", "))
+			}
 		case strings.HasPrefix(arg, "-"):
 			return fmt.Errorf("unknown option: %s", arg)
 		default:
@@ -56,26 +71,24 @@ func cmdNew(args []string) error {
 		return fmt.Errorf("cannot determine working directory: %w", err)
 	}
 
-	if mode == modeAuto {
-		if projectConfigExists(cwd) {
-			mode = modeProject
-		} else {
-			mode = modeGlobal
-		}
-	}
+	mode = resolveAutoMode(mode, cwd)
 
 	applyModeLabel(mode)
 
 	// Resolve source directory
 	var sourceDir string
 	if mode == modeProject {
-		sourceDir = filepath.Join(cwd, ".skillshare", "skills")
+		projectCfg, loadErr := config.LoadProject(cwd)
+		if loadErr != nil {
+			return fmt.Errorf("failed to load project config: %w", loadErr)
+		}
+		sourceDir = projectCfg.EffectiveSkillsSource(cwd)
 	} else {
 		cfg, err := config.Load()
 		if err != nil {
 			return fmt.Errorf("failed to load config: %w (run 'skillshare init' first)", err)
 		}
-		sourceDir = cfg.Source
+		sourceDir = cfg.EffectiveSkillsSource()
 	}
 
 	// Create skill directory path
@@ -87,16 +100,48 @@ func cmdNew(args []string) error {
 		return fmt.Errorf("skill '%s' already exists at %s", skillName, skillDir)
 	}
 
-	// Generate template
-	template := generateSkillTemplate(skillName)
+	// Determine pattern via wizard (esc cancels)
+	selectedPattern := patternFlag
+	var selectedCategory string
+	createDirs := patternFlag != "" && patternFlag != "none"
+
+	isTTY := runningInInteractiveTTY()
+
+	if selectedPattern == "" && isTTY {
+		selectedPattern, selectedCategory, createDirs = runNewWizard()
+		if selectedPattern == "" {
+			ui.Cancelled("created")
+			return nil
+		}
+	} else if selectedPattern != "" && selectedPattern != "none" && isTTY {
+		// -P given but still ask category interactively
+		c, err := promptCategory()
+		if err != nil {
+			return fmt.Errorf("category selection: %w", err)
+		}
+		selectedCategory = c
+	}
+
+	if selectedPattern == "" {
+		selectedPattern = "none"
+	}
+
+	pattern := findPattern(selectedPattern)
+
+	template := generatePatternTemplate(skillName, selectedPattern, selectedCategory)
+
+	var scaffold []string
+	if createDirs && pattern != nil {
+		scaffold = pattern.ScaffoldDirs
+	}
 
 	if dryRun {
-		ui.Header(ui.WithModeLabel("New Skill (dry-run)"))
-		ui.Info("Would create: %s", skillDir)
-		ui.Info("Would write: %s", skillFile)
+		ui.Row(ui.MarkNone, "Would create", utils.FoldHomePath(skillFile), ui.RowWidth("Would create"))
+		printScaffoldDirs(scaffold)
+		ui.Section("Preview")
+		fmt.Println(strings.TrimRight(template, "\n"))
 		fmt.Println()
-		ui.Info("Template preview:")
-		fmt.Println(template)
+		ui.DryRun()
 		return nil
 	}
 
@@ -112,124 +157,60 @@ func cmdNew(args []string) error {
 		return fmt.Errorf("failed to write SKILL.md: %w", err)
 	}
 
-	ui.Header(ui.WithModeLabel("New Skill Created"))
-	ui.Success("Created: %s", skillFile)
-	fmt.Println()
-	ui.Info("Next steps:")
-	fmt.Printf("  1. Edit %s\n", skillFile)
-	if mode == modeProject {
-		fmt.Println("  2. Run 'skillshare sync' to deploy")
-	} else {
-		fmt.Println("  2. Run 'skillshare sync' to deploy")
+	if len(scaffold) > 0 {
+		for _, dir := range scaffold {
+			dirPath := filepath.Join(skillDir, dir)
+			if err := os.MkdirAll(dirPath, 0755); err != nil {
+				return fmt.Errorf("failed to create %s: %w", dir, err)
+			}
+			gitkeep := filepath.Join(dirPath, ".gitkeep")
+			if err := os.WriteFile(gitkeep, []byte{}, 0644); err != nil {
+				return fmt.Errorf("failed to create %s/.gitkeep: %w", dir, err)
+			}
+		}
 	}
+
+	ui.Row(ui.MarkOK, "Created", utils.FoldHomePath(skillFile), ui.RowWidth("Created"))
+	printScaffoldDirs(scaffold)
+	ui.Next("skillshare sync", "link it into your targets once you've edited it")
 
 	return nil
 }
 
+// printScaffoldDirs lists the folders a pattern adds next to SKILL.md.
+func printScaffoldDirs(dirs []string) {
+	if len(dirs) == 0 {
+		return
+	}
+	names := make([]string, len(dirs))
+	for i, d := range dirs {
+		names[i] = d + "/"
+	}
+	ui.Note("with " + strings.Join(names, ", "))
+}
+
 // isValidSkillName validates skill name format
 func isValidSkillName(name string) bool {
-	// Allow lowercase letters, numbers, hyphens, and underscores
-	// Must start with a letter or underscore
-	matched, _ := regexp.MatchString(`^[a-z_][a-z0-9_-]*$`, name)
-	return matched
-}
-
-// generateSkillTemplate creates the SKILL.md content
-// Template follows Anthropic's skill-building guide best practices:
-// - Description includes WHAT + WHEN (trigger phrases)
-// - Progressive disclosure: frontmatter → body → references/
-// - Step-based instructions, examples, and troubleshooting sections
-func generateSkillTemplate(name string) string {
-	// Convert hyphen-case to Title Case for heading
-	title := toTitleCase(name)
-
-	return fmt.Sprintf(`---
-name: %s
-description: >-
-  Describe what this skill does. Use when user asks to
-  "trigger phrase 1", "trigger phrase 2", or needs help
-  with a specific task.
-# ── Optional fields ──────────────────────────────────
-# targets: []                         # e.g. [claude, cursor] — omit for all targets
-# license: MIT
-# allowed-tools: "Bash(python:*) WebFetch"
-# metadata:
-#   author: Your Name
-#   version: 1.0.0
----
-
-# %s
-
-Brief overview of what this skill does and its value.
-
-## When to Use
-
-Use this skill when the user:
-- Asks to "specific trigger phrase"
-- Mentions specific keywords or file types
-- Needs help with a particular task
-
-Do NOT use this skill for:
-- Unrelated tasks (clarify scope boundaries)
-
-## Instructions
-
-### Step 1: Gather Context
-
-Explain what to check or collect before starting.
-
-### Step 2: Execute
-
-Describe the core action clearly and specifically.
-
-### Step 3: Validate
-
-Explain how to verify the result is correct.
-
-## Examples
-
-**Example:** Common scenario
-User says: "Help me with <%s-related task>"
-Actions:
-1. First action
-2. Second action
-Result: Expected outcome
-
-## Troubleshooting
-
-**Error:** Common error message
-**Cause:** Why it happens
-**Solution:** How to fix it
-`, name, title, name)
-}
-
-// toTitleCase converts kebab-case to Title Case
-func toTitleCase(s string) string {
-	words := strings.Split(s, "-")
-	for i, word := range words {
-		if len(word) > 0 {
-			words[i] = strings.ToUpper(word[:1]) + word[1:]
-		}
-	}
-	return strings.Join(words, " ")
+	return skill.ValidNameRe.MatchString(name)
 }
 
 func printNewHelp() {
-	fmt.Println(`Usage: skillshare new <name> [options]
-
-Create a new skill with a SKILL.md template.
-
-Options:
-  --project, -p   Create in project (.skillshare/skills/)
-  --global, -g    Create in global (~/.config/skillshare/skills/)
-  --dry-run, -n   Preview without creating files
-  --help, -h      Show this help
-
-Arguments:
-  <name>          Skill name (lowercase, hyphens allowed)
-
-Examples:
-  skillshare new my-skill              # Create a new skill
-  skillshare new my-skill -p           # Create in project
-  skillshare new my-skill --dry-run    # Preview first`)
+	printHelp("skillshare new <name> [options]", "Create a new skill with a SKILL.md template.",
+		helpGroup{title: "Options", rows: []helpRow{
+			{"-P, --pattern <name>", "Use a design pattern (tool-wrapper, generator, reviewer, inversion, pipeline, none)"},
+			{"-p, --project", "Create in project (.skillshare/skills/)"},
+			{"-g, --global", "Create in global (~/.config/skillshare/skills/)"},
+			{"-n, --dry-run", "Preview without creating files"},
+		}},
+		helpGroup{title: "Arguments", rows: []helpRow{
+			{"<name>", "Skill name (lowercase, hyphens allowed)"},
+		}},
+		helpExamples(
+			helpRow{"skillshare new my-skill", "Create with interactive pattern selection"},
+			helpRow{"skillshare new my-skill -P reviewer", "Use reviewer pattern directly"},
+			helpRow{"skillshare new my-skill -P none", "Plain template, no pattern"},
+			helpRow{"skillshare new my-skill -p", "Create in project"},
+			helpRow{"skillshare new my-skill --dry-run", "Preview first"},
+		),
+	)
 }

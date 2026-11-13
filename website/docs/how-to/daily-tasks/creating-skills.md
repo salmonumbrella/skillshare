@@ -6,6 +6,10 @@ sidebar_position: 2
 
 From idea to published skill.
 
+:::tip
+Want to control which targets receive your skill? See [Filtering Skills](/docs/how-to/daily-tasks/filtering-skills).
+:::
+
 ## Overview
 
 ```mermaid
@@ -71,7 +75,7 @@ Review the code and make it better.
 ```
 
 **Include examples:**
-```markdown
+````markdown
 ## Example
 
 User: "Review this function"
@@ -81,7 +85,7 @@ def add(a, b):
 ```
 
 Response: Suggest adding type hints...
-```
+````
 
 **Specify when NOT to use:**
 ```markdown
@@ -307,15 +311,54 @@ validation-scripts
 scaffold-template
 
 # Exclude an entire group directory
-internal-tools
+internal-tools/
 
 # Work in progress
 prompt-eval-*
+
+# Ignore temp at any depth
+**/temp
+
+# Exclude tests but keep test-critical
+test-*
+!test-critical
 ```
 
-Patterns match against skill paths, so a group name like `internal-tools` excludes **all** skills under that directory. Use a precise path like `internal-tools/helper` to exclude only a specific skill within a group.
+`.skillignore` uses [gitignore syntax](https://git-scm.com/docs/gitignore) — supports `*`, `**`, `?`, `[abc]`, `!negation`, `/anchored`, `pattern/` (dir-only), and `\#`/`\!` escapes. A group name like `internal-tools` excludes **all** skills under that directory. Use a precise path like `internal-tools/helper` to exclude only a specific skill within a group.
 
 Skills matching these patterns won't appear in `skillshare install <repo>` discovery. This is applied server-side (in the repo), so all users benefit automatically. See [`runkids/my-skills`](https://github.com/runkids/my-skills) for a real-world example, and [install --exclude](/docs/reference/commands/install#excluding-skills) for user-side exclusion.
+
+### Source-root .skillignore (local)
+
+You can also place a `.skillignore` at your **source root** (`~/.config/skillshare/skills/.skillignore`) to globally hide skills from all commands — `doctor`, `status`, `list`, `sync`, `audit`, `diff`, and `check`:
+
+```text title="~/.config/skillshare/skills/.skillignore"
+# Temporarily mute a skill without uninstalling
+my-experimental-skill
+
+# Exclude all draft skills
+[Dd]raft*
+
+# Hide an entire tracked repo
+_archived-team-skills
+
+# Ignore vendored deps at any depth
+**/node_modules
+*.venv
+```
+
+Both layers apply: source-root patterns affect all skills (tracked and non-tracked), while repo-level patterns affect only that repo's skills. If either layer matches, the skill is excluded.
+
+### .skillignore.local (personal override)
+
+If a shared repo's `.skillignore` blocks a skill you need locally, create a `.skillignore.local` in the same directory. Its patterns are appended after `.skillignore`, so `!pattern` negations override the base file:
+
+```text title="_team-skills/.skillignore.local"
+# The repo ignores private-*, but I need my own
+!private-mine
+```
+
+This file should **not** be committed — add it to `.gitignore`. It works at both the source root and repo level.
 
 ---
 

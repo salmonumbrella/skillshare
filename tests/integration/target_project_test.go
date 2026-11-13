@@ -5,6 +5,7 @@ package integration
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -31,10 +32,19 @@ func TestTargetProject_AddCustomTarget(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
 	projectRoot := sb.SetupProjectDir("claude")
+	projectCWD := projectRoot
+	if runtime.GOOS != "windows" {
+		projectCWD = filepath.Join(sb.Root, "project-alias")
+		sb.CreateSymlink(projectRoot, projectCWD)
+	}
 
-	result := sb.RunCLIInDir(projectRoot, "target", "add", "my-ide", ".my-ide/skills/", "-p")
+	result := sb.RunCLIInDir(projectCWD, "target", "add", "my-ide", ".my-ide/skills/", "-p")
 	result.AssertSuccess(t)
 	result.AssertAnyOutputContains(t, "Added target")
+	cfg := sb.ReadFile(filepath.Join(projectRoot, ".skillshare", "config.yaml"))
+	if !strings.Contains(cfg, "my-ide") || !strings.Contains(cfg, ".my-ide/skills") {
+		t.Fatalf("custom target was not persisted: %s", cfg)
+	}
 }
 
 func TestTargetProject_AddDuplicate_Error(t *testing.T) {
@@ -54,7 +64,7 @@ func TestTargetProject_RemoveTarget(t *testing.T) {
 
 	result := sb.RunCLIInDir(projectRoot, "target", "remove", "cursor", "-p")
 	result.AssertSuccess(t)
-	result.AssertAnyOutputContains(t, "Removed target")
+	result.AssertAnyOutputContains(t, "Removed 1 target")
 
 	cfg := sb.ReadFile(filepath.Join(projectRoot, ".skillshare", "config.yaml"))
 	if strings.Contains(cfg, "cursor") {
@@ -223,4 +233,16 @@ func TestTargetProject_RemoveCopyMode_CleansManifest(t *testing.T) {
 	if sb.FileExists(manifestPath) {
 		t.Error("manifest should be removed after target remove")
 	}
+}
+
+func TestTargetProject_AddUnderPrefixedNamingUsesCopyMode(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	projectRoot := sb.SetupProjectDir("claude")
+	cfgPath := filepath.Join(projectRoot, ".skillshare", "config.yaml")
+	sb.WriteFile(cfgPath, "target_naming: prefixed\n"+sb.ReadFile(cfgPath))
+
+	sb.RunCLIInDir(projectRoot, "target", "add", "cursor", "-p").AssertSuccess(t)
+	// A project target defaults to merge, which prefixed naming cannot sync.
+	sb.RunCLIInDir(projectRoot, "sync", "-p").AssertOutputNotContains(t, "cursor    invalid config")
 }

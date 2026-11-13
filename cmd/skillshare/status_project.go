@@ -2,21 +2,20 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"skillshare/internal/audit"
-	"skillshare/internal/git"
+	"skillshare/internal/config"
+	"skillshare/internal/resource"
 	"skillshare/internal/sync"
 	"skillshare/internal/ui"
+	"skillshare/internal/utils"
 )
 
 func cmdStatusProject(root string) error {
-	if !projectConfigExists(root) {
-		if err := performProjectInit(root, projectInitOptions{}); err != nil {
-			return err
-		}
+	if err := ensureProjectConfig(root); err != nil {
+		return err
 	}
 
 	runtime, err := loadProjectRuntime(root)
@@ -24,29 +23,42 @@ func cmdStatusProject(root string) error {
 		return err
 	}
 
+	walk := runtime.skillsWalk()
 	sp := ui.StartSpinner("Discovering skills...")
-	discovered, discoverErr := sync.DiscoverSourceSkills(runtime.sourcePath)
+	discovered, stats, discoverErr := sync.DiscoverSourceSkillsWithStats(runtime.sourcePath, walk)
 	if discoverErr != nil {
 		discovered = nil
 	}
-	trackedRepos := extractTrackedRepos(discovered)
+	trackedRepos := extractTrackedRepos(runtime.sourcePath, walk)
 	sp.Stop()
+	printSkippedSourceLinkWarnings(walk, false)
 
-	printProjectSourceStatus(runtime.sourcePath, len(discovered))
-	printProjectTrackedReposStatus(runtime.sourcePath, discovered, trackedRepos)
+	agentCount := -1
+	if agents, err := (resource.AgentKind{}).Discover(runtime.agentsSourcePath); err == nil && dirExists(runtime.agentsSourcePath) {
+		agentCount = len(agents)
+	}
+	show := func(path string) string { return projectStatusPath(runtime.root, path) }
+	counts := sync.CountSkills(discovered)
+	printSourceStatus(runtime.sourcePath, runtime.agentsSourcePath, show, counts.Skills, agentCount, stats, counts.Variants)
+	printTrackedReposStatus(runtime.sourcePath, discovered, trackedRepos)
 	if err := printProjectTargetsStatus(runtime, discovered); err != nil {
 		return err
 	}
+
+	if len(runtime.config.Extras) > 0 {
+		printExtrasStatus(runtime.config.Extras, func(extra config.ExtraConfig) string {
+			return config.ResolveExtrasSourceDirProject(extra, runtime.config.EffectiveExtrasSource(root), root)
+		})
+	}
+
 	printAuditStatus(runtime.config.Audit)
 
 	return nil
 }
 
 func cmdStatusProjectJSON(root string) error {
-	if !projectConfigExists(root) {
-		if err := performProjectInit(root, projectInitOptions{}); err != nil {
-			return writeJSONError(err)
-		}
+	if err := ensureProjectConfig(root); err != nil {
+		return writeJSONError(err)
 	}
 
 	runtime, err := loadProjectRuntime(root)
@@ -54,44 +66,50 @@ func cmdStatusProjectJSON(root string) error {
 		return writeJSONError(err)
 	}
 
-	discovered, _ := sync.DiscoverSourceSkills(runtime.sourcePath)
-	trackedRepos := extractTrackedRepos(discovered)
-
+	walk := runtime.skillsWalk()
 	output := statusJSONOutput{
-		Source: statusJSONSource{
-			Path:   runtime.sourcePath,
-			Exists: dirExists(runtime.sourcePath),
-		},
-		SkillCount: len(discovered),
-		Version:    version,
+		Version: version,
 	}
 
-	// Tracked repos (parallel dirty checks)
-	output.TrackedRepos = buildTrackedRepoJSON(runtime.sourcePath, trackedRepos, discovered)
+	discovered, stats, _ := sync.DiscoverSourceSkillsWithStats(runtime.sourcePath, walk)
+	trackedRepos := extractTrackedRepos(runtime.sourcePath, walk)
 
-	// Targets
+	printSkippedSourceLinkWarnings(walk, true)
+	output.Source = statusJSONSource{
+		Path:        runtime.sourcePath,
+		Exists:      dirExists(runtime.sourcePath),
+		Skillignore: buildSkillignoreJSON(stats),
+	}
+	counts := sync.CountSkills(discovered)
+	output.SkillCount, output.VariantCount = counts.Skills, counts.Variants
+	output.TrackedRepos = buildTrackedRepoJSON(runtime.sourcePath, trackedRepos, discovered, walk)
+	warningSkills := variantWarningSkills(runtime.sourcePath, runtime.targets, "merge", walk, discovered)
+
 	for _, entry := range runtime.config.Targets {
 		target, ok := runtime.targets[entry.Name]
 		if !ok {
 			continue
 		}
-		mode := target.Mode
+		sc := target.SkillsConfig()
+		mode := sc.Mode
 		if mode == "" {
 			mode = "merge"
 		}
 		res := getTargetStatusDetail(target, runtime.sourcePath, mode)
 		output.Targets = append(output.Targets, statusJSONTarget{
 			Name:        entry.Name,
-			Path:        target.Path,
+			Path:        sc.Path,
 			Mode:        mode,
 			Status:      res.statusStr,
 			SyncedCount: res.syncedCount,
-			Include:     target.Include,
-			Exclude:     target.Exclude,
+			Include:     sc.Include,
+			Exclude:     sc.Exclude,
+
+			SkillsEnabled: sc.IsEnabled(),
+			Warning:       skillTargetWarning(target, mode, warningSkills),
 		})
 	}
 
-	// Audit
 	policy := audit.ResolvePolicy(audit.PolicyInputs{
 		ConfigProfile:   runtime.config.Audit.Profile,
 		ConfigThreshold: runtime.config.Audit.BlockThreshold,
@@ -105,85 +123,135 @@ func cmdStatusProjectJSON(root string) error {
 		Analyzers: policy.EffectiveAnalyzers(),
 	}
 
+	output.Agents = buildProjectAgentStatusJSON(runtime)
+
 	return writeJSON(&output)
 }
 
-func printProjectSourceStatus(sourcePath string, skillCount int) {
-	ui.Header("Source (project)")
-	info, err := os.Stat(sourcePath)
-	if err != nil {
-		ui.Error(".skillshare/skills/ (not found)")
-		return
+// buildProjectAgentStatusJSON builds the agents section for project status --json.
+func buildProjectAgentStatusJSON(rt *projectRuntime) *statusJSONAgents {
+	exists := dirExists(rt.agentsSourcePath)
+	result := &statusJSONAgents{
+		Source: rt.agentsSourcePath,
+		Exists: exists,
 	}
 
-	ui.Success(".skillshare/skills/ (%d skills, %s)", skillCount, info.ModTime().Format("2006-01-02 15:04"))
-}
-
-func printProjectTrackedReposStatus(sourcePath string, discovered []sync.DiscoveredSkill, trackedRepos []string) {
-	if len(trackedRepos) == 0 {
-		return
+	if !exists {
+		return result
 	}
 
-	ui.Header("Tracked Repositories")
-	for _, repoName := range trackedRepos {
-		repoPath := filepath.Join(sourcePath, repoName)
+	agents, _ := resource.AgentKind{}.Discover(rt.agentsSourcePath)
+	result.Count = len(agents)
 
-		skillCount := 0
-		for _, d := range discovered {
-			if d.IsInRepo && strings.HasPrefix(d.RelPath, repoName+"/") {
-				skillCount++
-			}
-		}
-
-		statusStr := "up-to-date"
-		statusIcon := "✓"
-		if isDirty, _ := git.IsDirty(repoPath); isDirty {
-			statusStr = "has uncommitted changes"
-			statusIcon = "!"
-		}
-
-		ui.Status(repoName, statusIcon, fmt.Sprintf("%d skills, %s", skillCount, statusStr))
-	}
-}
-
-func printProjectTargetsStatus(runtime *projectRuntime, discovered []sync.DiscoveredSkill) error {
-	ui.Header("Targets (project)")
-	driftTotal := 0
-	for _, entry := range runtime.config.Targets {
-		target, ok := runtime.targets[entry.Name]
-		if !ok {
-			ui.Error("%s: target not found", entry.Name)
+	builtinAgents := config.ProjectAgentTargets()
+	for _, entry := range rt.config.Targets {
+		agentPath := resolveProjectAgentTargetPath(entry, builtinAgents, rt.root)
+		if agentPath == "" {
 			continue
 		}
 
-		mode := target.Mode
+		ac := entry.AgentsConfig()
+		expected, err := expectedAgentsForTarget(ac, entry.Name, agents)
+		if err != nil {
+			expected = resource.ActiveAgents(agents) // invalid include/exclude: keep .agentignore at least
+		}
+		linked := countLinkedAgents(ac, agentPath, expected)
+		result.Targets = append(result.Targets, statusJSONAgentTarget{
+			Name:     entry.Name,
+			Path:     agentPath,
+			Expected: len(expected),
+			Linked:   linked,
+			Drift:    linked != len(expected) && len(expected) > 0,
+		})
+	}
+
+	return result
+}
+
+// resolveProjectAgentTargetPath resolves the agent path for a project target entry.
+func resolveProjectAgentTargetPath(entry config.ProjectTargetEntry, builtinAgents map[string]config.TargetConfig, projectRoot string) string {
+	ac := entry.AgentsConfig()
+	if ac.Path != "" {
+		return resolveProjectPath(projectRoot, ac.Path)
+	}
+	if builtin, ok := builtinAgents[entry.Name]; ok {
+		return resolveProjectPath(projectRoot, builtin.Path)
+	}
+	if builtin, ok := config.LookupProjectAgentTarget(entry.Name); ok {
+		return resolveProjectPath(projectRoot, builtin.Path)
+	}
+	return ""
+}
+
+func printProjectTargetsStatus(runtime *projectRuntime, discovered []sync.DiscoveredSkill) error {
+	warningSkills := variantWarningSkills(runtime.sourcePath, runtime.targets, "merge", runtime.skillsWalk(), discovered)
+	builtinAgents := config.ProjectAgentTargets()
+	agentsExist := dirExists(runtime.agentsSourcePath)
+	var agents []resource.DiscoveredResource
+	if agentsExist {
+		agents, _ = (resource.AgentKind{}).Discover(runtime.agentsSourcePath)
+	}
+
+	var rows []statusTarget
+	var warnings []string
+	notSynced := 0
+	for _, entry := range runtime.config.Targets {
+		target, ok := runtime.targets[entry.Name]
+		if !ok {
+			rows = append(rows, statusTarget{name: entry.Name, skills: statusCell{mark: ui.MarkFail, text: "target not found"}})
+			continue
+		}
+
+		sc := target.SkillsConfig()
+		mode := sc.Mode
 		if mode == "" {
 			mode = "merge"
 		}
-
 		res := getTargetStatusDetail(target, runtime.sourcePath, mode)
-		ui.Status(entry.Name, res.statusStr, res.detail)
+		if warning := skillTargetWarning(target, mode, warningSkills); warning != "" {
+			warnings = append(warnings, entry.Name+": "+warning)
+		}
 
-		if mode == "merge" || mode == "copy" {
-			filtered, err := sync.FilterSkills(discovered, target.Include, target.Exclude)
+		// A target with skills off expects nothing, so it has no drift.
+		expected := 0
+		if sc.IsEnabled() && (mode == "merge" || mode == "copy") {
+			var err error
+			expected, err = sync.ExpectedSkillCount(entry.Name, sc, discovered)
 			if err != nil {
 				return fmt.Errorf("target %s has invalid include/exclude config: %w", entry.Name, err)
 			}
-			filtered = sync.FilterSkillsByTarget(filtered, entry.Name)
-			expectedCount := len(filtered)
-
-			if res.syncedCount < expectedCount {
-				drift := expectedCount - res.syncedCount
-				if drift > driftTotal {
-					driftTotal = drift
-				}
-			}
-		} else if len(target.Include) > 0 || len(target.Exclude) > 0 {
-			ui.Warning("%s: include/exclude ignored in symlink mode", entry.Name)
+			notSynced = max(notSynced, expected-res.syncedCount)
+		} else if sc.IsEnabled() && (len(sc.Include) > 0 || len(sc.Exclude) > 0) {
+			warnings = append(warnings, entry.Name+": include/exclude ignored in symlink mode")
 		}
+
+		row := statusTarget{name: entry.Name, path: projectStatusPath(runtime.root, sc.Path), skills: skillsCell(res, sc.Path, mode, expected)}
+		if sc.IsEnabled() {
+			row.mode = mode
+		}
+		if agentsExist {
+			if agentPath := resolveProjectAgentTargetPath(entry, builtinAgents, runtime.root); agentPath != "" {
+				ac := entry.AgentsConfig()
+				expected, err := expectedAgentsForTarget(ac, entry.Name, agents)
+				if err != nil {
+					return err
+				}
+				preserved := 0
+				linked := countLinkedAgents(ac, agentPath, expected, &preserved)
+				row.agents = agentsCell(linked, len(expected), preserved)
+			}
+		}
+		rows = append(rows, row)
 	}
-	if driftTotal > 0 {
-		ui.Warning("%d skill(s) not synced — run 'skillshare sync'", driftTotal)
-	}
+	printStatusTargets(rows, agentsExist, warnings, notSynced)
 	return nil
+}
+
+// projectStatusPath shows a target folder relative to the project root when
+// it is inside the project.
+func projectStatusPath(root, path string) string {
+	if rel, err := filepath.Rel(root, path); err == nil && !strings.HasPrefix(rel, "..") {
+		return rel
+	}
+	return utils.FoldHomePath(path)
 }

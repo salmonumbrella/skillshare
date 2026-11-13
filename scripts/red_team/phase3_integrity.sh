@@ -13,25 +13,12 @@ Safe content for hash verification."
 
 SKILL_HASH=$(shasum -a 256 "$INTEGRITY_DIR/SKILL.md" | awk '{print $1}')
 
-cat > "$INTEGRITY_DIR/.skillshare-meta.json" <<META_EOF
-{
-  "source": "test/integrity",
-  "type": "local",
-  "installed_at": "2026-01-01T00:00:00Z",
-  "file_hashes": {
-    "SKILL.md": "sha256:$SKILL_HASH"
-  }
-}
-META_EOF
+write_store_meta "$SOURCE_DIR" "integrity-skill" \
+  "{\"source\":\"test/integrity\",\"type\":\"local\",\"installed_at\":\"2026-01-01T00:00:00Z\",\"file_hashes\":{\"SKILL.md\":\"sha256:$SKILL_HASH\"}}"
 
 ss_capture audit integrity-skill --format json
-HAS_INTEGRITY=false
-echo "$SS_OUTPUT" | jq -e '.results[0].findings[] | select(.pattern | startswith("content-"))' >/dev/null 2>&1 && HAS_INTEGRITY=true
-if [ "$HAS_INTEGRITY" = false ]; then
-  pass "TC-25: clean skill with correct hashes passes"
-else
-  fail "TC-25: unexpected integrity finding"
-fi
+assert_no_findings_matching "TC-25: clean skill with correct hashes passes" "$SS_OUTPUT" \
+  '.pattern | startswith("content-")'
 
 # ── TC-26: Tamper file → content-tampered (MEDIUM) ────────────
 
@@ -54,17 +41,8 @@ create_skill "$INTEGRITY_DIR" "# Integrity test
 Safe content for hash verification."
 SKILL_HASH=$(shasum -a 256 "$INTEGRITY_DIR/SKILL.md" | awk '{print $1}')
 
-cat > "$INTEGRITY_DIR/.skillshare-meta.json" <<META_EOF
-{
-  "source": "test/integrity",
-  "type": "local",
-  "installed_at": "2026-01-01T00:00:00Z",
-  "file_hashes": {
-    "SKILL.md": "sha256:$SKILL_HASH",
-    "extras.md": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-  }
-}
-META_EOF
+write_store_meta "$SOURCE_DIR" "integrity-skill" \
+  "{\"source\":\"test/integrity\",\"type\":\"local\",\"installed_at\":\"2026-01-01T00:00:00Z\",\"file_hashes\":{\"SKILL.md\":\"sha256:$SKILL_HASH\",\"extras.md\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"}}"
 
 ss_capture audit integrity-skill --format json
 assert_finding "TC-27: content-missing detected as LOW" "$SS_OUTPUT" "content-missing" "LOW"
@@ -72,16 +50,8 @@ assert_finding "TC-27: content-missing detected as LOW" "$SS_OUTPUT" "content-mi
 # ── TC-28: Unexpected file → content-unexpected (LOW) ─────────
 
 info "TC-28: unexpected file detected"
-cat > "$INTEGRITY_DIR/.skillshare-meta.json" <<META_EOF
-{
-  "source": "test/integrity",
-  "type": "local",
-  "installed_at": "2026-01-01T00:00:00Z",
-  "file_hashes": {
-    "SKILL.md": "sha256:$SKILL_HASH"
-  }
-}
-META_EOF
+write_store_meta "$SOURCE_DIR" "integrity-skill" \
+  "{\"source\":\"test/integrity\",\"type\":\"local\",\"installed_at\":\"2026-01-01T00:00:00Z\",\"file_hashes\":{\"SKILL.md\":\"sha256:$SKILL_HASH\"}}"
 
 echo "unexpected content" > "$INTEGRITY_DIR/sneaky.sh"
 

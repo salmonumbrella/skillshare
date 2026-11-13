@@ -1,53 +1,83 @@
+/// <reference types="vitest/config" />
+
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
+// The devcontainer runs the API on its own port to stay clear of other projects.
+const API = `http://localhost:${process.env.SKILLSHARE_API_PORT || 19420}`
+
 // SSE endpoints need explicit Accept header to prevent Vite proxy from buffering responses.
-const SSE_PROXY = { target: 'http://localhost:19420', headers: { Accept: 'text/event-stream' } }
+const SSE_PROXY = { target: API, headers: { Accept: 'text/event-stream' } }
 
 export default defineConfig({
+  base: './',
   plugins: [react(), tailwindcss()],
+  test: {
+    environment: 'jsdom',
+    setupFiles: './src/test/setup.ts',
+    // Node's native storage globals can shadow jsdom's implementation even when
+    // no storage file is configured. Let jsdom provide storage in test workers.
+    execArgv: 'localStorage' in globalThis ? ['--no-experimental-webstorage'] : [],
+  },
   resolve: {
     dedupe: ['react', 'react-dom'],
   },
   server: {
     host: true,
     port: 5173,
+    // inotify events are unreliable over the devcontainer's virtiofs mount, so
+    // file saves are sometimes silently missed and HMR doesn't fire. Poll for
+    // changes when CHOKIDAR_USEPOLLING is set (the devcontainer sets it); the
+    // host and CI keep faster native watching.
+    watch:
+      process.env.CHOKIDAR_USEPOLLING === 'true'
+        ? { usePolling: true, interval: 300 }
+        : undefined,
     proxy: {
       '/api/audit/stream': SSE_PROXY,
       '/api/update/stream': SSE_PROXY,
       '/api/check/stream': SSE_PROXY,
       '/api/diff/stream': SSE_PROXY,
-      '/api': 'http://localhost:19420',
+      '/api/doctor/stream': SSE_PROXY,
+      '/api/plugins/check/stream': SSE_PROXY,
+      '/api/plugins/update/stream': SSE_PROXY,
+      // Keep the browser's Host header: the MCP endpoints compare it against Origin,
+      // and changeOrigin (the string shorthand's default) would rewrite it to the target.
+      '/api': { target: API, changeOrigin: false },
     },
   },
   build: {
-    rollupOptions: {
+    rolldownOptions: {
       output: {
-        manualChunks(id) {
-          if (!id.includes('node_modules')) return;
-          // React core — rarely changes, cache separately
-          if (id.includes('/react-dom/') || id.includes('/react/') || id.includes('/scheduler/')) {
-            return 'vendor-react';
-          }
-          // CodeMirror ecosystem — heavy, only used in FileViewerModal + ConfigPage
-          if (id.includes('@codemirror') || id.includes('@uiw/') || id.includes('@lezer/')) {
-            return 'vendor-codemirror';
-          }
-          // Markdown ecosystem — only used in SkillDetailPage + FileViewerModal
-          if (
-            id.includes('react-markdown') || id.includes('remark-') ||
-            id.includes('micromark') || id.includes('mdast-') ||
-            id.includes('unified') || id.includes('unist-') ||
-            id.includes('hast-') || id.includes('vfile') ||
-            id.includes('devlop')
-          ) {
-            return 'vendor-markdown';
-          }
-          // TanStack Query — shared across all pages
-          if (id.includes('@tanstack/react-query')) {
-            return 'vendor-tanstack-query';
-          }
+        codeSplitting: {
+          groups: [
+            {
+              name: 'vendor-react',
+              test: /\/react-dom\/|\/react\/|\/scheduler\//,
+              priority: 20,
+            },
+            {
+              name: 'vendor-codemirror',
+              test: /@codemirror\/(?!lang-)|@uiw\/|codemirror/,
+              priority: 15,
+            },
+            {
+              name: 'vendor-codemirror-lang',
+              test: /@codemirror\/lang-|@lezer\//,
+              priority: 16,
+            },
+            {
+              name: 'vendor-markdown',
+              test: /react-markdown|remark-|micromark|mdast-|unified|unist-|hast-|vfile|devlop/,
+              priority: 15,
+            },
+            {
+              name: 'vendor-tanstack-query',
+              test: /@tanstack\/react-query/,
+              priority: 10,
+            },
+          ],
         },
       },
     },

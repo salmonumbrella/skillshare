@@ -1,7 +1,8 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"skillshare/internal/config"
 	"skillshare/internal/install"
 	"skillshare/internal/oplog"
+	"skillshare/internal/sourcewalk"
 	ssync "skillshare/internal/sync"
 	"skillshare/internal/ui"
 )
@@ -21,6 +23,7 @@ type checkRepoResult struct {
 	Name    string `json:"name"`
 	Status  string `json:"status"` // "up_to_date", "behind", "dirty", "error"
 	Behind  int    `json:"behind"`
+	Branch  string `json:"branch,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
@@ -29,14 +32,19 @@ type checkSkillResult struct {
 	Name        string `json:"name"`
 	Source      string `json:"source"`
 	Version     string `json:"version"`
-	Status      string `json:"status"` // "up_to_date", "update_available", "local", "error"
+	Status      string `json:"status"` // "up_to_date", "update_available", "stale", "modified", "local", "error"
 	InstalledAt string `json:"installed_at,omitempty"`
+	Message     string `json:"message,omitempty"`
 }
 
 // checkOutput is the JSON output structure
 type checkOutput struct {
 	TrackedRepos []checkRepoResult  `json:"tracked_repos"`
 	Skills       []checkSkillResult `json:"skills"`
+	// Agents is set only by --all, so check --json keeps its shape.
+	Agents *[]check.AgentCheckResult `json:"agents,omitempty"`
+	// Warnings names the requested names and groups that were skipped.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // checkOptions holds parsed arguments for check command
@@ -44,58 +52,68 @@ type checkOptions struct {
 	names  []string // positional (0+ = all)
 	groups []string // --group/-G
 	json   bool
-}
+	diff   bool // --diff: show each skill's changes since install
 
-// skillWithMeta holds a regular skill plus its parsed metadata for grouping.
-type skillWithMeta struct {
-	name string
-	path string
-	meta *install.SkillMeta
+	// exitCode (--exit-code) makes a check that found anything not up to date
+	// exit 1, so CI can gate on it without parsing --json.
+	exitCode bool
+	// allKinds (--all) checks agents as well as skills.
+	allKinds bool
+
+	parseOpts install.ParseOptions // source parsing and remote credential authorization
 }
 
 // collectCheckItems reads metadata and partitions items for parallel checking.
-// Returns: tracked repo inputs, URL-grouped skills, local skill results (no network needed).
-func collectCheckItems(sourceDir string, repos []string, skills []string) (
-	[]check.RepoCheckInput,
-	map[string][]skillWithMeta,
-	[]checkSkillResult,
-) {
+// Returns: tracked repo inputs and the planned skill check, in which skills
+// without a remote are already resolved (no network needed).
+// projectRoot is the base of relative local sources; "" in global mode.
+// follow resolves linked skill directories before they are hashed.
+func collectCheckItems(sourceDir, projectRoot string, repos []string, skills []string, follow *sourcewalk.Follow, parseOpts install.ParseOptions) ([]check.RepoCheckInput, *check.Resolution) {
 	var repoInputs []check.RepoCheckInput
 	for _, repo := range repos {
 		repoInputs = append(repoInputs, check.RepoCheckInput{
-			Name:     repo,
-			RepoPath: filepath.Join(sourceDir, repo),
+			Name:         repo,
+			RepoPath:     filepath.Join(sourceDir, repo),
+			ParseOptions: parseOpts,
 		})
 	}
 
-	urlGroups := make(map[string][]skillWithMeta)
-	var localResults []checkSkillResult
+	// Load centralized metadata store once for all skills.
+	store := install.LoadMetadataOrNew(sourceDir)
 
-	for _, skill := range skills {
-		skillPath := filepath.Join(sourceDir, skill)
-		meta, err := install.ReadMeta(skillPath)
+	checkSkills := make([]check.Skill, len(skills))
+	for i, skill := range skills {
+		checkSkills[i] = check.Skill{Name: skill, Entry: store.GetByPath(skill), Dir: filepath.Join(sourceDir, skill), Follow: follow}
+	}
 
-		if err != nil || meta == nil || meta.RepoURL == "" {
-			result := checkSkillResult{Name: skill, Status: "local"}
-			if meta != nil {
-				result.Source = meta.Source
-				result.Version = meta.Version
-				if !meta.InstalledAt.IsZero() {
-					result.InstalledAt = meta.InstalledAt.Format("2006-01-02")
-				}
+	return repoInputs, check.Plan(checkSkills, projectRoot)
+}
+
+// resolveCheckSkills asks the remotes of a planned skill check in parallel,
+// reporting the skill count of each finished remote to progressBar (may be nil).
+func resolveCheckSkills(plan *check.Resolution, progressBar *ui.ProgressBar, parseOpts install.ParseOptions) []checkSkillResult {
+	// Without a context the check runs to completion, so the error is always nil.
+	resolved, _ := plan.Run(context.Background(), check.Options{
+		ParseOptions: parseOpts,
+		Parallel:     true,
+		OnRemoteDone: func(skills int) {
+			if progressBar != nil {
+				progressBar.Add(skills)
 			}
-			localResults = append(localResults, result)
-			continue
-		}
-
-		urlGroups[meta.RepoURL] = append(urlGroups[meta.RepoURL], skillWithMeta{
-			name: skill,
-			path: skillPath,
-			meta: meta,
+		},
+	})
+	var results []checkSkillResult
+	for _, r := range resolved {
+		results = append(results, checkSkillResult{
+			Name:        r.Name,
+			Source:      r.Source,
+			Version:     r.Version,
+			Status:      r.Status,
+			InstalledAt: r.InstalledAt,
+			Message:     r.Message,
 		})
 	}
-
-	return repoInputs, urlGroups, localResults
+	return results
 }
 
 // parseCheckArgs parses command line arguments for the check command.
@@ -108,6 +126,10 @@ func parseCheckArgs(args []string) (*checkOptions, bool, error) {
 		switch {
 		case arg == "--json":
 			opts.json = true
+		case arg == "--diff":
+			opts.diff = true
+		case arg == "--exit-code":
+			opts.exitCode = true
 		case arg == "--group" || arg == "-G":
 			i++
 			if i >= len(args) {
@@ -122,14 +144,54 @@ func parseCheckArgs(args []string) (*checkOptions, bool, error) {
 			opts.names = append(opts.names, arg)
 		}
 	}
+	if opts.diff && opts.json {
+		return nil, false, fmt.Errorf("--diff cannot be combined with --json")
+	}
+	if opts.diff && opts.exitCode {
+		return nil, false, fmt.Errorf("--exit-code cannot be combined with --diff")
+	}
+	if opts.diff && len(opts.names) == 0 && len(opts.groups) == 0 {
+		return nil, false, fmt.Errorf("--diff needs a skill name or --group")
+	}
 
 	return opts, false, nil
 }
 
+// urlBranchSep separates URL and branch in composite grouping keys.
+// Tab is used because it cannot appear in URLs (unlike "@" which appears in SSH URLs).
+const urlBranchSep = "\t"
+
+// urlBranchKey creates a composite grouping key from a URL and optional branch.
+func urlBranchKey(url, branch string) string {
+	if branch != "" {
+		return url + urlBranchSep + branch
+	}
+	return url
+}
+
+// splitURLBranch splits a composite key back into URL and branch.
+func splitURLBranch(key string) (url, branch string) {
+	if idx := strings.Index(key, urlBranchSep); idx >= 0 {
+		return key[:idx], key[idx+1:]
+	}
+	return key, ""
+}
+
 func cmdCheck(args []string) error {
+	err := runCheckCommand(args)
+	// With --json every failure is a JSON object on stdout, including the
+	// ones found before any check ran (bad flags, missing config).
+	var silent *jsonSilentError
+	if err != nil && isStructuredOutput(args) && !errors.As(err, &silent) {
+		return writeJSONError(err)
+	}
+	return err
+}
+
+func runCheckCommand(args []string) error {
 	start := time.Now()
 
-	mode, rest, err := parseModeArgs(args)
+	mode, rest, err := parseModeArgs(args, "--group", "-G")
 	if err != nil {
 		return err
 	}
@@ -139,15 +201,12 @@ func cmdCheck(args []string) error {
 		return fmt.Errorf("cannot determine working directory: %w", err)
 	}
 
-	if mode == modeAuto {
-		if projectConfigExists(cwd) {
-			mode = modeProject
-		} else {
-			mode = modeGlobal
-		}
-	}
+	mode = resolveAutoMode(mode, cwd)
 
 	applyModeLabel(mode)
+
+	// Extract kind filter (e.g. "skillshare check agents" or "--all").
+	kind, rest := parseKindArgWithAll(rest)
 
 	scope := "global"
 	if mode == modeProject {
@@ -163,9 +222,28 @@ func cmdCheck(args []string) error {
 		return parseErr
 	}
 
+	if opts.diff && kind == kindAgents {
+		return fmt.Errorf("--diff compares skills only")
+	}
+	opts.allKinds = kind == kindAll
+	if opts.allKinds && (len(opts.names) > 0 || len(opts.groups) > 0) {
+		return fmt.Errorf("--all cannot be combined with names or --group; it checks every skill and agent")
+	}
+
 	cfgPath := config.ConfigPath()
 	if mode == modeProject {
 		cfgPath = config.ProjectConfigPath(cwd)
+		if kind == kindAgents {
+			projectCfg, loadErr := config.LoadProject(cwd)
+			if loadErr != nil {
+				err := fmt.Errorf("failed to load project config: %w", loadErr)
+				logCheckOp(cfgPath, 0, 0, 0, 0, scope, start, err)
+				return err
+			}
+			cmdErr := renderAgentCheck(projectCfg.EffectiveAgentsSource(cwd), opts.groups, opts.json, opts.exitCode, parseOptsFromProjectConfig(projectCfg))
+			logCheckOp(cfgPath, 0, 0, 0, 0, scope, start, cmdErr)
+			return cmdErr
+		}
 		cmdErr := cmdCheckProject(cwd, opts)
 		logCheckOp(cfgPath, 0, 0, 0, 0, scope, start, cmdErr)
 		return cmdErr
@@ -176,20 +254,38 @@ func cmdCheck(args []string) error {
 		return err
 	}
 
+	// Agent-only check: scan agents source directory and skip repo checks.
+	if kind == kindAgents {
+		agentsDir := cfg.EffectiveAgentsSource()
+		cmdErr := renderAgentCheck(agentsDir, opts.groups, opts.json, opts.exitCode, parseOptsFromConfig(cfg))
+		logCheckOp(cfgPath, 0, 0, 0, 0, scope, start, cmdErr)
+		return cmdErr
+	}
+
+	opts.parseOpts = parseOptsFromConfig(cfg)
+
 	// No names and no groups → check all (existing behavior)
 	if len(opts.names) == 0 && len(opts.groups) == 0 {
-		cmdErr := runCheck(cfg.Source, opts.json, targetNamesFromConfig(cfg.Targets))
+		agentsDir := ""
+		if opts.allKinds {
+			agentsDir = cfg.EffectiveAgentsSource()
+		}
+		cmdErr := runCheck(cfg.EffectiveSkillsSource(), agentsDir, "", opts, targetNamesFromConfig(cfg.Targets), cfg.SkillsWalk())
 		logCheckOp(cfgPath, 0, 0, 0, 0, scope, start, cmdErr)
 		return cmdErr
 	}
 
 	// Filtered check: resolve targets then check only those
-	cmdErr := runCheckFiltered(cfg.Source, opts)
+	cmdErr := runCheckFiltered(cfg.EffectiveSkillsSource(), "", opts, cfg.SkillsWalk())
 	logCheckOp(cfgPath, 0, 0, 0, 0, scope, start, cmdErr)
 	return cmdErr
 }
 
 func logCheckOp(cfgPath string, repos, skills, updatesAvailable, errors int, scope string, start time.Time, cmdErr error) {
+	// --exit-code reporting outdated items is a finding, not a failed check.
+	if isCheckOutdated(cmdErr) {
+		cmdErr = nil
+	}
 	e := oplog.NewEntry("check", statusFromErr(cmdErr), time.Since(start))
 	e.Args = map[string]any{
 		"repos_checked":     repos,
@@ -204,10 +300,13 @@ func logCheckOp(cfgPath string, repos, skills, updatesAvailable, errors int, sco
 	oplog.WriteWithLimit(cfgPath, oplog.OpsFile, e, logMaxEntries()) //nolint:errcheck
 }
 
-func runCheck(sourceDir string, jsonOutput bool, extraTargetNames []string) error {
-	if !jsonOutput {
-		ui.Header(ui.WithModeLabel("Checking for updates"))
-		ui.StepStart("Source", sourceDir)
+// runCheck checks every tracked repo and updatable skill in sourceDir, and
+// every agent in agentsDir when it is set (--all).
+func runCheck(sourceDir, agentsDir, projectRoot string, opts *checkOptions, extraTargetNames []string, walk sourcewalk.Options) error {
+	start := time.Now()
+	jsonOutput, parseOpts := opts.json, opts.parseOpts
+	if agentsDir != "" && !jsonOutput {
+		ui.Section("Skills")
 	}
 
 	var scanSpinner *ui.Spinner
@@ -215,9 +314,13 @@ func runCheck(sourceDir string, jsonOutput bool, extraTargetNames []string) erro
 		scanSpinner = ui.StartSpinner("Scanning skills...")
 	}
 
-	repos, err := install.GetTrackedRepos(sourceDir)
+	repos, err := install.GetTrackedRepos(sourceDir, walk)
 	if err != nil {
 		repos = nil
+	}
+	missingRepos, err := install.GetMissingTrackedRepos(sourceDir, walk)
+	if err != nil {
+		missingRepos = nil
 	}
 
 	skills, err := install.GetUpdatableSkills(sourceDir)
@@ -225,54 +328,30 @@ func runCheck(sourceDir string, jsonOutput bool, extraTargetNames []string) erro
 		skills = nil
 	}
 
-	if len(repos) == 0 && len(skills) == 0 {
+	if len(repos) == 0 && len(missingRepos) == 0 && len(skills) == 0 {
 		if scanSpinner != nil {
 			scanSpinner.Stop()
 		}
-		if jsonOutput {
-			out, _ := json.MarshalIndent(checkOutput{
-				TrackedRepos: []checkRepoResult{},
-				Skills:       []checkSkillResult{},
-			}, "", "  ")
-			fmt.Println(string(out))
-			return nil
+		if !jsonOutput {
+			ui.Done(ui.MarkNone, "No tracked repositories or updatable skills found", 0)
+			ui.Next("skillshare install <repo> --track", "add a tracked repository")
 		}
-		ui.Info("No tracked repositories or updatable skills found")
-		ui.Info("Use 'skillshare install <repo> --track' to add a tracked repository")
-		fmt.Println()
-		return nil
+		return finishCheck(nil, nil, agentsDir, opts)
 	}
 
 	// Collect & group
-	repoInputs, urlGroups, localResults := collectCheckItems(sourceDir, repos, skills)
+	repoInputs, plan := collectCheckItems(sourceDir, projectRoot, repos, skills, walk.Follow, parseOpts)
 
 	if scanSpinner != nil {
 		scanSpinner.Stop()
 	}
 
-	// Build unique URL list
-	var urlInputs []check.URLCheckInput
-	var urlOrder []string
-	for url := range urlGroups {
-		urlInputs = append(urlInputs, check.URLCheckInput{RepoURL: url})
-		urlOrder = append(urlOrder, url)
-	}
-
 	// Count total items for meaningful progress (skill count, not URL count)
-	totalSkills := 0
-	for _, group := range urlGroups {
-		totalSkills += len(group)
-	}
-	total := len(repoInputs) + totalSkills
-
-	if !jsonOutput {
-		ui.StepContinue("Items", fmt.Sprintf("%d tracked repo(s), %d skill(s)", len(repos), len(skills)))
-	}
+	total := len(repoInputs) + plan.RemoteSkills()
 
 	// Parallel check with progress bar
 	var progressBar *ui.ProgressBar
 	if !jsonOutput && total > 0 {
-		fmt.Println()
 		progressBar = ui.StartProgress("Checking for updates", total)
 	}
 
@@ -283,12 +362,7 @@ func runCheck(sourceDir string, jsonOutput bool, extraTargetNames []string) erro
 	}
 
 	repoOutputs := check.ParallelCheckRepos(repoInputs, repoOnDone)
-	urlOutputs := check.ParallelCheckURLs(urlInputs, nil)
-
-	// Increment by skill count per completed URL group
-	if progressBar != nil {
-		progressBar.Add(totalSkills)
-	}
+	skillResults := resolveCheckSkills(plan, progressBar, parseOpts)
 
 	if progressBar != nil {
 		progressBar.Stop()
@@ -296,170 +370,193 @@ func runCheck(sourceDir string, jsonOutput bool, extraTargetNames []string) erro
 
 	// Convert repo outputs
 	repoResults := toRepoResults(repoOutputs)
-
-	// Broadcast URL results to grouped skills (with per-skill tree hash comparison)
-	urlHashMap := make(map[string]check.URLCheckOutput)
-	for _, out := range urlOutputs {
-		urlHashMap[out.RepoURL] = out
+	for _, repo := range missingRepos {
+		repoResults = append(repoResults, checkRepoResult{
+			Name:    repo.Name,
+			Status:  "missing",
+			Message: missingTrackedRepoMessage(repo.Name),
+		})
 	}
 
-	skillResults := resolveSkillStatuses(urlGroups, urlHashMap, urlOrder)
-	skillResults = append(localResults, skillResults...)
-
-	// JSON output
-	if jsonOutput {
-		output := checkOutput{
-			TrackedRepos: repoResults,
-			Skills:       skillResults,
-		}
-		if output.TrackedRepos == nil {
-			output.TrackedRepos = []checkRepoResult{}
-		}
-		if output.Skills == nil {
-			output.Skills = []checkSkillResult{}
-		}
-		out, _ := json.MarshalIndent(output, "", "  ")
-		fmt.Println(string(out))
-		return nil
+	if !jsonOutput {
+		// Display results + summary, with unknown target names in skill-level
+		// targets fields among the warnings
+		warnings := unknownSkillTargetWarnings(sourceDir, extraTargetNames, walk)
+		renderCheckResults(repoResults, skillResults, false, warnings, start)
 	}
-
-	// Display results + summary
-	renderCheckResults(repoResults, skillResults, false)
-
-	// Warn about unknown target names in skill-level targets field
-	warnUnknownSkillTargets(sourceDir, extraTargetNames)
-
-	return nil
+	return finishCheck(repoResults, skillResults, agentsDir, opts)
 }
 
-// renderCheckResults displays repos and skills that need attention,
-// suppresses up_to_date/local items, and prints a summary line.
-// When showDetails is false (full check), update_available items are summarized.
-// When showDetails is true (filtered check), each item is listed individually.
-func renderCheckResults(repoResults []checkRepoResult, skillResults []checkSkillResult, showDetails bool) {
-	// Repos: only show behind/dirty/error
-	upToDateRepos := 0
-	hasRepoOutput := false
+// finishCheck closes a whole-source check: it checks the agents when agentsDir
+// is set (--all), writes the JSON result, and decides the exit status from
+// everything that was checked.
+func finishCheck(repos []checkRepoResult, skills []checkSkillResult, agentsDir string, opts *checkOptions) error {
+	tally := tallyCheck(repos, skills)
+	output := checkOutput{TrackedRepos: repos, Skills: skills}
+	if output.TrackedRepos == nil {
+		output.TrackedRepos = []checkRepoResult{}
+	}
+	if output.Skills == nil {
+		output.Skills = []checkSkillResult{}
+	}
+
+	if agentsDir != "" {
+		if !opts.json {
+			ui.Section("Agents")
+		}
+		agents, err := collectAgentCheck(agentsDir, nil, opts.json, opts.parseOpts)
+		if err != nil {
+			return err
+		}
+		for _, a := range agents {
+			tally.add(a.Status)
+		}
+		if opts.json {
+			if agents == nil {
+				agents = []check.AgentCheckResult{}
+			}
+			output.Agents = &agents
+		} else {
+			renderAgentResults(agents)
+		}
+	}
+
+	if opts.json {
+		return writeJSONResult(output, tally.err(opts.exitCode))
+	}
+	return tally.err(opts.exitCode)
+}
+
+// renderCheckResults lists the repos and skills that need attention, then
+// closes with what was found. up_to_date items are counted, not listed;
+// local skills get their own rows only when showDetails is true (filtered
+// check).
+func renderCheckResults(repoResults []checkRepoResult, skillResults []checkSkillResult, showDetails bool, warnings []string, start time.Time) {
+	type checkRow struct{ mark, name, value string }
+	var rows []checkRow
+	upToDateRepos, upToDateSkills, updatableRepos, updatableSkills, local, stale, modified, failed := 0, 0, 0, 0, 0, 0, 0, 0
+
 	for _, r := range repoResults {
 		switch r.Status {
 		case "up_to_date":
 			upToDateRepos++
 		case "behind":
-			if !hasRepoOutput {
-				fmt.Println()
-				hasRepoOutput = true
-			}
-			ui.ListItem("info", r.Name, fmt.Sprintf("%d commit(s) behind", r.Behind))
+			updatableRepos++
+			rows = append(rows, checkRow{ui.MarkWarn, r.Name, plural(r.Behind, "commit") + " behind"})
 		case "dirty":
-			if !hasRepoOutput {
-				fmt.Println()
-				hasRepoOutput = true
-			}
-			ui.ListItem("warning", r.Name, "has uncommitted changes")
+			rows = append(rows, checkRow{ui.MarkWarn, r.Name, "uncommitted changes"})
 		case "error":
-			if !hasRepoOutput {
-				fmt.Println()
-				hasRepoOutput = true
-			}
-			ui.ListItem("error", r.Name, fmt.Sprintf("error: %s", r.Message))
+			failed++
+			rows = append(rows, checkRow{ui.MarkFail, r.Name, r.Message})
+		case "missing":
+			rows = append(rows, checkRow{ui.MarkWarn, r.Name, r.Message})
 		}
 	}
-
-	// Skills: only show update_available/stale/error; suppress up_to_date and local
-	upToDateSkills := 0
-	localSkills := 0
-	staleSkills := 0
-	hasSkillOutput := false
 	for _, s := range skillResults {
 		switch s.Status {
 		case "up_to_date":
 			upToDateSkills++
 		case "local":
-			localSkills++
+			local++
 			if showDetails {
-				if !hasSkillOutput {
-					fmt.Println()
-					hasSkillOutput = true
-				}
-				ui.ListItem("info", s.Name, "local source")
+				rows = append(rows, checkRow{ui.MarkNone, s.Name, "local source"})
 			}
 		case "update_available":
-			if showDetails {
-				if !hasSkillOutput {
-					fmt.Println()
-					hasSkillOutput = true
-				}
-				detail := "update available"
-				if s.Source != "" {
-					detail += fmt.Sprintf("  %s", formatSourceShort(s.Source))
-				}
-				ui.ListItem("info", s.Name, detail)
-			}
-		case "stale":
-			staleSkills++
-			if !hasSkillOutput {
-				fmt.Println()
-				hasSkillOutput = true
-			}
-			ui.ListItem("warning", s.Name, "stale (deleted upstream)")
-		case "error":
-			if !hasSkillOutput {
-				fmt.Println()
-				hasSkillOutput = true
-			}
-			ui.ListItem("warning", s.Name, "cannot reach remote")
-		}
-	}
-
-	// Summary
-	updatableRepos := 0
-	for _, r := range repoResults {
-		if r.Status == "behind" {
-			updatableRepos++
-		}
-	}
-	updatableSkills := 0
-	for _, s := range skillResults {
-		if s.Status == "update_available" {
 			updatableSkills++
+			rows = append(rows, checkRow{ui.MarkWarn, s.Name, updateAvailableText(s.Source)})
+		case "stale":
+			stale++
+			rows = append(rows, checkRow{ui.MarkWarn, s.Name, "stale — no longer in the upstream repository"})
+		case "modified":
+			modified++
+			rows = append(rows, checkRow{ui.MarkWarn, s.Name, s.Message})
+		case "error":
+			failed++
+			rows = append(rows, checkRow{ui.MarkFail, s.Name, skillErrorMessage(s)})
 		}
 	}
 
-	fmt.Println()
-	upToDateTotal := upToDateRepos + upToDateSkills
-	if upToDateTotal > 0 {
-		parts := []string{}
-		if upToDateRepos > 0 {
-			parts = append(parts, fmt.Sprintf("%d repo(s)", upToDateRepos))
-		}
-		if upToDateSkills > 0 {
-			parts = append(parts, fmt.Sprintf("%d skill(s)", upToDateSkills))
-		}
-		ui.SuccessMsg("%s up to date", strings.Join(parts, " + "))
+	names := make([]string, len(rows))
+	for i, r := range rows {
+		names[i] = r.name
 	}
-	if localSkills > 0 {
-		ui.Info("%d local skill(s) skipped", localSkills)
+	width := ui.RowWidth(names...)
+	for _, r := range rows {
+		ui.Row(r.mark, r.name, r.value, width)
 	}
-	if staleSkills > 0 {
-		ui.Warning("%d skill(s) stale (deleted upstream) — run 'skillshare update --all --prune' to remove", staleSkills)
+	for _, w := range warnings {
+		ui.Warning("Skill targets: %s", w)
 	}
-	if updatableRepos+updatableSkills == 0 {
-		if upToDateTotal == 0 && localSkills == 0 && staleSkills == 0 {
-			ui.SuccessMsg("Everything is up to date")
-		}
-	} else {
+	if len(rows)+len(warnings) > 0 {
 		fmt.Println()
-		parts := []string{}
-		if updatableRepos > 0 {
-			parts = append(parts, fmt.Sprintf("%d repo(s)", updatableRepos))
-		}
-		if updatableSkills > 0 {
-			parts = append(parts, fmt.Sprintf("%d skill(s)", updatableSkills))
-		}
-		ui.Info("%s have updates available", strings.Join(parts, " + "))
-		ui.Info("Run 'skillshare update <name>' or 'skillshare update --all'")
 	}
-	fmt.Println()
+
+	upToDate := upToDateRepos + upToDateSkills
+	var mark, text string
+	switch {
+	case updatableRepos+updatableSkills > 0:
+		mark, text = ui.MarkWarn, "Updates available for "+repoSkillCounts(updatableRepos, updatableSkills)
+		if upToDate > 0 {
+			text += fmt.Sprintf(", %d up to date", upToDate)
+		}
+	case upToDate > 0:
+		mark, text = ui.MarkOK, repoSkillCounts(upToDateRepos, upToDateSkills)+" up to date"
+	case modified > 0:
+		mark, text = ui.MarkWarn, plural(modified, "skill")+" modified locally"
+	case local > 0:
+		mark, text = ui.MarkNone, plural(local, "local skill")+" skipped"
+		local = 0
+	default:
+		mark, text = ui.MarkNone, "Nothing checked"
+	}
+	if local > 0 {
+		text += fmt.Sprintf(", %d local skipped", local)
+	}
+	if stale > 0 {
+		mark, text = ui.MarkWarn, fmt.Sprintf("%s, %d stale", text, stale)
+	}
+	if modified > 0 && updatableRepos+updatableSkills+upToDate > 0 {
+		mark, text = ui.MarkWarn, fmt.Sprintf("%s, %d modified locally", text, modified)
+	}
+	if failed > 0 {
+		mark, text = ui.MarkWarn, fmt.Sprintf("%s, %d failed to check", text, failed)
+	}
+	ui.Done(mark, text, time.Since(start))
+
+	var next []string
+	if updatableRepos+updatableSkills > 0 {
+		next = append(next, "skillshare update --all", "pull the updates")
+	}
+	if stale > 0 {
+		next = append(next, "skillshare update --all --prune", "remove stale skills")
+	}
+	if modified > 0 {
+		next = append(next, "skillshare check <name> --diff", "see the local changes",
+			"skillshare update <name> --force", "discard local changes and reinstall")
+	}
+	if len(next) > 0 {
+		ui.Next(next...)
+	}
+}
+
+// repoSkillCounts names how many repos and skills, leaving out zeros.
+func repoSkillCounts(repos, skills int) string {
+	var parts []string
+	if repos > 0 {
+		parts = append(parts, plural(repos, "repo"))
+	}
+	if skills > 0 {
+		parts = append(parts, plural(skills, "skill"))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// updateAvailableText says an update is available, with its source in dim.
+func updateAvailableText(source string) string {
+	if source == "" {
+		return "update available"
+	}
+	return "update available " + ui.DimText("· "+formatSourceShort(sourceLabel(source)))
 }
 
 func toRepoResults(outputs []check.RepoCheckOutput) []checkRepoResult {
@@ -469,137 +566,18 @@ func toRepoResults(outputs []check.RepoCheckOutput) []checkRepoResult {
 			Name:    o.Name,
 			Status:  o.Status,
 			Behind:  o.Behind,
+			Branch:  o.Branch,
 			Message: o.Message,
 		}
 	}
 	return results
 }
 
-// resolveSkillStatuses determines the status of each skill using tree hash
-// comparison when available, falling back to commit hash comparison.
-//
-// Fast path: if all skills in a URL group have Version == RemoteHash,
-// they are all up_to_date without any additional network call.
-//
-// Slow path: when HEAD moved, skills with TreeHash are compared via
-// blobless fetch + ls-tree. Skills without TreeHash fall back to
-// commit-level comparison (existing behavior).
-func resolveSkillStatuses(
-	urlGroups map[string][]skillWithMeta,
-	urlHashMap map[string]check.URLCheckOutput,
-	urlOrder []string,
-) []checkSkillResult {
-	var results []checkSkillResult
-
-	for _, url := range urlOrder {
-		out := urlHashMap[url]
-		group := urlGroups[url]
-
-		// Pre-fill base result fields for each skill
-		type pending struct {
-			result checkSkillResult
-			meta   *install.SkillMeta
-		}
-		items := make([]pending, len(group))
-		for i, sw := range group {
-			r := checkSkillResult{
-				Name:    sw.name,
-				Source:  sw.meta.Source,
-				Version: sw.meta.Version,
-			}
-			if !sw.meta.InstalledAt.IsZero() {
-				r.InstalledAt = sw.meta.InstalledAt.Format("2006-01-02")
-			}
-			items[i] = pending{result: r, meta: sw.meta}
-		}
-
-		// Error from ls-remote → all error
-		if out.Err != nil {
-			for i := range items {
-				items[i].result.Status = "error"
-			}
-			for _, it := range items {
-				results = append(results, it.result)
-			}
-			continue
-		}
-
-		// Fast path: commit hash matches → all up_to_date
-		allMatch := true
-		for _, it := range items {
-			if it.meta.Version != out.RemoteHash {
-				allMatch = false
-				break
-			}
-		}
-		if allMatch {
-			for i := range items {
-				items[i].result.Status = "up_to_date"
-			}
-			for _, it := range items {
-				results = append(results, it.result)
-			}
-			continue
-		}
-
-		// Slow path: HEAD moved — collect subdirs that have TreeHash
-		var subdirs []string
-		for _, it := range items {
-			if it.meta.TreeHash != "" && it.meta.Subdir != "" {
-				subdirs = append(subdirs, it.meta.Subdir)
-			}
-		}
-
-		// Fetch remote tree hashes once per URL (nil on error → fallback)
-		var remoteTreeHashes map[string]string
-		if len(subdirs) > 0 {
-			remoteTreeHashes = check.FetchRemoteTreeHashes(url)
-		}
-
-		for i, it := range items {
-			// Already matched by commit hash → up_to_date
-			if it.meta.Version == out.RemoteHash {
-				items[i].result.Status = "up_to_date"
-				continue
-			}
-
-			// Try tree hash comparison
-			if it.meta.TreeHash != "" && it.meta.Subdir != "" && remoteTreeHashes != nil {
-				// ls-tree paths never have leading "/", but meta.Subdir may
-				normalizedSubdir := strings.TrimPrefix(it.meta.Subdir, "/")
-				if remoteHash, ok := remoteTreeHashes[normalizedSubdir]; ok {
-					if it.meta.TreeHash == remoteHash {
-						items[i].result.Status = "up_to_date"
-					} else {
-						items[i].result.Status = "update_available"
-					}
-				} else {
-					// Subdir not found remotely — skill deleted upstream
-					items[i].result.Status = "stale"
-				}
-				continue
-			}
-
-			// Fallback: commit hash differs, no tree hash → update_available
-			items[i].result.Status = "update_available"
-		}
-
-		for _, it := range items {
-			results = append(results, it.result)
-		}
-	}
-
-	return results
-}
-
 // runCheckFiltered checks only the specified targets (resolved from names/groups).
 // Note: unlike runCheck, this intentionally skips warnUnknownSkillTargets because
 // filtered checks only verify update status for explicitly named skills/groups.
-func runCheckFiltered(sourceDir string, opts *checkOptions) error {
-	if !opts.json {
-		ui.Header(ui.WithModeLabel("Checking for updates"))
-		ui.StepStart("Source", sourceDir)
-	}
+func runCheckFiltered(sourceDir, projectRoot string, opts *checkOptions, walks ...sourcewalk.Options) error {
+	start := time.Now()
 
 	// --- Resolve targets ---
 	var resolveSpinner *ui.Spinner
@@ -607,14 +585,15 @@ func runCheckFiltered(sourceDir string, opts *checkOptions) error {
 		resolveSpinner = ui.StartSpinner("Resolving skills...")
 	}
 
+	checkStore, _ := install.LoadMetadata(sourceDir)
 	var targets []updateTarget
 	seen := map[string]bool{}
 	var resolveWarnings []string
 
 	for _, name := range opts.names {
 		// Check group directory first (same logic as update)
-		if isGroupDir(name, sourceDir) {
-			groupMatches, groupErr := resolveGroupUpdatable(name, sourceDir)
+		if isGroupDir(name, sourceDir, checkStore) {
+			groupMatches, groupErr := resolveGroupUpdatable(name, sourceDir, walks...)
 			if groupErr != nil {
 				resolveWarnings = append(resolveWarnings, fmt.Sprintf("%s: %v", name, groupErr))
 				continue
@@ -623,7 +602,9 @@ func runCheckFiltered(sourceDir string, opts *checkOptions) error {
 				resolveWarnings = append(resolveWarnings, fmt.Sprintf("%s: no updatable skills in group", name))
 				continue
 			}
-			ui.Info("'%s' is a group — expanding to %d updatable skill(s)", name, len(groupMatches))
+			if !opts.json {
+				ui.Note(fmt.Sprintf("'%s' is a group — expanding to %s", name, plural(len(groupMatches), "updatable skill")))
+			}
 			for _, m := range groupMatches {
 				if !seen[m.name] {
 					seen[m.name] = true
@@ -633,7 +614,7 @@ func runCheckFiltered(sourceDir string, opts *checkOptions) error {
 			continue
 		}
 
-		match, err := resolveByBasename(sourceDir, name)
+		match, err := resolveByBasename(sourceDir, name, walks...)
 		if err != nil {
 			resolveWarnings = append(resolveWarnings, fmt.Sprintf("%s: %v", name, err))
 			continue
@@ -645,7 +626,7 @@ func runCheckFiltered(sourceDir string, opts *checkOptions) error {
 	}
 
 	for _, group := range opts.groups {
-		groupMatches, err := resolveGroupUpdatable(group, sourceDir)
+		groupMatches, err := resolveGroupUpdatable(group, sourceDir, walks...)
 		if err != nil {
 			resolveWarnings = append(resolveWarnings, fmt.Sprintf("--group %s: %v", group, err))
 			continue
@@ -666,23 +647,35 @@ func runCheckFiltered(sourceDir string, opts *checkOptions) error {
 		resolveSpinner.Stop()
 	}
 
-	for _, w := range resolveWarnings {
-		ui.Warning("%s", w)
+	// With --json stdout carries the result only: skipped names go in its
+	// warnings field, or in the error when nothing is left to check.
+	if !opts.json {
+		for _, w := range resolveWarnings {
+			ui.Warning("%s", w)
+		}
 	}
 
 	if len(targets) == 0 {
-		if opts.json {
-			out, _ := json.MarshalIndent(checkOutput{
-				TrackedRepos: []checkRepoResult{},
-				Skills:       []checkSkillResult{},
-			}, "", "  ")
-			fmt.Println(string(out))
-			return nil
-		}
+		err := fmt.Errorf("no skills found")
 		if len(resolveWarnings) > 0 {
-			return fmt.Errorf("no valid skills to check")
+			err = fmt.Errorf("no valid skills to check")
 		}
-		return fmt.Errorf("no skills found")
+		if opts.json {
+			// An empty result would read as "all clear".
+			if len(resolveWarnings) > 0 {
+				err = fmt.Errorf("%w: %s", err, strings.Join(resolveWarnings, "; "))
+			}
+			return writeJSONError(err)
+		}
+		return err
+	}
+
+	var follow *sourcewalk.Follow
+	if len(walks) > 0 {
+		follow = walks[0].Follow
+	}
+	if opts.diff {
+		return runCheckDiff(sourceDir, targets, opts.parseOpts, follow)
 	}
 
 	// --- Partition targets for parallel check ---
@@ -696,35 +689,9 @@ func runCheckFiltered(sourceDir string, opts *checkOptions) error {
 		}
 	}
 
-	// --- Header details (Header + StepStart already shown above) ---
-	if !opts.json {
-		ui.StepContinue("Items", fmt.Sprintf("%d tracked repo(s), %d skill(s)", len(repoNames), len(skillNames)))
+	repoInputs, plan := collectCheckItems(sourceDir, projectRoot, repoNames, skillNames, follow, opts.parseOpts)
 
-		// Single skill: show per-skill detail like update does
-		if len(targets) == 1 && !targets[0].isRepo {
-			t := targets[0]
-			skillPath := filepath.Join(sourceDir, t.name)
-			if meta, metaErr := install.ReadMeta(skillPath); metaErr == nil && meta != nil && meta.Source != "" {
-				ui.StepContinue("Skill", t.name)
-				ui.StepContinue("Source", meta.Source)
-			}
-		}
-	}
-
-	repoInputs, urlGroups, localResults := collectCheckItems(sourceDir, repoNames, skillNames)
-
-	var urlInputs []check.URLCheckInput
-	var urlOrder []string
-	for url := range urlGroups {
-		urlInputs = append(urlInputs, check.URLCheckInput{RepoURL: url})
-		urlOrder = append(urlOrder, url)
-	}
-
-	totalSkills := 0
-	for _, group := range urlGroups {
-		totalSkills += len(group)
-	}
-	total := len(repoInputs) + totalSkills
+	total := len(repoInputs) + plan.RemoteSkills()
 	isSingle := len(targets) == 1
 
 	// Single target: spinner; multiple targets: progress bar
@@ -734,12 +701,9 @@ func runCheckFiltered(sourceDir string, opts *checkOptions) error {
 		if isSingle {
 			spinner = ui.StartSpinner("Checking...")
 		} else {
-			fmt.Println()
 			progressBar = ui.StartProgress("Checking targets", total)
 		}
 	}
-
-	startCheck := time.Now()
 
 	repoOnDone := func() {
 		if progressBar != nil {
@@ -748,10 +712,9 @@ func runCheckFiltered(sourceDir string, opts *checkOptions) error {
 	}
 
 	repoOutputs := check.ParallelCheckRepos(repoInputs, repoOnDone)
-	urlOutputs := check.ParallelCheckURLs(urlInputs, nil)
+	skillResults := resolveCheckSkills(plan, progressBar, opts.parseOpts)
 
 	if progressBar != nil {
-		progressBar.Add(totalSkills)
 		progressBar.Stop()
 	}
 	if spinner != nil {
@@ -760,18 +723,11 @@ func runCheckFiltered(sourceDir string, opts *checkOptions) error {
 
 	repoResults := toRepoResults(repoOutputs)
 
-	urlHashMap := make(map[string]check.URLCheckOutput)
-	for _, out := range urlOutputs {
-		urlHashMap[out.RepoURL] = out
-	}
-
-	skillResults := resolveSkillStatuses(urlGroups, urlHashMap, urlOrder)
-	skillResults = append(localResults, skillResults...)
-
 	if opts.json {
 		output := checkOutput{
 			TrackedRepos: repoResults,
 			Skills:       skillResults,
+			Warnings:     resolveWarnings,
 		}
 		if output.TrackedRepos == nil {
 			output.TrackedRepos = []checkRepoResult{}
@@ -779,83 +735,143 @@ func runCheckFiltered(sourceDir string, opts *checkOptions) error {
 		if output.Skills == nil {
 			output.Skills = []checkSkillResult{}
 		}
-		out, _ := json.MarshalIndent(output, "", "  ")
-		fmt.Println(string(out))
-		return nil
+		return writeJSONResult(output, checkResultsError(repoResults, skillResults, opts.exitCode))
 	}
 
-	// Single target: use StepResult like update does
+	// Single target: one row, like update
 	if isSingle {
 		r := singleCheckStatus(repoResults, skillResults)
-		ui.StepResult(r.status, r.message, time.Since(startCheck))
-		fmt.Println()
-		return nil
+		ui.Row(r.mark, targets[0].name, r.text+ui.Took(time.Since(start)), ui.RowWidth(targets[0].name))
+		if r.next != "" {
+			ui.Next(r.next, r.why)
+		}
+		return checkResultsError(repoResults, skillResults, opts.exitCode)
 	}
 
 	// Display results + summary (filtered: show local skills individually)
-	renderCheckResults(repoResults, skillResults, true)
+	renderCheckResults(repoResults, skillResults, true, nil, start)
 
+	return checkResultsError(repoResults, skillResults, opts.exitCode)
+}
+
+func checkResultsError(repos []checkRepoResult, skills []checkSkillResult, exitCode bool) error {
+	return tallyCheck(repos, skills).err(exitCode)
+}
+
+func tallyCheck(repos []checkRepoResult, skills []checkSkillResult) checkTally {
+	var tally checkTally
+	for _, r := range repos {
+		tally.add(r.Status)
+	}
+	for _, s := range skills {
+		tally.add(s.Status)
+	}
+	return tally
+}
+
+// checkOutdatedError is what --exit-code returns when every item could be
+// checked but some are not up to date.
+type checkOutdatedError struct{ count int }
+
+func (e *checkOutdatedError) Error() string {
+	return plural(e.count, "item") + " not up to date"
+}
+
+func isCheckOutdated(err error) bool {
+	var outdated *checkOutdatedError
+	return errors.As(err, &outdated)
+}
+
+// checkTally counts check statuses for the exit code.
+type checkTally struct{ failed, outdated int }
+
+func (c *checkTally) add(status string) {
+	switch status {
+	case "error":
+		c.failed++
+	case "up_to_date", "local":
+	default:
+		c.outdated++
+	}
+}
+
+// err reports items that failed to check; with exitCode it also reports
+// items that are not up to date.
+func (c checkTally) err(exitCode bool) error {
+	if c.failed > 0 {
+		return fmt.Errorf("%s failed to check", plural(c.failed, "item"))
+	}
+	if exitCode && c.outdated > 0 {
+		return &checkOutdatedError{count: c.outdated}
+	}
 	return nil
 }
 
-// singleCheckResult holds the display status for a single-target check.
-type singleCheckResult struct {
-	status  string // "success" or "error"
-	message string
+// skillErrorMessage returns the reason for an "error" skill result, falling
+// back to the remote-probe failure that most errors come from.
+func skillErrorMessage(s checkSkillResult) string {
+	if s.Message != "" {
+		return s.Message
+	}
+	return "cannot reach remote"
 }
 
-// singleCheckStatus derives a StepResult-compatible status from a single check.
+// singleCheckResult is the row for a single-target check and the command
+// that acts on it, if any.
+type singleCheckResult struct {
+	mark, text string
+	next, why  string
+}
+
+// singleCheckStatus derives the row for a single-target check.
 func singleCheckStatus(repos []checkRepoResult, skills []checkSkillResult) singleCheckResult {
 	// Repo results
 	for _, r := range repos {
 		switch r.Status {
 		case "up_to_date":
-			return singleCheckResult{"success", "Up to date"}
+			return singleCheckResult{mark: ui.MarkOK, text: "up to date"}
 		case "behind":
-			return singleCheckResult{"info", fmt.Sprintf("%d commit(s) behind — run 'skillshare update' to update", r.Behind)}
+			return singleCheckResult{ui.MarkWarn, plural(r.Behind, "commit") + " behind", "skillshare update " + r.Name, "pull them"}
+		case "dirty":
+			return singleCheckResult{mark: ui.MarkWarn, text: "uncommitted changes"}
 		case "error":
-			return singleCheckResult{"error", r.Message}
+			return singleCheckResult{mark: ui.MarkFail, text: r.Message}
 		default:
-			return singleCheckResult{"info", r.Status}
+			return singleCheckResult{mark: ui.MarkWarn, text: r.Message}
 		}
 	}
 	// Skill results
 	for _, s := range skills {
 		switch s.Status {
 		case "up_to_date":
-			return singleCheckResult{"success", "Up to date"}
+			return singleCheckResult{mark: ui.MarkOK, text: "up to date"}
 		case "update_available":
-			return singleCheckResult{"info", "Update available — run 'skillshare update' to update"}
+			return singleCheckResult{ui.MarkWarn, updateAvailableText(s.Source), "skillshare update " + s.Name, "pull the update"}
 		case "stale":
-			return singleCheckResult{"warning", "Stale (deleted upstream) — run 'skillshare update --prune' to remove"}
+			return singleCheckResult{ui.MarkWarn, "stale — no longer in the upstream repository", "skillshare update --all --prune", "remove stale skills"}
+		case "modified":
+			return singleCheckResult{ui.MarkWarn, s.Message, "skillshare check " + s.Name + " --diff", "see the changes; update --force discards them"}
 		case "local":
-			return singleCheckResult{"success", "Local skill (no remote source)"}
+			return singleCheckResult{mark: ui.MarkNone, text: "local source, nothing to compare"}
 		case "error":
-			return singleCheckResult{"error", "Cannot reach remote"}
+			return singleCheckResult{mark: ui.MarkFail, text: skillErrorMessage(s)}
 		default:
-			return singleCheckResult{"info", s.Status}
+			return singleCheckResult{mark: ui.MarkNone, text: s.Status}
 		}
 	}
-	return singleCheckResult{"success", "Up to date"}
+	return singleCheckResult{mark: ui.MarkOK, text: "up to date"}
 }
 
-func warnUnknownSkillTargets(sourceDir string, extraTargetNames []string) {
+// unknownSkillTargetWarnings names skill-level targets that match no
+// configured or known target.
+func unknownSkillTargetWarnings(sourceDir string, extraTargetNames []string, walk sourcewalk.Options) []string {
 	sp := ui.StartSpinner("Validating skill targets...")
-	discovered, err := ssync.DiscoverSourceSkills(sourceDir)
+	defer sp.Stop()
+	discovered, err := ssync.DiscoverSourceSkills(sourceDir, walk)
 	if err != nil {
-		sp.Stop()
-		return
+		return nil
 	}
-
-	warnings := findUnknownSkillTargets(discovered, extraTargetNames)
-	sp.Stop()
-	if len(warnings) > 0 {
-		fmt.Println()
-		for _, w := range warnings {
-			ui.Warning("Skill targets: %s", w)
-		}
-		fmt.Println()
-	}
+	return findUnknownSkillTargets(discovered, extraTargetNames)
 }
 
 // formatSourceShort returns a shortened source for display
@@ -867,34 +883,137 @@ func formatSourceShort(source string) string {
 	return source
 }
 
+// renderAgentCheck checks the agents in agentsDir and displays the results
+// (text or JSON).
+func renderAgentCheck(agentsDir string, groups []string, jsonMode, exitCode bool, parseOpts install.ParseOptions) error {
+	agentResults, err := collectAgentCheck(agentsDir, groups, jsonMode, parseOpts)
+	if err != nil {
+		if jsonMode {
+			return writeJSONError(err)
+		}
+		return err
+	}
+
+	var tally checkTally
+	for _, r := range agentResults {
+		tally.add(r.Status)
+	}
+	if jsonMode {
+		return writeJSONResult(agentResults, tally.err(exitCode))
+	}
+	renderAgentResults(agentResults)
+	return tally.err(exitCode)
+}
+
+// collectAgentCheck checks the agents in agentsDir against their recorded
+// sources. If groups is non-empty, only agents in those group subdirectories
+// are checked. quiet leaves the spinner out.
+func collectAgentCheck(agentsDir string, groups []string, quiet bool, parseOpts install.ParseOptions) ([]check.AgentCheckResult, error) {
+	agentResults := check.CheckAgents(agentsDir)
+
+	if len(groups) > 0 {
+		filtered, err := filterAgentResultsByGroups(agentResults, groups, agentsDir)
+		if err != nil {
+			return nil, err
+		}
+		agentResults = filtered
+	}
+
+	trackedIndices := make([]int, 0, len(agentResults))
+	tracked := make([]check.AgentCheckResult, 0, len(agentResults))
+	for i := range agentResults {
+		if agentResults[i].Source != "" {
+			trackedIndices = append(trackedIndices, i)
+			tracked = append(tracked, agentResults[i])
+		}
+	}
+	if len(tracked) > 0 {
+		if quiet {
+			check.EnrichAgentResultsWithRemote(tracked, nil, parseOpts)
+		} else {
+			sp := ui.StartSpinner(fmt.Sprintf("Checking %s...", plural(len(tracked), "tracked agent")))
+			check.EnrichAgentResultsWithRemote(tracked, nil, parseOpts)
+			sp.Stop()
+		}
+		for i, idx := range trackedIndices {
+			agentResults[idx] = tracked[i]
+		}
+	}
+
+	return agentResults, nil
+}
+
+// renderAgentResults prints one row per agent and the closing line.
+func renderAgentResults(agentResults []check.AgentCheckResult) {
+	if len(agentResults) == 0 {
+		ui.Done(ui.MarkNone, "No agents found", 0)
+		return
+	}
+	names := make([]string, len(agentResults))
+	for i, r := range agentResults {
+		names[i] = r.Name
+	}
+	width := ui.RowWidth(names...)
+	upToDate, updates, attention := 0, 0, 0
+	for _, r := range agentResults {
+		switch r.Status {
+		case "up_to_date":
+			upToDate++
+			ui.Row(ui.MarkOK, r.Name, "up to date", width)
+		case "update_available":
+			updates++
+			ui.Row(ui.MarkWarn, r.Name, updateAvailableText(r.Source), width)
+		case "drifted", "dirty":
+			attention++
+			ui.Row(ui.MarkWarn, r.Name, r.Message, width)
+		case "local":
+			ui.Row(ui.MarkNone, r.Name, "local agent", width)
+		case "error":
+			attention++
+			ui.Row(ui.MarkFail, r.Name, r.Message, width)
+		}
+	}
+	fmt.Println()
+	switch {
+	case updates > 0:
+		ui.Done(ui.MarkWarn, "Updates available for "+plural(updates, "agent"), 0)
+		ui.Next("skillshare update agents --all", "pull the updates")
+	case attention > 0:
+		ui.Done(ui.MarkWarn, plural(attention, "agent")+" need attention", 0)
+	case upToDate > 0:
+		ui.Done(ui.MarkOK, plural(upToDate, "agent")+" up to date", 0)
+	default:
+		ui.Done(ui.MarkNone, "No tracked agents to compare", 0)
+	}
+}
+
 func printCheckHelp() {
-	fmt.Println(`Usage: skillshare check [name...] [options]
-       skillshare check --group <group> [options]
-
-Check for available updates to tracked repositories and installed skills.
-
-For tracked repos: fetches from origin and checks if behind
-For regular skills: compares installed version with remote HEAD
-
-If no names or groups are specified, all items are checked.
-If a positional name matches a group directory, it is automatically expanded.
-
-Arguments:
-  name...                Skill name(s) or tracked repo name(s) (optional)
-
-Options:
-  --group, -G <name>  Check all updatable skills in a group (repeatable)
-  --project, -p       Check project-level skills (.skillshare/)
-  --global, -g        Check global skills (~/.config/skillshare)
-  --json              Output results as JSON
-  --help, -h          Show this help
-
-Examples:
-  skillshare check                     # Check all items
-  skillshare check my-skill            # Check a single skill
-  skillshare check a b c               # Check multiple skills
-  skillshare check --group frontend    # Check all skills in frontend/
-  skillshare check x -G backend        # Mix names and groups
-  skillshare check --json              # Output as JSON (for CI)
-  skillshare check -p                  # Check project skills`)
+	printHelp("skillshare check [agents] [name...] [options]\n       skillshare check --group <group> [options]", "Check for available updates to tracked repositories and installed skills.\n\nFor tracked repos: fetches from origin and checks if behind\nFor regular skills: compares installed version with remote HEAD\n\nIf no names or groups are specified, all items are checked.\nIf a positional name matches a group directory, it is automatically expanded.",
+		helpGroup{title: "Arguments", rows: []helpRow{
+			{"name...", "Skill name(s) or tracked repo name(s) (optional)"},
+		}},
+		helpGroup{title: "Options", rows: []helpRow{
+			{"--all", "Check both skills and agents"},
+			{"-G, --group <name>", "Check all updatable skills in a group (repeatable)"},
+			{"-p, --project", "Check project-level skills (.skillshare/)"},
+			{"-g, --global", "Check global skills (~/.config/skillshare)"},
+			{"--json", "Output results as JSON"},
+			{"--diff", "Show what changed in named skills since install"},
+			{"--exit-code", "Exit 1 when anything is not up to date (for CI)"},
+		}},
+		helpExamples(
+			helpRow{"skillshare check", "Check all items"},
+			helpRow{"skillshare check my-skill", "Check a single skill"},
+			helpRow{"skillshare check a b c", "Check multiple skills"},
+			helpRow{"skillshare check --group frontend", "Check all skills in frontend/"},
+			helpRow{"skillshare check x -G backend", "Mix names and groups"},
+			helpRow{"skillshare check --json", "Output as JSON (for CI)"},
+			helpRow{"skillshare check --exit-code", "Fail a CI job when updates are pending"},
+			helpRow{"skillshare check my-skill --diff", "Show local edits to a skill"},
+			helpRow{"skillshare check -p", "Check project skills"},
+			helpRow{"skillshare check agents", "Check all agents"},
+			helpRow{"skillshare check agents -G demo", "Check agents in demo/"},
+			helpRow{"skillshare check --all", "Check skills + agents"},
+		),
+	)
 }

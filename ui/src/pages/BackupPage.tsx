@@ -1,407 +1,418 @@
-import { useState } from 'react';
-import { Link } from 'react-router-dom';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import {
-  Archive,
-  Clock,
-  RotateCcw,
-  Trash2,
-  RefreshCw,
-  Target,
-  Plus,
-} from 'lucide-react';
+import { useContext, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { Archive, ChevronDown, ChevronRight, Copy, Link2, Plus, Trash2 } from 'lucide-react';
 import { api } from '../api/client';
+import { ApiError } from '../api/http';
 import type { BackupInfo, RestoreValidateResponse } from '../api/client';
-import { useAppContext } from '../context/AppContext';
-import { queryKeys, staleTimes } from '../lib/queryKeys';
-import { formatSize } from '../lib/format';
-import Card from '../components/Card';
-import HandButton from '../components/HandButton';
-import Badge from '../components/Badge';
+import AgentIcon from '../components/AgentIcon';
+import Button from '../components/Button';
 import ConfirmDialog from '../components/ConfirmDialog';
+import DialogShell from '../components/DialogShell';
 import EmptyState from '../components/EmptyState';
-import { PageSkeleton } from '../components/Skeleton';
+import PageHeader from '../components/PageHeader';
+import { Select } from '../components/Select';
+import Skeleton from '../components/Skeleton';
+import Spinner from '../components/Spinner';
 import { useToast } from '../components/Toast';
+import FileBackups from '../components/backups/FileBackups';
+import HooksBackups from '../components/backups/HooksBackups';
+import MCPBackups from '../components/backups/MCPBackups';
+import RetentionPopover from '../components/backups/RetentionPopover';
+import { backupItem, filterItems, retentionSummary } from '../components/backups/backupView';
+import { TargetAgents } from '../components/targetAgents';
+import { useAppContext } from '../context/AppContext';
+import { formatDateTime, formatRelativeTime, formatSize, useI18n, useT, plural } from '../i18n';
+import type { Locale } from '../i18n/locales';
+import { shortenHome } from '../lib/paths';
+import { queryKeys, staleTimes } from '../lib/queryKeys';
+import { SettingsTabs } from './SettingsPage';
+import { useHooksQuery, useMcpQuery, useOverviewQuery } from '../hooks/useSharedQueries';
+import { invalidate } from '../lib/queryEvents';
+import { segSlide } from '../lib/segSlide';
 
-function timeAgo(dateStr: string): string {
-  const now = Date.now();
-  const then = new Date(dateStr).getTime();
-  const diff = now - then;
-  const mins = Math.floor(diff / 60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  if (days < 30) return `${days}d ago`;
-  return `${Math.floor(days / 30)}mo ago`;
-}
+const CONFLICTS_SHOWN = 6;
+const TABS = ['folders', 'files', 'mcp', 'hooks'] as const;
 
-function formatDate(dateStr: string): string {
-  return new Date(dateStr).toLocaleString(undefined, {
-    year: 'numeric',
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  });
+/** Backups all sit side by side, so any one of them names the folder they share. */
+const backupsDir = (path: string) => path.replace(/[/\\][^/\\]+$/, '');
+
+/** Consecutive rows (newest first) under one heading per day: today and yesterday by name, older days by date. */
+function dayGroups<T extends { backup: BackupInfo }>(rows: T[], locale: Locale) {
+  const groups: { key: string; label: string; sub: string; rows: T[] }[] = [];
+  const today = new Date().setHours(0, 0, 0, 0);
+  const rtf = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' });
+  for (const r of rows) {
+    const d = new Date(r.backup.date);
+    const key = d.toDateString();
+    let g = groups.at(-1);
+    if (g?.key !== key) {
+      const ago = Math.round((today - new Date(d).setHours(0, 0, 0, 0)) / 86_400_000);
+      const date = formatDateTime(d, locale, { dateStyle: 'medium' });
+      const named = rtf.format(-ago, 'day');
+      g = ago <= 1
+        ? { key, label: named.charAt(0).toLocaleUpperCase(locale) + named.slice(1), sub: date, rows: [] }
+        : { key, label: date, sub: formatDateTime(d, locale, { weekday: 'long' }), rows: [] };
+      groups.push(g);
+    }
+    g.rows.push(r);
+  }
+  return groups;
 }
 
 export default function BackupPage() {
+  const t = useT();
   const { isProjectMode } = useAppContext();
-  const { toast } = useToast();
-  const queryClient = useQueryClient();
-  const { data, isPending, error } = useQuery({
-    queryKey: queryKeys.backups,
-    queryFn: () => api.listBackups(),
-    staleTime: staleTimes.backups,
-  });
+  const [params] = useSearchParams();
+  const tab = TABS.find((k) => k === params.get('tab')) ?? 'folders';
 
-  if (isProjectMode) {
-    return (
-      <div className="animate-sketch-in">
-        <Card decoration="tape" className="text-center py-12">
-          <Archive size={40} strokeWidth={2} className="text-pencil-light mx-auto mb-4" />
-          <h2
-            className="text-2xl font-bold text-pencil mb-2"
-            style={{ fontFamily: 'var(--font-heading)' }}
-          >
-            Backup & Restore is not available in project mode
-          </h2>
-          <p className="text-pencil-light mb-4">
-            Project skills are managed through your project's own version control.
-          </p>
-          <Link
-            to="/"
-            className="text-blue hover:underline"
-            style={{ fontFamily: 'var(--font-hand)' }}
-          >
-            Back to Dashboard
-          </Link>
-        </Card>
-      </div>
-    );
-  }
-
-  const [creating, setCreating] = useState(false);
-  const [cleanupOpen, setCleanupOpen] = useState(false);
-  const [cleaningUp, setCleaningUp] = useState(false);
-  const [restoreTarget, setRestoreTarget] = useState<{ timestamp: string; target: string } | null>(null);
-  const [restoring, setRestoring] = useState(false);
-  const [validation, setValidation] = useState<{
-    loading: boolean;
-    result: RestoreValidateResponse | null;
-  }>({ loading: false, result: null });
-
-  const backups = data?.backups ?? [];
-
-  const handleCreate = async () => {
-    setCreating(true);
-    try {
-      const res = await api.createBackup();
-      if (res.backedUpTargets?.length) {
-        toast(`Backed up ${res.backedUpTargets.length} target(s)`, 'success');
-      } else {
-        toast('Nothing to back up', 'info');
-      }
-      queryClient.invalidateQueries({ queryKey: queryKeys.backups });
-    } catch (e: any) {
-      toast(e.message, 'error');
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  const handleCleanup = async () => {
-    setCleaningUp(true);
-    try {
-      const res = await api.cleanupBackups();
-      toast(`Cleaned up ${res.removed} old backup(s)`, 'success');
-      queryClient.invalidateQueries({ queryKey: queryKeys.backups });
-    } catch (e: any) {
-      toast(e.message, 'error');
-    } finally {
-      setCleaningUp(false);
-      setCleanupOpen(false);
-    }
-  };
-
-  const openRestoreDialog = async (timestamp: string, target: string) => {
-    setRestoreTarget({ timestamp, target });
-    setValidation({ loading: true, result: null });
-    try {
-      const result = await api.validateRestore({ timestamp, target });
-      setValidation({ loading: false, result });
-    } catch {
-      setValidation({ loading: false, result: null });
-    }
-  };
-
-  const closeRestoreDialog = () => {
-    setRestoreTarget(null);
-    setValidation({ loading: false, result: null });
-  };
-
-  const handleRestore = async () => {
-    if (!restoreTarget) return;
-    setRestoring(true);
-    const needsForce = (validation.result?.conflicts?.length ?? 0) > 0;
-    try {
-      await api.restore({ ...restoreTarget, force: needsForce });
-      toast(`Restored ${restoreTarget.target} from backup`, 'success');
-      queryClient.invalidateQueries({ queryKey: queryKeys.backups });
-      queryClient.invalidateQueries({ queryKey: queryKeys.targets.all });
-    } catch (e: any) {
-      toast(e.message, 'error');
-    } finally {
-      setRestoring(false);
-      closeRestoreDialog();
-    }
-  };
-
-  if (isPending) return <PageSkeleton />;
-
-  if (error) {
-    return (
-      <Card>
-        <p className="text-danger">{error.message}</p>
-      </Card>
-    );
-  }
+  const overview = useOverviewQuery();
+  // Each tab reads its own list; the counts in the tab bar share those queries.
+  const folders = useQuery({ queryKey: queryKeys.backups, queryFn: () => api.listBackups(), staleTime: staleTimes.backups });
+  const files = useQuery({ queryKey: queryKeys.fileBackups.all, queryFn: () => api.listFileBackups() });
+  const mcp = useMcpQuery();
+  const hooks = useHooksQuery();
+  const counts = { folders: folders.data?.backups.length, files: files.data?.files.length, mcp: mcp.data?.backups.length, hooks: hooks.data?.backups.length };
+  const create = useCreateBackup();
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
-      <div>
-        <h2
-          className="text-3xl font-bold text-pencil"
-          style={{ fontFamily: 'var(--font-heading)' }}
-        >
-          Backup & Restore
-        </h2>
-        <p
-          className="text-pencil-light mt-1"
-          style={{ fontFamily: 'var(--font-hand)' }}
-        >
-          Create snapshots of your targets and restore them when needed
-        </p>
+    <div className="ss-wrap animate-page-in">
+      <PageHeader
+        className="!mb-0"
+        title={t('layout.nav.settings')}
+        subtitle={`${t(isProjectMode ? 'app.project' : 'app.global')}${overview.data?.configDir ? ` · ${shortenHome(overview.data.configDir)}` : ''}`}
+      />
+      <SettingsTabs current="backup" />
+
+      <div className="flex items-center gap-4">
+        <nav ref={segSlide} className="ss-seg" aria-label={t('backup.tabs')}>
+          {TABS.map((k) => (
+            <Link key={k} to={k === 'folders' ? '?' : `?tab=${k}`} replace className={tab === k ? 'on' : ''} aria-current={tab === k ? 'page' : undefined}>
+              {t(`backup.tab.${k}`)}
+              {counts[k] !== undefined && <span className="ss-cnt">{counts[k]}</span>}
+            </Link>
+          ))}
+        </nav>
+        <span className="flex-1" />
+        {tab === 'folders' && (
+          <Button variant="primary" onClick={() => create.mutate()} loading={create.isPending}><Plus size={15} />{t('backup.actions.backUpNow')}</Button>
+        )}
       </div>
 
-      {/* Action Card */}
-      <Card variant="postit">
-        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-          <div>
-            <p
-              className="text-lg font-medium text-pencil"
-              style={{ fontFamily: 'var(--font-hand)' }}
-            >
-              {backups.length === 0
-                ? 'No backups yet'
-                : `${backups.length} backup${backups.length !== 1 ? 's' : ''} on file`}
-            </p>
-            {data && data.totalSizeBytes > 0 && (
-              <p className="text-sm text-pencil-light">
-                Total size: {formatSize(data.totalSizeBytes)}
-              </p>
-            )}
-          </div>
-          <div className="flex gap-3">
-            <HandButton
-              variant="primary"
-              size="lg"
-              onClick={handleCreate}
-              disabled={creating}
-            >
-              {creating ? (
-                <><RefreshCw size={18} strokeWidth={2.5} className="animate-spin" /> Creating...</>
-              ) : (
-                <><Plus size={18} strokeWidth={2.5} /> Create Backup</>
-              )}
-            </HandButton>
-            {backups.length > 0 && (
-              <HandButton
-                variant="ghost"
-                size="sm"
-                onClick={() => setCleanupOpen(true)}
-              >
-                <Trash2 size={16} strokeWidth={2.5} /> Cleanup
-              </HandButton>
-            )}
-          </div>
-        </div>
-      </Card>
-
-      {/* Backup List */}
-      {backups.length === 0 ? (
-        <EmptyState
-          icon={Archive}
-          title="No backups found"
-          description="Create your first backup to protect your target configurations"
-          action={
-            <HandButton variant="primary" onClick={handleCreate} disabled={creating}>
-              <Archive size={16} strokeWidth={2.5} /> Create First Backup
-            </HandButton>
-          }
-        />
-      ) : (
-        <div className="space-y-4">
-          {backups.map((backup, i) => (
-            <BackupCard
-              key={backup.timestamp}
-              backup={backup}
-              isNewest={i === 0}
-              index={i}
-              onRestore={(target) =>
-                openRestoreDialog(backup.timestamp, target)
-              }
-            />
-          ))}
-        </div>
-      )}
-
-      {/* Cleanup Dialog */}
-      <ConfirmDialog
-        open={cleanupOpen}
-        title="Cleanup Old Backups"
-        message={
-          <span>
-            This will remove old backups based on retention policy
-            (max 30 days, max 10 backups, max 500 MB).
-          </span>
-        }
-        confirmText="Cleanup"
-        variant="danger"
-        loading={cleaningUp}
-        onConfirm={handleCleanup}
-        onCancel={() => setCleanupOpen(false)}
-      />
-
-      {/* Restore Dialog */}
-      <ConfirmDialog
-        open={restoreTarget !== null}
-        title="Restore Backup"
-        wide
-        message={
-          restoreTarget ? (
-            <div className="text-left space-y-3">
-              <div className="space-y-1 text-sm">
-                <div><strong>Target:</strong> {restoreTarget.target}</div>
-                <div><strong>From:</strong> <code className="text-xs bg-paper-dark/50 px-1 rounded">{restoreTarget.timestamp}</code></div>
-                {validation.result && validation.result.backupSizeBytes > 0 && (
-                  <div><strong>Backup size:</strong> {formatSize(validation.result.backupSizeBytes)}</div>
-                )}
-              </div>
-
-              {validation.loading && (
-                <p className="text-pencil-light italic text-sm">Checking target state...</p>
-              )}
-
-              {validation.result?.currentIsSymlink && (
-                <p className="text-blue text-sm">
-                  Current target is a symlink — it will be safely replaced.
-                </p>
-              )}
-
-              {(validation.result?.conflicts?.length ?? 0) > 0 && (
-                <div className="bg-warning/10 border border-warning/30 rounded p-2 text-sm">
-                  <p className="font-medium text-warning mb-1">
-                    Target has {validation.result!.conflicts.length} existing item(s) that will be overwritten:
-                  </p>
-                  <ul className="list-disc list-inside text-pencil-light max-h-24 overflow-y-auto">
-                    {validation.result!.conflicts.slice(0, 10).map((f) => (
-                      <li key={f}>{f}</li>
-                    ))}
-                    {validation.result!.conflicts.length > 10 && (
-                      <li>...and {validation.result!.conflicts.length - 10} more</li>
-                    )}
-                  </ul>
-                </div>
-              )}
-
-              {validation.result && !validation.result.currentIsSymlink && validation.result.conflicts.length === 0 && (
-                <p className="text-green text-sm">
-                  Target is empty or does not exist — safe to restore.
-                </p>
-              )}
-            </div>
-          ) : <span />
-        }
-        confirmText={
-          (validation.result?.conflicts?.length ?? 0) > 0
-            ? 'Restore (overwrite)'
-            : 'Restore'
-        }
-        variant="danger"
-        loading={restoring || validation.loading}
-        onConfirm={handleRestore}
-        onCancel={closeRestoreDialog}
-      />
+      {tab === 'files' ? <FileBackups /> : tab === 'mcp' ? <MCPBackups /> : tab === 'hooks' ? <HooksBackups /> : <FolderBackups creating={create.isPending} />}
     </div>
   );
 }
 
-function BackupCard({
-  backup,
-  isNewest,
-  index,
-  onRestore,
-}: {
-  backup: BackupInfo;
-  isNewest: boolean;
-  index: number;
-  onRestore: (target: string) => void;
-}) {
+function useCreateBackup() {
+  const t = useT();
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.createBackup(),
+    onSuccess: (res) => {
+      toast(res.backedUpTargets?.length ? t('backup.toast.backedUp', { count: res.backedUpTargets.length }) : t('backup.toast.nothingToBackUp'), res.backedUpTargets?.length ? 'success' : 'info');
+      void invalidate(queryClient, 'backupsChanged');
+    },
+    onError: (e: Error) => toast(e.message, 'error'),
+  });
+}
+
+/** Snapshots of whole target folders, taken before each sync. */
+function FolderBackups({ creating }: { creating: boolean }) {
+  const t = useT();
+  const { isProjectMode } = useAppContext();
+  const { locale } = useI18n();
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
+
+  const { data, isPending, error } = useQuery({ queryKey: queryKeys.backups, queryFn: () => api.listBackups(), staleTime: staleTimes.backups });
+  const [filter, setFilter] = useState('');
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [deleteAllOpen, setDeleteAllOpen] = useState(false);
+  const [deleting, setDeleting] = useState<BackupInfo | null>(null);
+  const [open, setOpen] = useState<string | null>(null);
+  const [restore, setRestore] = useState<{ backup: BackupInfo; target: string } | null>(null);
+  const agentOf = useContext(TargetAgents);
+
+  const backups = data?.backups ?? [];
+  const refresh = () => invalidate(queryClient, 'backupsChanged');
+  const date = (b: BackupInfo) => formatDateTime(b.date, locale, { dateStyle: 'medium', timeStyle: 'short' });
+
+  const cleanup = useMutation({
+    mutationFn: () => api.cleanupBackups(),
+    onSuccess: (res) => { toast(t('backup.toast.cleanedUp', { count: res.removed }), 'success'); refresh(); setCleanupOpen(false); },
+    onError: (e: Error) => { toast(e instanceof ApiError && e.status === 409 ? t('backup.cleanup.busy') : e.message, 'error'); setCleanupOpen(false); },
+  });
+  const removeAll = useMutation({
+    mutationFn: () => api.deleteAllBackups(),
+    onSuccess: (res) => { toast(t('backup.toast.deletedAll', { count: res.removed }), 'success'); refresh(); setDeleteAllOpen(false); },
+    onError: (e: Error) => { toast(e.message, 'error'); refresh(); setDeleteAllOpen(false); },
+  });
+  const limits = useMutation({
+    mutationFn: (l: { maxCount: number; maxSizeMB: number }) => api.patchConfig({ backupMaxCount: l.maxCount, backupMaxSizeMB: l.maxSizeMB }),
+    onSuccess: () => { toast(t('settings.toast.saved'), 'success'); void invalidate(queryClient, 'backupLimitsSaved'); },
+    onError: (e: Error) => toast(e.message, 'error'),
+  });
+  const remove = useMutation({
+    mutationFn: (b: BackupInfo) => api.deleteBackup(b.timestamp),
+    onSuccess: () => { toast(t('backup.toast.deleted'), 'success'); refresh(); setDeleting(null); },
+    onError: (e: Error) => { toast(e.message, 'error'); setDeleting(null); },
+  });
+
+  const items = backups.flatMap((b) => b.targets.map(backupItem));
+  const targets = [...new Set(items.map((i) => i.target))].sort();
+  const bothKinds = items.some((i) => i.kind === 'agents') && items.some((i) => i.kind === 'skills');
+  const rows = backups.map((b) => ({ backup: b, items: filterItems(b.targets.map(backupItem), filter) })).filter((r) => r.items.length > 0);
+
+  const copyPath = (b: BackupInfo) => { void navigator.clipboard?.writeText(b.path); toast(t('backup.toast.pathCopied'), 'success'); };
+
   return (
-    <Card
-      decoration={isNewest ? 'tape' : 'none'}
-      style={{
-        transform: `rotate(${index % 2 === 0 ? '-0.2' : '0.2'}deg)`,
-      }}
-    >
-      <div className="space-y-3">
-        {/* Timestamp row */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2 text-pencil">
-            <Clock size={16} strokeWidth={2.5} />
-            <span
-              className="font-medium"
-              style={{ fontFamily: 'var(--font-hand)' }}
-            >
-              {formatDate(backup.date)}
-            </span>
-            <span className="text-sm text-pencil-light">
-              {timeAgo(backup.date)}
+    <>
+      {creating && (
+        <div className="ss-note" role="status">
+          <span className="flex flex-1 flex-col gap-2">
+            <span>{t('backup.creating')}</span>
+            <span className="ss-bar indet"><span /></span>
+          </span>
+        </div>
+      )}
+
+      {isPending ? (
+        <div className="ss-list" role="status">
+          <div className="ss-lh gap-2"><Spinner size="sm" />{t('backup.loading')}</div>
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="ss-r">
+              <Skeleton className="h-4 w-[180px]" />
+              <Skeleton className="h-4 flex-1" />
+            </div>
+          ))}
+        </div>
+      ) : error ? (
+        <div className="ss-note bad"><span className="flex-1">{error.message}</span></div>
+      ) : backups.length === 0 ? (
+        <EmptyState icon={Archive} title={t('backup.empty.title')} description={t('backup.empty.description')} action={
+          <button type="button" className="ss-btn sm ghost" onClick={() => setCleanupOpen(true)}><Trash2 size={14} />{t('backup.actions.cleanup')}</button>
+        } />
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            {(targets.length > 1 || bothKinds) && (
+              <Select
+                className="self-start"
+                prefix={t('backup.filter.label')}
+                chip={{ clearValue: '', clearLabel: t('backup.filter.clear') }}
+                value={filter}
+                onChange={setFilter}
+                options={[
+                  { value: '', label: t('backup.filter.all') },
+                  ...(targets.length > 1 ? targets.map((name) => ({ value: name, label: name, icon: <AgentIcon target={name} size={14} /> })) : []),
+                  ...(bothKinds ? [{ value: 'agents', label: t('backup.filter.agents') }] : []),
+                ]}
+              />
+            )}
+            <span className="flex-1" />
+            {data?.retention && <RetentionPopover retention={data.retention} editable={!isProjectMode} saving={limits.isPending} onSave={(l) => limits.mutateAsync(l)} />}
+            <button type="button" className="ss-btn sm ghost" onClick={() => setCleanupOpen(true)}><Trash2 size={14} />{t('backup.actions.cleanup')}</button>
+            <button type="button" className="ss-btn sm ghost !text-bad" onClick={() => setDeleteAllOpen(true)}><Trash2 size={14} />{t('backup.actions.deleteAll')}</button>
+          </div>
+          <div className="ss-list">
+            {rows.length === 0 && <div className="ss-r text-[13px] text-ink-3">{t('backup.filter.empty')}</div>}
+            {dayGroups(rows, locale).map((g, gi) => (
+              <div key={g.key}>
+                <div className="ss-lh !h-auto gap-2 py-2.5" style={gi ? { borderTop: 'var(--sep)' } : undefined}>
+                  <span className="font-semibold text-ink">{g.label}</span>
+                  <span>{g.sub}</span>
+                </div>
+                {g.rows.map(({ backup: b, items: shown }, ri) => {
+                  const expanded = open === b.timestamp;
+                  const entries = new Map((b.entries ?? []).map((e) => [e.name, e]));
+                  const icons = [...new Map(shown.map((it) => [agentOf[it.target] ?? it.target, it.target])).values()];
+                  return (
+                    <div key={b.timestamp} style={ri ? { borderTop: 'var(--sep)' } : undefined}>
+                      <button type="button" className="ss-r link w-full text-left" aria-expanded={expanded} onClick={() => setOpen(expanded ? null : b.timestamp)}>
+                        <span className="flex w-[120px] shrink-0 flex-col gap-px">
+                          <span className="font-mono text-[13px] font-semibold">{formatDateTime(b.date, locale, { timeStyle: 'short' })}</span>
+                          <span className="text-xs text-ink-3">{formatRelativeTime(b.date, locale)}</span>
+                        </span>
+                        <span className="ss-stack shrink-0">
+                          {icons.map((target) => <span key={target} className="ss-at"><AgentIcon target={target} size={14} /></span>)}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-[13px] text-ink-2">{shown.map((it) => (it.kind === 'agents' ? `${it.target} agents` : it.target)).join(', ')}</span>
+                        <span className="w-[80px] shrink-0 text-right font-mono text-[13px] text-ink-2">{b.sizeBytes > 0 ? formatSize(b.sizeBytes, locale) : '—'}</span>
+                        {expanded ? <ChevronDown size={15} className="shrink-0 text-ink-3" /> : <ChevronRight size={15} className="shrink-0 text-ink-3" />}
+                      </button>
+                      {expanded && (
+                        <div className="ss-r fold !flex-col !items-stretch !gap-0 !py-2 !pl-[148px]">
+                          {shown.map((it) => {
+                            const e = entries.get(it.name);
+                            return (
+                              <div key={it.name} className="flex items-center gap-2.5 py-1.5">
+                                <span className="ss-at"><AgentIcon target={it.target} size={14} /></span>
+                                <span className="font-mono text-[13px]">{it.target}</span>
+                                <span className="ss-tag">{it.kind}</span>
+                                {e && <span className="text-xs text-ink-3">{t(plural('backup.item.files', e.files), { count: e.files, size: formatSize(e.sizeBytes, locale) })}</span>}
+                                <span className="flex-1" />
+                                <Button variant="secondary" size="sm" onClick={() => setRestore({ backup: b, target: it.name })}>{t('backup.actions.restore')}</Button>
+                              </div>
+                            );
+                          })}
+                          <div className="mt-1 flex items-center gap-1 pt-2" style={{ borderTop: 'var(--sep)' }}>
+                            <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink-3">{shortenHome(b.path)}</span>
+                            <button type="button" className="ss-btn sm ghost" onClick={() => copyPath(b)}><Copy size={14} />{t('common.copyPath')}</button>
+                            <button type="button" className="ss-btn sm ghost !text-bad" onClick={() => setDeleting(b)}><Trash2 size={14} />{t('backup.actions.delete')}</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+          <div className="flex items-center gap-3 text-[13px] text-ink-3">
+            <span>
+              {t(plural('backup.footer.count', backups.length), { count: backups.length })}
+              {data && data.totalSizeBytes > 0 ? ` · ${formatSize(data.totalSizeBytes, locale)}` : ''}
+              {` · ${shortenHome(backupsDir(backups[0].path))}`}
             </span>
           </div>
-          {backup.sizeBytes > 0 && (
-            <span className="text-xs text-pencil-light">
-              {formatSize(backup.sizeBytes)}
-            </span>
-          )}
-        </div>
+        </>
+      )}
 
-        {/* Targets */}
-        <div className="flex items-center gap-2 flex-wrap">
-          <Target size={14} strokeWidth={2.5} className="text-pencil-light" />
-          {backup.targets.map((t) => (
-            <Badge key={t} variant="info">{t}</Badge>
-          ))}
-        </div>
+      <div className="ss-note">
+        <Trash2 size={15} />
+        <span className="flex-1">{t('backup.trashNote')}</span>
+        <Link to="/skills?tab=trash" className="font-semibold text-ink-2 hover:text-ink">{t('backup.trashNote.skills')}</Link>
+        <Link to="/agents?tab=trash" className="font-semibold text-ink-2 hover:text-ink">{t('backup.trashNote.agents')}</Link>
+      </div>
 
-        {/* Actions */}
-        <div className="border-t border-dashed border-pencil-light/40 pt-3 flex gap-2">
-          {backup.targets.map((t) => (
-            <HandButton
-              key={t}
-              variant="secondary"
-              size="sm"
-              onClick={() => onRestore(t)}
-            >
-              <RotateCcw size={14} strokeWidth={2.5} /> Restore {t}
-            </HandButton>
-          ))}
+      {restore && (
+        <RestoreDialog
+          backup={restore.backup}
+          target={restore.target}
+          onClose={() => setRestore(null)}
+          onDone={() => {
+            setRestore(null);
+            void invalidate(queryClient, 'backupRestored');
+          }}
+        />
+      )}
+
+      <ConfirmDialog
+        open={cleanupOpen}
+        title={t('backup.cleanup.title')}
+        message={t('backup.cleanup.message', { policy: data?.retention ? retentionSummary(t, data.retention, locale) : '' })}
+        confirmText={t('backup.cleanup.confirmText')}
+        variant="danger"
+        loading={cleanup.isPending}
+        onConfirm={() => cleanup.mutate()}
+        onCancel={() => setCleanupOpen(false)}
+      />
+      <ConfirmDialog
+        open={deleteAllOpen}
+        title={t('backup.deleteAll.title', { count: String(backups.length) })}
+        message={t('backup.deleteAll.message', { size: formatSize(data?.totalSizeBytes ?? 0, locale) })}
+        confirmText={t('backup.deleteAll.confirmText')}
+        variant="danger"
+        loading={removeAll.isPending}
+        onConfirm={() => removeAll.mutate()}
+        onCancel={() => setDeleteAllOpen(false)}
+      />
+      <ConfirmDialog
+        open={deleting !== null}
+        title={t('backup.delete.title')}
+        message={deleting ? t('backup.delete.message', { date: date(deleting) }) : ''}
+        confirmText={t('backup.delete.confirmText')}
+        variant="danger"
+        loading={remove.isPending}
+        onConfirm={() => deleting && remove.mutate(deleting)}
+        onCancel={() => setDeleting(null)}
+      />
+    </>
+  );
+}
+
+function RestoreDialog({ backup, target, onClose, onDone }: {
+  backup: BackupInfo;
+  target: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const t = useT();
+  const { locale } = useI18n();
+  const { toast } = useToast();
+  const [more, setMore] = useState(false);
+
+  const check = useQuery<RestoreValidateResponse>({
+    queryKey: queryKeys.restoreValidate(backup.timestamp, target),
+    queryFn: () => api.validateRestore({ timestamp: backup.timestamp, target }),
+    staleTime: 0,
+  });
+  const conflicts = check.data?.conflicts ?? [];
+  const run = useMutation({
+    mutationFn: () => api.restore({ timestamp: backup.timestamp, target, force: conflicts.length > 0 }),
+    onSuccess: () => { toast(t('backup.toast.restored', { target }), 'success'); onDone(); },
+    onError: (e: Error) => toast(e.message, 'error'),
+  });
+
+  const taken = formatDateTime(backup.date, locale, { dateStyle: 'medium', timeStyle: 'short' });
+
+  return (
+    <DialogShell open onClose={onClose} padding="none" preventClose={run.isPending} ariaLabel={t('backup.restore.title')}>
+      <div className="dh">
+        <div>
+          <h2 className="ss-h2">{t('backup.restore.title')}</h2>
+          <p className="mt-1 text-[13px] text-ink-3">{t('backup.restore.taken', { date: taken })}</p>
         </div>
       </div>
-    </Card>
+
+      <div className="db">
+        <div className="ss-r !min-h-0 !px-0">
+          <ItemLabel name={target} />
+        </div>
+        {check.isPending ? (
+          <p className="text-[13px] text-ink-3">{t('backup.restore.checkingTarget')}</p>
+        ) : check.error ? (
+          <div className="ss-note bad"><span className="flex-1">{check.error.message}</span></div>
+        ) : conflicts.length > 0 ? (
+          <div className="ss-note warn flex-col !items-stretch">
+            <span>{t(plural('backup.restore.overwriteWarning', conflicts.length), { count: conflicts.length })}</span>
+            <ul className="mt-2 flex flex-col gap-1 font-mono text-[12px]">
+              {(more ? conflicts : conflicts.slice(0, CONFLICTS_SHOWN)).map((f) => <li key={f}>{f}</li>)}
+            </ul>
+            {!more && conflicts.length > CONFLICTS_SHOWN && (
+              <button type="button" className="ss-btn sm ghost mt-1 self-start !px-0" onClick={() => setMore(true)}>
+                {t('backup.restore.moreConflicts', { count: conflicts.length - CONFLICTS_SHOWN })}
+              </button>
+            )}
+          </div>
+        ) : (
+          <p className="text-[13px] text-ink-2">{t('backup.restore.emptyOrMissing')}</p>
+        )}
+        {check.data?.currentIsSymlink && (
+          <div className="ss-note inf"><Link2 size={15} /><span className="flex-1">{t('backup.restore.symlinkNote')}</span></div>
+        )}
+      </div>
+      <div className="df">
+        <Button variant="ghost" onClick={onClose} disabled={run.isPending}>{t('common.cancel')}</Button>
+        <Button variant="danger" onClick={() => run.mutate()} loading={run.isPending} disabled={check.isPending || !!check.error}>
+          {conflicts.length > 0 ? t('backup.actions.restoreOverwrite') : t('backup.actions.restore')}
+        </Button>
+      </div>
+    </DialogShell>
+  );
+}
+
+/** A snapshot folder as target and kind: `claude-agents` reads as claude with an agents tag. */
+function ItemLabel({ name }: { name: string }) {
+  const it = backupItem(name);
+  return (
+    <>
+      <span className="ss-at"><AgentIcon target={it.target} size={16} /></span>
+      <span className="nm">{it.target}</span>
+      <span className="ss-tag">{it.kind}</span>
+      <span className="flex-1" />
+    </>
   );
 }

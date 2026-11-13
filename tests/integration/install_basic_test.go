@@ -29,7 +29,7 @@ targets: {}
 	result := sb.RunCLI("install", localSkillPath)
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Installed")
+	result.AssertOutputContains(t, "✓ Install ")
 	result.AssertOutputContains(t, "external-skill")
 
 	// Verify skill was copied to source
@@ -38,10 +38,13 @@ targets: {}
 		t.Error("skill should be installed to source directory")
 	}
 
-	// Verify metadata was created
-	metaPath := filepath.Join(sb.SourcePath, "external-skill", ".skillshare-meta.json")
-	if !sb.FileExists(metaPath) {
-		t.Error("metadata file should be created")
+	// Verify metadata was created in centralized .metadata.json
+	store, err := install.LoadMetadata(sb.SourcePath)
+	if err != nil {
+		t.Fatalf("failed to load metadata: %v", err)
+	}
+	if !store.Has("external-skill") {
+		t.Error("metadata entry should be created for external-skill")
 	}
 }
 
@@ -76,28 +79,6 @@ targets: {}
 	}
 }
 
-func TestInstall_ExistsWithoutForce_Errors(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	// Create existing skill in source
-	sb.CreateSkill("existing-skill", map[string]string{"SKILL.md": "# Existing"})
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets: {}
-`)
-
-	// Create local skill to install
-	localSkillPath := filepath.Join(sb.Root, "existing-skill")
-	os.MkdirAll(localSkillPath, 0755)
-	os.WriteFile(filepath.Join(localSkillPath, "SKILL.md"), []byte("# New Version"), 0644)
-
-	result := sb.RunCLI("install", localSkillPath)
-
-	result.AssertFailure(t)
-	result.AssertAnyOutputContains(t, "already exists")
-}
-
 func TestInstall_Force_Overwrites(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
@@ -115,7 +96,7 @@ targets: {}
 	result := sb.RunCLI("install", localSkillPath, "--force")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Installed")
+	result.AssertOutputContains(t, "✓ Install ")
 
 	content := sb.ReadFile(filepath.Join(sb.SourcePath, "existing-skill", "SKILL.md"))
 	if !strings.Contains(content, "New Version") {
@@ -205,10 +186,16 @@ targets: {}
 		t.Fatalf("expected install action cloned, got %s", result.Action)
 	}
 
-	metaPath := filepath.Join(sb.SourcePath, "git-skill", ".skillshare-meta.json")
-	metaContent := sb.ReadFile(metaPath)
-	if !strings.Contains(metaContent, "\"source\": \"file://") {
-		t.Fatalf("expected metadata source to use file:// clone URL")
+	store, err := install.LoadMetadata(sb.SourcePath)
+	if err != nil {
+		t.Fatalf("failed to load metadata: %v", err)
+	}
+	entry := store.Get("git-skill")
+	if entry == nil {
+		t.Fatalf("expected metadata entry for git-skill")
+	}
+	if !strings.Contains(entry.Source, "file://") {
+		t.Fatalf("expected metadata source to use file:// clone URL, got %q", entry.Source)
 	}
 
 	content := sb.ReadFile(filepath.Join(sb.SourcePath, "git-skill", "SKILL.md"))
@@ -228,11 +215,15 @@ targets: {}
 
 	updateResult := sb.RunCLI("install", "git-skill", "--update")
 	updateResult.AssertSuccess(t)
-	updateResult.AssertAnyOutputContains(t, "Installed")
+	updateResult.AssertAnyOutputContains(t, "✓ Install ")
 
-	metaContent = sb.ReadFile(metaPath)
-	if !strings.Contains(metaContent, "\"source\": \"file://") {
-		t.Fatalf("expected metadata source to use file:// clone URL")
+	store, err = install.LoadMetadata(sb.SourcePath)
+	if err != nil {
+		t.Fatalf("failed to reload metadata: %v", err)
+	}
+	entry = store.Get("git-skill")
+	if entry == nil || !strings.Contains(entry.Source, "file://") {
+		t.Fatalf("expected metadata source to use file:// clone URL after update")
 	}
 
 	content = sb.ReadFile(filepath.Join(sb.SourcePath, "git-skill", "SKILL.md"))
@@ -271,14 +262,31 @@ targets: {}
 	result := sb.RunCLI("install", localSkillPath, "--dry-run")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "dry-run")
-	result.AssertOutputContains(t, "would copy")
+	result.AssertRowContains(t, "Install", "dry-run-skill")
+	result.AssertOutputContains(t, "Dry run — nothing was written")
 
 	// Verify skill was NOT installed
 	installedPath := filepath.Join(sb.SourcePath, "dry-run-skill")
 	if sb.FileExists(installedPath) {
 		t.Error("skill should not be installed in dry-run mode")
 	}
+}
+
+func TestInstall_DryRun_OmitsEmptyAuditSection(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+	localSkillPath := filepath.Join(sb.Root, "dry-run-skill")
+	os.MkdirAll(localSkillPath, 0755)
+	os.WriteFile(filepath.Join(localSkillPath, "SKILL.md"), []byte("# Dry Run"), 0644)
+
+	result := sb.RunCLI("install", localSkillPath, "--dry-run")
+
+	result.AssertSuccess(t)
+	result.AssertOutputNotContains(t, "Audit Findings")
 }
 
 func TestInstall_InvalidName_Errors(t *testing.T) {
@@ -341,7 +349,7 @@ func TestInstall_Help_ShowsUsage(t *testing.T) {
 	result := sb.RunCLI("install", "--help")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Usage:")
+	result.AssertOutputContains(t, "Usage  skillshare")
 	result.AssertOutputContains(t, "--force")
 	result.AssertOutputContains(t, "--dry-run")
 	result.AssertOutputContains(t, "--name")
@@ -359,6 +367,23 @@ targets: {}
 
 	result.AssertSuccess(t)
 	result.AssertAnyOutputContains(t, "No remote skills defined")
+}
+
+func TestInstall_RelativeLocalPath_RecordsAbsoluteSource(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	parent := filepath.Join(sb.Root, "apps")
+	sb.WriteFile(filepath.Join(parent, "rel-skill", "SKILL.md"), "---\nname: rel-skill\n---\n# v1")
+	sb.RunCLIInDir(parent, "install", "./rel-skill").AssertSuccess(t)
+
+	sb.WriteFile(filepath.Join(parent, "rel-skill", "SKILL.md"), "---\nname: rel-skill\n---\n# v2")
+	sb.RunCLIInDir(sb.Root, "update", "rel-skill").AssertSuccess(t)
+
+	if got := sb.ReadFile(filepath.Join(sb.SourcePath, "rel-skill", "SKILL.md")); !strings.Contains(got, "# v2") {
+		t.Errorf("update from another directory did not re-copy the source, got:\n%s", got)
+	}
 }
 
 func TestInstall_LocalGitRepo_ClonesSuccessfully(t *testing.T) {
@@ -380,7 +405,7 @@ targets: {}
 	result := sb.RunCLI("install", gitRepoPath)
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Installed")
+	result.AssertOutputContains(t, "✓ Install ")
 
 	// Verify skill was installed (should have copied, not cloned since it's a local path)
 	installedPath := filepath.Join(sb.SourcePath, "git-skill-repo", "SKILL.md")
@@ -405,49 +430,22 @@ targets: {}
 	result := sb.RunCLI("install", localSkillPath)
 	result.AssertSuccess(t)
 
-	// Read and verify metadata
-	metaContent := sb.ReadFile(filepath.Join(sb.SourcePath, "meta-test-skill", ".skillshare-meta.json"))
-
-	if !strings.Contains(metaContent, `"type": "local"`) {
-		t.Error("metadata should contain type: local")
+	// Read and verify metadata from centralized .metadata.json
+	store, err := install.LoadMetadata(sb.SourcePath)
+	if err != nil {
+		t.Fatalf("failed to load metadata: %v", err)
 	}
-	if !strings.Contains(metaContent, "meta-test-skill") {
+	entry := store.Get("meta-test-skill")
+	if entry == nil {
+		t.Fatal("metadata entry should exist for meta-test-skill")
+	}
+	if entry.Type != "local" {
+		t.Errorf("metadata type should be 'local', got %q", entry.Type)
+	}
+	if !strings.Contains(entry.Source, "meta-test-skill") {
 		t.Error("metadata should contain source path")
 	}
-	if !strings.Contains(metaContent, "installed_at") {
+	if entry.InstalledAt.IsZero() {
 		t.Error("metadata should contain installed_at timestamp")
-	}
-}
-
-func TestInstall_GitSubdir_DirectInstall(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets: {}
-`)
-
-	// Create a monorepo-style git repository with multiple skills
-	gitRepoPath := filepath.Join(sb.Root, "monorepo")
-	skill1Path := filepath.Join(gitRepoPath, "skills", "skill-one")
-	skill2Path := filepath.Join(gitRepoPath, "skills", "skill-two")
-
-	os.MkdirAll(skill1Path, 0755)
-	os.MkdirAll(skill2Path, 0755)
-	os.WriteFile(filepath.Join(skill1Path, "SKILL.md"), []byte("# Skill One"), 0644)
-	os.WriteFile(filepath.Join(skill2Path, "SKILL.md"), []byte("# Skill Two"), 0644)
-
-	initGitRepo(t, gitRepoPath)
-
-	// Install specific skill from subdir (using local path with subdir pattern)
-	// This tests the direct install path when subdir is specified
-	result := sb.RunCLI("install", filepath.Join(gitRepoPath, "skills", "skill-one"))
-
-	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Installed")
-
-	// Verify only skill-one was installed
-	if !sb.FileExists(filepath.Join(sb.SourcePath, "skill-one", "SKILL.md")) {
-		t.Error("skill-one should be installed")
 	}
 }

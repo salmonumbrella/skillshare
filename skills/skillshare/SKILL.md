@@ -1,144 +1,227 @@
 ---
 name: skillshare
-version: v0.16.12
 description: |
-  Manages and syncs AI CLI skills across 50+ tools from a single source.
-  Use this skill whenever the user mentions "skillshare", runs skillshare commands,
-  manages skills (install, update, uninstall, sync, audit, check, diff, search),
-  or troubleshoots skill configuration (orphaned symlinks, broken targets, sync
-  issues). Covers both global (~/.config/skillshare/) and project (.skillshare/)
-  modes. Also use when: adding new AI tool targets (Claude, Cursor, Windsurf, etc.),
-  setting target include/exclude filters or copy vs symlink mode, using backup/restore
-  or trash recovery, piping skillshare output to scripts (--json), setting up CI/CD
-  audit pipelines, or building/sharing skill hubs (hub index, hub add).
+  Manage skills, agents, extras, hooks, plugins, and MCP connection settings with the Skillshare CLI.
+  Use when the user asks to configure or run Skillshare, install or sync resources
+  across AI tools, manage shared memory notes, review a session for lessons or dream over saved memories,
+  import MCP settings, manage targets and project folders, audit skills, recover backups,
+  or troubleshoot Skillshare configuration and sync. Covers global and project modes,
+  noninteractive automation, and guidance for the terminal UI.
 argument-hint: "[command] [target] [--json] [--dry-run] [-p|-g]"
+metadata:
+  version: v0.30.6
 ---
 
 # Skillshare CLI
 
-Global: `~/.config/skillshare/skills/` → all AI CLIs. Project: `.skillshare/skills/` → repo-local.
-Auto-detects project mode when `.skillshare/config.yaml` exists. Force with `-p` or `-g`.
+Use Skillshare to maintain a source and distribute resources to configured targets.
+Read only the reference relevant to the requested operation; the routing table is below.
+Check `skillshare <command> --help` if the installed version differs from these examples.
 
-## Recipes
+## Scope and resource selection
 
-### Getting Started
+- Global config: `~/.config/skillshare/config.yaml`. Project config: `.skillshare/config.yaml`
+  or `skillshare/config.yaml`; hidden wins when both exist. Use `-g` or `-p` explicitly
+  when location matters instead of relying on auto-detection.
+- Skills are directories containing `SKILL.md`; agents are single Markdown files.
+  Source paths can be customized. Use the configured sources instead of assuming defaults.
+- Tracked `skills/<known-agent>/<skill-path>/SKILL.md` copies form one logical skill
+  per repository/prefix/suffix. Merge/copy select the exact agent variant (including
+  aliases and account `agent:` identity). Recognition requires the same suffix under
+  two distinct canonical agents. Compatible targets sharing a folder select the
+  union of their agent identities; a universal-only target does not infer an agent.
+  Status counts logical skills and physical variants; lists and sync operations retain
+  physical names. Explicit targets/overrides and physical filters still apply.
+  Whole-directory symlink mode exposes all variants. See [sync.md](references/sync.md).
+- Use native agents targets for agents. Use extras for arbitrary file resources or when
+  flattening/content transformation is required; `extension:` works only on extras targets.
+- Shared memory notes live in the `memory` extra. Use `extras memory` to manage Markdown
+  notes and reading guidance; nested paths such as `wiki/architecture.md` are supported.
+  Read [extras.md](references/extras.md) for scope, version checks, and agent setup.
+  For a session retrospective or Dreaming across saved notes, read
+  [memory-review.md](references/memory-review.md). The host agent performs the review;
+  Skillshare never launches or schedules an agent.
+- MCP uses its own receiving targets and source definitions. Read [mcp.md](references/mcp.md)
+  before editing MCP settings or importing native configurations. Its Agent notes cover
+  what is specific to Claude Code, Codex, OpenCode and Pi: scopes and files, names and
+  credentials they refuse, Pi's built-in MCP and `piOptions`, OMP's native MCP and preserved enable/disable lists, the portable `tools` policy,
+  upgrading Pi settings from 0.22, turning a global server off in one project, `mcp.projects` for many folders from
+  one config, and `mcp serve` for Agents that cannot reach the synced skill folders.
+- Plugins keep their native components together. Read [plugins.md](references/plugins.md)
+  for installation, import, sync selection, updates, and native compatibility limits
+  across Claude, Codex, Cursor, Antigravity, Pi, OMP, and OpenCode, including Pi packages from pi.dev
+  and OMP marketplace plugins and standalone extension selection.
+- Hooks preserve each Agent's native event map or extension/plugin code. Read
+  [hooks.md](references/hooks.md) before import, synchronization or recovery.
+
+## Execution rules
+
+1. **Choose noninteractive inputs.** Supply names and selection flags supported by the
+   specific command. Use `--no-tui` for plain output or `--json` where supported.
+   Do not add `--force` simply to avoid a prompt: it can overwrite conflicts or override audits.
+2. **Keep previews separate from writes.** Use `--dry-run` where supported. After changing
+   skills or agents, sync the intended resource and scope. MCP and hooks mutations save source only
+   unless `--sync` is supplied; `sync --all` also includes extras, MCP and hooks, but excludes plugins.
+3. **Inspect audit blocks.** Review findings before choosing an override. `install --json`
+   permits overwrite and selects all when no skill/agent filter is given, but retains
+   the audit gate; it is not merely an output format. Read [install.md](references/install.md)
+   and [audit.md](references/audit.md) before using it for automation.
+4. **Use the matching recovery mechanism.** Uninstalled skills go to trash; native MCP
+   entries use MCP backups. Do not substitute filesystem deletion for CLI uninstall.
+5. **Keep credentials out of MCP definitions.** Use `{fromEnv: VARIABLE}` references.
+   Managing settings does not require resolving secrets, copying OAuth credentials,
+   starting servers, or probing their tools.
+6. **Respect operation scope.** Local configuration work does not imply permission to
+   commit, push, or publish. Run those commands when included in the user's request.
+
+## Common workflows
+
+### Inspect and diagnose
+
 ```bash
-skillshare init --no-copy --all-targets --git --skill  # Fresh global setup
-skillshare init -p --targets "claude,cursor"            # Fresh project setup
-skillshare init --copy-from claude --all-targets --git  # Import from existing CLI
-skillshare init --discover --select "windsurf"          # Add new AI tool later
+skillshare status --json
+skillshare list --json
+skillshare diff --json
+skillshare doctor --json
+skillshare mcp --json
 ```
-### Installing Skills
+
+`doctor` exits 1 when it finds errors. Audit uses `--format json`; JSON flags and
+TUI availability vary by command. See the relevant reference rather than assuming parity.
+
+For automatic release checks and notices, use `skillshare updates off` / `on`.
+`skillshare updates check` explicitly checks the CLI version even when automatic
+checks are off; see [status.md](references/status.md#updates) for the shared preference
+and environment override. Installed resource-source checks are separate.
+
+### Track an upstream repository or install selected skills
+
+Choose the resource and scope before installing. Use `-g` for user-wide resources
+or `-p` for this project; keep that scope on preview, apply, update, and sync.
+
+| Intent | Command |
+|--------|---------|
+| Keep an upstream skill collection as one Git checkout | `skillshare install owner/repo --track --name team -g` |
+| Install only named skills with their source metadata | `skillshare install owner/repo -s pdf,commit -g` |
+| Install all discovered skills individually | `skillshare install owner/repo --all -g` |
+| Manage a complete native plugin, including hooks/MCP | Use `plugin discover` and `plugin add`; see below |
+
+For the scoped preview → apply → update → sync workflow, read
+[install.md](references/install.md#track-a-collection-without-a-picker). It covers
+following the latest upstream branch, rejected flag combinations, and target filters.
+
+For project setup, use `init -p`, then `install -p` and `sync -p`. Rehydrate configured
+remote dependencies with `install` without a source. For full flag details and agents,
+read [install.md](references/install.md) and [sync.md](references/sync.md).
+
+To use a local skills checkout in place, run `skillshare link <path> --enable`, then
+`sync`; `skillshare unlink <name>` removes only the link. Read
+[TROUBLESHOOTING.md](references/TROUBLESHOOTING.md) for how such links are followed.
+
+### Disable or remove
+
 ```bash
-skillshare install user/repo -s pdf,commit       # Select specific skills
-skillshare install user/repo --all               # Install everything
-skillshare install user/repo --into frontend     # Place in subdirectory
-skillshare install gitlab.com/team/repo          # Any Git host
-skillshare install user/repo --track             # Enable `update` later
-skillshare install user/repo -s pdf -p           # Install to project
-skillshare install                               # Reinstall all tracked remotes from config
-skillshare sync                                  # Always sync after install
-skillshare sync extras                           # Sync non-skill extras (rules, commands)
-skillshare sync --all                            # Sync skills + extras together
+skillshare disable 'draft-*' --dry-run
+skillshare disable 'draft-*'
+skillshare enable 'draft-*'
+skillshare uninstall my-skill
+skillshare sync
+skillshare trash restore my-skill
+skillshare sync
 ```
-### Creating & Discovering Skills
+
+Run the requested operation, not this entire example sequence. Quote glob patterns so
+Skillshare receives them unchanged. Disabling uses ignore rules; uninstall uses trash.
+
+### Move skills into folders
+
 ```bash
-skillshare new my-skill                          # Create a new skill from template
-skillshare search "react testing"                # Search GitHub for skills
-skillshare collect                               # Pull target-local changes back to source
+skillshare move my-skill frontend --dry-run
+skillshare move my-skill other-skill frontend
+skillshare sync
 ```
-### Removing Skills
+
+Use `move` instead of `mv` for installed skills: it keeps their install records, so
+nothing is downloaded again. It does not sync; run `sync` afterwards. Read
+[install.md](references/install.md) for refusals and project mode.
+
+### Project folders from the global config
+
 ```bash
-skillshare uninstall my-skill                    # Remove one (moves to trash)
-skillshare uninstall skill-a skill-b             # Remove multiple
-skillshare uninstall -G frontend                 # Remove entire group
-skillshare sync                                  # Always sync after uninstall
+skillshare project list --json
+skillshare project localize ~/work/existing --dry-run
+skillshare project add ~/work/app --target claude,codex --skills-mode copy --dry-run
+skillshare project add ~/work/app --target claude,codex --skills-mode copy --sync
+skillshare project edit app --skills-include 'frontend-*'
+skillshare project sync app --json
+skillshare project remove app --dry-run --json
 ```
-### Team / Organization
+
+`project` always uses the global config, including inside a repo; it does not accept
+`-p`. New projects are saved in `config.yaml`, or on this machine only with
+`--machine-local` or `projects_storage: machine-local` (`--shared` overrides the setting);
+`localize` and `share` move one between the two. Removing a local copy of a `config.yaml`
+project keeps `config.yaml`'s version unless `--shared` is given. Edit filters replace lists. Removal detaches skills and keeps agent files;
+JSON removal requires `--yes` unless previewing. Read [targets.md](references/targets.md)
+for saved-then-sync failures, retries, and partial removal results.
+
+### MCP settings
+
 ```bash
-# Creator: init project (see Getting Started) → add skills → commit .skillshare/
-skillshare install -p && skillshare sync                  # Member: clone → install → sync
-skillshare install github.com/team/repo --track -p        # Track shared repo
-skillshare push                                           # Cross-machine: push on A
-skillshare pull                                           # Cross-machine: pull on B
+skillshare mcp import --from claude --json
+skillshare mcp add docs --url https://example.com/mcp --target claude --no-tui
+skillshare sync mcp --dry-run --json
+skillshare sync mcp
 ```
-### Skill Hubs
+
+`--target` is singular and repeatable. A preview does not apply changes. For revisions,
+editing, import conflicts, credentials, backups, and human-operated TUI commands, read
+[mcp.md](references/mcp.md).
+
+### Complete plugins
+
+Use `plugin discover` and `plugin add` for a complete native package; `plugin import`
+adopts an existing native installation. Run only the requested operation. Read
+[plugins.md](references/plugins.md) before applying changes; it covers the scoped
+upstream workflow, supported targets, and source-ref rules.
+`plugin check/update` handles upstream changes; `sync plugins` reconciles target
+selection. Plugins are excluded from `sync --all`.
+
+### Skill hubs
+
 ```bash
 skillshare hub add https://example.com/hub.json          # Save a hub source
 skillshare hub add https://example.com/hub.json --label my-hub  # With custom label
+skillshare hub add git@ghe.corp.com:team/skills.git --label ghe  # SSH/private/GHE hub source
 skillshare hub list                                      # List saved hubs
 skillshare hub default my-hub                            # Set default hub
 skillshare hub remove my-hub                             # Remove a hub
 skillshare hub index --source ~/.config/skillshare/skills/ --full --audit  # Build hub index
 ```
-### Controlling Where Skills Go
-```bash
-# SKILL.md frontmatter: targets: [claude]        → only syncs to Claude
-skillshare target claude --add-include "team-*"   # glob filter
-skillshare target claude --add-exclude "_legacy*"  # exclude pattern
-skillshare target codex --mode copy && skillshare sync --force  # copy mode
-```
-See [targets.md](references/targets.md) for details.
-### Updates & Maintenance
-```bash
-skillshare check                              # See what has updates
-skillshare update my-skill && skillshare sync  # Update one
-skillshare update --all && skillshare sync     # Update all
-skillshare update --all --diff                 # Show what changed
-```
-### Scripting & CI/CD
-```bash
-skillshare status --json                       # Full status as JSON
-skillshare check --json                        # Update status as JSON
-skillshare sync --json                         # Sync results as JSON
-skillshare diff --json                         # Diff results as JSON
-skillshare install user/repo --json            # Install result as JSON (implies --force --all)
-skillshare update --all --json                 # Update results as JSON
-skillshare uninstall my-skill --json           # Uninstall result as JSON (implies --force)
-skillshare collect claude --json               # Collect result as JSON (implies --force)
-skillshare target list --json                  # Target list as JSON
-skillshare list --json                         # Skill list as JSON
-skillshare search react --json                 # Search results as JSON
-skillshare audit --format json                 # Audit results as JSON
-```
-### Recovery & Troubleshooting
-```bash
-skillshare trash restore <name> && skillshare sync  # Undo delete
-skillshare sync                                     # Skill missing? Re-sync
-skillshare doctor && skillshare status              # Diagnose issues
-skillshare install user/repo --force                 # Override audit block
-skillshare install user/repo --skip-audit            # Bypass scan entirely
-```
-See [TROUBLESHOOTING.md](references/TROUBLESHOOTING.md) for more.
-
-## Quick Lookup
-| Commands | Project? | `--json`? |
-|----------|:--------:|:---------:|
-| `status`, `diff`, `list`, `doctor` | ✓ (auto) | ✓ (except doctor) |
-| `sync`, `collect` | ✓ (auto) | ✓ |
-| `install`, `uninstall`, `update`, `check`, `search`, `new` | ✓ (`-p`) | ✓ (except new) |
-| `target`, `audit`, `trash`, `log`, `hub` | ✓ (`-p`) | ✓ (target list, audit, log) |
-| `push`, `pull`, `backup`, `restore` | ✗ | ✗ |
-| `tui`, `upgrade` | ✗ | ✗ |
-| `ui` | ✓ (`-p`) | ✗ |
-
-## AI Caller Rules
-1. **Non-interactive** — AI cannot answer prompts. Use `--force`, `--all`, `-s`, `--targets`, `--no-copy`, `--all-targets`, `--yes`.
-2. **Sync after mutations** — `install`, `uninstall`, `update`, `collect`, `target` all need `sync`.
-3. **Audit** — `install` auto-scans; CRITICAL blocks. `--force` to override, `--skip-audit` to bypass. Detects hardcoded secrets (API keys, tokens, private keys).
-4. **Uninstall safely** — moves to trash (7 days). `trash restore <name>` to undo. **NEVER** `rm -rf` symlinks.
-5. **Output** — `--json` for structured data (12 commands support it, see Quick Lookup). `--no-tui` for plain text on TUI commands (`list`, `log`, `audit`, `diff`, `trash list`, `backup list`). `tui off` disables TUI globally. `--dry-run` to preview.
+The active `follow_source_links` setting also applies to `hub index` (including
+`--source`), built-in dashboard search, and Hub draft candidates.
 
 ## References
+
+Read the matching file for command flags, examples, and limitations. Avoid loading all
+references for a single task.
+
 | Topic | File |
 |-------|------|
+| Native agents, selection, ignore rules, and recovery | [native-agents.md](references/native-agents.md) |
+| MCP configuration, imports, TUI, and recovery | [mcp.md](references/mcp.md) |
+| Native hooks, code bindings, scopes and recovery | [hooks.md](references/hooks.md) |
+| Complete plugins, native lifecycle, and sync selection | [plugins.md](references/plugins.md) |
 | Init flags | [init.md](references/init.md) |
-| Sync/collect/push/pull | [sync.md](references/sync.md) |
-| Install/update/uninstall/new | [install.md](references/install.md) |
-| Status/diff/list/search/check | [status.md](references/status.md) |
+| Sync/collect/commit/push/pull | [sync.md](references/sync.md) |
+| Install/update/uninstall/move/new | [install.md](references/install.md) |
+| Status/diff/list/search/check/updates | [status.md](references/status.md) |
 | Security audit | [audit.md](references/audit.md) |
+| Reviewing an untrusted skill before install | [audit-review.md](references/audit-review.md) |
 | Trash | [trash.md](references/trash.md) |
 | Operation log | [log.md](references/log.md) |
 | Targets | [targets.md](references/targets.md) |
+| Extras (rules/commands/prompts) | [extras.md](references/extras.md) |
+| Session retrospectives and Dreaming over saved notes | [memory-review.md](references/memory-review.md) |
 | Backup/restore | [backup.md](references/backup.md) |
 | Troubleshooting | [TROUBLESHOOTING.md](references/TROUBLESHOOTING.md) |

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"skillshare/internal/config"
 )
 
 func tempConfigPath(t *testing.T) string {
@@ -19,6 +21,7 @@ func tempConfigPath(t *testing.T) string {
 
 func TestLogDir_Global(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", "/custom/state")
+	t.Setenv("XDG_CONFIG_HOME", "/home/user/.config")
 
 	got := LogDir("/home/user/.config/skillshare/config.yaml")
 	want := "/custom/state/skillshare/logs"
@@ -32,6 +35,17 @@ func TestLogDir_Project(t *testing.T) {
 	want := "/project/.skillshare/logs"
 	if got != want {
 		t.Errorf("LogDir(project) = %q, want %q", got, want)
+	}
+}
+
+func TestLogDir_VisibleProject(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", "/custom/state")
+	t.Setenv("XDG_CONFIG_HOME", "/home/user/.config")
+
+	got := LogDir("/project/skillshare/config.yaml")
+	want := "/project/skillshare/logs"
+	if got != want {
+		t.Errorf("LogDir(visible project) = %q, want %q", got, want)
 	}
 }
 
@@ -479,6 +493,9 @@ func TestDeleteEntries_SeparateFiles(t *testing.T) {
 }
 
 func TestRewriteEntries_PreservesOriginalOnWriteFailure(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("chmod 0555 has no effect when running as root")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.log")
 
@@ -576,5 +593,57 @@ func TestWriteWithLimit_HysteresisAvoidsTruncation(t *testing.T) {
 	}
 	if len(entries) != 11 {
 		t.Errorf("got %d entries, want 11 (hysteresis should prevent truncation)", len(entries))
+	}
+}
+
+func TestLogDir_SelectedGlobalConfigRoundTrip(t *testing.T) {
+	for _, dir := range []string{"shared/skillshare", "shared/.skillshare", ".config/skillshare"} {
+		t.Run(dir, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+			t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
+			selected := filepath.Join(home, filepath.FromSlash(dir), "config.yaml")
+			t.Setenv("SKILLSHARE_CONFIG", selected)
+			canonical := filepath.Join(config.BaseDir(), "config.yaml")
+			want := filepath.Join(config.StateDir(), "logs")
+			if got := LogDir(selected); got != want {
+				t.Errorf("selected global logs=%q want %q", got, want)
+			}
+			if err := Write(canonical, OpsFile, Entry{Command: "project", Status: "ok"}); err != nil {
+				t.Fatal(err)
+			}
+			entries, err := Read(selected, OpsFile, 0)
+			if err != nil || len(entries) != 1 {
+				t.Errorf("global reader lost canonical write: %v %v", entries, err)
+			}
+			if err := Write(selected, AuditFile, Entry{Command: "audit", Status: "ok"}); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range []string{"logs", ".gitignore"} {
+				if _, err := os.Stat(filepath.Join(filepath.Dir(selected), name)); !os.IsNotExist(err) {
+					t.Fatalf("global config treated as a project: %s exists (%v)", name, err)
+				}
+			}
+			project := filepath.Join(home, "app", "skillshare", "config.yaml")
+			if err := Write(project, OpsFile, Entry{Command: "sync", Status: "ok"}); err != nil {
+				t.Fatal(err)
+			}
+			if got := LogDir(project); got != filepath.Join(filepath.Dir(project), "logs") {
+				t.Fatalf("real project moved: %s", got)
+			}
+			if err := Clear(selected, OpsFile); err != nil {
+				t.Fatal(err)
+			}
+			entries, err = Read(canonical, OpsFile, 0)
+			if err != nil || len(entries) != 0 {
+				t.Errorf("global clear missed canonical write: %v %v", entries, err)
+			}
+			entries, err = Read(project, OpsFile, 0)
+			if err != nil || len(entries) != 1 {
+				t.Errorf("global clear changed real project: %v %v", entries, err)
+			}
+		})
 	}
 }

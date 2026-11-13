@@ -24,6 +24,52 @@ skillshare init --source ~/my-skills
 
 ---
 
+### `failed to load project config: ...`
+
+**Cause:** `.skillshare/config.yaml` exists but cannot be parsed (malformed YAML, wrong types, etc.). Mutating commands (`uninstall`, `new`, `enable`/`disable`, `check`) refuse to proceed in this state so they don't accidentally touch the default `.skillshare/skills/` directory when you have a custom `sources` configuration.
+
+**Solution:** Fix the YAML and re-run the command. Common issues:
+
+```yaml
+# WRONG — targets must be a list
+targets: {}
+
+# RIGHT
+targets: []
+```
+
+```yaml
+# WRONG — skills must be a list
+skills: my-skill
+
+# RIGHT
+skills:
+  - name: my-skill
+    source: github.com/org/my-skill
+```
+
+Validate the file with any YAML linter, or temporarily restore from `.skillshare/backups/` if you have one.
+
+---
+
+### `target "<name>": skills target path X overlaps skills source Y`
+
+**Cause:** Your `sources.skills` resolves to the same directory as a target's skills path (or one contains the other). For example, configuring `sources.skills: .claude/skills` together with a `claude` target — both point to `.claude/skills/`. Without this guard, `sync --force` would treat the source as a target directory and delete its contents.
+
+**Solution:** Choose a source path that does not alias any target. Common safe choices:
+
+```yaml
+# Co-locate with project docs
+sources:
+  skills: ./docs/skills
+
+# Keep under .skillshare/ (default — remove the sources key entirely)
+```
+
+The same check applies to `sources.agents` against agent target paths.
+
+---
+
 ## Target Errors
 
 ### `target add: path does not exist`
@@ -75,6 +121,26 @@ skillshare restore <target>
 
 **Prevention:** Use `skillshare target remove` instead of manual deletion.
 
+### `sync` keeps showing the same changes {#sync-keeps-showing-the-same-changes}
+
+**Cause:** Two targets sync skills into the same folder with different `include` or `exclude` filters, `mode`, or `target_naming` (filters and naming don't matter when both targets use `symlink` mode, which links the whole folder). Each sync redoes the folder the way one target wants and undoes the other's work (adding or removing filtered skills, renaming entries, or switching links and copies), so the folder never settles. `sync` names them:
+
+```
+! codex and universal sync skills to ~/.agents/skills with different settings, so each sync undoes the other
+  keep one: skillshare target codex --skills=false
+```
+
+**Solution:** Let one target write the folder and turn skills off for the other. Its agents, MCP servers and instructions stay managed, and the tool still reads the skills in the shared folder:
+
+```bash
+skillshare target codex --skills=false --dry-run
+skillshare target codex --skills=false
+```
+
+In the dashboard, the **Sync** page shows the same warning with a button that stops syncing skills for that target. Giving both targets the same filters, mode and target naming also works.
+
+A target from a registered project (`<project>@<tool>`) has no skills switch of its own, because a project's skills setting covers all its targets. For one, the command drops only that tool from the project, `skillshare project edit <root> --target <other tools>`, or turns skills off with `skillshare project edit <root> --no-skills` when it is the project's only target.
+
 ### `sync seems stuck or slow`
 
 **Cause:** Large files in skills directory.
@@ -87,6 +153,60 @@ ignore:
   - "**/.git/**"
   - "**/node_modules/**"
 ```
+
+### `no space left on device` / `ENOSPC` during sync
+
+**Cause:** Something is filling the volume. Check the backup directory first, then your source.
+
+**Solution:**
+```bash
+df -h ~                                     # Confirm the volume is full
+du -sh ~/.local/share/skillshare/backups    # Backup usage
+du -sh ~/.config/skillshare/skills          # Source usage
+```
+
+If backups are large, prune them — retention runs automatically after each `sync`, but a directory grown before that can be cleared on demand:
+
+```bash
+skillshare backup --cleanup --dry-run   # Preview
+skillshare backup --cleanup
+```
+
+If a volume is pinned at 100%, `rm` can fail with "Permission denied" until a little space is freed. Free one large file first, then prune.
+
+If the **source** is large, the artifacts are inside your skills. Backups do not copy them (symlinked skills are skipped), but every target in copy mode does. Move runtime caches, model weights, and browser profiles outside the skill tree, or exclude them with `ignore:`.
+
+See [Backups & Disk Space](/docs/reference/commands/backup#backups--disk-space) for how backup scope differs from `.gitignore` and `ignore:`.
+
+---
+
+## Extras Errors
+
+These come from single-file extras in `prepend` or `append` mode, which keep the source's content in a managed block of the target file. See [single-file extras](/docs/reference/commands/extras#single-file-extras).
+
+### `the managed block of <source> in <target> was edited by hand`
+
+**Cause:** The text between the block's markers no longer matches what skillshare wrote. Sync does not overwrite it.
+
+**Solution:** On the dashboard's **AGENTS.md** tab, use **Collect block into** to keep the edit in the shared file, or **Rewrite block from** to drop it (it is kept as a drift backup). For other single-file extras, copy the edit back to the source file, or delete the block from the target, then sync again.
+
+### `<target> has a damaged managed block`
+
+**Cause:** A block marker was removed or changed by hand, for example the `<!-- /skillshare:extra -->` end marker was deleted. skillshare cannot tell the block from your own lines, so sync, mode changes and restore all stop for that target.
+
+**Solution:** Put the missing marker back, or delete the whole block including its begin marker, then sync again.
+
+### `<target> ends inside an open code fence`
+
+**Cause:** The target file ends inside a Markdown code block that was never closed (a ```` ``` ```` line without its closing pair). A block appended after it would read as code.
+
+**Solution:** Close the code block in the target file, or use `prepend` for that target.
+
+### `<source> has lines that read as skillshare block markers`
+
+**Cause:** The source file has a line that looks like a block marker, such as `<!-- /skillshare:extra -->` outside a code block. Written into a block, it would end the block early.
+
+**Solution:** Put the example inside a fenced code block, or change the line.
 
 ---
 
@@ -135,29 +255,85 @@ git checkout -- .
 skillshare pull
 ```
 
-### `merge conflicts`
+### `pull stopped: this machine and the remote both changed ...`
 
-**Cause:** Same file was edited on multiple machines.
+**Cause:** The same file was edited on two machines. `pull` undid the merge, so the repository is unchanged. Conflicts in `.metadata.json` alone never cause this; they are resolved automatically.
 
 **Solution:**
 ```bash
 cd ~/.config/skillshare/skills
-git status                    # See conflicted files
-# Edit files to resolve conflicts
+git pull --no-rebase          # Redo the merge and keep the conflicts
+# Edit the conflicted files
 git add .
-git commit -m "Resolve conflicts"
+git commit --no-edit
+skillshare push
 skillshare sync
 ```
 
-### `Git identity not configured`
+### `Git had no identity`
 
-**Cause:** No `user.name` / `user.email` in git config. skillshare uses a local fallback (`skillshare@local`) so init can complete, but you should set your own.
+**Cause:** Git had no `user.name` / `user.email` when `skillshare init` created the source repo. skillshare wrote a fallback (`skillshare@local`) into that repo's own config so its commits work. The repo setting outranks `git config --global`, so setting a global identity later does not replace it.
+
+A repo you created yourself is left alone: skillshare uses the fallback only for its one initial commit.
+
+**Solution:** set your identity in the repo (the path the message prints; this is the default):
+```bash
+git -C ~/.config/skillshare/skills config user.name "Your Name"
+git -C ~/.config/skillshare/skills config user.email "you@example.com"
+```
+
+Or remove the repo setting so your global identity applies: `git -C ~/.config/skillshare/skills config --unset user.name` (and `user.email`).
+
+### `Git root mismatch`
+
+**Cause:** `git_root` in `config.yaml` points to a scope directory that has no git repo, but another scope directory does. This happens when you change `git_root` without relocating the repository — switching scope means "start versioning a different directory", not "move the existing history". See [`git_root`](/docs/reference/targets/configuration#git-root).
+
+**Solution:** Pick one of the three options the error prints:
+```bash
+# Start a fresh repo at the configured scope (no history)
+skillshare init --git-root <scope>
+
+# Move the existing repo over, keeping history
+mv <old-scope>/.git <new-scope>/.git
+
+# Or keep using the existing repo: set git_root back in config.yaml
+#   git_root: <scope-that-has-the-repo>
+```
+
+### `tracked repository clone is missing`
+
+**Cause:** A tracked repo is declared in `.metadata.json`, but the clone directory (for example `skills/_team-skills/`) is missing locally. This often happens after cloning your skillshare source repo on a new machine because tracked repo directories are intentionally listed in the managed `.gitignore` block.
+
+**Solution:** Rehydrate the missing tracked repo clones from metadata:
+```bash
+skillshare install
+skillshare sync
+```
+
+For project mode:
+```bash
+skillshare install -p
+skillshare sync -p
+```
+
+`status`, `check`, `update --all`, and `doctor` report this state and suggest `skillshare install`.
+
+### `nested git repositories must be disabled first`
+
+**Cause:** With `git_root: root`, a subdirectory that Git does not ignore (e.g. a skill you cloned by hand) has its own `.git`. Git would upload it as an **empty submodule**, silently dropping its files, so `commit`/`push` abort until each nested repo is disabled. Tracked repositories installed with `--track` are listed in the managed `.gitignore` block, so they are skipped unless they were already committed.
 
 **Solution:**
 ```bash
-git config --global user.name "Your Name"
-git config --global user.email "you@example.com"
+# Disable each reported nested repo (reversible — just rename back to re-enable)
+mv ~/.config/skillshare/<dir>/.git ~/.config/skillshare/<dir>/.git.disabled
 ```
+Or use the one-click disable on the web UI Git Sync page. skillshare also keeps `config.yaml` out of a root-scope repo automatically (it holds machine-specific paths).
+
+### `Invalid git_root`
+
+**Cause:** `git_root` in `config.yaml` is set to an unrecognized value (e.g. a typo).
+
+**Solution:** Use one of `skills`, `agents`, `extras`, or `root` — or leave it empty (defaults to `skills`).
 
 ---
 
@@ -175,6 +351,24 @@ skillshare install <source> --update
 # Or force overwrite
 skillshare install <source> --force
 ```
+
+### `git failed (exit 128): repository not found or authentication required`
+
+**Cause:** The repository URL is wrong, the repo doesn't exist, or authentication is missing.
+
+skillshare now provides actionable error messages for common git failures instead of raw exit codes. The error message includes suggestions:
+
+```
+Error: git failed (exit 128): repository not found or authentication required
+```
+
+If a token was used but rejected:
+
+```
+Error: git failed (exit 128): authentication token was rejected — check permissions and expiry
+```
+
+**Solution:** See the authentication options below.
 
 ### `Authentication failed` / `Access denied`
 
@@ -261,6 +455,36 @@ See [Environment Variables — Git SSL / TLS](/docs/reference/appendix/environme
 
 **Solution:** Check the source path is correct and points to a skill directory.
 
+### `"<path>" is in git submodule "<submodule>" ..., and skillshare does not fetch submodules`
+
+**Cause:** The path you asked for is a git submodule in the repository, or sits inside one. skillshare does not fetch submodules, so the directory would be empty.
+
+**Solution:** Install from the upstream repository named in the error. If you maintain the hub, copy the skill files into it instead of mounting them as a submodule.
+
+---
+
+## Update Errors
+
+### `pull stopped: this machine and the remote both changed ...` (tracked repository)
+
+**Cause:** A tracked repository has local commits that conflict with the remote. `update` merges diverged history, but a conflicting file stops it and the merge is undone.
+
+**Solution:**
+```bash
+# Force update (replaces local with remote)
+skillshare update --force
+
+# Or manually resolve
+cd ~/.config/skillshare/skills/_repo-name
+git pull --no-rebase
+# Edit the conflicted files, then
+git add . && git commit --no-edit
+```
+
+:::tip
+`skillshare update` and `skillshare install` now show actionable error messages for git failures (authentication, SSL, divergent branches) instead of raw exit codes.
+:::
+
 ---
 
 ## Audit Errors
@@ -326,6 +550,27 @@ skillshare doctor
 # 3. Restart AI CLI
 ```
 
+### Antigravity does not load synced skills {#antigravity-does-not-load-synced-skills}
+
+**Cause:** The Antigravity app's skill scanner only discovers **real directories** — it skips symlinks. skillshare's default `merge` mode creates one symlink per skill (an NTFS junction on Windows), so none of them are picked up. On Windows this surfaces as an `Incorrect function` error; on macOS and Linux the skills are silently absent.
+
+This is an Antigravity-side limitation, not a skillshare bug. It applies to the `antigravity` target (the app, `~/.gemini/config/skills`); the standalone `agy` CLI is a separate `antigravity-cli` target reading `~/.gemini/antigravity-cli/skills`. Two workarounds:
+
+**Option 1 — switch the target to `copy` mode**
+
+```bash
+skillshare target antigravity --mode copy
+skillshare sync --force
+```
+
+Real directories are written instead of symlinks. Trade-off: re-run `skillshare sync` after editing a source skill.
+
+**Option 2 — point Antigravity at your source directory**
+
+In Antigravity: **Settings → Customizations → Skill Custom Paths → "+ Add"**, then enter the **absolute** path to your skillshare source (e.g. `/Users/you/.config/skillshare/skills`). The `~` shorthand is not expanded, so a full path is required.
+
+Either way, restart Antigravity to reload skills.
+
 ### `skill name 'X' is defined in multiple places`
 
 **Cause:** Multiple skills have the same `name` field and land on the same target.
@@ -353,9 +598,105 @@ targets:
 ```
 
 :::tip
-If filters already isolate the duplicates, sync shows an info message instead of a warning — no action needed.
+If filters already isolate the duplicates, sync prints nothing about them — no action needed.
 See [Target Filters](/docs/reference/targets/configuration#include--exclude-target-filters) for full syntax.
 :::
+
+---
+
+## Agent Errors
+
+### Warning: `No agents folder: <targets>`
+
+**Cause:** You ran `skillshare sync` (or `skillshare sync agents`) and one or more configured targets don't define an agents directory. Only Claude, Cursor, Augment, and OpenCode have built-in agent paths; other targets are silently skipped.
+
+**Solutions:**
+
+1. Ignore the warning if those targets don't need agents.
+2. Add an `agents:` sub-key to the target in `config.yaml` to enable agent sync for it:
+
+```yaml
+targets:
+  myapp:
+    path: ~/myapp/skills
+    agents:
+      path: ~/myapp/agents
+```
+
+Then re-run `skillshare sync agents`.
+
+### `backup is not supported in project mode (except for agents)`
+
+**Cause:** You ran `skillshare backup -p` (or `skillshare backup -p <target>`) without the `agents` filter. In project mode, only agent backups are supported — skill backups are global-only.
+
+**Solution:** Add the `agents` positional argument or use `--all`:
+
+```bash
+skillshare backup -p agents          # Project agent targets
+skillshare backup -p agents claude   # Specific target
+skillshare backup -p --all           # Same as above (narrows to agents)
+```
+
+The same rule applies to `restore`: `restore is not supported in project mode (except for agents)`.
+
+### `agent name 'X' has invalid characters`
+
+**Cause:** An agent filename or `name:` frontmatter field contains characters outside the allowed set.
+
+**Solution:** Agent names must use only `a-z`, `0-9`, `_`, `-`, `.`. Rename the file (and update its `name:` field to match) so they share the same canonical name.
+
+### `source was lost by an earlier update; reinstall this agent` {#agent-source-lost}
+
+**Cause:** Older versions of `update agents` rewrote an agent's recorded source to `/agents/<name>.md` and dropped its repository URL ([#777](https://github.com/runkids/skillshare/issues/777)). Without the repository, the agent cannot be checked or updated.
+
+**Solution:** Install the agent again from its repository, which records the source correctly:
+
+```bash
+skillshare install <repo> --kind agent --all --force
+```
+
+### `.agentignore` patterns not taking effect
+
+**Causes:**
+
+1. The file is in the wrong location. It must live at the agents source root: `~/.config/skillshare/agents/.agentignore` (global) or `.skillshare/agents/.agentignore` (project).
+2. Your pattern matches a different segment than you expect — the file uses [gitignore syntax](https://git-scm.com/docs/gitignore).
+
+**Solution:** Confirm the file path with `skillshare doctor` and re-check the pattern. Agents are matched by basename (without `.md`), so `draft-*` matches `draft-experiment.md`. Use `skillshare disable <agent> --kind agent` to let the CLI write the entry for you.
+
+---
+
+## Plugin Errors {#plugin-errors}
+
+### `<agent> CLI is not installed or not on PATH` {#plugin-cli-not-on-path}
+
+**Cause:** Plugin commands run the Agent's native CLI (`claude`, `codex`, and so on) on the machine running Skillshare, and that CLI was not found. A scheduled job or a dashboard started from a service often has a shorter `PATH` than your terminal.
+
+**Solutions:**
+
+1. Install the Agent's CLI on that machine.
+2. If it is installed, add its directory to the `PATH` of whatever starts Skillshare, such as the scheduled job's environment.
+3. For an [account target](/docs/reference/commands/plugin#accounts), you can set `cli` to the executable's absolute path instead.
+
+### `Codex CLI not found on the machine running Skillshare` {#plugin-codex-not-found}
+
+**Cause:** Skillshare looked for the Codex CLI on `PATH`, in the Homebrew folders, and inside the Codex desktop app, and found none. The message lists every place it looked.
+
+**Solutions:**
+
+1. Install the Codex app or the Codex CLI on that machine.
+2. If Codex is somewhere else, set [`SKILLSHARE_CODEX_CLI`](/docs/reference/appendix/environment-variables#skillshare_codex_cli) to its path in the environment that starts Skillshare, such as the scheduled job. It stays on that machine, so a config shared with another OS is not affected.
+
+### `The native marketplace X is gone` {#plugin-marketplace-gone}
+
+**Cause:** This machine has a local import receipt, but its native marketplace is no longer registered. Skillshare skips the operation; a receipt is not a reviewed reinstall source.
+
+**Solutions:**
+
+1. Restore the marketplace and install or update the plugin in the native client. Import its local ID into the declared package if it needs rebinding.
+2. Or remove that Agent from the plugin and add the plugin again from its source. See [Cross-Machine Sync — Plugins](/docs/how-to/sharing/cross-machine-sync#plugins).
+
+A second machine without a receipt instead shows **Import required on this machine** and skips that target. Install natively there, then import its local ID with the declared package name.
 
 ---
 

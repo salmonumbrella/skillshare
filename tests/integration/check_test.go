@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"skillshare/internal/install"
 	"skillshare/internal/testutil"
 )
 
@@ -71,36 +72,400 @@ targets: {}
 func TestCheck_TrackedRepo_Behind(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets: {}
-`)
-
-	// Create a "remote" bare repo
-	remoteRepo := filepath.Join(sb.Root, "remote-repo.git")
-	gitInit(t, remoteRepo, true)
-
-	// Clone it as a tracked repo
-	trackedPath := filepath.Join(sb.SourcePath, "_test-repo")
-	gitClone(t, remoteRepo, trackedPath)
-
-	// Create initial content and push
-	os.MkdirAll(filepath.Join(trackedPath, "my-skill"), 0755)
-	os.WriteFile(filepath.Join(trackedPath, "my-skill", "SKILL.md"), []byte("# Test"), 0644)
-	gitAddCommit(t, trackedPath, "initial")
-	gitPush(t, trackedPath)
-
-	// Clone another working copy, make commits, push them
-	otherClone := filepath.Join(sb.Root, "other-clone")
-	gitClone(t, remoteRepo, otherClone)
-	os.WriteFile(filepath.Join(otherClone, "my-skill", "SKILL.md"), []byte("# Updated"), 0644)
-	gitAddCommit(t, otherClone, "update from other")
-	gitPush(t, otherClone)
+	behindTrackedRepo(t, sb)
 
 	// Now tracked repo is behind
 	result := sb.RunCLI("check")
 	result.AssertSuccess(t)
 	result.AssertOutputContains(t, "behind")
+}
+
+// behindTrackedRepo sets up a tracked repo that is one commit behind its remote.
+func behindTrackedRepo(t *testing.T, sb *testutil.Sandbox) {
+	t.Helper()
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+	remoteRepo := filepath.Join(sb.Root, "remote-repo.git")
+	gitInit(t, remoteRepo, true)
+	trackedPath := filepath.Join(sb.SourcePath, "_test-repo")
+	gitClone(t, remoteRepo, trackedPath)
+	os.MkdirAll(filepath.Join(trackedPath, "my-skill"), 0755)
+	os.WriteFile(filepath.Join(trackedPath, "my-skill", "SKILL.md"), []byte("# Test"), 0644)
+	gitAddCommit(t, trackedPath, "initial")
+	gitPush(t, trackedPath)
+	otherClone := filepath.Join(sb.Root, "other-clone")
+	gitClone(t, remoteRepo, otherClone)
+	os.WriteFile(filepath.Join(otherClone, "my-skill", "SKILL.md"), []byte("# Updated"), 0644)
+	gitAddCommit(t, otherClone, "update from other")
+	gitPush(t, otherClone)
+}
+
+func TestCheck_ExitCode_FailsWhenBehind(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+
+	result := sb.RunCLI("check", "--exit-code")
+	result.AssertExitCode(t, 1)
+	result.AssertAnyOutputContains(t, "1 item not up to date")
+}
+
+func TestCheck_ExitCode_JSONKeepsResults(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+
+	result := sb.RunCLI("check", "--json", "--exit-code")
+	result.AssertExitCode(t, 1)
+
+	var output struct {
+		TrackedRepos []struct {
+			Status string `json:"status"`
+		} `json:"tracked_repos"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
+		t.Fatalf("failed to parse JSON output: %v\noutput: %s", err, result.Stdout)
+	}
+	if len(output.TrackedRepos) != 1 || output.TrackedRepos[0].Status != "behind" {
+		t.Errorf("expected one behind repo, got %+v", output.TrackedRepos)
+	}
+}
+
+func TestCheck_ExitCode_SucceedsWhenUpToDate(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+	sb.CreateSkill("local-skill", map[string]string{"SKILL.md": "# Local"})
+	writeMetaEntry(t, filepath.Join(sb.SourcePath, "local-skill"), &install.MetadataEntry{
+		Source: "/local/path",
+		Type:   "local",
+	})
+
+	sb.RunCLI("check", "--exit-code").AssertSuccess(t)
+}
+
+func TestCheck_ExitCode_SingleNameFailsWhenBehind(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+
+	result := sb.RunCLI("check", "_test-repo", "--exit-code")
+	result.AssertExitCode(t, 1)
+	result.AssertAnyOutputContains(t, "1 item not up to date")
+}
+
+func TestCheckProject_ExitCode_FailsOnceSourceChanges(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	projectRoot := sb.SetupProjectDir("claude")
+	skillFile := filepath.Join(projectRoot, "vendor", "team-skill", "SKILL.md")
+	sb.WriteFile(skillFile, "---\nname: team-skill\n---\n# v1")
+	sb.RunCLIInDir(projectRoot, "install", "./vendor/team-skill", "-p").AssertSuccess(t)
+
+	sb.RunCLIInDir(projectRoot, "check", "-p", "--exit-code").AssertSuccess(t)
+
+	sb.WriteFile(skillFile, "---\nname: team-skill\n---\n# v2")
+	sb.RunCLIInDir(projectRoot, "check", "-p", "--exit-code").AssertExitCode(t, 1)
+}
+
+// driftedAgent leaves the sandbox with one installed agent, tutor, whose file
+// no longer matches the hash recorded at install.
+func driftedAgent(t *testing.T, sb *testutil.Sandbox) {
+	t.Helper()
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+	agentsDir := filepath.Join(filepath.Dir(sb.SourcePath), "agents")
+	os.MkdirAll(agentsDir, 0755)
+	os.WriteFile(filepath.Join(agentsDir, "tutor.md"), []byte("# Tutor, edited"), 0644)
+	store, err := install.LoadMetadata(agentsDir)
+	if err != nil {
+		t.Fatalf("load agent metadata: %v", err)
+	}
+	store.Set("tutor", &install.MetadataEntry{
+		Source:     "owner/agents",
+		Kind:       "agent",
+		FileHashes: map[string]string{"tutor.md": "sha256:0000"},
+	})
+	if err := store.Save(agentsDir); err != nil {
+		t.Fatalf("save agent metadata: %v", err)
+	}
+}
+
+func TestCheck_Agents_ExitCode_FailsWhenDrifted(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	driftedAgent(t, sb)
+
+	sb.RunCLI("check", "agents").AssertSuccess(t)
+
+	result := sb.RunCLI("check", "agents", "--exit-code")
+	result.AssertExitCode(t, 1)
+	result.AssertAnyOutputContains(t, "1 item not up to date")
+}
+
+func TestCheck_All_ExitCode_FailsWhenAgentDrifted(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	driftedAgent(t, sb)
+
+	result := sb.RunCLI("check", "--all", "--exit-code")
+	result.AssertExitCode(t, 1)
+	result.AssertAnyOutputContains(t, "1 item not up to date")
+}
+
+func TestCheck_All_ExitCode_CountsSkillsAndAgents(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+	driftedAgent(t, sb)
+
+	result := sb.RunCLI("check", "--all", "--exit-code")
+	result.AssertExitCode(t, 1)
+	result.AssertAnyOutputContains(t, "2 items not up to date")
+}
+
+func TestCheck_All_JSON_ListsAgentsBesideSkills(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	driftedAgent(t, sb)
+
+	result := sb.RunCLI("check", "--all", "--json")
+	result.AssertSuccess(t)
+	var out struct {
+		TrackedRepos []any `json:"tracked_repos"`
+		Skills       []any `json:"skills"`
+		Agents       []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		} `json:"agents"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &out); err != nil {
+		t.Fatalf("check --all --json is not one JSON object: %v\n%s", err, result.Stdout)
+	}
+	if len(out.Agents) != 1 || out.Agents[0].Name != "tutor" || out.Agents[0].Status != "drifted" {
+		t.Errorf("agents = %+v, want tutor drifted", out.Agents)
+	}
+}
+
+func TestCheck_All_JSON_NoAgents_ListsNone(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+
+	result := sb.RunCLI("check", "--all", "--json")
+	result.AssertSuccess(t)
+	if !strings.Contains(result.Stdout, `"agents": []`) {
+		t.Errorf("want an empty agents array, got:\n%s", result.Stdout)
+	}
+}
+
+func TestCheck_JSON_WithoutAll_HasNoAgentsKey(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	driftedAgent(t, sb)
+
+	result := sb.RunCLI("check", "--json")
+	result.AssertSuccess(t)
+	if strings.Contains(result.Stdout, `"agents"`) {
+		t.Errorf("check --json should keep its shape, got:\n%s", result.Stdout)
+	}
+}
+
+func TestCheck_All_RejectsNames(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	driftedAgent(t, sb)
+
+	result := sb.RunCLI("check", "--all", "tutor")
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "--all cannot be combined with names or --group")
+}
+
+func TestCheckProject_All_ReportsAgents(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	projectRoot := sb.SetupProjectDir("claude")
+	sb.CreateProjectSkill(projectRoot, "local-skill", map[string]string{
+		"SKILL.md": "---\nname: local-skill\n---\n# Local",
+	})
+	agentsDir := filepath.Join(projectRoot, ".skillshare", "agents")
+	os.MkdirAll(agentsDir, 0755)
+	os.WriteFile(filepath.Join(agentsDir, "reviewer.md"), []byte("# Reviewer"), 0644)
+
+	result := sb.RunCLIInDir(projectRoot, "check", "-p", "--all")
+	result.AssertSuccess(t)
+	result.AssertAnyOutputContains(t, "reviewer")
+}
+
+func TestCheckProject_All_ChecksAgentsWithoutSkillsDir(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	projectRoot := sb.SetupProjectDir("claude")
+	os.RemoveAll(filepath.Join(projectRoot, ".skillshare", "skills"))
+	agentsDir := filepath.Join(projectRoot, ".skillshare", "agents")
+	os.MkdirAll(agentsDir, 0755)
+	os.WriteFile(filepath.Join(agentsDir, "reviewer.md"), []byte("# Reviewer"), 0644)
+
+	result := sb.RunCLIInDir(projectRoot, "check", "-p", "--all")
+	result.AssertSuccess(t)
+	result.AssertAnyOutputContains(t, "reviewer")
+}
+
+func TestCheck_UnknownName_JSON_Fails(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+
+	assertJSONError(t, sb.RunCLI("check", "no-such-skill", "--json"), "no-such-skill")
+}
+
+// assertJSONError fails unless the command exited 1 with stdout holding one
+// JSON object whose error names want.
+func assertJSONError(t *testing.T, result *testutil.Result, want string) {
+	t.Helper()
+	result.AssertExitCode(t, 1)
+	var out struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &out); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v\n%s", err, result.Stdout)
+	}
+	if !strings.Contains(out.Error, want) {
+		t.Errorf("error = %q, want it to contain %q", out.Error, want)
+	}
+}
+
+func TestCheck_JSON_TwoUnknownNames_NamesBoth(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+
+	result := sb.RunCLI("check", "first-typo", "second-typo", "--json")
+	assertJSONError(t, result, "first-typo")
+	assertJSONError(t, result, "second-typo")
+}
+
+func TestCheck_JSON_UnknownGroup_Fails(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+
+	assertJSONError(t, sb.RunCLI("check", "--group", "no-such-group", "--json"), "no-such-group")
+}
+
+func TestCheck_JSON_GroupOfLocalSkillsOnly_Fails(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+	localSkill := filepath.Join(sb.SourcePath, "mine", "notes")
+	os.MkdirAll(localSkill, 0755)
+	os.WriteFile(filepath.Join(localSkill, "SKILL.md"), []byte("---\nname: notes\n---\n# Notes"), 0644)
+
+	for _, args := range [][]string{{"check", "mine", "--json"}, {"check", "--group", "mine", "--json"}} {
+		assertJSONError(t, sb.RunCLI(args...), "no updatable skills in group")
+	}
+}
+
+func TestCheck_JSON_UnknownName_ExitCodeFlag_Fails(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+
+	assertJSONError(t, sb.RunCLI("check", "no-such-skill", "--json", "--exit-code"), "no-such-skill")
+}
+
+func TestCheck_JSON_InvalidFlagCombination_IsJSON(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+
+	assertJSONError(t, sb.RunCLI("check", "--all", "_test-repo", "--json"), "--all cannot be combined")
+}
+
+func TestCheckProject_JSON_UnknownName_Fails(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	projectRoot := sb.SetupProjectDir("claude")
+
+	assertJSONError(t, sb.RunCLIInDir(projectRoot, "check", "-p", "no-such-skill", "--json"), "no-such-skill")
+}
+
+func TestCheckProject_JSON_NoProjectConfig_IsJSON(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	emptyDir := filepath.Join(sb.Root, "not-a-project")
+	os.MkdirAll(emptyDir, 0755)
+
+	assertJSONError(t, sb.RunCLIInDir(emptyDir, "check", "-p", "--json"), "no project config")
+}
+
+func TestCheck_GroupName_JSON_KeepsStdoutJSON(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+	groupSkill := filepath.Join(sb.SourcePath, "frontend", "ui-kit")
+	os.MkdirAll(groupSkill, 0755)
+	os.WriteFile(filepath.Join(groupSkill, "SKILL.md"), []byte("---\nname: ui-kit\n---\n# UI"), 0644)
+	store, err := install.LoadMetadata(sb.SourcePath)
+	if err != nil {
+		t.Fatalf("load metadata: %v", err)
+	}
+	store.Set("frontend/ui-kit", &install.MetadataEntry{Source: "owner/repo", Group: "frontend"})
+	if err := store.Save(sb.SourcePath); err != nil {
+		t.Fatalf("save metadata: %v", err)
+	}
+
+	result := sb.RunCLI("check", "frontend", "--json")
+	if !json.Valid([]byte(result.Stdout)) {
+		t.Errorf("stdout is not JSON:\n%s", result.Stdout)
+	}
+	if !strings.Contains(result.Stdout, "ui-kit") {
+		t.Errorf("the group should expand to ui-kit, got:\n%s", result.Stdout)
+	}
+}
+
+func TestCheck_UnknownNameBesideKnown_JSON_KeepsStdoutJSON(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	behindTrackedRepo(t, sb)
+
+	result := sb.RunCLI("check", "_test-repo", "no-such-skill", "--json")
+	result.AssertSuccess(t)
+	var out struct {
+		TrackedRepos []struct {
+			Name string `json:"name"`
+		} `json:"tracked_repos"`
+		Warnings []string `json:"warnings"`
+	}
+	if err := json.Unmarshal([]byte(result.Stdout), &out); err != nil {
+		t.Fatalf("stdout is not one JSON object: %v\n%s", err, result.Stdout)
+	}
+	if len(out.TrackedRepos) != 1 {
+		t.Errorf("tracked_repos = %+v, want _test-repo", out.TrackedRepos)
+	}
+	if len(out.Warnings) != 1 || !strings.Contains(out.Warnings[0], "no-such-skill") {
+		t.Errorf("warnings = %q, want one naming no-such-skill", out.Warnings)
+	}
+}
+
+func TestCheck_ExitCode_RejectsDiff(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+
+	result := sb.RunCLI("check", "x", "--diff", "--exit-code")
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "--exit-code cannot be combined with --diff")
 }
 
 func TestCheck_TrackedRepo_TokenEnvDoesNotBreakFileFetch(t *testing.T) {
@@ -142,17 +507,16 @@ targets: {}
 	// Create a skill with metadata (but local source, so check will show "local source")
 	sb.CreateSkill("my-skill", map[string]string{
 		"SKILL.md": "# My Skill",
-		".skillshare-meta.json": `{
-			"source": "/local/path",
-			"type": "local",
-			"installed_at": "2024-01-01T00:00:00Z"
-		}`,
+	})
+	writeMetaEntry(t, filepath.Join(sb.SourcePath, "my-skill"), &install.MetadataEntry{
+		Source: "/local/path",
+		Type:   "local",
 	})
 
 	result := sb.RunCLI("check")
 	result.AssertSuccess(t)
 	// Unfiltered check summarizes local skills instead of listing each one
-	result.AssertOutputContains(t, "1 local skill(s) skipped")
+	result.AssertOutputContains(t, "1 local skill skipped")
 }
 
 func TestCheck_JsonOutput(t *testing.T) {
@@ -166,11 +530,10 @@ targets: {}
 	// Create a skill with metadata
 	sb.CreateSkill("json-skill", map[string]string{
 		"SKILL.md": "# JSON Skill",
-		".skillshare-meta.json": `{
-			"source": "/local/path",
-			"type": "local",
-			"installed_at": "2024-01-01T00:00:00Z"
-		}`,
+	})
+	writeMetaEntry(t, filepath.Join(sb.SourcePath, "json-skill"), &install.MetadataEntry{
+		Source: "/local/path",
+		Type:   "local",
 	})
 
 	result := sb.RunCLI("check", "--json")
@@ -214,6 +577,77 @@ targets: {}
 	}
 	if len(output.Skills) != 0 {
 		t.Errorf("expected 0 skills, got %d", len(output.Skills))
+	}
+}
+
+func TestCheck_LocalSource_DetectsChangeUntilUpdated(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	setupGlobalConfig(sb)
+
+	external := filepath.Join(sb.Root, "app-bundle", "app-skill")
+	sb.WriteFile(filepath.Join(external, "SKILL.md"), "---\nname: app-skill\n---\n# v1")
+	sb.RunCLI("install", external).AssertSuccess(t)
+
+	checkStatus := func() string {
+		t.Helper()
+		result := sb.RunCLI("check", "--json")
+		result.AssertSuccess(t)
+		var output checkOutput
+		if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
+			t.Fatalf("failed to parse JSON output: %v\noutput: %s", err, result.Stdout)
+		}
+		for _, s := range output.Skills {
+			if s.Name == "app-skill" {
+				return s.Status
+			}
+		}
+		t.Fatalf("app-skill missing from check output: %s", result.Stdout)
+		return ""
+	}
+
+	if got := checkStatus(); got != "up_to_date" {
+		t.Fatalf("after install: status = %q, want up_to_date", got)
+	}
+
+	sb.WriteFile(filepath.Join(external, "SKILL.md"), "---\nname: app-skill\n---\n# v2")
+	if got := checkStatus(); got != "update_available" {
+		t.Fatalf("after source change: status = %q, want update_available", got)
+	}
+
+	sb.RunCLI("update", "app-skill").AssertSuccess(t)
+	if got := checkStatus(); got != "up_to_date" {
+		t.Fatalf("after update: status = %q, want up_to_date", got)
+	}
+}
+
+func TestCheck_LocalSource_Missing(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	setupGlobalConfig(sb)
+
+	external := filepath.Join(sb.Root, "app-bundle", "gone-skill")
+	sb.WriteFile(filepath.Join(external, "SKILL.md"), "---\nname: gone-skill\n---\n# v1")
+	sb.RunCLI("install", external).AssertSuccess(t)
+	os.RemoveAll(external)
+
+	result := sb.RunCLI("check", "gone-skill")
+	result.AssertExitCode(t, 1)
+	result.AssertAnyOutputContains(t, "local source not found")
+
+	for _, args := range [][]string{{"check", "--json"}, {"check", "gone-skill", "--json"}} {
+		result := sb.RunCLI(args...)
+		result.AssertExitCode(t, 1)
+		if result.Stderr != "" {
+			t.Errorf("JSON failure wrote to stderr: %s", result.Stderr)
+		}
+		var output checkOutput
+		if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
+			t.Fatalf("invalid JSON: %v: %s", err, result.Stdout)
+		}
+		if len(output.Skills) != 1 || output.Skills[0].Status != "error" {
+			t.Fatalf("expected failed skill in JSON: %s", result.Stdout)
+		}
 	}
 }
 
@@ -375,151 +809,19 @@ func TestCheckProject_MultiNames(t *testing.T) {
 
 // ── Tree hash tests ──────────────────────────────────────
 
-// TestCheck_TreeHash_SkillUnchanged verifies that when a registry repo gets a
-// new commit in a different subdir, the unchanged skill stays "up_to_date".
-func TestCheck_TreeHash_SkillUnchanged(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
+// writeMetaEntry writes a single metadata entry to .metadata.json in the source root.
+func writeMetaEntry(t *testing.T, skillDir string, entry *install.MetadataEntry) {
+	t.Helper()
+	sourceDir := findSourceRoot(skillDir)
+	rel, _ := filepath.Rel(sourceDir, skillDir)
 
-	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
-
-	// Create bare remote with two skill subdirs
-	remoteRepo := filepath.Join(sb.Root, "registry.git")
-	workClone := filepath.Join(sb.Root, "work")
-	gitInit(t, remoteRepo, true)
-	gitClone(t, remoteRepo, workClone)
-
-	os.MkdirAll(filepath.Join(workClone, "skills", "skill-a"), 0755)
-	os.WriteFile(filepath.Join(workClone, "skills", "skill-a", "SKILL.md"), []byte("# Skill A"), 0644)
-	os.MkdirAll(filepath.Join(workClone, "skills", "skill-b"), 0755)
-	os.WriteFile(filepath.Join(workClone, "skills", "skill-b", "SKILL.md"), []byte("# Skill B"), 0644)
-	gitAddCommit(t, workClone, "add both skills")
-	gitPush(t, workClone)
-
-	// Get current commit hash and tree hash for skill-a
-	commitHash := gitRevParse(t, workClone, "HEAD")
-	treeHash := gitRevParse(t, workClone, "HEAD:skills/skill-a")
-
-	// Install skill-a with tree hash metadata
-	skillDir := sb.CreateSkill("skill-a", map[string]string{
-		"SKILL.md": "# Skill A",
-	})
-	writeMetaWithTreeHash(t, skillDir, "file://"+remoteRepo, commitHash, treeHash, "skills/skill-a")
-
-	// Now push a change to skill-b (skill-a is untouched)
-	os.WriteFile(filepath.Join(workClone, "skills", "skill-b", "SKILL.md"), []byte("# Skill B v2"), 0644)
-	gitAddCommit(t, workClone, "update skill-b only")
-	gitPush(t, workClone)
-
-	// Check: skill-a should be up_to_date (tree hash matches)
-	result := sb.RunCLI("check", "--json")
-	result.AssertSuccess(t)
-
-	var output checkOutput
-	if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
-		t.Fatalf("failed to parse JSON: %v\noutput: %s", err, result.Stdout)
+	store, err := install.LoadMetadata(sourceDir)
+	if err != nil {
+		t.Fatalf("writeMetaEntry: load: %v", err)
 	}
-
-	if len(output.Skills) != 1 {
-		t.Fatalf("expected 1 skill, got %d", len(output.Skills))
-	}
-	if output.Skills[0].Status != "up_to_date" {
-		t.Errorf("expected up_to_date, got %q", output.Skills[0].Status)
-	}
-}
-
-// TestCheck_TreeHash_SkillChanged verifies that when a skill's subdir changes,
-// it correctly reports "update_available".
-func TestCheck_TreeHash_SkillChanged(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
-
-	remoteRepo := filepath.Join(sb.Root, "registry.git")
-	workClone := filepath.Join(sb.Root, "work")
-	gitInit(t, remoteRepo, true)
-	gitClone(t, remoteRepo, workClone)
-
-	os.MkdirAll(filepath.Join(workClone, "skills", "my-skill"), 0755)
-	os.WriteFile(filepath.Join(workClone, "skills", "my-skill", "SKILL.md"), []byte("# V1"), 0644)
-	gitAddCommit(t, workClone, "add skill")
-	gitPush(t, workClone)
-
-	commitHash := gitRevParse(t, workClone, "HEAD")
-	treeHash := gitRevParse(t, workClone, "HEAD:skills/my-skill")
-
-	skillDir := sb.CreateSkill("my-skill", map[string]string{
-		"SKILL.md": "# V1",
-	})
-	writeMetaWithTreeHash(t, skillDir, "file://"+remoteRepo, commitHash, treeHash, "skills/my-skill")
-
-	// Modify the skill's subdir and push
-	os.WriteFile(filepath.Join(workClone, "skills", "my-skill", "SKILL.md"), []byte("# V2"), 0644)
-	gitAddCommit(t, workClone, "update skill")
-	gitPush(t, workClone)
-
-	result := sb.RunCLI("check", "--json")
-	result.AssertSuccess(t)
-
-	var output checkOutput
-	if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
-		t.Fatalf("failed to parse JSON: %v\noutput: %s", err, result.Stdout)
-	}
-
-	if len(output.Skills) != 1 {
-		t.Fatalf("expected 1 skill, got %d", len(output.Skills))
-	}
-	if output.Skills[0].Status != "update_available" {
-		t.Errorf("expected update_available, got %q", output.Skills[0].Status)
-	}
-}
-
-// TestCheck_TreeHash_FallbackNoTreeHash verifies backward compatibility:
-// when meta has no TreeHash, falls back to commit hash comparison.
-func TestCheck_TreeHash_FallbackNoTreeHash(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
-
-	remoteRepo := filepath.Join(sb.Root, "registry.git")
-	workClone := filepath.Join(sb.Root, "work")
-	gitInit(t, remoteRepo, true)
-	gitClone(t, remoteRepo, workClone)
-
-	os.MkdirAll(filepath.Join(workClone, "skills", "old-skill"), 0755)
-	os.WriteFile(filepath.Join(workClone, "skills", "old-skill", "SKILL.md"), []byte("# Old"), 0644)
-	gitAddCommit(t, workClone, "add skill")
-	gitPush(t, workClone)
-
-	commitHash := gitRevParse(t, workClone, "HEAD")
-
-	// Install with old-style metadata (no tree_hash)
-	skillDir := sb.CreateSkill("old-skill", map[string]string{
-		"SKILL.md": "# Old",
-	})
-	writeMetaNoTreeHash(t, skillDir, "file://"+remoteRepo, commitHash, "skills/old-skill")
-
-	// Push an unrelated change (skill untouched)
-	os.WriteFile(filepath.Join(workClone, "README.md"), []byte("# Readme"), 0644)
-	gitAddCommit(t, workClone, "unrelated change")
-	gitPush(t, workClone)
-
-	result := sb.RunCLI("check", "--json")
-	result.AssertSuccess(t)
-
-	var output checkOutput
-	if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
-		t.Fatalf("failed to parse JSON: %v\noutput: %s", err, result.Stdout)
-	}
-
-	if len(output.Skills) != 1 {
-		t.Fatalf("expected 1 skill, got %d", len(output.Skills))
-	}
-	// Without tree_hash, commit hash differs → update_available (backward compat)
-	if output.Skills[0].Status != "update_available" {
-		t.Errorf("expected update_available (fallback), got %q", output.Skills[0].Status)
+	store.Set(rel, entry)
+	if err := store.Save(sourceDir); err != nil {
+		t.Fatalf("writeMetaEntry: save: %v", err)
 	}
 }
 
@@ -538,34 +840,23 @@ func gitRevParse(t *testing.T, dir, ref string) string {
 
 func writeMetaWithTreeHash(t *testing.T, skillDir, repoURL, version, treeHash, subdir string) {
 	t.Helper()
-	meta := map[string]any{
-		"source":       repoURL + "//" + subdir,
-		"type":         "github",
-		"repo_url":     repoURL,
-		"version":      version,
-		"tree_hash":    treeHash,
-		"subdir":       subdir,
-		"installed_at": "2026-01-01T00:00:00Z",
-	}
-	data, _ := json.Marshal(meta)
-	if err := os.WriteFile(filepath.Join(skillDir, ".skillshare-meta.json"), data, 0644); err != nil {
-		t.Fatalf("writeMetaWithTreeHash: %v", err)
-	}
-}
+	sourceDir := findSourceRoot(skillDir)
+	rel, _ := filepath.Rel(sourceDir, skillDir)
 
-func writeMetaNoTreeHash(t *testing.T, skillDir, repoURL, version, subdir string) {
-	t.Helper()
-	meta := map[string]any{
-		"source":       repoURL + "//" + subdir,
-		"type":         "github",
-		"repo_url":     repoURL,
-		"version":      version,
-		"subdir":       subdir,
-		"installed_at": "2026-01-01T00:00:00Z",
+	store, err := install.LoadMetadata(sourceDir)
+	if err != nil {
+		t.Fatalf("writeMetaWithTreeHash: load: %v", err)
 	}
-	data, _ := json.Marshal(meta)
-	if err := os.WriteFile(filepath.Join(skillDir, ".skillshare-meta.json"), data, 0644); err != nil {
-		t.Fatalf("writeMetaNoTreeHash: %v", err)
+	store.Set(rel, &install.MetadataEntry{
+		Source:   repoURL + "//" + subdir,
+		Type:     "github",
+		RepoURL:  repoURL,
+		Version:  version,
+		TreeHash: treeHash,
+		Subdir:   subdir,
+	})
+	if err := store.Save(sourceDir); err != nil {
+		t.Fatalf("writeMetaWithTreeHash: save: %v", err)
 	}
 }
 
@@ -662,5 +953,45 @@ func run(t *testing.T, dir string, name string, args ...string) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("%s %v failed: %s\n%s", name, args, err, out)
+	}
+}
+
+func TestCheckProject_RelativeLocalSource_DetectsChangeUntilUpdated(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	projectRoot := sb.SetupProjectDir("claude")
+	skillFile := filepath.Join(projectRoot, "vendor", "team-skill", "SKILL.md")
+	sb.WriteFile(skillFile, "---\nname: team-skill\n---\n# v1")
+	sb.RunCLIInDir(projectRoot, "install", "./vendor/team-skill", "-p").AssertSuccess(t)
+
+	checkStatus := func() string {
+		t.Helper()
+		result := sb.RunCLIInDir(projectRoot, "check", "-p", "--json")
+		result.AssertSuccess(t)
+		var output checkOutput
+		if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
+			t.Fatalf("failed to parse JSON output: %v\noutput: %s", err, result.Stdout)
+		}
+		for _, s := range output.Skills {
+			if s.Name == "team-skill" {
+				return s.Status
+			}
+		}
+		t.Fatalf("team-skill missing from check output: %s", result.Stdout)
+		return ""
+	}
+
+	if got := checkStatus(); got != "up_to_date" {
+		t.Fatalf("after install: status = %q, want up_to_date", got)
+	}
+
+	sb.WriteFile(skillFile, "---\nname: team-skill\n---\n# v2")
+	if got := checkStatus(); got != "update_available" {
+		t.Fatalf("after source change: status = %q, want update_available", got)
+	}
+
+	sb.RunCLIInDir(projectRoot, "update", "team-skill", "-p").AssertSuccess(t)
+	if got := checkStatus(); got != "up_to_date" {
+		t.Fatalf("after update: status = %q, want up_to_date", got)
 	}
 }

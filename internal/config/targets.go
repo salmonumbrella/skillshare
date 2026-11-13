@@ -2,20 +2,117 @@ package config
 
 import (
 	_ "embed"
+	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strings"
 	"sync"
 
 	"gopkg.in/yaml.v3"
 	"skillshare/internal/utils"
 )
 
+// targetPathPair holds the global and project paths for a single resource kind.
+type targetPathPair struct {
+	Global  string `yaml:"global"`
+	Project string `yaml:"project"`
+}
+
+// targetAlsoScans lists additional filesystem paths a target's runtime is
+// known to scan beyond its primary skills path. Sourced from each tool's
+// official documentation. Used by `skillshare doctor` to warn about
+// cross-target discovery overlap (e.g. Codex's runtime scans ~/.agents/skills
+// even though its primary skillshare path is ~/.codex/skills).
+//
+// In targets.yaml it is a list with one entry per scanned folder, so a
+// folder's global and project paths and its env switches are written once.
+type targetAlsoScans struct {
+	Global  []string
+	Project []string
+	// DisabledByEnv maps an also_scans path to the environment variables that
+	// make the runtime skip it.
+	DisabledByEnv map[string][]string
+}
+
+type alsoScansEntry struct {
+	Global  string `yaml:"global"`
+	Project string `yaml:"project"`
+	// OffWhenEnv lists the environment variables that make the runtime skip
+	// this folder, most specific first (doctor suggests the first that applies).
+	OffWhenEnv []string `yaml:"off_when_env"`
+}
+
+func (a *targetAlsoScans) UnmarshalYAML(node *yaml.Node) error {
+	var entries []alsoScansEntry
+	if err := node.Decode(&entries); err != nil {
+		return err
+	}
+	a.DisabledByEnv = make(map[string][]string)
+	for _, e := range entries {
+		if e.Global != "" {
+			a.Global = append(a.Global, e.Global)
+		}
+		if e.Project != "" {
+			a.Project = append(a.Project, e.Project)
+		}
+		if len(e.OffWhenEnv) > 0 {
+			a.DisabledByEnv[e.Global] = e.OffWhenEnv
+			a.DisabledByEnv[e.Project] = e.OffWhenEnv
+		}
+	}
+	return nil
+}
+
+// targetInstructions is the instruction file (CLAUDE.md, AGENTS.md, ...) a
+// target's runtime reads. Import marks runtimes that follow an @path line, so a
+// managed import line can replace a symlink.
+type targetInstructions struct {
+	Global  string `yaml:"global,omitempty"`
+	Project string `yaml:"project,omitempty"`
+	Import  bool   `yaml:"import,omitempty"`
+	// SameAs names the target whose global file this one also reads.
+	SameAs string `yaml:"same_as,omitempty"`
+	// MaxChars is the length past which the runtime cuts the global file.
+	MaxChars int `yaml:"max_chars,omitempty"`
+	// ProjectFallback is the file read in a project that has no Project file.
+	ProjectFallback string `yaml:"project_fallback,omitempty"`
+	// Rules is a directory of extra .md files the runtime loads as well.
+	Rules targetPathPair `yaml:"rules,omitempty"`
+}
+
+// InstructionsTarget is a target's instruction file. Path (and Rules) are
+// tilde-expanded in global mode and relative to the project root in project
+// mode. Fallback is set in project mode only.
+type InstructionsTarget struct {
+	Path     string
+	Import   bool
+	SameAs   string
+	MaxChars int
+	Fallback string
+	Rules    string
+}
+
 type targetSpec struct {
-	GlobalName  string   `yaml:"global_name"`
-	ProjectName string   `yaml:"project_name"`
-	GlobalPath  string   `yaml:"global_path"`
-	ProjectPath string   `yaml:"project_path"`
-	Aliases     []string `yaml:"aliases,omitempty"` // Deprecated: backward compat for old project_name values. Remove once safe.
+	Name string `yaml:"name"`
+	// Detect is the tool's install directory (e.g. ~/.codex). Only needed for
+	// targets whose skills path is shared with another target, where the skills
+	// path alone cannot tell the tools apart.
+	Detect string `yaml:"detect,omitempty"`
+	// ConfigDir is the directory the Agent keeps its files in, where the Agent can be told to
+	// use another one (CLAUDE_CONFIG_DIR). A target may then be such another directory.
+	ConfigDir string          `yaml:"config_dir,omitempty"`
+	Skills    targetPathPair  `yaml:"skills"`
+	Agents    targetPathPair  `yaml:"agents,omitempty"`
+	AlsoScans targetAlsoScans `yaml:"also_scans,omitempty"`
+	// OneSkillPerName marks a runtime that loads a single skill per name across
+	// its own folder and the folders it also scans.
+	OneSkillPerName bool               `yaml:"one_skill_per_name,omitempty"`
+	Instructions    targetInstructions `yaml:"instructions,omitempty"`
+	// Files are plain files the tool reads besides its instruction file,
+	// relative to its file root (see TargetFileRoot).
+	Files   []string `yaml:"files,omitempty"`
+	Aliases []string `yaml:"aliases,omitempty"`
 }
 
 type targetsFile struct {
@@ -31,7 +128,7 @@ var (
 	loadTargetsOnce sync.Once
 )
 
-func loadTargetSpecs() ([]targetSpec, error) {
+func loadTargetTemplates() ([]targetSpec, error) {
 	loadTargetsOnce.Do(func() {
 		var file targetsFile
 		if err := yaml.Unmarshal(defaultTargetsData, &file); err != nil {
@@ -44,6 +141,22 @@ func loadTargetSpecs() ([]targetSpec, error) {
 	return loadedTargets, loadTargetsErr
 }
 
+func loadTargetSpecs() ([]targetSpec, error) {
+	templates, err := loadTargetTemplates()
+	if err != nil {
+		return nil, err
+	}
+	// Resolve native config homes per call, without changing the embedded defaults
+	// or explicit paths saved in a user's config.
+	specs := append([]targetSpec(nil), templates...)
+	for i, spec := range specs {
+		if home := targetConfigHome(spec.Name, runtime.GOOS); home != "" {
+			specs[i].Skills.Global = filepath.Join(home, "skills")
+		}
+	}
+	return specs, loadTargetsErr
+}
+
 // DefaultTargets returns the well-known CLI skills directories for global mode.
 func DefaultTargets() map[string]TargetConfig {
 	specs, err := loadTargetSpecs()
@@ -53,14 +166,30 @@ func DefaultTargets() map[string]TargetConfig {
 
 	targets := make(map[string]TargetConfig)
 	for _, spec := range specs {
-		if spec.GlobalName == "" || spec.GlobalPath == "" {
+		if spec.Name == "" || spec.Skills.Global == "" {
 			continue
 		}
-		path := normalizeTargetPath(spec.GlobalPath)
-		targets[spec.GlobalName] = TargetConfig{Path: path}
+		path := normalizeTargetPath(spec.Skills.Global)
+		targets[spec.Name] = TargetConfig{Path: path}
 	}
 
 	return targets
+}
+
+// DefaultTargets returns built-in defaults for this configuration. An account
+// shell must not redirect the plain OMP target into that account's directory.
+func (c *Config) DefaultTargets() map[string]TargetConfig {
+	defaults := DefaultTargets()
+	if home := targetConfigHome("omp", runtime.GOOS); home != "" {
+		for _, account := range c.Targets {
+			if spec, ok := globalSpec(account.Agent); ok && spec.Name == "omp" && account.ConfigDir != "" &&
+				utils.PathsEqual(utils.ResolveSymlink(home), utils.ResolveSymlink(filepath.Clean(expandPath(account.ConfigDir)))) {
+				defaults["omp"] = TargetConfig{Path: filepath.Join(AgentConfigDir("omp"), "skills")}
+				break
+			}
+		}
+	}
+	return defaults
 }
 
 // ProjectTargets returns the well-known CLI skills directories for project mode.
@@ -72,14 +201,422 @@ func ProjectTargets() map[string]TargetConfig {
 
 	targets := make(map[string]TargetConfig)
 	for _, spec := range specs {
-		if spec.ProjectName == "" || spec.ProjectPath == "" {
+		if spec.Name == "" || spec.Skills.Project == "" {
 			continue
 		}
-		path := normalizeTargetPath(spec.ProjectPath)
-		targets[spec.ProjectName] = TargetConfig{Path: path}
+		path := normalizeTargetPath(spec.Skills.Project)
+		targets[spec.Name] = TargetConfig{Path: path}
 	}
 
 	return targets
+}
+
+// DefaultAgentTargets returns the well-known agent directories for global mode.
+// Only targets that define agent paths are included.
+func DefaultAgentTargets() map[string]TargetConfig {
+	specs, err := loadTargetSpecs()
+	if err != nil {
+		return map[string]TargetConfig{}
+	}
+
+	targets := make(map[string]TargetConfig)
+	for _, spec := range specs {
+		if spec.Name == "" || spec.Agents.Global == "" {
+			continue
+		}
+		path := normalizeTargetPath(spec.Agents.Global)
+		targets[spec.Name] = TargetConfig{Path: path}
+	}
+
+	return targets
+}
+
+// ProjectAgentTargets returns the well-known agent directories for project mode.
+// Only targets that define agent paths are included.
+func ProjectAgentTargets() map[string]TargetConfig {
+	specs, err := loadTargetSpecs()
+	if err != nil {
+		return map[string]TargetConfig{}
+	}
+
+	targets := make(map[string]TargetConfig)
+	for _, spec := range specs {
+		if spec.Name == "" || spec.Agents.Project == "" {
+			continue
+		}
+		path := normalizeTargetPath(spec.Agents.Project)
+		targets[spec.Name] = TargetConfig{Path: path}
+	}
+
+	return targets
+}
+
+// LookupGlobalAgentTarget returns the known global agent target config for a
+// target name or alias.
+func LookupGlobalAgentTarget(name string) (TargetConfig, bool) {
+	return lookupAgentTarget(name, false)
+}
+
+// LookupProjectAgentTarget returns the known project agent target config for a
+// target name or alias.
+func LookupProjectAgentTarget(name string) (TargetConfig, bool) {
+	return lookupAgentTarget(name, true)
+}
+
+func lookupAgentTarget(name string, project bool) (TargetConfig, bool) {
+	specs, err := loadTargetSpecs()
+	if err != nil {
+		return TargetConfig{}, false
+	}
+	for _, spec := range specs {
+		if !targetSpecMatchesName(spec, name) {
+			continue
+		}
+		path := spec.Agents.Global
+		if project {
+			path = spec.Agents.Project
+		}
+		if spec.Name == "" || path == "" {
+			return TargetConfig{}, false
+		}
+		return TargetConfig{Path: normalizeTargetPath(path)}, true
+	}
+	return TargetConfig{}, false
+}
+
+// LookupInstructions returns the instruction file of a target name or alias.
+// It reports false for unknown targets and targets without that file.
+func LookupInstructions(name string, project bool) (InstructionsTarget, bool) {
+	specs, err := loadTargetSpecs()
+	if err != nil {
+		return InstructionsTarget{}, false
+	}
+	for _, spec := range specs {
+		if !targetSpecMatchesName(spec, name) {
+			continue
+		}
+		return specInstructions(spec, project)
+	}
+	return InstructionsTarget{}, false
+}
+
+func specInstructions(spec targetSpec, project bool) (InstructionsTarget, bool) {
+	in := spec.Instructions
+	it := InstructionsTarget{Path: in.Global, Import: in.Import, SameAs: in.SameAs, MaxChars: in.MaxChars, Rules: in.Rules.Global}
+	if project {
+		it = InstructionsTarget{Path: in.Project, Import: in.Import, Fallback: in.ProjectFallback, Rules: in.Rules.Project}
+	}
+	if it.Path == "" {
+		return InstructionsTarget{}, false
+	}
+	it.Path, it.Rules, it.Fallback = normalizeTargetPath(it.Path), normalizeTargetPath(it.Rules), normalizeTargetPath(it.Fallback)
+	return it, true
+}
+
+// TargetInstructions returns the instruction file of a configured target. A
+// target that is another config directory of an Agent reads the Agent's file
+// moved into that directory; a target expanded from projects has none.
+func TargetInstructions(name string, tc TargetConfig, project bool) (InstructionsTarget, bool) {
+	if tc.ProjectRoot() != "" {
+		return InstructionsTarget{}, false
+	}
+	if tc.Instructions != nil && strings.TrimSpace(tc.Instructions.Path) != "" {
+		return customInstructions(*tc.Instructions, project), true
+	}
+	if tc.Agent == "" || tc.ConfigDir == "" || project {
+		return LookupInstructions(name, project)
+	}
+	spec, ok := globalSpec(tc.Agent)
+	if !ok || spec.ConfigDir == "" {
+		return InstructionsTarget{}, false
+	}
+	it, ok := specInstructions(spec, false)
+	if !ok {
+		return InstructionsTarget{}, false
+	}
+	base, dir := normalizeTargetPath(spec.ConfigDir), expandPath(tc.ConfigDir)
+	move := func(path string) string {
+		rel, err := filepath.Rel(base, path)
+		if path == "" || err != nil || strings.HasPrefix(rel, "..") {
+			return ""
+		}
+		return filepath.Join(dir, rel)
+	}
+	if it.Path = move(it.Path); it.Path == "" {
+		return InstructionsTarget{}, false
+	}
+	// An account's file is its own, never another target's.
+	it.Rules, it.SameAs = move(it.Rules), ""
+	return it, true
+}
+
+// customInstructions turns a user-set instruction file into an
+// InstructionsTarget: tilde-expanded in global mode, left relative to the
+// project root in project mode (instructions.Resolve joins it).
+func customInstructions(ic TargetInstructionsConfig, project bool) InstructionsTarget {
+	path := strings.TrimSpace(ic.Path)
+	if project {
+		path = filepath.Clean(filepath.FromSlash(path))
+	} else {
+		path = filepath.Clean(normalizeTargetPath(path))
+	}
+	return InstructionsTarget{Path: path, Import: ic.Import}
+}
+
+// AlsoScansGlobal returns the additional filesystem paths a target's runtime
+// scans in global mode beyond its primary skills path. Paths are tilde-expanded
+// and OS-normalised. Returns nil for unknown targets or targets without
+// also_scans metadata.
+func AlsoScansGlobal(name string) []string {
+	specs, err := loadTargetSpecs()
+	if err != nil {
+		return nil
+	}
+	for _, spec := range specs {
+		if spec.Name != name {
+			continue
+		}
+		if len(spec.AlsoScans.Global) == 0 {
+			return nil
+		}
+		paths := make([]string, len(spec.AlsoScans.Global))
+		for i, p := range spec.AlsoScans.Global {
+			paths[i] = normalizeTargetPath(p)
+		}
+		return paths
+	}
+	return nil
+}
+
+// AlsoScansProject returns the project-mode equivalent of AlsoScansGlobal.
+func AlsoScansProject(name string) []string {
+	specs, err := loadTargetSpecs()
+	if err != nil {
+		return nil
+	}
+	for _, spec := range specs {
+		if spec.Name != name {
+			continue
+		}
+		if len(spec.AlsoScans.Project) == 0 {
+			return nil
+		}
+		paths := make([]string, len(spec.AlsoScans.Project))
+		for i, p := range spec.AlsoScans.Project {
+			paths[i] = normalizeTargetPath(p)
+		}
+		return paths
+	}
+	return nil
+}
+
+// LoadsOneSkillPerName reports whether a target's runtime loads a single skill
+// per name across its own folder and the folders it also scans.
+func LoadsOneSkillPerName(name string) bool {
+	specs, err := loadTargetSpecs()
+	if err != nil {
+		return false
+	}
+	for _, spec := range specs {
+		if spec.Name == name {
+			return spec.OneSkillPerName
+		}
+	}
+	return false
+}
+
+// ScanOff is an also_scans path a target's runtime skips because EnvVar is set.
+type ScanOff struct {
+	Path   string
+	EnvVar string
+}
+
+// AlsoScansDisabledBy returns, per also_scans path (normalised like
+// AlsoScansGlobal/AlsoScansProject), the environment variables that make the
+// target's runtime skip it, most specific first.
+func AlsoScansDisabledBy(name string, isProject bool) map[string][]string {
+	specs, err := loadTargetSpecs()
+	if err != nil {
+		return nil
+	}
+	for _, spec := range specs {
+		if spec.Name != name {
+			continue
+		}
+		raw := spec.AlsoScans.Global
+		if isProject {
+			raw = spec.AlsoScans.Project
+		}
+		out := make(map[string][]string)
+		for _, p := range raw {
+			if vars := spec.AlsoScans.DisabledByEnv[p]; len(vars) > 0 {
+				out[normalizeTargetPath(p)] = vars
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// ScansTurnedOff returns the also_scans paths an environment variable of this
+// process turns off. It assumes the runtime sees the same environment.
+func ScansTurnedOff(name string, isProject bool) []ScanOff {
+	var off []ScanOff
+	for path, vars := range AlsoScansDisabledBy(name, isProject) {
+		for _, v := range vars {
+			if envTrue(os.Getenv(v)) {
+				off = append(off, ScanOff{Path: path, EnvVar: v})
+				break
+			}
+		}
+	}
+	sort.Slice(off, func(i, j int) bool { return off[i].Path < off[j].Path })
+	return off
+}
+
+// envTrue reports whether v is a true value as OpenCode's flags read it
+// (Effect's Config.boolean).
+func envTrue(v string) bool {
+	switch v {
+	case "true", "yes", "on", "1", "y":
+		return true
+	}
+	return false
+}
+
+// DetectDir returns the install directory that identifies a target's tool,
+// tilde-expanded and OS-normalised. Returns "" for unknown targets or targets
+// without detect metadata (their skills path already identifies them).
+func DetectDir(name string) string {
+	specs, err := loadTargetSpecs()
+	if err != nil {
+		return ""
+	}
+	for _, spec := range specs {
+		if spec.Name != name {
+			continue
+		}
+		return normalizeTargetPath(spec.Detect)
+	}
+	return ""
+}
+
+// RuntimeScanPaths returns every path a target's runtime reads: its also_scans
+// paths plus its built-in default skills path. Callers stay correct when a
+// default path moves into also_scans (or back), and when the user has pinned
+// the target to a different path in their config.
+func RuntimeScanPaths(name string, isProject bool) []string {
+	var scans []string
+	var primary string
+	if isProject {
+		scans = AlsoScansProject(name)
+		primary = ProjectTargets()[name].Path
+	} else {
+		scans = AlsoScansGlobal(name)
+		primary = DefaultTargets()[name].Path
+	}
+	off := make(map[string]bool)
+	for _, s := range ScansTurnedOff(name, isProject) {
+		off[s.Path] = true
+	}
+
+	paths := make([]string, 0, len(scans)+1)
+	seen := make(map[string]bool, len(scans)+1)
+	for _, p := range scans {
+		if p == "" || seen[p] || off[p] {
+			continue
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	if primary != "" && !seen[primary] {
+		paths = append(paths, primary)
+	}
+	return paths
+}
+
+// TargetScanPaths returns every path a target's runtime reads: for a built-in
+// target, its also_scans paths plus its built-in default skills path; for an
+// account target, config-root scan paths remapped to the account directory
+// while preserving external scan paths (such as Codex's ~/.agents/skills),
+// plus its account primary skills path.
+func TargetScanPaths(name string, target TargetConfig, isProject bool) []string {
+	agent := name
+	isAccount := target.Agent != ""
+	if isAccount {
+		agent = target.Agent
+	}
+
+	var candidatePaths []string
+	if isProject {
+		candidatePaths = append(candidatePaths, AlsoScansProject(agent)...)
+		if isAccount {
+			if primary := ProjectTargets()[agent].Path; primary != "" {
+				candidatePaths = append(candidatePaths, primary)
+			}
+		} else if primary := ProjectTargets()[name].Path; primary != "" {
+			candidatePaths = append(candidatePaths, primary)
+		}
+	} else {
+		candidatePaths = append(candidatePaths, AlsoScansGlobal(agent)...)
+		if isAccount {
+			// Accounts remap the canonical path, independent of runtime overrides.
+			if spec, ok := globalSpec(agent); ok && spec.Skills.Global != "" {
+				candidatePaths = append(candidatePaths, normalizeTargetPath(spec.Skills.Global))
+			}
+		} else if primary := DefaultTargets()[name].Path; primary != "" {
+			candidatePaths = append(candidatePaths, primary)
+		}
+	}
+
+	off := make(map[string]bool)
+	for _, s := range ScansTurnedOff(agent, isProject) {
+		off[s.Path] = true
+	}
+
+	baseConfigDir := ""
+	accountDir := ""
+	if isAccount {
+		baseConfigDir = AgentConfigDir(agent)
+		if target.ConfigDir != "" {
+			accountDir = normalizeTargetPath(ExpandPath(target.ConfigDir))
+		}
+	}
+
+	remapPath := func(p string) string {
+		norm := normalizeTargetPath(p)
+		if !isAccount || baseConfigDir == "" || accountDir == "" {
+			return norm
+		}
+		rel, err := filepath.Rel(baseConfigDir, norm)
+		if err == nil && !strings.HasPrefix(rel, "..") {
+			return filepath.Join(accountDir, rel)
+		}
+		return norm
+	}
+
+	paths := make([]string, 0, len(candidatePaths)+1)
+	seen := make(map[string]bool, len(candidatePaths)+1)
+	for _, p := range candidatePaths {
+		remapped := remapPath(p)
+		if remapped == "" || seen[remapped] || off[p] {
+			continue
+		}
+		seen[remapped] = true
+		paths = append(paths, remapped)
+	}
+
+	if isAccount {
+		if raw := target.SkillsConfig().Path; raw != "" {
+			p := normalizeTargetPath(ExpandPath(raw))
+			if p != "" && !seen[p] {
+				seen[p] = true
+				paths = append(paths, p)
+			}
+		}
+	}
+
+	return paths
 }
 
 // LookupProjectTarget returns the known project target config for a name.
@@ -96,10 +633,8 @@ func LookupProjectTarget(name string) (TargetConfig, bool) {
 		return TargetConfig{}, false
 	}
 	for _, spec := range specs {
-		for _, alias := range spec.Aliases {
-			if alias == name && spec.ProjectName != "" && spec.ProjectPath != "" {
-				return targets[spec.ProjectName], true
-			}
+		if targetSpecMatchesName(spec, name) && spec.Name != "" && spec.Skills.Project != "" {
+			return TargetConfig{Path: normalizeTargetPath(spec.Skills.Project)}, true
 		}
 	}
 	return TargetConfig{}, false
@@ -139,14 +674,14 @@ func GroupedProjectTargets() []GroupedProjectTarget {
 	var pathOrder []string
 
 	for _, spec := range specs {
-		if spec.ProjectName == "" || spec.ProjectPath == "" {
+		if spec.Name == "" || spec.Skills.Project == "" {
 			continue
 		}
-		path := normalizeTargetPath(spec.ProjectPath)
+		path := normalizeTargetPath(spec.Skills.Project)
 		if pg, ok := pathMap[path]; ok {
-			pg.names = append(pg.names, spec.ProjectName)
+			pg.names = append(pg.names, spec.Name)
 		} else {
-			pathMap[path] = &pathGroup{path: path, names: []string{spec.ProjectName}}
+			pathMap[path] = &pathGroup{path: path, names: []string{spec.Name}}
 			pathOrder = append(pathOrder, path)
 		}
 	}
@@ -188,12 +723,44 @@ func GroupedProjectTargets() []GroupedProjectTarget {
 	return result
 }
 
-// MatchesTargetName checks whether a skill-declared target name matches a
-// config target name.  It handles alias matching (e.g. "claude" matches
-// the alias "claude-code") by looking up the target spec registry.
+var canonicalTargetNamesOnce sync.Once
+var canonicalTargetNames map[string]string
+
+// CanonicalTargetName resolves registry names and aliases without treating a
+// shared destination path as agent identity. Unknown names return empty.
+func CanonicalTargetName(name string) string {
+	if _, tool, ok := SplitProjectTarget(name); ok {
+		name = tool
+	}
+	canonicalTargetNamesOnce.Do(func() {
+		specs, err := loadTargetSpecs()
+		if err != nil {
+			return
+		}
+		canonicalTargetNames = make(map[string]string)
+		for _, spec := range specs {
+			for _, alias := range append([]string{spec.Name}, spec.Aliases...) {
+				if _, exists := canonicalTargetNames[alias]; !exists {
+					canonicalTargetNames[alias] = spec.Name
+				}
+			}
+		}
+	})
+	return canonicalTargetNames[name]
+}
+
+// MatchesTargetName checks explicit target declarations, including aliases and
+// targets sharing a skills path for compatibility.
 func MatchesTargetName(skillTarget, configTarget string) bool {
 	if skillTarget == configTarget {
 		return true
+	}
+	// A skill for claude also belongs in a project's claude target.
+	if _, tool, ok := SplitProjectTarget(configTarget); ok {
+		configTarget = tool
+		if skillTarget == tool {
+			return true
+		}
 	}
 
 	specs, err := loadTargetSpecs()
@@ -202,9 +769,9 @@ func MatchesTargetName(skillTarget, configTarget string) bool {
 	}
 
 	for _, spec := range specs {
-		allNames := make([]string, 0, 2+len(spec.Aliases))
-		allNames = append(allNames, spec.GlobalName, spec.ProjectName)
-		allNames = append(allNames, spec.Aliases...) // backward compat — remove once safe
+		allNames := make([]string, 0, 1+len(spec.Aliases))
+		allNames = append(allNames, spec.Name)
+		allNames = append(allNames, spec.Aliases...)
 		hasSkill := false
 		hasConfig := false
 		for _, n := range allNames {
@@ -245,9 +812,9 @@ func KnownTargetNames() []string {
 	seen := make(map[string]bool)
 	var names []string
 	for _, spec := range specs {
-		candidates := make([]string, 0, 2+len(spec.Aliases))
-		candidates = append(candidates, spec.GlobalName, spec.ProjectName)
-		candidates = append(candidates, spec.Aliases...) // backward compat — remove once safe
+		candidates := make([]string, 0, 1+len(spec.Aliases))
+		candidates = append(candidates, spec.Name)
+		candidates = append(candidates, spec.Aliases...)
 		for _, n := range candidates {
 			if n != "" && !seen[n] {
 				seen[n] = true
@@ -264,20 +831,10 @@ func resolveTargetPaths(specs []targetSpec, name string) []string {
 	var paths []string
 	seen := make(map[string]bool)
 	for _, spec := range specs {
-		allNames := make([]string, 0, 2+len(spec.Aliases))
-		allNames = append(allNames, spec.GlobalName, spec.ProjectName)
-		allNames = append(allNames, spec.Aliases...)
-		match := false
-		for _, n := range allNames {
-			if n == name {
-				match = true
-				break
-			}
-		}
-		if !match {
+		if !targetSpecMatchesName(spec, name) {
 			continue
 		}
-		for _, p := range []string{spec.ProjectPath, spec.GlobalPath} {
+		for _, p := range []string{spec.Skills.Project, spec.Skills.Global} {
 			if p != "" && !seen[p] {
 				seen[p] = true
 				paths = append(paths, p)
@@ -285,6 +842,47 @@ func resolveTargetPaths(specs []targetSpec, name string) []string {
 		}
 	}
 	return paths
+}
+
+func targetSpecMatchesName(spec targetSpec, name string) bool {
+	if spec.Name == name {
+		return true
+	}
+	for _, alias := range spec.Aliases {
+		if alias == name {
+			return true
+		}
+	}
+	return false
+}
+
+// ProjectTargetDotDirs returns the set of hidden directory names (e.g. ".claude",
+// ".cursor") that are first path segments in any project target path. These are
+// well-known AI-tool config directories that should be skipped during skill
+// discovery to avoid counting target-synced copies as source skills.
+// ".skillshare" is always included.
+func ProjectTargetDotDirs() map[string]bool {
+	specs, err := loadTargetSpecs()
+	if err != nil {
+		return map[string]bool{".skillshare": true}
+	}
+
+	dirs := map[string]bool{".skillshare": true}
+	for _, spec := range specs {
+		// Collect dot-dirs from skill, agent and also-scanned project paths.
+		projectPaths := []string{spec.Skills.Project, spec.Agents.Project}
+		projectPaths = append(projectPaths, spec.AlsoScans.Project...)
+		for _, p := range projectPaths {
+			if p == "" {
+				continue
+			}
+			first := strings.SplitN(p, "/", 2)[0]
+			if strings.HasPrefix(first, ".") {
+				dirs[first] = true
+			}
+		}
+	}
+	return dirs
 }
 
 func normalizeTargetPath(path string) string {
@@ -295,4 +893,34 @@ func normalizeTargetPath(path string) string {
 		path = expandPath(path)
 	}
 	return filepath.FromSlash(path)
+}
+
+func targetConfigHome(name, goos string) string {
+	switch name {
+	case "omp":
+		// Match MCP: trim the override and never resolve it against the working directory.
+		if home := strings.TrimSpace(os.Getenv("PI_CODING_AGENT_DIR")); filepath.IsAbs(home) {
+			return filepath.Clean(home)
+		}
+	case "deepseek-harness":
+		if home := os.Getenv("DSH_HOME"); strings.TrimSpace(home) != "" {
+			// Harness resolves relative overrides against the current directory.
+			if path, err := filepath.Abs(expandPath(home)); err == nil {
+				return path
+			}
+		}
+	case "gitlab-duo":
+		if home := os.Getenv("GLAB_CONFIG_DIR"); home != "" {
+			return home
+		}
+		if home := os.Getenv("XDG_CONFIG_HOME"); home != "" {
+			return filepath.Join(home, "gitlab", "duo")
+		}
+		if goos == "windows" {
+			if home := os.Getenv("APPDATA"); home != "" {
+				return filepath.Join(home, "GitLab", "duo")
+			}
+		}
+	}
+	return ""
 }

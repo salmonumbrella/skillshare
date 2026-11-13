@@ -1,0 +1,92 @@
+import { useEffect, type ReactNode, type RefObject } from 'react';
+import { createPortal } from 'react-dom';
+import { useFocusTrap } from '../hooks/useFocusTrap';
+import { dialogGhost } from '../lib/exitGhost';
+
+const maxWidthClass = {
+  sm: 'max-w-sm',
+  md: 'max-w-md',
+  lg: 'max-w-lg',
+  xl: 'max-w-xl',
+  '2xl': 'max-w-2xl',
+  '3xl': 'max-w-3xl',
+  '4xl': 'max-w-4xl',
+  '5xl': 'max-w-5xl',
+  '6xl': 'max-w-6xl',
+  '7xl': 'max-w-7xl',
+  full: 'max-w-none',
+} as const;
+
+const paddingClass = {
+  none: '',
+  sm: 'p-3',
+  md: 'p-4',
+  lg: 'p-6',
+} as const;
+
+interface DialogShellProps {
+  open: boolean;
+  onClose: () => void;
+  children: ReactNode;
+  maxWidth?: keyof typeof maxWidthClass;
+  /** Use "none" with the .dh / .db / .df sections for the standard header, body and footer */
+  padding?: keyof typeof paddingClass;
+  /** Prevent close on Escape / backdrop click (e.g. during loading) */
+  preventClose?: boolean;
+  className?: string;
+  ariaLabel?: string;
+}
+
+export default function DialogShell({
+  open,
+  onClose,
+  children,
+  maxWidth = 'lg',
+  padding = 'lg',
+  preventClose = false,
+  className = '',
+  ariaLabel,
+}: DialogShellProps) {
+  const trapRef = useFocusTrap(open);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleKey = (e: KeyboardEvent) => {
+      // An inner control that used the key (an editor's completion list) keeps the dialog open.
+      if (e.key === 'Escape' && !preventClose && !e.defaultPrevented) onClose();
+    };
+    document.addEventListener('keydown', handleKey);
+    return () => document.removeEventListener('keydown', handleKey);
+  }, [open, preventClose, onClose]);
+
+  // Prevent background scroll while modal is open
+  useEffect(() => {
+    if (!open) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, [open]);
+
+  if (!open) return null;
+
+  return createPortal(
+    <div
+      ref={dialogGhost}
+      className="ss-scrim p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-label={ariaLabel}
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget && !preventClose) onClose();
+      }}
+    >
+      <div
+        ref={trapRef as RefObject<HTMLDivElement>}
+        className={`ss-dlg relative w-full max-h-[calc(100vh-2rem)] ${maxWidthClass[maxWidth]} ${paddingClass[padding]} animate-dialog-in ${className}`}
+      >
+        {children}
+      </div>
+    </div>,
+    document.body,
+  );
+}

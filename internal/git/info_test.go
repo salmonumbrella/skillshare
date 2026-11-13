@@ -1,11 +1,15 @@
 package git
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"skillshare/internal/install"
 )
 
 // initTestRepo creates a temporary git repo with one commit
@@ -37,6 +41,87 @@ func initTestRepo(t *testing.T) string {
 	run("commit", "-m", "initial")
 
 	return dir
+}
+
+// TestPushRemoteWithEnv_TokenNotInError uses a fake git executable to verify
+// that PushRemoteWithEnv sanitizes credential-bearing content from git error
+// output. This does not assume every real git failure prints credentials; it
+// verifies that this wrapper does not return sensitive subprocess output
+// verbatim when such output is present.
+func TestPushRemoteWithEnv_TokenNotInError(t *testing.T) {
+	const token = "ghp_test_token_12345_redact"
+	const fakeGitErr = "fatal: unable to access 'https://x-access-token:" + token + "@github.com/org/repo.git/': Could not resolve host: github.com"
+
+	fakeBin := t.TempDir()
+	fakeGit := filepath.Join(fakeBin, "git")
+
+	script := "#!/bin/sh\n" +
+		"echo \"" + fakeGitErr + "\" >&2\n" +
+		"exit 128\n"
+
+	if err := os.WriteFile(fakeGit, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GITHUB_TOKEN", token)
+
+	extraEnv := install.AuthEnvForURL("https://github.com/org/repo.git", install.ParseOptions{})
+
+	err := PushRemoteWithEnv(t.TempDir(), extraEnv)
+	if err == nil {
+		t.Fatal("expected git push to fail")
+	}
+
+	msg := err.Error()
+
+	// Token must not appear in error output.
+	if strings.Contains(msg, token) {
+		t.Fatalf("token leaked in error: %v", err)
+	}
+
+	// Useful diagnostic text should survive sanitization.
+	if !strings.Contains(msg, "Could not resolve host") && !strings.Contains(msg, "unable to access") {
+		t.Fatalf("expected useful diagnostic in error, got: %v", err)
+	}
+}
+
+func TestPushRemoteWithEnv_PreservesStdoutDiagnostics(t *testing.T) {
+	const token = "ghp_stdout_token_12345_redact"
+	const stdoutDiagnostic = "pre-push hook rejected branch https://x-access-token:" + token + "@github.com/org/repo.git/"
+
+	fakeBin := t.TempDir()
+	fakeGit := filepath.Join(fakeBin, "git")
+
+	script := "#!/bin/sh\n" +
+		"echo \"" + stdoutDiagnostic + "\"\n" +
+		"echo \"error: failed to push some refs to 'https://github.com/org/repo.git'\" >&2\n" +
+		"exit 1\n"
+
+	if err := os.WriteFile(fakeGit, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GITHUB_TOKEN", token)
+
+	extraEnv := install.AuthEnvForURL("https://github.com/org/repo.git", install.ParseOptions{})
+
+	err := PushRemoteWithEnv(t.TempDir(), extraEnv)
+	if err == nil {
+		t.Fatal("expected git push to fail")
+	}
+
+	msg := err.Error()
+	if strings.Contains(msg, token) {
+		t.Fatalf("token leaked in error: %v", err)
+	}
+	if !strings.Contains(msg, "pre-push hook rejected branch") {
+		t.Fatalf("expected stdout diagnostic in error, got: %v", err)
+	}
+	if !strings.Contains(msg, "failed to push some refs") {
+		t.Fatalf("expected stderr diagnostic in error, got: %v", err)
+	}
 }
 
 func TestIsRepo(t *testing.T) {
@@ -88,7 +173,7 @@ func TestStageAndCommit(t *testing.T) {
 	os.WriteFile(filepath.Join(repo, "new.txt"), []byte("hello"), 0644)
 
 	// Stage all
-	if err := StageAll(repo); err != nil {
+	if err := StageAll(repo, repo, "commit", func(string) {}); err != nil {
 		t.Fatalf("StageAll failed: %v", err)
 	}
 
@@ -127,6 +212,19 @@ func TestGetStatus(t *testing.T) {
 	}
 	if status == "" {
 		t.Error("expected non-empty status after adding untracked file")
+	}
+}
+
+func TestIsDirty_ErrorIncludesGitStderr(t *testing.T) {
+	repo := initTestRepo(t)
+	// A truncated index makes git status fail with a message on stderr.
+	if err := os.WriteFile(filepath.Join(repo, ".git", "index"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := IsDirty(repo)
+	if err == nil || !strings.Contains(err.Error(), "index") {
+		t.Fatalf("expected git's stderr in the error, got %v", err)
 	}
 }
 
@@ -175,15 +273,15 @@ func TestAuthEnvForRepo_UsesGitHubToken(t *testing.T) {
 	addRemote(t, repo, "https://github.com/org/private-repo.git")
 	t.Setenv("GITHUB_TOKEN", "ghp_test_token_123")
 
-	env := AuthEnvForRepo(repo)
-	if len(env) != 3 {
-		t.Fatalf("expected auth env with 3 entries, got %d: %v", len(env), env)
-	}
-	if !strings.Contains(env[1], "url.https://x-access-token:ghp_test_token_123@github.com/.insteadOf") {
-		t.Fatalf("unexpected auth key env: %q", env[1])
-	}
-	if !strings.Contains(env[2], "https://github.com/") {
-		t.Fatalf("unexpected auth value env: %q", env[2])
+	env := AuthEnvForRepo(repo, install.ParseOptions{})
+	for _, want := range []string{
+		"GIT_CONFIG_KEY_0=credential.https://github.com.helper",
+		"SKILLSHARE_GIT_AUTH_USERNAME=x-access-token",
+		"SKILLSHARE_GIT_AUTH_PASSWORD=ghp_test_token_123",
+	} {
+		if !slices.Contains(env, want) {
+			t.Errorf("auth env %q missing %q", env, want)
+		}
 	}
 }
 
@@ -192,15 +290,15 @@ func TestAuthEnvForRepo_UsesGitLabToken(t *testing.T) {
 	addRemote(t, repo, "https://gitlab.com/group/private-repo.git")
 	t.Setenv("GITLAB_TOKEN", "glpat_test_token_123")
 
-	env := AuthEnvForRepo(repo)
-	if len(env) != 3 {
-		t.Fatalf("expected auth env with 3 entries, got %d: %v", len(env), env)
-	}
-	if !strings.Contains(env[1], "url.https://oauth2:glpat_test_token_123@gitlab.com/.insteadOf") {
-		t.Fatalf("unexpected auth key env: %q", env[1])
-	}
-	if !strings.Contains(env[2], "https://gitlab.com/") {
-		t.Fatalf("unexpected auth value env: %q", env[2])
+	env := AuthEnvForRepo(repo, install.ParseOptions{})
+	for _, want := range []string{
+		"GIT_CONFIG_KEY_0=credential.https://gitlab.com.helper",
+		"SKILLSHARE_GIT_AUTH_USERNAME=oauth2",
+		"SKILLSHARE_GIT_AUTH_PASSWORD=glpat_test_token_123",
+	} {
+		if !slices.Contains(env, want) {
+			t.Errorf("auth env %q missing %q", env, want)
+		}
 	}
 }
 
@@ -210,7 +308,7 @@ func TestAuthEnvForRepo_NoTokenReturnsNil(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("SKILLSHARE_GIT_TOKEN", "")
 
-	env := AuthEnvForRepo(repo)
+	env := AuthEnvForRepo(repo, install.ParseOptions{})
 	if env != nil {
 		t.Fatalf("expected nil auth env without tokens, got: %v", env)
 	}
@@ -222,7 +320,7 @@ func TestAuthEnvForRepo_SSHRemote_ReturnsNil(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "ghp_test_token_123")
 	t.Setenv("SKILLSHARE_GIT_TOKEN", "generic-token")
 
-	env := AuthEnvForRepo(repo)
+	env := AuthEnvForRepo(repo, install.ParseOptions{})
 	if env != nil {
 		t.Fatalf("expected nil auth env for SSH remote, got: %v", env)
 	}
@@ -296,26 +394,33 @@ func TestHasRemoteSkillDirs(t *testing.T) {
 	}
 }
 
-func TestHasLocalSkillDirs(t *testing.T) {
-	repo := initTestRepo(t)
+func TestHasLocalContent(t *testing.T) {
+	repo := t.TempDir()
+	runGit(t, repo, "init")
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte(".DS_Store\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".DS_Store"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-	hasSkills, err := HasLocalSkillDirs(repo)
+	hasLocal, err := HasLocalContent(repo)
 	if err != nil {
-		t.Fatalf("HasLocalSkillDirs failed: %v", err)
+		t.Fatalf("HasLocalContent failed: %v", err)
 	}
-	if hasSkills {
-		t.Fatal("expected no local skill directories in fresh repo")
+	if hasLocal {
+		t.Fatal("expected .gitignore and ignored files alone to count as no local content")
 	}
 
-	if err := os.MkdirAll(filepath.Join(repo, "my-skill"), 0o755); err != nil {
-		t.Fatalf("failed to create local skill dir: %v", err)
+	if err := os.WriteFile(filepath.Join(repo, "reviewer.md"), []byte("# agent\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	hasSkills, err = HasLocalSkillDirs(repo)
+	hasLocal, err = HasLocalContent(repo)
 	if err != nil {
-		t.Fatalf("HasLocalSkillDirs failed: %v", err)
+		t.Fatalf("HasLocalContent failed: %v", err)
 	}
-	if !hasSkills {
-		t.Fatal("expected local skill directory to be detected")
+	if !hasLocal {
+		t.Fatal("expected a root-level file to count as local content")
 	}
 }
 
@@ -422,6 +527,147 @@ func TestPullWithProgress(t *testing.T) {
 	}
 }
 
+// divergeFromRemote commits remoteFile on another clone and pushes it, then
+// commits localFile in repo without pushing, as two machines syncing would.
+func divergeFromRemote(t *testing.T, remote, repo string, remoteFile, localFile [2]string) {
+	t.Helper()
+	other := cloneRepo(t, remote)
+	for _, c := range []struct {
+		dir  string
+		file [2]string
+	}{{other, remoteFile}, {repo, localFile}} {
+		runGit(t, c.dir, "config", "user.email", "test@test.com")
+		runGit(t, c.dir, "config", "user.name", "test")
+		if err := os.WriteFile(filepath.Join(c.dir, c.file[0]), []byte(c.file[1]), 0644); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, c.dir, "add", "-A")
+		runGit(t, c.dir, "commit", "-m", "edit "+c.file[0])
+	}
+	runGit(t, other, "push", "origin", "HEAD:main")
+}
+
+func TestPullWithProgress_MergesDivergedHistory(t *testing.T) {
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{"README.md": "# v1\n"})
+	repo := cloneRepo(t, remote)
+	divergeFromRemote(t, remote, repo, [2]string{"remote.md", "r\n"}, [2]string{"local.md", "l\n"})
+
+	if _, err := PullWithProgress(repo, nil, nil); err != nil {
+		t.Fatalf("expected diverged pull to merge, got: %v", err)
+	}
+	for _, f := range []string{"remote.md", "local.md"} {
+		if _, err := os.Stat(filepath.Join(repo, f)); err != nil {
+			t.Errorf("expected %s after merge: %v", f, err)
+		}
+	}
+}
+
+func TestPullWithProgress_ConflictLeavesRepoClean(t *testing.T) {
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{"README.md": "# v1\n"})
+	repo := cloneRepo(t, remote)
+	divergeFromRemote(t, remote, repo, [2]string{"README.md", "# remote\n"}, [2]string{"README.md", "# local\n"})
+
+	if _, err := PullWithProgress(repo, nil, nil); err == nil {
+		t.Fatal("expected a conflicting pull to fail")
+	}
+	if status := runGit(t, repo, "status", "--porcelain"); status != "" {
+		t.Fatalf("expected the merge to be aborted, got status:\n%s", status)
+	}
+}
+
+// blockedPull pushes a remote commit that edits a.txt, adds added.txt, and
+// edits sub/b.txt, then makes sub/ read-only so the pull fails partway: git
+// writes a.txt and added.txt before it cannot unlink sub/b.txt.
+func blockedPull(t *testing.T) string {
+	t.Helper()
+	if os.Getuid() == 0 {
+		t.Skip("test requires non-root user")
+	}
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{
+		"a.txt": "a1\n", "sub/b.txt": "b1\n",
+	})
+	repo := cloneRepo(t, remote)
+	other := cloneRepo(t, remote)
+	runGit(t, other, "config", "user.email", "test@test.com")
+	runGit(t, other, "config", "user.name", "test")
+	for name, body := range map[string]string{"a.txt": "a2\n", "added.txt": "new\n", "sub/b.txt": "b2\n"} {
+		if err := os.WriteFile(filepath.Join(other, name), []byte(body), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runGit(t, other, "add", "-A")
+	runGit(t, other, "commit", "-m", "remote edits")
+	runGit(t, other, "push", "origin", "HEAD:main")
+
+	sub := filepath.Join(repo, "sub")
+	if err := os.Chmod(sub, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(sub, 0755) })
+	return repo
+}
+
+func TestPullWithProgress_FailedCheckoutLeavesNoResidue(t *testing.T) {
+	repo := blockedPull(t)
+
+	if _, err := PullWithProgress(repo, nil, nil); err == nil {
+		t.Fatal("expected the pull to fail on the read-only directory")
+	}
+	if status := runGit(t, repo, "status", "--porcelain", "-uall"); status != "" {
+		t.Fatalf("expected the partial checkout to be undone, got status:\n%s", status)
+	}
+}
+
+func TestPullWithProgress_FailedCheckoutKeepsLocalEdits(t *testing.T) {
+	repo := blockedPull(t)
+	notes := filepath.Join(repo, "notes.txt")
+	if err := os.WriteFile(notes, []byte("mine\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := PullWithProgress(repo, nil, nil); err == nil {
+		t.Fatal("expected the pull to fail on the read-only directory")
+	}
+	if got, err := os.ReadFile(notes); err != nil || string(got) != "mine\n" {
+		t.Fatalf("expected the local edit to survive, got %q (%v)", got, err)
+	}
+}
+
+func TestPullWithProgress_ResolvesMetadataConflict(t *testing.T) {
+	meta := func(entries string) string {
+		return `{"version": 1, "entries": {` + entries + `}}` + "\n"
+	}
+	shared := func(at string) string {
+		return `"shared": {"source": "github.com/o/r/shared", "installed_at": "` + at + `"}`
+	}
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{
+		".metadata.json": meta(shared("2026-01-01T00:00:00Z")),
+	})
+	repo := cloneRepo(t, remote)
+	divergeFromRemote(t, remote, repo,
+		[2]string{".metadata.json", meta(shared("2026-03-01T00:00:00Z") + `, "remote-only": {"source": "r"}`)},
+		[2]string{".metadata.json", meta(shared("2026-02-01T00:00:00Z") + `, "local-only": {"source": "l"}`)})
+
+	if _, err := PullWithProgress(repo, nil, nil); err != nil {
+		t.Fatalf("expected a metadata-only conflict to resolve, got: %v", err)
+	}
+	store, err := install.LoadMetadata(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"remote-only", "local-only"} {
+		if !store.Has(name) {
+			t.Errorf("expected entry %q after merge", name)
+		}
+	}
+	if got := store.Get("shared").InstalledAt.Format("2006-01-02"); got != "2026-03-01" {
+		t.Errorf("expected the later installed_at to win, got %s", got)
+	}
+	if status := runGit(t, repo, "status", "--porcelain"); status != "" {
+		t.Fatalf("expected the merge to be committed, got status:\n%s", status)
+	}
+}
+
 func TestForcePullWithProgress(t *testing.T) {
 	remote := createBareRemoteWithBranch(t, "main", map[string]string{
 		"README.md": "# v1\n",
@@ -466,6 +712,182 @@ func TestForcePullWithProgress(t *testing.T) {
 	}
 	if !strings.Contains(string(content), "remote") {
 		t.Fatalf("expected repo to reset to remote content, got: %s", content)
+	}
+}
+
+func TestListLocalBranches(t *testing.T) {
+	repo := initTestRepo(t)
+
+	branches, err := ListLocalBranches(repo)
+	if err != nil {
+		t.Fatalf("ListLocalBranches failed: %v", err)
+	}
+	if len(branches) != 1 {
+		t.Fatalf("expected 1 branch, got %d: %v", len(branches), branches)
+	}
+
+	// Create another branch
+	runGit(t, repo, "branch", "feature-x")
+	branches, err = ListLocalBranches(repo)
+	if err != nil {
+		t.Fatalf("ListLocalBranches failed: %v", err)
+	}
+	if len(branches) != 2 {
+		t.Fatalf("expected 2 branches, got %d: %v", len(branches), branches)
+	}
+	found := false
+	for _, b := range branches {
+		if b == "feature-x" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected to find feature-x in %v", branches)
+	}
+}
+
+func TestListRemoteBranches(t *testing.T) {
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{
+		"README.md": "# test\n",
+	})
+	repo := cloneRepo(t, remote)
+
+	// Push a second branch to remote
+	updater := filepath.Join(t.TempDir(), "updater")
+	runGit(t, "", "clone", remote, updater)
+	runGit(t, updater, "config", "user.email", "test@test.com")
+	runGit(t, updater, "config", "user.name", "test")
+	runGit(t, updater, "checkout", "-b", "develop")
+	os.WriteFile(filepath.Join(updater, "dev.txt"), []byte("dev"), 0644)
+	runGit(t, updater, "add", "-A")
+	runGit(t, updater, "commit", "-m", "dev branch")
+	runGit(t, updater, "push", "origin", "develop")
+
+	// Fetch so repo knows about remote develop
+	runGit(t, repo, "fetch")
+
+	remoteBranches, err := ListRemoteBranches(repo)
+	if err != nil {
+		t.Fatalf("ListRemoteBranches failed: %v", err)
+	}
+
+	// "main" is local, so only "develop" should appear as remote-only
+	found := false
+	for _, b := range remoteBranches {
+		if b == "main" {
+			t.Error("main should not be in remote-only list (it exists locally)")
+		}
+		if b == "develop" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected develop in remote branches, got: %v", remoteBranches)
+	}
+}
+
+func TestCheckout_LocalBranch(t *testing.T) {
+	repo := initTestRepo(t)
+
+	// Create a local branch and switch back
+	runGit(t, repo, "branch", "feature-a")
+
+	if err := Checkout(repo, "feature-a"); err != nil {
+		t.Fatalf("Checkout local branch failed: %v", err)
+	}
+
+	branch, _ := GetCurrentBranch(repo)
+	if branch != "feature-a" {
+		t.Errorf("expected branch feature-a, got %s", branch)
+	}
+}
+
+func TestCheckout_RemoteBranch(t *testing.T) {
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{
+		"README.md": "# test\n",
+	})
+	repo := cloneRepo(t, remote)
+
+	// Push a develop branch to remote via another clone
+	updater := filepath.Join(t.TempDir(), "updater")
+	runGit(t, "", "clone", remote, updater)
+	runGit(t, updater, "config", "user.email", "test@test.com")
+	runGit(t, updater, "config", "user.name", "test")
+	runGit(t, updater, "checkout", "-b", "develop")
+	os.WriteFile(filepath.Join(updater, "dev.txt"), []byte("dev"), 0644)
+	runGit(t, updater, "add", "-A")
+	runGit(t, updater, "commit", "-m", "dev branch")
+	runGit(t, updater, "push", "origin", "develop")
+
+	// Fetch so repo sees origin/develop
+	runGit(t, repo, "fetch")
+
+	// Checkout remote-only branch
+	if err := Checkout(repo, "develop"); err != nil {
+		t.Fatalf("Checkout remote branch failed: %v", err)
+	}
+
+	branch, _ := GetCurrentBranch(repo)
+	if branch != "develop" {
+		t.Errorf("expected branch develop, got %s", branch)
+	}
+}
+
+func TestCheckout_NonexistentBranch(t *testing.T) {
+	repo := initTestRepo(t)
+
+	err := Checkout(repo, "does-not-exist")
+	if err == nil {
+		t.Error("expected error for non-existent branch")
+	}
+}
+
+func TestGetRemoteURL(t *testing.T) {
+	dir := initTestRepo(t)
+
+	// No remote → error (git exits non-zero when no remote configured)
+	url, err := GetRemoteURL(dir)
+	if err == nil {
+		t.Fatal("GetRemoteURL() expected error for repo with no remote, got nil")
+	}
+	if url != "" {
+		t.Errorf("GetRemoteURL() = %q, want empty on error", url)
+	}
+
+	// Add remote
+	addRemote(t, dir, "https://github.com/test/repo.git")
+
+	url, err = GetRemoteURL(dir)
+	if err != nil {
+		t.Fatalf("GetRemoteURL() error: %v", err)
+	}
+	if url != "https://github.com/test/repo.git" {
+		t.Errorf("GetRemoteURL() = %q, want %q", url, "https://github.com/test/repo.git")
+	}
+}
+
+func TestGetHeadMessage(t *testing.T) {
+	dir := initTestRepo(t) // commits "initial"
+
+	msg, err := GetHeadMessage(dir)
+	if err != nil {
+		t.Fatalf("GetHeadMessage() error: %v", err)
+	}
+	if msg != "initial" {
+		t.Errorf("GetHeadMessage() = %q, want %q", msg, "initial")
+	}
+}
+
+func TestGetTrackingBranch(t *testing.T) {
+	dir := initTestRepo(t)
+
+	// No upstream → empty string, no error
+	branch, err := GetTrackingBranch(dir)
+	if err != nil {
+		t.Fatalf("GetTrackingBranch() error: %v", err)
+	}
+	if branch != "" {
+		t.Errorf("GetTrackingBranch() = %q, want empty", branch)
 	}
 }
 
@@ -516,4 +938,224 @@ func cloneRepo(t *testing.T, remote string) string {
 	repo := filepath.Join(t.TempDir(), "repo")
 	runGit(t, "", "clone", remote, repo)
 	return repo
+}
+
+func TestSetOrAddRemote(t *testing.T) {
+	repo := initTestRepo(t)
+
+	// Adds origin when absent.
+	if err := SetOrAddRemote(repo, "https://example.com/a.git"); err != nil {
+		t.Fatalf("add origin: %v", err)
+	}
+	if got, _ := GetRemoteURL(repo); got != "https://example.com/a.git" {
+		t.Errorf("origin = %q, want a.git", got)
+	}
+
+	// Updates the URL when origin already exists.
+	if err := SetOrAddRemote(repo, "https://example.com/b.git"); err != nil {
+		t.Fatalf("update origin: %v", err)
+	}
+	if got, _ := GetRemoteURL(repo); got != "https://example.com/b.git" {
+		t.Errorf("origin = %q, want b.git", got)
+	}
+
+	// Rejects flag-smuggling URLs (argv injection) without invoking git.
+	if err := SetOrAddRemote(repo, "--upload-pack=touch /tmp/pwned"); err == nil {
+		t.Error("expected dash-prefixed remote URL to be rejected")
+	}
+	if got, _ := GetRemoteURL(repo); got != "https://example.com/b.git" {
+		t.Errorf("origin changed after rejected input: %q", got)
+	}
+}
+
+func TestAheadCount_CountsUnpushedCommits(t *testing.T) {
+	repo := cloneRepo(t, createBareRemoteWithBranch(t, "main", map[string]string{"a/SKILL.md": "# a\n"}))
+	runGit(t, repo, "-c", "user.name=test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "local")
+
+	if got := AheadCount(repo); got != 1 {
+		t.Fatalf("AheadCount() = %d, want 1", got)
+	}
+}
+
+func TestFirstPull_MergesUnrelatedRemoteHistory(t *testing.T) {
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{"remote-skill/SKILL.md": "# remote\n"})
+	repo := initTestRepo(t)
+	if err := os.MkdirAll(filepath.Join(repo, "local-skill"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "remote", "add", "origin", remote)
+
+	if _, err := FirstPull(repo, false, install.ParseOptions{}); err != nil {
+		t.Fatalf("FirstPull() error: %v", err)
+	}
+	_, statErr := os.Stat(filepath.Join(repo, "remote-skill", "SKILL.md"))
+	if statErr != nil || !HasUpstream(repo) {
+		t.Fatalf("expected remote files merged and upstream set (stat err: %v, upstream: %v)", statErr, HasUpstream(repo))
+	}
+}
+
+func TestFirstPull_KeepsFilesOnlyLocalCommits(t *testing.T) {
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{"remote-skill/SKILL.md": "# remote\n"})
+	repo := initTestRepo(t) // commits README.md at the root, no directories
+	runGit(t, repo, "remote", "add", "origin", remote)
+
+	if _, err := FirstPull(repo, false, install.ParseOptions{}); err != nil {
+		t.Fatalf("FirstPull() error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "README.md")); err != nil {
+		t.Fatalf("local committed file was discarded: %v", err)
+	}
+}
+
+func TestFirstPull_RootScopeScaffoldMergesAndStaysClean(t *testing.T) {
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{"skills/remote-skill/SKILL.md": "# remote\n"})
+	repo := t.TempDir()
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "test@test.com")
+	runGit(t, repo, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("config.yaml\n.DS_Store\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".gitignore")
+	runGit(t, repo, "commit", "-m", "scaffold")
+	if err := os.MkdirAll(filepath.Join(repo, "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "config.yaml"), []byte("source: x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "remote", "add", "origin", remote)
+
+	if _, err := FirstPull(repo, false, install.ParseOptions{}); err != nil {
+		t.Fatalf("FirstPull() error: %v", err)
+	}
+	if dirty, err := IsDirty(repo); err != nil || dirty {
+		t.Fatalf("expected the root-scope ignore rule to survive (dirty=%v, err=%v): %s", dirty, err, runGit(t, repo, "status", "--porcelain"))
+	}
+}
+
+func TestFirstPull_RootScopeRemoteTracksConfig_Refused(t *testing.T) {
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{
+		"config.yaml":                  "source: remote\n",
+		"skills/remote-skill/SKILL.md": "# remote\n",
+	})
+	repo := t.TempDir()
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "test@test.com")
+	runGit(t, repo, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte("config.yaml\n.DS_Store\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", ".gitignore")
+	runGit(t, repo, "commit", "-m", "scaffold")
+	if err := os.MkdirAll(filepath.Join(repo, "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "config.yaml"), []byte("source: local\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "remote", "add", "origin", remote)
+
+	// Merge path (force=false) must refuse
+	_, err := FirstPull(repo, false, install.ParseOptions{})
+	if !errors.Is(err, ErrRemoteTracksConfig) {
+		t.Fatalf("FirstPull(force=false) err = %v, want ErrRemoteTracksConfig", err)
+	}
+	content, err := os.ReadFile(filepath.Join(repo, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "source: local\n" {
+		t.Fatalf("local config.yaml was overwritten: got %q, want %q", string(content), "source: local\n")
+	}
+
+	// Reset path (force=true) must also refuse
+	_, err = FirstPull(repo, true, install.ParseOptions{})
+	if !errors.Is(err, ErrRemoteTracksConfig) {
+		t.Fatalf("FirstPull(force=true) err = %v, want ErrRemoteTracksConfig", err)
+	}
+	content, err = os.ReadFile(filepath.Join(repo, "config.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "source: local\n" {
+		t.Fatalf("local config.yaml was overwritten on force: got %q, want %q", string(content), "source: local\n")
+	}
+}
+
+func TestFirstPull_NonRootScopeRemoteTracksConfig_Allowed(t *testing.T) {
+	// A non-root scope repo has no local config.yaml and does not ignore config.yaml.
+	remote := createBareRemoteWithBranch(t, "main", map[string]string{
+		"config.yaml":           "dummy\n",
+		"remote-skill/SKILL.md": "# remote\n",
+	})
+	repo := t.TempDir()
+	runGit(t, repo, "init")
+	runGit(t, repo, "config", "user.email", "test@test.com")
+	runGit(t, repo, "config", "user.name", "test")
+	runGit(t, repo, "remote", "add", "origin", remote)
+
+	if _, err := FirstPull(repo, false, install.ParseOptions{}); err != nil {
+		t.Fatalf("FirstPull() error: %v", err)
+	}
+}
+
+func TestFirstPull_EmptyRemoteReportsNoBranches(t *testing.T) {
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	runGit(t, "", "init", "--bare", remote)
+	repo := initTestRepo(t)
+	runGit(t, repo, "remote", "add", "origin", remote)
+
+	if _, err := FirstPull(repo, false, install.ParseOptions{}); !errors.Is(err, ErrNoRemoteBranches) {
+		t.Fatalf("FirstPull() error = %v, want ErrNoRemoteBranches", err)
+	}
+}
+
+// Git exports GIT_DIR to hooks; commands on a skillshare repo must still act
+// on that repo (#852).
+func TestGetCurrentFullHash_IgnoresCallerGitDir(t *testing.T) {
+	repo := initTestRepo(t)
+	caller := initTestRepo(t)
+	runGit(t, caller, "commit", "--allow-empty", "-m", "caller")
+	want := runGit(t, repo, "rev-parse", "HEAD")
+
+	t.Setenv("GIT_DIR", filepath.Join(caller, ".git"))
+	got, err := GetCurrentFullHash(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("GetCurrentFullHash() = %s, want %s from the repo, not GIT_DIR", got, want)
+	}
+}
+
+func TestAuthEnvForRepo_ConfiguredProviderOrigins(t *testing.T) {
+	for _, provider := range []struct {
+		name  string
+		token string
+		opts  install.ParseOptions
+	}{
+		{"gitea", "GITEA_TOKEN", install.ParseOptions{GiteaHosts: []string{"forge.example"}}},
+		{"cnb", "CNB_TOKEN", install.ParseOptions{CNBHosts: []string{"forge.example"}}},
+	} {
+		t.Run(provider.name, func(t *testing.T) {
+			t.Setenv("SKILLSHARE_GIT_TOKEN", "")
+			t.Setenv(provider.token, "private-provider-token")
+			for _, host := range []string{"forge.example", "forge.example.attacker.test"} {
+				repo := initTestRepo(t)
+				addRemote(t, repo, "https://"+host+"/org/repo.git")
+				env := AuthEnvForRepo(repo, provider.opts)
+				if host == "forge.example" {
+					if !slices.Contains(env, "SKILLSHARE_GIT_AUTH_PASSWORD=private-provider-token") {
+						t.Fatalf("configured provider origin missing credentials: %v", env)
+					}
+				} else if env != nil {
+					t.Fatalf("lookalike origin received credentials: %v", env)
+				}
+				if env := AuthEnvForRepo(repo, install.ParseOptions{}); env != nil {
+					t.Fatalf("unconfigured provider origin received credentials: %v", env)
+				}
+			}
+		})
+	}
 }

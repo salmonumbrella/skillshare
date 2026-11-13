@@ -8,6 +8,23 @@ All environment variables recognized by skillshare.
 
 ## Configuration
 
+### SKILLSHARE_AUTO_UPDATE_CHECK {#skillshare_auto_update_check}
+
+Override global `updates.auto_check` for automatic release-version checks and notifications.
+
+```bash
+SKILLSHARE_AUTO_UPDATE_CHECK=false skillshare status
+```
+
+**Default:** `updates.auto_check` in config.yaml, or `true` when unset.
+Accepts `true`/`false`, `1`/`0`, `t`/`f` and Go boolean case variants; empty or
+invalid values are ignored. The environment takes precedence without rewriting config.
+CLI, web UI and compatible desktop app version notifications are suppressed when false;
+explicit checks and upgrades remain available. GUI apps must inherit this variable
+when launched. Desktop support requires an app release that includes
+[skillshare-app#126](https://github.com/runkids/skillshare-app/pull/126); upgrading
+the CLI alone does not disable checks in older desktop builds. See [updates](/docs/reference/commands/updates).
+
 ### SKILLSHARE_CONFIG
 
 Override the config file path.
@@ -60,14 +77,16 @@ export XDG_DATA_HOME=~/my-data
 
 ### XDG_STATE_HOME
 
-Override the state directory (operation logs).
+Override the state directory (operation logs, machine-local project registrations and their mutation locks).
 
 ```bash
 export XDG_STATE_HOME=~/my-state
-# skillshare will use ~/my-state/skillshare/logs/
+# skillshare will use ~/my-state/skillshare/logs/, ~/my-state/skillshare/projects/
 ```
 
 **Default:** `~/.local/state/skillshare/`
+
+When unset, project registrations and their locks default to `%LOCALAPPDATA%\skillshare\state` on Windows. Keep this override local to the machine. See [shared and local registrations](../commands/project.md#local-registrations).
 
 ---
 
@@ -88,11 +107,97 @@ Starting from v0.13.0, skillshare follows the XDG Base Directory Specification f
 
 ---
 
+### SKILLSHARE_GITLAB_HOSTS
+
+Comma-separated list of self-managed GitLab hostnames to treat with nested subgroup support. Useful in CI/CD where you may not have a config file.
+
+```bash
+SKILLSHARE_GITLAB_HOSTS=git.company.com,code.internal.io skillshare install git.company.com/team/frontend/ui
+```
+
+When both the env var and config file [`gitlab_hosts`](/docs/reference/targets/configuration#gitlab_hosts) are set, their values are **merged** (deduplicated). Invalid entries (containing scheme, path, port, or empty) are silently skipped.
+
+**Default:** None (only config file values are used)
+
+---
+
+### SKILLSHARE_AZURE_HOSTS
+
+Comma-separated list of self-hosted Azure DevOps Server hostnames.
+
+```bash
+SKILLSHARE_AZURE_HOSTS=azuredevops.mycompany.com,tfs.internal.io
+```
+
+When both the env var and config file [`azure_hosts`](/docs/reference/targets/configuration#azure_hosts) are set, their values are **merged** (deduplicated). Invalid entries in the env var are silently skipped.
+
+**Default:** _(none)_
+
+### SKILLSHARE_GITEA_HOSTS
+
+Comma-separated list of self-hosted Gitea hostnames. Hosts containing `gitea` in the name are detected without it.
+
+```bash
+SKILLSHARE_GITEA_HOSTS=git.company.com,code.internal.io
+```
+
+Merged with the config file's [`gitea_hosts`](/docs/reference/targets/configuration#gitea_hosts).
+
+**Default:** _(none)_
+
+### SKILLSHARE_CNB_HOSTS
+
+Comma-separated list of self-hosted CNB hostnames. `cnb.cool` is detected without it.
+
+```bash
+SKILLSHARE_CNB_HOSTS=cnb.company.com
+```
+
+Merged with the config file's [`cnb_hosts`](/docs/reference/targets/configuration#cnb_hosts).
+
+**Default:** _(none)_
+
+---
+
+## Web UI
+
+### SKILLSHARE_UI_BASE_PATH
+
+Set the URL sub-path for serving the web dashboard behind a reverse proxy.
+
+```bash
+SKILLSHARE_UI_BASE_PATH=/skillshare skillshare ui --host 0.0.0.0 --no-open
+```
+
+Equivalent to `--base-path /skillshare`. The flag takes precedence if both are set.
+
+**Default:** None (dashboard served at root `/`)
+
+See [Reverse Proxy](/docs/reference/commands/ui#reverse-proxy) for Nginx and Caddy examples.
+
+### SKILLSHARE_UI_TRUSTED_ORIGINS
+
+Comma-separated addresses the web dashboard answers at besides `localhost` and IP addresses, such as the domain of a reverse proxy.
+
+```bash
+SKILLSHARE_UI_TRUSTED_ORIGINS=https://tools.example.com skillshare ui --host 0.0.0.0 --no-open
+```
+
+Equivalent to `--trusted-origin https://tools.example.com`. When the flag is given, the variable is ignored.
+
+**Default:** None
+
+See [Reverse Proxy](/docs/reference/commands/ui#reverse-proxy).
+
+---
+
 ## GitHub API
 
 ### GITHUB_TOKEN
 
 GitHub personal access token.
+
+Provider tokens are sent only over HTTPS on the default port (or 443): `github.com`, `gitlab.com`, `bitbucket.org`, `dev.azure.com`, `*.visualstudio.com`, `gitea.com`, and `cnb.cool`. Self-hosted Gitea/CNB requires an exact hostname in `gitea_hosts`/`cnb_hosts`, even if its name contains the provider name. For self-hosted GitHub/GitLab or other hosts, use a host-scoped Git credential helper, or set `SKILLSHARE_GIT_TOKEN` only for the intended invocation. That generic fallback can be sent to **any HTTPS source**; provider-looking names do not authorize provider tokens.
 
 **Used for:**
 - GitHub API requests (`skillshare search`, `skillshare upgrade`, version check)
@@ -138,7 +243,7 @@ skillshare search "react patterns"
 
 ---
 
-## Git Authentication
+## Git Authentication {#git-authentication}
 
 These variables enable HTTPS authentication for private repositories. When set, skillshare automatically injects the token during `install` and `update` — no URL modification needed.
 
@@ -231,6 +336,43 @@ skillshare install https://dev.azure.com/org/project/_git/repo --track
 $env:AZURE_DEVOPS_TOKEN = "your_pat_here"
 ```
 
+### GITEA_TOKEN
+
+Gitea access token. Used for HTTPS clone of private repos on `gitea.com` and self-hosted Gitea, and for the Gitea Contents API when a subdirectory is installed without a full clone.
+
+**Creating a token:**
+1. In Gitea, go to **Settings → Applications**
+2. Generate a new token
+3. Permissions: `repository: Read` (pull only) or `repository: Read and Write` (push & pull)
+
+```bash
+export GITEA_TOKEN=your_token
+skillshare install https://gitea.com/org/skills.git --track
+```
+
+**Windows:**
+```powershell
+$env:GITEA_TOKEN = "your_token"
+```
+
+Self-hosted Gitea requires an exact hostname in [`gitea_hosts`](/docs/reference/targets/configuration#gitea_hosts) to authorize `GITEA_TOKEN`, even when the name contains `gitea`. Provider authentication requires HTTPS on the default port or 443.
+
+### CNB_TOKEN
+
+[CNB](https://cnb.cool) access token with read permission on the repository. Used for HTTPS clone of private repos on `cnb.cool` and self-hosted CNB.
+
+```bash
+export CNB_TOKEN=your_token
+skillshare install https://cnb.cool/org/skills --track
+```
+
+**Windows:**
+```powershell
+$env:CNB_TOKEN = "your_token"
+```
+
+A private deployment on another domain needs [`cnb_hosts`](/docs/reference/targets/configuration#cnb_hosts).
+
 ### SKILLSHARE_GIT_TOKEN
 
 Generic fallback token for any HTTPS git host. Used when no platform-specific token is set.
@@ -245,11 +387,37 @@ skillshare install https://git.example.com/org/skills.git --track
 $env:SKILLSHARE_GIT_TOKEN = "your_token"
 ```
 
-**Token priority:** Platform-specific (`GITHUB_TOKEN`, `GITLAB_TOKEN`, `BITBUCKET_TOKEN`, `AZURE_DEVOPS_TOKEN`) > `SKILLSHARE_GIT_TOKEN`.
+**Token priority:** Platform-specific (`GITHUB_TOKEN`, `GITLAB_TOKEN`, `BITBUCKET_TOKEN`, `AZURE_DEVOPS_TOKEN`, `GITEA_TOKEN`, `CNB_TOKEN`) > `SKILLSHARE_GIT_TOKEN`.
 
 ---
 
-## Git SSL / TLS
+## Plugins {#plugins}
+
+### SKILLSHARE_CODEX_CLI
+
+The Codex CLI that [plugin commands](/docs/reference/commands/plugin) run, on this machine only. Set it when Skillshare cannot find Codex by itself. It is read from the environment, so a `config.yaml` shared between macOS and Windows does not need a path that is wrong on the other one.
+
+Without it, Skillshare runs `codex` from `PATH`, then tries these places:
+
+| OS | Places |
+|---|---|
+| macOS | `/opt/homebrew/bin/codex`, `/usr/local/bin/codex`, and the CLI inside the Codex app (`ChatGPT.app` or `Codex.app` in `/Applications` or `~/Applications`) |
+| Windows | `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin\codex.exe` from the official PowerShell installer, then the CLI the Codex app installs, `%LOCALAPPDATA%\OpenAI\Codex\bin\<version>\codex.exe` (the newest one) |
+
+```bash
+export SKILLSHARE_CODEX_CLI=/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex
+```
+
+**Windows:**
+```powershell
+$env:SKILLSHARE_CODEX_CLI = "C:\Tools\codex.exe"
+```
+
+An [account target](/docs/reference/commands/plugin#accounts) with its own `cli` keeps that `cli`.
+
+---
+
+## Git SSL / TLS {#git-ssl--tls}
 
 These standard Git environment variables are passed through to all git operations. They are useful for self-hosted Git servers (GitLab, Gitea, etc.) with self-signed certificates or internal CAs.
 
@@ -330,9 +498,15 @@ export GITHUB_TOKEN="ghp_your_token_here"
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `SKILLSHARE_CONFIG` | Config file path | `~/.config/skillshare/config.yaml` |
+| `SKILLSHARE_UI_BASE_PATH` | Web UI sub-path for reverse proxy | None |
+| `SKILLSHARE_UI_TRUSTED_ORIGINS` | Web UI addresses besides localhost and IPs (comma-separated) | None |
+| `SKILLSHARE_GITLAB_HOSTS` | Custom GitLab hostnames (comma-separated) | None |
+| `SKILLSHARE_AZURE_HOSTS` | Custom Azure DevOps Server hostnames (comma-separated) | None |
+| `SKILLSHARE_GITEA_HOSTS` | Custom Gitea hostnames (comma-separated) | None |
+| `SKILLSHARE_CNB_HOSTS` | Custom CNB hostnames (comma-separated) | None |
 | `XDG_CONFIG_HOME` | Base config directory | `~/.config` (Linux/macOS), `%AppData%` (Windows) |
 | `XDG_DATA_HOME` | Data directory (backups, trash) | `~/.local/share` |
-| `XDG_STATE_HOME` | State directory (logs) | `~/.local/state` |
+| `XDG_STATE_HOME` | State directory (logs, local project registrations and locks) | `~/.local/state` |
 | `XDG_CACHE_HOME` | Cache directory (version check, UI) | `~/.cache` |
 | `GITHUB_TOKEN` | GitHub API + git clone auth | None |
 | `GH_TOKEN` | GitHub API (fallback for `GITHUB_TOKEN`) | None |
@@ -340,7 +514,10 @@ export GITHUB_TOKEN="ghp_your_token_here"
 | `BITBUCKET_TOKEN` | Bitbucket git clone auth | None |
 | `BITBUCKET_USERNAME` | Bitbucket username for app password auth | None |
 | `AZURE_DEVOPS_TOKEN` | Azure DevOps git clone auth | None |
+| `GITEA_TOKEN` | Gitea git clone + Contents API auth | None |
+| `CNB_TOKEN` | CNB git clone + contents API auth | None |
 | `SKILLSHARE_GIT_TOKEN` | Generic git clone auth (fallback) | None |
+| `SKILLSHARE_CODEX_CLI` | Codex CLI for plugin commands on this machine | `codex` on `PATH`, then known install places |
 | `GIT_SSL_CAINFO` | Custom CA certificate bundle path | System default |
 | `GIT_SSL_NO_VERIFY` | Disable SSL certificate verification | `false` |
 | `SKILLSHARE_TEST_BINARY` | Test binary path | `bin/skillshare` |

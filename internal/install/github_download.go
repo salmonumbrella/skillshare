@@ -168,6 +168,13 @@ func downloadFile(client *http.Client, fileURL, destPath string) error {
 		return fmt.Errorf("download returned %d", resp.StatusCode)
 	}
 
+	return writeDownloadedFile(destPath, resp.Body)
+}
+
+// writeDownloadedFile stores a file fetched through a forge content API. Those
+// APIs do not report the git file mode, so a script that starts with "#!" is
+// made executable; a file the kernel could run directly always carries one.
+func writeDownloadedFile(destPath string, r io.Reader) error {
 	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 		return err
 	}
@@ -178,8 +185,25 @@ func downloadFile(client *http.Client, fileURL, destPath string) error {
 	}
 	defer f.Close()
 
-	_, err = io.Copy(f, resp.Body)
-	return err
+	var head [2]byte
+	n, err := io.ReadFull(r, head[:])
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return err
+	}
+	if _, err := f.Write(head[:n]); err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, r); err != nil {
+		return err
+	}
+	// Set the mode explicitly either way: O_TRUNC keeps the mode of a file
+	// that already existed, so a script re-downloaded as plain content must
+	// lose its bit.
+	mode := os.FileMode(0644)
+	if n == 2 && head[0] == '#' && head[1] == '!' {
+		mode = 0755
+	}
+	return f.Chmod(mode)
 }
 
 func fetchLatestCommitHash(owner, repo, apiBase string, source *Source) (string, error) {
@@ -206,18 +230,18 @@ func fetchLatestCommitHash(owner, repo, apiBase string, source *Source) (string,
 
 	// Fallback for edge cases (e.g. GHE API path differences): use git ls-remote.
 	if source != nil && source.CloneURL != "" {
-		return getRemoteHeadCommit(source.CloneURL)
+		return getRemoteHeadCommit(source.CloneURL, source.authEnv())
 	}
 
 	return "", fmt.Errorf("failed to fetch latest commit hash")
 }
 
-func getRemoteHeadCommit(cloneURL string) (string, error) {
+func getRemoteHeadCommit(cloneURL string, extraEnv []string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitCommandTimeout)
 	defer cancel()
 
 	cmd := gitCommand(ctx, "ls-remote", cloneURL, "HEAD")
-	cmd.Env = append(cmd.Env, authEnv(cloneURL)...)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
@@ -246,13 +270,10 @@ func gitHubAPIBase(source *Source) (string, error) {
 	if host == "" {
 		return "", fmt.Errorf("unable to determine source host")
 	}
-	if !strings.Contains(host, "github") {
+	if !isGitHubLikeHost(host) {
 		return "", fmt.Errorf("source host %q is not GitHub-compatible", host)
 	}
-	if host == "github.com" {
-		return "https://api.github.com", nil
-	}
-	return fmt.Sprintf("https://%s/api/v3", host), nil
+	return gitHubAPIBaseForHost(host), nil
 }
 
 func buildGitHubContentsURL(apiBase, owner, repo, path string) string {

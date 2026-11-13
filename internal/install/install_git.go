@@ -2,24 +2,71 @@ package install
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+
+	"skillshare/internal/gitenv"
+	"skillshare/internal/sourcewalk"
+	"skillshare/internal/utils"
 )
+
+var commitSHAPattern = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
+
+// IsCommitSHA reports whether ref looks like an abbreviated or full commit hash
+// rather than a branch or tag name.
+func IsCommitSHA(ref string) bool {
+	return commitSHAPattern.MatchString(ref)
+}
 
 func isGitInstalled() bool {
 	_, err := exec.LookPath("git")
 	return err == nil
 }
 
-// IsGitRepo checks if path is a git repository
+// IsGitRepo recognizes .git directories and gitdir files used by worktrees/submodules.
 func IsGitRepo(path string) bool {
 	gitDir := filepath.Join(path, ".git")
 	info, err := os.Stat(gitDir)
-	return err == nil && info.IsDir()
+	return err == nil && (info.IsDir() || info.Mode().IsRegular())
+}
+
+// IsLocalGitRepo reports whether path is the root of a git repository, either a
+// working tree (.git) or a bare repository (HEAD and objects at the root).
+func IsLocalGitRepo(path string) bool {
+	if IsGitRepo(path) {
+		return true
+	}
+	head, headErr := os.Stat(filepath.Join(path, "HEAD"))
+	objects, objErr := os.Stat(filepath.Join(path, "objects"))
+	return headErr == nil && head.Mode().IsRegular() && objErr == nil && objects.IsDir()
+}
+
+// IsTrackedCheckout reports whether path is a tracked repo checkout: a
+// _-prefixed directory that is a git repo.
+func IsTrackedCheckout(path string) bool {
+	return utils.IsTrackedRepoDir(filepath.Base(path)) && IsGitRepo(path)
+}
+
+// TrackedAncestor returns the slash path of the first tracked checkout above
+// the last element of rel, a slash path below sourceDir. A checkout behind a
+// link the policy follows is the user's own and does not count.
+func TrackedAncestor(sourceDir, rel string, follow *sourcewalk.Follow) (string, bool) {
+	dir := sourceDir
+	parents := strings.Split(rel, "/")
+	for i, seg := range parents[:len(parents)-1] {
+		dir = filepath.Join(dir, seg)
+		if _, followed := follow.Resolve(dir); utils.IsTrackedRepoDir(seg) && !followed && IsGitRepo(dir) {
+			return strings.Join(parents[:i+1], "/"), true
+		}
+	}
+	return "", false
 }
 
 // gitCommandTimeout is the maximum time for a git network operation.
@@ -29,8 +76,8 @@ const gitCommandTimeout = 180 * time.Second
 // gitCommand creates an exec.Cmd for git with GIT_TERMINAL_PROMPT=0
 // to prevent interactive credential prompts that hang CLI spinners and web UI.
 func gitCommand(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Env = append(os.Environ(),
+	cmd := gitenv.CommandContext(ctx, args...)
+	cmd.Env = append(cmd.Env,
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=",
 		"SSH_ASKPASS=",
@@ -48,17 +95,18 @@ func runGitCommandEnv(args []string, dir string, extraEnv []string) error {
 	return runGitCommandWithProgress(args, dir, extraEnv, nil)
 }
 
-func usedTokenAuth(extraEnv []string) bool {
+// UsedTokenAuth reports whether extraEnv contains token-based auth overrides.
+func UsedTokenAuth(extraEnv []string) bool {
 	for _, env := range extraEnv {
-		if strings.HasPrefix(env, "GIT_CONFIG_KEY_") && strings.Contains(env, ".insteadOf") {
+		if strings.HasPrefix(env, gitAuthPasswordEnv+"=") {
 			return true
 		}
 	}
 	return false
 }
 
-// wrapGitError inspects stderr output to produce actionable error messages.
-func wrapGitError(stderr string, err error, tokenAuthAttempted bool) error {
+// WrapGitError inspects stderr output to produce actionable error messages.
+func WrapGitError(stderr string, err error, tokenAuthAttempted bool) error {
 	s := sanitizeTokens(strings.TrimSpace(stderr))
 	if IsSSLError(s) {
 		return fmt.Errorf("SSL certificate verification failed — options:\n"+
@@ -72,19 +120,141 @@ func wrapGitError(stderr string, err error, tokenAuthAttempted bool) error {
 		}
 		return fmt.Errorf("authentication required — options:\n"+
 			"       1. SSH URL: git@<host>:<owner>/<repo>.git\n"+
-			"       2. Token env var: GITHUB_TOKEN, GITLAB_TOKEN, BITBUCKET_TOKEN, AZURE_DEVOPS_TOKEN, or SKILLSHARE_GIT_TOKEN\n"+
+			"       2. Token env var: GITHUB_TOKEN, GITLAB_TOKEN, BITBUCKET_TOKEN, AZURE_DEVOPS_TOKEN, CNB_TOKEN, GITEA_TOKEN, or SKILLSHARE_GIT_TOKEN\n"+
 			"       3. Git credential helper: gh auth login\n       %s", s)
 	}
 	if s != "" {
-		return fmt.Errorf("%s", s)
+		// Extract the fatal/error line from verbose git output, strip hint lines
+		msg := extractGitFatal(s)
+		if login := sshPublickeyLogin(msg); login != "" {
+			msg += "\n       check your SSH key: ssh -T " + login
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	// When stderr is empty, extract exit code for a more actionable message
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		code := exitErr.ExitCode()
+		switch code {
+		case 128:
+			if tokenAuthAttempted {
+				return fmt.Errorf("git failed (exit 128): authentication token was rejected — check permissions and expiry")
+			}
+			return fmt.Errorf("git failed (exit 128): repository not found or authentication required")
+		case 1:
+			return fmt.Errorf("git failed (exit 1): command error — check network connectivity and repository URL")
+		default:
+			return fmt.Errorf("git failed (exit %d)", code)
+		}
 	}
 	return err
+}
+
+// gitRemoteReadFatal is git's generic message when the transport (usually ssh)
+// fails; the reason is on the line ssh printed before it.
+const gitRemoteReadFatal = "Could not read from remote repository."
+
+// sshPublickeyLogin returns "user@host" when msg carries an ssh
+// "user@host: Permission denied (publickey)." reason, otherwise "".
+func sshPublickeyLogin(msg string) string {
+	i := strings.Index(msg, ": Permission denied (publickey")
+	if i < 0 {
+		return ""
+	}
+	login := msg[:i]
+	if j := strings.LastIndex(login, " "); j >= 0 {
+		login = login[j+1:]
+	}
+	if !strings.Contains(login, "@") {
+		return ""
+	}
+	return login
+}
+
+// extractGitFatal extracts the "fatal:" or "error:" line from git stderr,
+// stripping verbose "hint:" lines. If no fatal/error line is found, returns
+// the original text with hint lines removed. For the generic remote-read
+// failure it keeps the preceding transport line that explains it.
+func extractGitFatal(stderr string) string {
+	var fatal, reason string
+	var nonHint, listed []string
+	listing := false
+	for _, line := range strings.Split(stderr, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "hint:") {
+			continue
+		}
+		// git indents what an error ending in ":" lists, such as the files a merge would overwrite.
+		if listing && line != trimmed {
+			listed = append(listed, trimmed)
+			nonHint = append(nonHint, trimmed)
+			continue
+		}
+		listing = false
+		if strings.HasPrefix(trimmed, "fatal: ") {
+			fatal = strings.TrimPrefix(trimmed, "fatal: ")
+			if fatal == gitRemoteReadFatal && reason == "" {
+				reason = lastTransportLine(nonHint)
+			}
+			listed, listing = nil, strings.HasSuffix(fatal, ":")
+		} else if strings.HasPrefix(trimmed, "error: ") {
+			fatal = strings.TrimPrefix(trimmed, "error: ")
+			listed, listing = nil, strings.HasSuffix(fatal, ":")
+		}
+		nonHint = append(nonHint, trimmed)
+	}
+	if len(listed) > 0 {
+		fatal += " " + strings.Join(listed, ", ")
+	}
+	if fatal != "" {
+		if strings.Contains(fatal, "failed to push some refs") && len(nonHint) > 1 {
+			return strings.Join(nonHint, "; ")
+		}
+		if fatal == gitRemoteReadFatal && reason != "" {
+			return strings.TrimSuffix(fatal, ".") + " — " + reason
+		}
+		return fatal
+	}
+	if len(nonHint) > 0 {
+		return strings.Join(nonHint, "; ")
+	}
+	return stderr
+}
+
+// lastTransportLine returns the last line before a remote-read failure that
+// explains it, skipping git's own progress and warning chatter.
+func lastTransportLine(lines []string) string {
+	for i := len(lines) - 1; i >= 0; i-- {
+		l := lines[i]
+		if strings.HasPrefix(l, "Cloning into") || strings.HasPrefix(l, "warning:") ||
+			strings.HasPrefix(l, "fatal:") || strings.HasPrefix(l, "error:") {
+			continue
+		}
+		return l
+	}
+	return ""
 }
 
 // cloneRepo performs a git clone (quiet mode for cleaner output).
 // If a token is available in env vars, it injects authentication via
 // GIT_CONFIG env vars without modifying the stored remote URL.
-func cloneRepo(url, destPath string, shallow bool, onProgress ProgressCallback) error {
+// branch specifies the branch to clone; empty string uses the remote default.
+func cloneRepo(url, destPath, branch string, shallow bool, onProgress ProgressCallback) error {
+	return cloneRepoWithEnv(url, destPath, branch, shallow, authEnv(url), onProgress)
+}
+
+func cloneRepoWithEnv(url, destPath, branch string, shallow bool, extraEnv []string, onProgress ProgressCallback) error {
+	// git clone --branch accepts branches and tags but not commit SHAs:
+	// clone the default branch, then detach HEAD at the pinned commit.
+	if IsCommitSHA(branch) {
+		if err := cloneRepoWithEnv(url, destPath, "", shallow, extraEnv, onProgress); err != nil {
+			return err
+		}
+		return checkoutCommit(destPath, branch, shallow, extraEnv, onProgress)
+	}
 	args := []string{"clone"}
 	if onProgress != nil {
 		args = append(args, "--progress")
@@ -94,25 +264,232 @@ func cloneRepo(url, destPath string, shallow bool, onProgress ProgressCallback) 
 	if shallow {
 		args = append(args, "--depth", "1")
 	}
+	if branch != "" {
+		args = append(args, "--branch", branch)
+	}
 	args = append(args, url, destPath)
-	return runGitCommandWithProgress(args, "", authEnv(url), onProgress)
+	return runGitCommandWithProgress(args, "", extraEnv, onProgress)
 }
 
-// gitPull performs a git pull (quiet mode).
-// If the remote uses HTTPS and a token is available, it injects
-// authentication via GIT_CONFIG env vars (same mechanism as cloneRepo).
-func gitPull(repoPath string, onProgress ProgressCallback) error {
-	remoteURL := getRemoteURL(repoPath)
+// checkoutCommit detaches HEAD at sha. A targeted fetch works for full SHAs on
+// GitHub/GitLab; when the server refuses or the SHA is abbreviated, it deepens
+// the clone and resolves the commit locally.
+func checkoutCommit(repoPath, sha string, shallow bool, extraEnv []string, onProgress ProgressCallback) error {
+	fetch := []string{"fetch", "--quiet", "origin", sha}
+	if shallow {
+		fetch = []string{"fetch", "--quiet", "--depth", "1", "origin", sha}
+	}
+	if err := runGitCommandWithProgress(fetch, repoPath, extraEnv, onProgress); err == nil {
+		return runGitCommandWithProgress([]string{"checkout", "--quiet", "--detach", "FETCH_HEAD"}, repoPath, extraEnv, nil)
+	}
+	// clone --depth 1 implies --single-branch, so fetch every branch and tag
+	// explicitly: the pinned commit may live off the default branch.
+	full := []string{"fetch", "--quiet", "--tags", "origin", "+refs/heads/*:refs/remotes/origin/*"}
+	if isShallowRepo(repoPath) {
+		full = append(full[:2], append([]string{"--unshallow"}, full[2:]...)...)
+	}
+	if err := runGitCommandWithProgress(full, repoPath, extraEnv, onProgress); err != nil {
+		return fmt.Errorf("resolve commit %s: %w", sha, err)
+	}
+	return runGitCommandWithProgress([]string{"checkout", "--quiet", "--detach", sha}, repoPath, extraEnv, nil)
+}
+
+func isShallowRepo(repoPath string) bool {
+	cmd := gitenv.Command("rev-parse", "--is-shallow-repository")
+	cmd.Dir = repoPath
+	out, err := cmd.Output()
+	return err == nil && strings.TrimSpace(string(out)) == "true"
+}
+
+// isDetachedHead reports whether HEAD points at a commit rather than a branch.
+func isDetachedHead(repoPath string) bool {
+	cmd := gitenv.Command("symbolic-ref", "-q", "HEAD")
+	cmd.Dir = repoPath
+	return cmd.Run() != nil
+}
+
+// ref is what to clone: the locked commit when there is one, else the branch.
+func (s *Source) ref() string {
+	if s.Commit != "" {
+		return s.Commit
+	}
+	return s.Branch
+}
+
+// recordCommit notes the full SHA a clone landed on, for the lockfile.
+func (s *Source) recordCommit(repoPath string) {
+	if hash, err := getGitFullHash(repoPath); err == nil {
+		s.Commit = hash
+	}
+}
+
+func cloneRepoForSource(source *Source, destPath, branch string, shallow bool, onProgress ProgressCallback) error {
+	if source.Commit != "" {
+		branch = source.Commit
+	}
+	err := cloneSourceWithFallback(source, destPath, branch, shallow, onProgress)
+	if err == nil {
+		source.recordCommit(destPath)
+	}
+	return err
+}
+
+func cloneSourceWithFallback(source *Source, destPath, branch string, shallow bool, onProgress ProgressCallback) error {
+	err := cloneRepoWithEnv(source.CloneURL, destPath, branch, shallow, source.authEnv(), onProgress)
+	if err == nil {
+		return nil
+	}
+	if !shouldRetryNestedGitLabURL(err) {
+		return err
+	}
+
+	var lastErr error
+	for _, fallback := range cloneFallbackSourcesForNestedGitLabURL(source) {
+		if cleanupErr := removeAll(destPath); cleanupErr != nil && !os.IsNotExist(cleanupErr) {
+			return fmt.Errorf("clone failed (%v), and cleanup before fallback failed: %w", err, cleanupErr)
+		}
+		if onProgress != nil {
+			onProgress("Clone failed; retrying as a nested GitLab repository...")
+		}
+		fallbackErr := cloneRepoWithEnv(fallback.CloneURL, destPath, branch, shallow, fallback.authEnv(), onProgress)
+		if fallbackErr == nil {
+			*source = fallback
+			return nil
+		}
+		lastErr = fallbackErr
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("%w (nested GitLab fallback also failed: %v)", err, lastErr)
+	}
+	return err
+}
+
+func shouldRetryNestedGitLabURL(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsAuthError(err.Error()) || IsSSLError(err.Error()) {
+		return false
+	}
+
+	low := strings.ToLower(err.Error())
+	blockedHints := []string{
+		"remote branch",
+		"could not resolve host",
+		"failed to connect",
+		"connection timed out",
+		"operation timed out",
+		"network is unreachable",
+		"permission denied",
+	}
+	for _, hint := range blockedHints {
+		if strings.Contains(low, hint) {
+			return false
+		}
+	}
+
+	retryHints := []string{
+		"repository not found",
+		"not a git repository",
+		"not a valid git repo",
+		"does not appear to be a git repository",
+		"requested url returned error: 404",
+	}
+	for _, hint := range retryHints {
+		if strings.Contains(low, hint) {
+			return true
+		}
+	}
+	if strings.Contains(low, "repository") && strings.Contains(low, "not found") {
+		return true
+	}
+	return false
+}
+
+func cloneFallbackSourcesForNestedGitLabURL(source *Source) []Source {
+	if source == nil || source.Type != SourceTypeGitHTTPS || source.Subdir == "" {
+		return nil
+	}
+
+	u, err := url.Parse(source.CloneURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil
+	}
+
+	repoPath := strings.Trim(strings.TrimSuffix(u.Path, ".git"), "/")
+	if repoPath == "" || strings.Contains(repoPath, "/-/") {
+		return nil
+	}
+
+	subdirParts := strings.Split(strings.Trim(source.Subdir, "/"), "/")
+	if len(subdirParts) == 0 {
+		return nil
+	}
+
+	fallbacks := make([]Source, 0, len(subdirParts))
+	for i := 1; i <= len(subdirParts); i++ {
+		candidate := *source
+		candidateRepoPath := repoPath + "/" + strings.Join(subdirParts[:i], "/")
+		remaining := strings.Join(subdirParts[i:], "/")
+
+		candidateURL := *u
+		candidateURL.Path = "/" + candidateRepoPath + ".git"
+		candidate.CloneURL = candidateURL.String()
+		candidate.Subdir = remaining
+		if remaining == "" {
+			candidate.Name = filepath.Base(candidateRepoPath)
+		} else {
+			candidate.Name = filepath.Base(remaining)
+		}
+
+		fallbacks = append(fallbacks, candidate)
+	}
+
+	return fallbacks
+}
+
+// ShallowCloneToTemp clones cloneURL into a fresh temporary directory using a
+// shallow (depth 1) clone, injecting auth env for the URL. The caller owns the
+// returned directory and must remove it. branch may be empty to use the remote
+// default. On error the temp directory is removed and an empty path returned.
+func ShallowCloneToTemp(cloneURL, branch string, opts ParseOptions) (string, error) {
+	dir, err := os.MkdirTemp("", "skillshare-clone-*")
+	if err != nil {
+		return "", err
+	}
+	if err := cloneRepoWithEnv(cloneURL, dir, branch, true, AuthEnvForURL(cloneURL, opts), nil); err != nil {
+		cleanupTempRepo(dir)
+		return "", err
+	}
+	return dir, nil
+}
+
+// gitPull performs a quiet pull with the operation's resolved credentials.
+func gitPull(repoPath string, extraEnv []string, onProgress ProgressCallback) error {
 	args := []string{"pull", "--quiet"}
 	if onProgress != nil {
 		args = []string{"pull", "--progress"}
 	}
-	return runGitCommandWithProgress(args, repoPath, authEnv(remoteURL), onProgress)
+	return runGitCommandWithProgress(args, repoPath, extraEnv, onProgress)
+}
+
+// gitForcePull moves the checkout to its upstream branch, discarding local
+// edits. It fetches first, so a failed fetch leaves the edits in place.
+func gitForcePull(repoPath string, extraEnv []string, onProgress ProgressCallback) error {
+	args := []string{"fetch", "--quiet"}
+	if onProgress != nil {
+		args = []string{"fetch", "--progress"}
+	}
+	if err := runGitCommandWithProgress(args, repoPath, extraEnv, onProgress); err != nil {
+		return err
+	}
+	return runGitCommandEnv([]string{"reset", "--hard", "--quiet", "@{u}"}, repoPath, nil)
 }
 
 // getRemoteURL returns the fetch URL for the "origin" remote, or "".
 func getRemoteURL(repoPath string) string {
-	cmd := exec.Command("git", "remote", "get-url", "origin")
+	cmd := gitenv.Command("remote", "get-url", "origin")
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -123,7 +500,7 @@ func getRemoteURL(repoPath string) string {
 
 // getGitCommit returns the current HEAD commit hash
 func getGitCommit(repoPath string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "--short", "HEAD")
+	cmd := gitenv.Command("rev-parse", "--short", "HEAD")
 	cmd.Dir = repoPath
 	output, err := cmd.Output()
 	if err != nil {
@@ -137,7 +514,7 @@ func getGitCommit(repoPath string) (string, error) {
 // imports internal/install (for AuthEnvForURL), so the reverse import would
 // create a cycle.
 func getGitFullHash(repoPath string) (string, error) {
-	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd := gitenv.Command("rev-parse", "HEAD")
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
@@ -176,7 +553,7 @@ func validateTrackedRepoDirName(name string) error {
 // NOTE: duplicates git.ResetHard — kept here to avoid import cycle
 // (internal/git imports internal/install).
 func gitResetHard(repoPath, rev string) error {
-	cmd := exec.Command("git", "reset", "--hard", rev)
+	cmd := gitenv.Command("reset", "--hard", rev)
 	cmd.Dir = repoPath
 	return cmd.Run()
 }
@@ -184,20 +561,39 @@ func gitResetHard(repoPath, rev string) error {
 // getSubdirTreeHash returns the git tree hash for a subdirectory within a repo.
 // This is the SHA of the tree object for that directory — it changes only when
 // files inside the subdir change, even if the repo HEAD moves.
-// Returns "" on any error (no .git, subdir not found, etc.).
+// Returns "" on any error (no .git, subdir not found, etc.), and when the
+// subdir holds a symlink: install copies the link's target, whose changes the
+// tree hash cannot see, so such a skill is compared by commit instead.
 func getSubdirTreeHash(repoPath, subdir string) string {
 	if subdir == "" {
 		return ""
 	}
 	// Strip leading "/" from subdir — git rev-parse doesn't accept absolute paths
 	subdir = strings.TrimPrefix(subdir, "/")
-	cmd := exec.Command("git", "rev-parse", "HEAD:"+subdir)
+	cmd := gitenv.Command("rev-parse", "HEAD:"+subdir)
 	cmd.Dir = repoPath
 	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
+	// shortcut: a symlink whose target stays inside the subdir also disables the tree hash, resolve link targets if that costs too many reinstalls.
+	lsCmd := gitenv.Command("ls-tree", "-r", "HEAD:"+subdir)
+	lsCmd.Dir = repoPath
+	entries, err := lsCmd.Output()
+	if err != nil || hasSymlinkEntry(string(entries)) {
+		return ""
+	}
 	return strings.TrimSpace(string(out))
+}
+
+// hasSymlinkEntry reports whether `git ls-tree` output lists a symlink.
+func hasSymlinkEntry(lsTree string) bool {
+	for _, line := range strings.Split(lsTree, "\n") {
+		if strings.HasPrefix(line, "120000 ") {
+			return true
+		}
+	}
+	return false
 }
 
 // copyDir copies a directory recursively

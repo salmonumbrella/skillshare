@@ -4,6 +4,9 @@ package integration
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -146,28 +149,6 @@ func TestUninstall_JSON_DryRun(t *testing.T) {
 	}
 }
 
-func TestUninstall_JSON_ImpliesForce(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.CreateSkill("auto-force", map[string]string{"SKILL.md": "# Auto"})
-	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
-
-	// --json should skip confirmation (implies --force)
-	result := sb.RunCLI("uninstall", "auto-force", "--json")
-	result.AssertSuccess(t)
-
-	var output map[string]any
-	if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
-		t.Fatalf("invalid JSON output: %v\nStdout: %s", err, result.Stdout)
-	}
-
-	removed, ok := output["removed"].([]any)
-	if !ok || len(removed) != 1 {
-		t.Errorf("expected 1 removed skill, got %v", output["removed"])
-	}
-}
-
 // --- collect --json ---
 
 // --- target list --json ---
@@ -193,6 +174,71 @@ func TestTarget_List_JSON(t *testing.T) {
 	}
 	if len(targets) != 1 {
 		t.Errorf("expected 1 target, got %d", len(targets))
+	}
+}
+
+func TestTarget_List_Project_JSON_IncludesSyncMetadata(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectDir := sb.SetupProjectDir("claude")
+	sb.CreateProjectSkill(projectDir, "alpha", map[string]string{"SKILL.md": "# Alpha"})
+
+	sb.RunCLIInDir(projectDir, "sync", "-p").AssertSuccess(t)
+
+	result := sb.RunCLIInDir(projectDir, "target", "list", "-p", "--json")
+	result.AssertSuccess(t)
+
+	var output map[string]any
+	if err := json.Unmarshal([]byte(result.Stdout), &output); err != nil {
+		t.Fatalf("invalid JSON output: %v\nStdout: %s", err, result.Stdout)
+	}
+
+	targets, ok := output["targets"].([]any)
+	if !ok || len(targets) != 1 {
+		t.Fatalf("expected exactly 1 target, got %v", output["targets"])
+	}
+
+	target, ok := targets[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected target object, got %T", targets[0])
+	}
+
+	wantPath := filepath.Join(projectDir, ".claude", "skills")
+	if target["path"] != wantPath {
+		t.Fatalf("expected absolute target path %q, got %v", wantPath, target["path"])
+	}
+	if target["targetNaming"] != "flat" {
+		t.Fatalf("expected targetNaming=flat, got %v", target["targetNaming"])
+	}
+
+	syncSummary, ok := target["sync"].(string)
+	if !ok || !strings.Contains(syncSummary, "merged") {
+		t.Fatalf("expected sync summary containing merged, got %v", target["sync"])
+	}
+
+	agentSync, ok := target["agentSync"].(string)
+	if !ok || agentSync == "" {
+		t.Fatalf("expected non-empty agentSync, got %v", target["agentSync"])
+	}
+	if _, ok := output["extras"]; ok {
+		t.Fatalf("did not expect extras in target list JSON, got %v", output["extras"])
+	}
+	if runtime.GOOS != "windows" {
+		projectAlias := filepath.Join(sb.Root, "project-alias")
+		sb.CreateSymlink(projectDir, projectAlias)
+		aliasResult := sb.RunCLIInDir(projectAlias, "target", "list", "-p", "--json")
+		aliasResult.AssertSuccess(t)
+		var aliasOutput map[string]any
+		if err := json.Unmarshal([]byte(aliasResult.Stdout), &aliasOutput); err != nil {
+			t.Fatalf("invalid aliased JSON output: %v\nStdout: %s", err, aliasResult.Stdout)
+		}
+		aliasTargets := aliasOutput["targets"].([]any)
+		aliasTarget := aliasTargets[0].(map[string]any)
+		wantAliasPath := filepath.Join(projectAlias, ".claude", "skills")
+		if aliasTarget["path"] != wantAliasPath {
+			t.Fatalf("expected aliased target path %q, got %v", wantAliasPath, aliasTarget["path"])
+		}
 	}
 }
 
@@ -486,6 +532,88 @@ func TestInstall_JSON_FromConfig_PureJSON(t *testing.T) {
 	assertPureJSON(t, stdout)
 }
 
+func TestInstall_Project_JSON_Agent_PureJSON(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectDir := sb.Root + "/agent-project"
+	agentSource := sb.Root + "/agent-bundle"
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	sb.WriteFile(agentSource+"/reviewer.md", "# Reviewer\n")
+	initGitRepo(t, agentSource)
+
+	result := sb.RunCLIInDir(projectDir, "install", "file://"+agentSource, "--kind", "agent", "-p", "--json")
+	result.AssertSuccess(t)
+
+	stdout := strings.TrimSpace(result.Stdout)
+	assertPureJSON(t, stdout)
+
+	output := parseJSON(t, result.Stdout)
+	skills, ok := output["skills"].([]any)
+	if !ok {
+		t.Fatalf("skills should be an array, got %T", output["skills"])
+	}
+	if len(skills) != 1 || skills[0] != "reviewer" {
+		t.Fatalf("expected installed agent in JSON payload, got %v", skills)
+	}
+
+	if _, err := os.Stat(projectDir + "/.skillshare/agents/reviewer.md"); err != nil {
+		t.Fatalf("expected project agent to be installed: %v", err)
+	}
+}
+
+func TestUpdate_Agents_JSON_ReportsFinalStatus(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	repoDir := filepath.Join(sb.Home, "json-agent-repo")
+	if err := os.MkdirAll(repoDir, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "reviewer.md"), []byte("# Reviewer v1\n"), 0o644); err != nil {
+		t.Fatalf("write initial agent: %v", err)
+	}
+	initGitRepo(t, repoDir)
+
+	installResult := sb.RunCLI("install", "file://"+repoDir, "--kind", "agent", "--skip-audit")
+	installResult.AssertSuccess(t)
+
+	if err := os.WriteFile(filepath.Join(repoDir, "reviewer.md"), []byte("# Reviewer v2\n"), 0o644); err != nil {
+		t.Fatalf("write updated agent: %v", err)
+	}
+	run(t, repoDir, "git", "add", "reviewer.md")
+	run(t, repoDir, "git", "commit", "-m", "update reviewer")
+
+	result := sb.RunCLI("update", "agents", "--all", "--json")
+	result.AssertSuccess(t)
+
+	stdout := strings.TrimSpace(result.Stdout)
+	assertPureJSON(t, stdout)
+
+	output := parseJSON(t, result.Stdout)
+	agents, ok := output["agents"].([]any)
+	if !ok {
+		t.Fatalf("agents should be an array, got %T", output["agents"])
+	}
+	if len(agents) != 1 {
+		t.Fatalf("expected 1 agent result, got %d", len(agents))
+	}
+	item, ok := agents[0].(map[string]any)
+	if !ok {
+		t.Fatalf("agent result should be an object, got %T", agents[0])
+	}
+	if item["name"] != "reviewer" {
+		t.Fatalf("expected agent name reviewer, got %v", item["name"])
+	}
+	if item["status"] != "updated" {
+		t.Fatalf("expected final status updated, got %v", item["status"])
+	}
+}
+
 // --- diff --project --json (P1: spinner/progress must not pollute stdout) ---
 
 func TestDiff_Project_JSON_PureJSON(t *testing.T) {
@@ -537,6 +665,175 @@ func TestUninstall_JSON_NoSkillsFound_ReturnsJSONError(t *testing.T) {
 	}
 }
 
+func TestUninstall_JSON_AllFailedReportsError(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory the test user cannot write")
+	}
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+	sb.CreateSkill("stuck", map[string]string{"SKILL.md": "# Stuck"})
+	lockDir(t, filepath.Join(sb.Home, ".local", "share", "skillshare", "trash"))
+
+	result := sb.RunCLI("uninstall", "stuck", "--json")
+	result.AssertFailure(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+	if msg, _ := parseJSON(t, result.Stdout)["error"].(string); !strings.Contains(msg, "stuck: ") {
+		t.Errorf("expected error field to name the skill and its reason, got: %s", result.Stdout)
+	}
+}
+
+func TestUninstall_Project_JSON_PureOutput(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	root := sb.SetupProjectDir("claude")
+	sb.CreateProjectSkill(root, "one", map[string]string{"SKILL.md": "# One"})
+
+	result := sb.RunCLIInDir(root, "uninstall", "one", "-p", "--json")
+	result.AssertSuccess(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+	if removed, _ := parseJSON(t, result.Stdout)["removed"].([]any); len(removed) != 1 {
+		t.Errorf("expected one removed skill, got: %s", result.Stdout)
+	}
+}
+
+// The first -p command in a folder initializes the project; its banner must
+// not reach stdout under --json.
+func TestUninstall_Project_JSON_PureOnFirstRun(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	root := filepath.Join(sb.Root, "fresh")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	result := sb.RunCLIInDir(root, "uninstall", "nosuch", "-p", "--json")
+	result.AssertFailure(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+}
+
+func TestUninstall_Project_JSON_FailureReportsError(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory the test user cannot write")
+	}
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	root := sb.SetupProjectDir("claude")
+	sb.CreateProjectSkill(root, "stuck", map[string]string{"SKILL.md": "# Stuck"})
+	lockDir(t, filepath.Join(root, ".skillshare", "trash"))
+
+	result := sb.RunCLIInDir(root, "uninstall", "stuck", "-p", "--json")
+	result.AssertFailure(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+	if msg, _ := parseJSON(t, result.Stdout)["error"].(string); !strings.Contains(msg, "stuck: ") {
+		t.Errorf("expected error field to name the skill and its reason, got: %s", result.Stdout)
+	}
+}
+
+func TestUninstall_Agents_Project_RejectsUnknownOption(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	root := sb.SetupProjectDir("claude")
+
+	result := sb.RunCLIInDir(root, "uninstall", "-p", "agents", "--bogus")
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "unknown option: --bogus")
+}
+
+func TestUninstall_Agents_JSON_WritesOplog(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	createAgentSource(t, sb, map[string]string{"tutor.md": "# Tutor agent"})
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	sb.RunCLI("uninstall", "-g", "agents", "tutor", "--json").AssertSuccess(t)
+	if e := lastUninstallOp(t, sb.ConfigPath); e == nil || e.Status != "ok" {
+		t.Errorf("JSON agent uninstall should log an ok entry, got %+v", e)
+	}
+}
+
+func TestUninstall_Agents_JSON_FailureReportsReason(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory the test user cannot write")
+	}
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	createAgentSource(t, sb, map[string]string{"tutor.md": "# Tutor agent"})
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	lockDir(t, filepath.Join(sb.Home, ".local", "share", "skillshare", "trash", "agents"))
+
+	result := sb.RunCLI("uninstall", "-g", "agents", "tutor", "--json")
+	result.AssertFailure(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+	msg, _ := parseJSON(t, result.Stdout)["error"].(string)
+	if !strings.Contains(msg, "tutor: ") || !strings.Contains(msg, "permission denied") {
+		t.Errorf("expected error field to name the agent and its reason, got: %s", result.Stdout)
+	}
+}
+
+func TestUninstall_Agents_JSON_NotFoundReportsError(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	createAgentSource(t, sb, map[string]string{"tutor.md": "# Tutor agent"})
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	result := sb.RunCLI("uninstall", "-g", "agents", "missing", "--json")
+	result.AssertFailure(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+	if msg, _ := parseJSON(t, result.Stdout)["error"].(string); !strings.Contains(msg, "not found") {
+		t.Errorf("expected not-found error, got: %s", result.Stdout)
+	}
+}
+
+func TestUninstall_Agents_JSON_PureOutput(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	createAgentSource(t, sb, map[string]string{"tutor.md": "# Tutor agent"})
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	result := sb.RunCLI("uninstall", "-g", "agents", "tutor", "--json")
+	result.AssertSuccess(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+	if removed, _ := parseJSON(t, result.Stdout)["removed"].([]any); len(removed) != 1 {
+		t.Errorf("expected tutor in removed, got: %s", result.Stdout)
+	}
+}
+
+func TestUninstall_Agents_JSON_ProjectPureOutput(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	root := sb.SetupProjectDir("claude")
+	sb.WriteFile(filepath.Join(root, ".skillshare", "agents", "tutor.md"), "# Tutor agent")
+
+	result := sb.RunCLIInDir(root, "uninstall", "-p", "agents", "tutor", "--json")
+	result.AssertSuccess(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+}
+
+func TestUninstall_Agents_JSON_AllWithNoAgents(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	createAgentSource(t, sb, map[string]string{})
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	result := sb.RunCLI("uninstall", "-g", "agents", "--all", "--json")
+	result.AssertSuccess(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+}
+
+// lockDir creates dir and makes it read-only until the test ends.
+func lockDir(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0755) })
+}
+
 func TestUninstall_JSON_AllEmpty_ReturnsJSONError(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
@@ -559,7 +856,7 @@ func TestUninstall_JSON_AllEmpty_ReturnsJSONError(t *testing.T) {
 	}
 }
 
-func TestUninstall_JSON_PreflightEmpty_ReturnsJSONError(t *testing.T) {
+func TestUninstall_JSON_DirtyRepoRequiresExplicitForce(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
 
@@ -579,12 +876,57 @@ func TestUninstall_JSON_PreflightEmpty_ReturnsJSONError(t *testing.T) {
 	// Add uncommitted change
 	sb.WriteFile(repoPath+"/dirty.txt", "uncommitted")
 
-	// --json implies --force, so this should actually succeed.
-	// But if the skill is the only target and preflight skips it, we should get JSON error.
-	// Actually --json implies --force which bypasses preflight. Let's test without --force override.
-	// Note: --json already implies --force in current code, so we can't test preflight block via --json.
-	// Skip this test — it's not actually testable with --json implying --force.
-	t.Skip("--json implies --force, cannot test preflight block in JSON mode")
+	result := sb.RunCLI("uninstall", "uninst-preflight", "--json")
+	result.AssertFailure(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+
+	output := parseJSON(t, result.Stdout)
+	if _, ok := output["error"]; !ok {
+		t.Error("expected 'error' field in JSON output")
+	}
+	if !sb.FileExists(repoPath) {
+		t.Fatal("dirty tracked repo should remain without explicit --force")
+	}
+
+	// An all-dirty batch should explain why pre-flight rejected every target.
+	secondRepoPath := sb.SourcePath + "/_uninst-preflight-2"
+	run(t, sb.Root, "git", "clone", remoteDir, secondRepoPath)
+	sb.WriteFile(secondRepoPath+"/dirty.txt", "uncommitted")
+
+	result = sb.RunCLI("uninstall", "uninst-preflight", "uninst-preflight-2", "--json")
+	result.AssertFailure(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+	output = parseJSON(t, result.Stdout)
+	errorMessage, _ := output["error"].(string)
+	if !strings.Contains(errorMessage, "uncommitted changes") {
+		t.Fatalf("expected actionable dirty-repo error, got %q", errorMessage)
+	}
+	if !sb.FileExists(repoPath) || !sb.FileExists(secondRepoPath) {
+		t.Fatal("all dirty tracked repos should remain without explicit --force")
+	}
+
+	// Batch JSON output should stay pure while skipping only the dirty repo.
+	sb.CreateSkill("clean-skill", map[string]string{"SKILL.md": "# Clean"})
+	result = sb.RunCLI("uninstall", "uninst-preflight", "clean-skill", "--json")
+	result.AssertSuccess(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+	output = parseJSON(t, result.Stdout)
+	if output["skipped"] != float64(1) {
+		t.Fatalf("expected one skipped dirty repo, got %v", output["skipped"])
+	}
+	if !sb.FileExists(repoPath) {
+		t.Fatal("batch uninstall should preserve the dirty tracked repo")
+	}
+	if sb.FileExists(filepath.Join(sb.SourcePath, "clean-skill")) {
+		t.Fatal("batch uninstall should remove the clean skill")
+	}
+
+	result = sb.RunCLI("uninstall", "uninst-preflight", "--json", "--force")
+	result.AssertSuccess(t)
+	assertPureJSON(t, strings.TrimSpace(result.Stdout))
+	if sb.FileExists(repoPath) {
+		t.Fatal("dirty tracked repo should be removed with explicit --force")
+	}
 }
 
 // --- status --project --json ---
@@ -614,23 +956,6 @@ func TestStatus_Project_JSON(t *testing.T) {
 }
 
 // --- update --json single target (P1: verify suppressUIToDevnull works) ---
-
-func TestUpdate_JSON_SingleTarget_PureJSON(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
-
-	d := sb.CreateSkill("json-pure", map[string]string{"SKILL.md": "# Test"})
-	writeMeta(t, d)
-
-	result := sb.RunCLI("update", "json-pure", "--json", "--dry-run")
-	result.AssertSuccess(t)
-
-	// stdout must be pure JSON — UI header/step/spinner must not leak
-	stdout := strings.TrimSpace(result.Stdout)
-	assertPureJSON(t, stdout)
-}
 
 func TestUpdate_JSON_BatchTarget_PureJSON(t *testing.T) {
 	sb := testutil.NewSandbox(t)
@@ -772,5 +1097,201 @@ func TestCollect_JSON_NoLocalSkills(t *testing.T) {
 	}
 	if _, ok := output["dry_run"]; !ok {
 		t.Error("missing 'dry_run' field")
+	}
+}
+
+func TestCollect_JSON_ProjectSkills_PureJSON(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectDir := sb.SetupProjectDir("claude")
+	targetSkillDir := filepath.Join(projectDir, ".claude", "skills", "local-skill")
+	if err := os.MkdirAll(targetSkillDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetSkillDir, "SKILL.md"), []byte("# Local"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result := sb.RunCLIInDir(projectDir, "collect", "-p", "--json")
+	result.AssertSuccess(t)
+
+	stdout := strings.TrimSpace(result.Stdout)
+	assertPureJSON(t, stdout)
+
+	output := parseJSON(t, stdout)
+	pulled, ok := output["pulled"].([]any)
+	if !ok || len(pulled) != 1 || pulled[0] != "local-skill" {
+		t.Fatalf("expected pulled=[local-skill], got %v", output["pulled"])
+	}
+}
+
+func TestCollect_Agents_JSON_OutputsValidJSON(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	createAgentSource(t, sb, nil)
+	claudeAgents := createAgentTarget(t, sb, "claude")
+	if err := os.WriteFile(filepath.Join(claudeAgents, "local-agent.md"), []byte("# Local"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    skills:
+      path: ` + sb.CreateTarget("claude") + `
+    agents:
+      path: ` + claudeAgents + `
+`)
+
+	result := sb.RunCLI("collect", "agents", "claude", "--json")
+	result.AssertSuccess(t)
+
+	stdout := strings.TrimSpace(result.Stdout)
+	assertPureJSON(t, stdout)
+
+	output := parseJSON(t, stdout)
+	pulled, ok := output["pulled"].([]any)
+	if !ok || len(pulled) != 1 || pulled[0] != "local-agent.md" {
+		t.Fatalf("expected pulled=[local-agent.md], got %v", output["pulled"])
+	}
+	if output["dry_run"] != false {
+		t.Errorf("dry_run should be false, got %v", output["dry_run"])
+	}
+}
+
+func TestCollect_Agents_JSON_DryRun_DoesNotWrite(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	agentsSource := createAgentSource(t, sb, nil)
+	claudeAgents := createAgentTarget(t, sb, "claude")
+	if err := os.WriteFile(filepath.Join(claudeAgents, "local-agent.md"), []byte("# Local"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    skills:
+      path: ` + sb.CreateTarget("claude") + `
+    agents:
+      path: ` + claudeAgents + `
+`)
+
+	result := sb.RunCLI("collect", "agents", "claude", "--json", "--dry-run")
+	result.AssertSuccess(t)
+
+	output := parseJSON(t, strings.TrimSpace(result.Stdout))
+	if output["dry_run"] != true {
+		t.Errorf("dry_run should be true, got %v", output["dry_run"])
+	}
+
+	if _, err := os.Stat(filepath.Join(agentsSource, "local-agent.md")); !os.IsNotExist(err) {
+		t.Error("dry-run should not collect local-agent.md")
+	}
+}
+
+func TestCollect_Agents_JSON_SkipsConfirmationButNotForce(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	agentsSource := createAgentSource(t, sb, map[string]string{
+		"local-agent.md": "# Source version",
+	})
+	claudeAgents := createAgentTarget(t, sb, "claude")
+	if err := os.WriteFile(filepath.Join(claudeAgents, "local-agent.md"), []byte("# Target version"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    skills:
+      path: ` + sb.CreateTarget("claude") + `
+    agents:
+      path: ` + claudeAgents + `
+`)
+
+	// No stdin input provided: if --json failed to skip the confirmation prompt,
+	// this would block on the unanswered "Collect these...? [y/N]" read.
+	result := sb.RunCLI("collect", "agents", "claude", "--json")
+	result.AssertSuccess(t)
+
+	output := parseJSON(t, strings.TrimSpace(result.Stdout))
+	skipped, ok := output["skipped"].([]any)
+	if !ok || len(skipped) != 1 || skipped[0] != "local-agent.md" {
+		t.Fatalf("expected skipped=[local-agent.md], got %v", output["skipped"])
+	}
+
+	content, err := os.ReadFile(filepath.Join(agentsSource, "local-agent.md"))
+	if err != nil {
+		t.Fatalf("failed to read source agent: %v", err)
+	}
+	if string(content) != "# Source version" {
+		t.Errorf("expected source untouched without --force, got %q", string(content))
+	}
+}
+
+func TestCollect_Agents_JSON_ExplicitForce_Overwrites(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	agentsSource := createAgentSource(t, sb, map[string]string{
+		"local-agent.md": "# Source version",
+	})
+	claudeAgents := createAgentTarget(t, sb, "claude")
+	if err := os.WriteFile(filepath.Join(claudeAgents, "local-agent.md"), []byte("# Target version"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets:
+  claude:
+    skills:
+      path: ` + sb.CreateTarget("claude") + `
+    agents:
+      path: ` + claudeAgents + `
+`)
+
+	result := sb.RunCLI("collect", "agents", "claude", "--json", "--force")
+	result.AssertSuccess(t)
+
+	output := parseJSON(t, strings.TrimSpace(result.Stdout))
+	pulled, ok := output["pulled"].([]any)
+	if !ok || len(pulled) != 1 || pulled[0] != "local-agent.md" {
+		t.Fatalf("expected pulled=[local-agent.md], got %v", output["pulled"])
+	}
+
+	content, err := os.ReadFile(filepath.Join(agentsSource, "local-agent.md"))
+	if err != nil {
+		t.Fatalf("failed to read source agent: %v", err)
+	}
+	if string(content) != "# Target version" {
+		t.Errorf("expected overwrite via --force, got %q", string(content))
+	}
+}
+
+func TestCollect_Project_Agents_JSON_PureJSON(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	projectDir := setupProjectWithAgents(t, sb)
+	claudeAgents := filepath.Join(projectDir, ".claude", "agents")
+	if err := os.WriteFile(filepath.Join(claudeAgents, "local-agent.md"), []byte("# Local"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result := sb.RunCLIInDir(projectDir, "collect", "-p", "agents", "--json")
+	result.AssertSuccess(t)
+
+	stdout := strings.TrimSpace(result.Stdout)
+	assertPureJSON(t, stdout)
+
+	output := parseJSON(t, stdout)
+	pulled, ok := output["pulled"].([]any)
+	if !ok || len(pulled) != 1 || pulled[0] != "local-agent.md" {
+		t.Fatalf("expected pulled=[local-agent.md], got %v", output["pulled"])
 	}
 }

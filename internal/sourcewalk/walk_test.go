@@ -1,0 +1,346 @@
+package sourcewalk
+
+import (
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+)
+
+func fixture(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, name := range []string{"a/child", "skip/child", "z"} {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(name), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(root, "a"), filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func resolvedPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
+// Walk reports paths under the resolved root, so tests must compare against
+// that spelling rather than t.TempDir's possibly aliased one.
+func resolvedFixture(t *testing.T) string {
+	t.Helper()
+	return resolvedPath(t, fixture(t))
+}
+
+func TestSkipTargetDotDir(t *testing.T) {
+	orig := TargetDotDirs
+	TargetDotDirs = map[string]bool{".claude": true, ".cursor": true, ".skillshare": true}
+	defer func() { TargetDotDirs = orig }()
+
+	root := filepath.Join(t.TempDir(), ".skillshare")
+	for dir, want := range map[string]bool{
+		".":                  false, // the source root is never skipped
+		"some-skill/.claude": true,  // nested below a source child
+		".cursor":            false, // first level stays visible
+	} {
+		path := filepath.Join(root, dir)
+		if err := os.MkdirAll(path, 0755); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := SkipTargetDotDir(root, path, info); got != want {
+			t.Errorf("SkipTargetDotDir(%q) = %v, want %v", dir, got, want)
+		}
+	}
+}
+
+func TestWalkParity(t *testing.T) {
+	root := resolvedFixture(t)
+	for _, skip := range []string{"", "skip", "z", "."} {
+		t.Run("skip="+skip, func(t *testing.T) {
+			collect := func(paths *[]string) filepath.WalkFunc {
+				return func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						return err
+					}
+					rel, _ := filepath.Rel(root, path)
+					*paths = append(*paths, rel+":"+info.Mode().String())
+					if rel == skip {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+			var want, got []string
+			wantErr := filepath.Walk(root, collect(&want))
+			gotErr := Walk(root, Options{}, collect(&got))
+			if !reflect.DeepEqual(got, want) || !errors.Is(gotErr, wantErr) {
+				t.Fatalf("got %v, %v; want %v, %v", got, gotErr, want, wantErr)
+			}
+		})
+	}
+}
+
+func TestWalkDirParity(t *testing.T) {
+	root := resolvedFixture(t)
+	for _, skip := range []string{"", "skip", "z", "."} {
+		t.Run("skip="+skip, func(t *testing.T) {
+			collect := func(paths *[]string) fs.WalkDirFunc {
+				return func(path string, entry fs.DirEntry, err error) error {
+					if err != nil {
+						return err
+					}
+					rel, _ := filepath.Rel(root, path)
+					*paths = append(*paths, rel+":"+entry.Type().String())
+					if rel == skip {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+			var want, got []string
+			wantErr := filepath.WalkDir(root, collect(&want))
+			gotErr := WalkDir(root, Options{}, collect(&got))
+			if !reflect.DeepEqual(got, want) || !errors.Is(gotErr, wantErr) {
+				t.Fatalf("got %v, %v; want %v, %v", got, gotErr, want, wantErr)
+			}
+		})
+	}
+}
+
+func TestSymlinkRoot(t *testing.T) {
+	root := resolvedFixture(t)
+	link := filepath.Join(t.TempDir(), "source")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatal(err)
+	}
+	var walkPaths, dirPaths []string
+	if err := Walk(link, Options{}, func(path string, _ os.FileInfo, err error) error { walkPaths = append(walkPaths, path); return err }); err != nil {
+		t.Fatal(err)
+	}
+	if err := WalkDir(link, Options{}, func(path string, _ fs.DirEntry, err error) error { dirPaths = append(dirPaths, path); return err }); err != nil {
+		t.Fatal(err)
+	}
+	wantPaths := []string{
+		root,
+		filepath.Join(root, "a"),
+		filepath.Join(root, "a", "child"),
+		filepath.Join(root, "link"),
+		filepath.Join(root, "skip"),
+		filepath.Join(root, "skip", "child"),
+		filepath.Join(root, "z"),
+	}
+	if !reflect.DeepEqual(walkPaths, wantPaths) || !reflect.DeepEqual(dirPaths, wantPaths) {
+		t.Fatalf("unexpected paths: %v / %v", walkPaths, dirPaths)
+	}
+	got, err := ReadDir(link, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("entry count: %d != %d", len(got), len(want))
+	}
+	for i, entry := range got {
+		if entry.Name() != want[i].Name() || entry.Type() != want[i].Type() {
+			t.Fatalf("entry %d: %v != %v", i, entry, want[i])
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("entry count: %d != %d", len(got), len(want))
+	}
+}
+
+func TestWalkErrors(t *testing.T) {
+	sentinel := errors.New("callback failure")
+	root := fixture(t)
+	if err := Walk(root, Options{}, func(string, os.FileInfo, error) error { return sentinel }); err != sentinel {
+		t.Fatal(err)
+	}
+	if err := WalkDir(root, Options{}, func(string, fs.DirEntry, error) error { return sentinel }); err != sentinel {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(root, "missing")
+	for _, swallow := range []bool{false, true} {
+		check := func(path string, err error) error {
+			if path != missing || !os.IsNotExist(err) {
+				t.Fatalf("unexpected callback: %s, %v", path, err)
+			}
+			if swallow {
+				return nil
+			}
+			return err
+		}
+		err := Walk(missing, Options{}, func(path string, info os.FileInfo, err error) error {
+			if info != nil {
+				t.Fatal(info)
+			}
+			return check(path, err)
+		})
+		if (err == nil) != swallow {
+			t.Fatalf("Walk: %v", err)
+		}
+		err = WalkDir(missing, Options{}, func(path string, entry fs.DirEntry, err error) error {
+			if entry != nil {
+				t.Fatal(entry)
+			}
+			return check(path, err)
+		})
+		if (err == nil) != swallow {
+			t.Fatalf("WalkDir: %v", err)
+		}
+	}
+	if _, err := ReadDir(missing, Options{}); !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
+func TestReadDirLogicalErrorPaths(t *testing.T) {
+	root := fixture(t)
+	link := filepath.Join(t.TempDir(), "source")
+	if err := os.Symlink(root, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadDir(link, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadDir(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A removed file makes Info report an error after the directory was read.
+	if err := os.Remove(filepath.Join(root, "z")); err != nil {
+		t.Fatal(err)
+	}
+	_, gotErr := got[len(got)-1].Info()
+	_, wantErr := want[len(want)-1].Info()
+	if !reflect.DeepEqual(gotErr, wantErr) {
+		t.Fatalf("Info error: %v != %v", gotErr, wantErr)
+	}
+	// A link to a file is resolved successfully but cannot be read as a directory.
+	fileLink := filepath.Join(t.TempDir(), "file")
+	if err := os.Symlink(filepath.Join(root, "a", "child"), fileLink); err != nil {
+		t.Fatal(err)
+	}
+	_, gotErr = ReadDir(fileLink, Options{})
+	_, wantErr = os.ReadDir(fileLink)
+	if !reflect.DeepEqual(gotErr, wantErr) {
+		t.Fatalf("ReadDir error: %v != %v", gotErr, wantErr)
+	}
+}
+
+// TestAgentsSkillsDirThroughLinkedRoot checks that a repository reached
+// through a link (a followed source link, or `install ./link`) is scanned
+// for authored skills instead of being treated as empty.
+func TestAgentsSkillsDirThroughLinkedRoot(t *testing.T) {
+	dotDirs := map[string]bool{".agents": true}
+	for _, tt := range []struct {
+		name   string
+		skills []string
+		want   bool
+	}{
+		{"authored skills", []string{"skills/x", ".agents/skills/x"}, false},
+		{"only .agents/skills", []string{".agents/skills/x"}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := t.TempDir()
+			for _, p := range tt.skills {
+				if err := os.MkdirAll(filepath.Join(repo, p), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(repo, p, "SKILL.md"), []byte("# x"), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			link := filepath.Join(t.TempDir(), "repo")
+			if err := os.Symlink(repo, link); err != nil {
+				t.Fatal(err)
+			}
+			dir, ok := AgentsSkillsDir(link, dotDirs)
+			if ok != tt.want {
+				t.Fatalf("AgentsSkillsDir() ok = %v, want %v", ok, tt.want)
+			}
+			if ok && dir != filepath.Join(link, ".agents", "skills") {
+				t.Errorf("AgentsSkillsDir() dir = %q, want it under the link", dir)
+			}
+		})
+	}
+}
+
+func TestAgentsSkillsDirRequiresRealDirectories(t *testing.T) {
+	dotDirs := map[string]bool{".agents": true}
+	for _, linkedRoot := range []bool{false, true} {
+		rootName := "real root"
+		if linkedRoot {
+			rootName = "linked root"
+		}
+		t.Run(rootName, func(t *testing.T) {
+			for _, tt := range []struct {
+				name      string
+				component string
+				link      bool
+				want      bool
+			}{
+				{name: "real fallback", want: true},
+				{name: "linked .agents", component: ".agents", link: true},
+				{name: "linked skills", component: ".agents/skills", link: true},
+				{name: "file .agents", component: ".agents"},
+				{name: "file skills", component: ".agents/skills"},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					repo := t.TempDir()
+					if tt.want {
+						write(t, filepath.Join(repo, ".agents", "skills", "x", "SKILL.md"))
+					} else {
+						component := filepath.Join(repo, filepath.FromSlash(tt.component))
+						if err := os.MkdirAll(filepath.Dir(component), 0755); err != nil {
+							t.Fatal(err)
+						}
+						if tt.link {
+							outside := t.TempDir()
+							write(t, filepath.Join(outside, "skills", "x", "SKILL.md"))
+							target := outside
+							if tt.component == ".agents/skills" {
+								target = filepath.Join(outside, "skills")
+							}
+							symlink(t, target, component)
+						} else {
+							write(t, component)
+						}
+					}
+					root := repo
+					if linkedRoot {
+						root = filepath.Join(t.TempDir(), "repo")
+						symlink(t, repo, root)
+					}
+					dir, ok := AgentsSkillsDir(root, dotDirs)
+					wantDir := ""
+					if tt.want {
+						wantDir = filepath.Join(root, ".agents", "skills")
+					}
+					if ok != tt.want || dir != wantDir {
+						t.Fatalf("AgentsSkillsDir() = %q, %v; want %q, %v", dir, ok, wantDir, tt.want)
+					}
+				})
+			}
+		})
+	}
+}

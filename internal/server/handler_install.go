@@ -1,26 +1,136 @@
 package server
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"skillshare/internal/config"
 	"skillshare/internal/install"
+	"skillshare/internal/skillmove"
+	"skillshare/internal/sourcefs"
 )
+
+// reloadSkillsStore refreshes the in-memory skills metadata store from disk.
+// install.Install writes metadata to the file via its own store instance, so the
+// server's cached s.skillsStore stays stale after an install — a freshly
+// installed skill would then render with an empty source/type (shown as "Local"
+// with a blank source in the UI) until the server restarts.
+func (s *Server) reloadSkillsStore() error {
+	st, err := install.LoadMetadataWithMigration(s.cfg.EffectiveSkillsSource(), "")
+	if err != nil {
+		return err
+	}
+	s.skillsStore = st
+	return nil
+}
+
+// reconcileSkillsConfig syncs the skills config with the metadata store,
+// logging failures as warnings so the calling operation still succeeds.
+func (s *Server) reconcileSkillsConfig(sourceDir string) {
+	if err := s.reconcileSkills(sourceDir, true); err != nil {
+		log.Printf("warning: failed to reconcile skills config: %v", err)
+	}
+}
+
+// skillsStoreOnDisk reads the store an install is about to change. The cached
+// one may lag a CLI command run while the dashboard is open.
+func (s *Server) skillsStoreOnDisk() *install.MetadataStore {
+	if st, err := install.LoadMetadataWithMigration(s.cfg.EffectiveSkillsSource(), ""); err == nil && st != nil {
+		return st
+	}
+	return s.skillsStore
+}
+
+// reconcileInstalledSkills is reconcileSkillsConfig after an install. before
+// is the store as it was before the install, so a project config entry follows
+// a skill installed from another source (config.ReconcileProjectInstall).
+func (s *Server) reconcileInstalledSkills(before *install.MetadataStore, sourceDir string) {
+	if !s.IsProjectMode() {
+		s.reconcileSkillsConfig(sourceDir)
+		return
+	}
+	if err := config.ReconcileProjectInstall(s.projectRoot, s.projectCfg, before, s.skillsStore, sourceDir); err != nil {
+		log.Printf("warning: failed to reconcile skills config: %v", err)
+	}
+}
+
+// reconcileSkills is reconcileSkillsConfig for a caller that reports the error.
+// Without prune it only adopts moved records.
+func (s *Server) reconcileSkills(sourceDir string, prune bool) error {
+	if s.IsProjectMode() {
+		if prune {
+			return config.ReconcileProjectSkills(s.projectRoot, s.projectCfg, s.skillsStore, sourceDir)
+		}
+		return config.AdoptMovedProjectSkills(s.projectRoot, s.projectCfg, s.skillsStore, sourceDir)
+	}
+	if prune {
+		return config.ReconcileGlobalSkills(s.cfg, s.skillsStore)
+	}
+	return config.AdoptMovedGlobalSkills(s.cfg, s.skillsStore)
+}
+
+// adoptMovedSkills is the sync step. It reads the store from disk first: the
+// cached one may be the empty stand-in New uses when the file does not load,
+// and saving that would drop every record.
+func (s *Server) adoptMovedSkills() error {
+	if err := s.reloadSkillsStore(); err != nil {
+		return err
+	}
+	return s.reconcileSkills(s.cfg.EffectiveSkillsSource(), false)
+}
+
+// checkInstallInto refuses an into folder an install must not land in: inside
+// a skill or inside a tracked checkout, with the codes move uses. A path below
+// a source link is left to the install, which follows it or refuses it itself. It writes the response and returns false when it refuses.
+// Agents install under the agents source, which these rules do not describe.
+func (s *Server) checkInstallInto(w http.ResponseWriter, into, kind string) bool {
+	if into == "" || kind == "agent" {
+		return true
+	}
+	opts := skillmove.Options{SourceDir: s.cfg.EffectiveSkillsSource(), Follow: s.skillsWalk().Follow, Install: true}
+	_, refusal := skillmove.CheckDest(into, opts)
+	if refusal == nil {
+		return true
+	}
+	status := http.StatusConflict
+	if refusal.Code == skillmove.CodeInvalidDest {
+		status = http.StatusBadRequest
+	}
+	writeCodedError(w, status, string(refusal.Code), refusal.Error(), nil)
+	return false
+}
+
+func discoverInstallSource(source *install.Source) (*install.DiscoveryResult, error) {
+	if source.IsGit() {
+		if source.HasSubdir() {
+			return install.DiscoverFromGitSubdir(source)
+		}
+		return install.DiscoverFromGit(source)
+	}
+	return install.DiscoverLocal(source)
+}
 
 // handleDiscover clones a git repo to a temp dir, discovers skills, then cleans up.
 // Returns whether the caller needs to present a selection UI.
 func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
+	parseOpts := s.parseOpts()
+	s.mu.RUnlock()
+
 	var body struct {
 		Source string `json:"source"`
+		Branch string `json:"branch"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if err := decodeJSON(w, r, &body, defaultJSONBodyLimit); err != nil {
+		if !errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+		}
 		return
 	}
 	if body.Source == "" {
@@ -28,28 +138,16 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	source, err := install.ParseSource(body.Source)
+	source, err := install.ParseSourceWithOptions(body.Source, parseOpts)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid source: "+err.Error())
 		return
 	}
-
-	// Non-git sources (local paths) don't need discovery
-	if !source.IsGit() {
-		writeJSON(w, map[string]any{
-			"needsSelection": false,
-			"skills":         []any{},
-		})
-		return
+	if body.Branch != "" {
+		source.Branch = body.Branch
 	}
 
-	// Use subdir-aware discovery when a subdirectory is specified
-	var discovery *install.DiscoveryResult
-	if source.HasSubdir() {
-		discovery, err = install.DiscoverFromGitSubdir(source)
-	} else {
-		discovery, err = install.DiscoverFromGit(source)
-	}
+	discovery, err := discoverInstallSource(source)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -58,12 +156,19 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 
 	skills := make([]map[string]string, len(discovery.Skills))
 	for i, sk := range discovery.Skills {
-		skills[i] = map[string]string{"name": sk.Name, "path": sk.Path, "description": sk.Description}
+		skills[i] = map[string]string{"name": sk.Name, "path": sk.Path, "description": sk.Description, "kind": "skill"}
+	}
+
+	agents := make([]map[string]string, len(discovery.Agents))
+	for i, ag := range discovery.Agents {
+		agents[i] = map[string]string{"name": ag.Name, "path": ag.Path, "fileName": ag.FileName, "kind": "agent"}
 	}
 
 	writeJSON(w, map[string]any{
-		"needsSelection": len(discovery.Skills) > 1,
+		"needsSelection": len(discovery.Skills) > 1 || len(discovery.Agents) > 0,
 		"skills":         skills,
+		"agents":         agents,
+		"warnings":       discovery.Warnings,
 	})
 }
 
@@ -72,9 +177,12 @@ func (s *Server) handleInstallBatch(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer s.trackProjectLock()()
+	before := s.skillsStoreOnDisk()
 
 	var body struct {
 		Source string `json:"source"`
+		Branch string `json:"branch"`
 		Skills []struct {
 			Name string `json:"name"`
 			Path string `json:"path"`
@@ -82,28 +190,43 @@ func (s *Server) handleInstallBatch(w http.ResponseWriter, r *http.Request) {
 		Force     bool   `json:"force"`
 		SkipAudit bool   `json:"skipAudit"`
 		Into      string `json:"into"`
+		Name      string `json:"name"`
+		Kind      string `json:"kind,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if err := decodeJSON(w, r, &body, defaultJSONBodyLimit); err != nil {
+		if !errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+		}
 		return
 	}
 	if body.Source == "" || len(body.Skills) == 0 {
 		writeError(w, http.StatusBadRequest, "source and skills are required")
 		return
 	}
+	if !s.checkInstallInto(w, body.Into, body.Kind) {
+		return
+	}
 
-	source, err := install.ParseSource(body.Source)
+	source, err := install.ParseSourceWithOptions(body.Source, s.parseOpts())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid source: "+err.Error())
 		return
 	}
-
-	var discovery *install.DiscoveryResult
-	if source.HasSubdir() {
-		discovery, err = install.DiscoverFromGitSubdir(source)
-	} else {
-		discovery, err = install.DiscoverFromGit(source)
+	if body.Branch != "" {
+		source.Branch = body.Branch
 	}
+
+	if s.IsProjectMode() {
+		if err := install.RejectProjectRootLocalInstall(source, s.projectRoot); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else if source.Type == install.SourceTypeLocalPath {
+		// Global metadata has no fixed base for a relative path.
+		source.Raw = source.Path
+	}
+
+	discovery, err := discoverInstallSource(source)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "discovery failed: "+err.Error())
 		return
@@ -119,47 +242,87 @@ func (s *Server) handleInstallBatch(w http.ResponseWriter, r *http.Request) {
 
 	// Ensure Into directory exists
 	if body.Into != "" {
-		if err := os.MkdirAll(filepath.Join(s.cfg.Source, body.Into), 0755); err != nil {
+		baseDir, follow := s.cfg.EffectiveSkillsSource(), s.skillsWalk().Follow
+		if body.Kind == "agent" {
+			baseDir, follow = s.agentsSource(), nil
+		}
+		if err := sourcefs.MkdirAllIn(baseDir, body.Into, follow); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create into directory: "+err.Error())
 			return
 		}
 	}
 
-	// Cross-path duplicate detection
-	if !body.Force && source.CloneURL != "" {
-		if err := install.CheckCrossPathDuplicate(s.cfg.Source, source.CloneURL, body.Into); err != nil {
-			writeError(w, http.StatusConflict, err.Error())
-			return
-		}
-	}
+	// Note: no cross-path duplicate check for batch — user explicitly selected
+	// specific skills from discovery, so installing to a different path is intentional.
 
 	results := make([]batchResultItem, 0, len(body.Skills))
 	installOpts := install.InstallOptions{
 		Force:          body.Force,
+		AuditOverride:  body.Force,
 		SkipAudit:      body.SkipAudit,
 		AuditThreshold: s.auditThreshold(),
+		Branch:         body.Branch,
+		SourceDir:      s.cfg.EffectiveSkillsSource(),
+		SourceFollow:   s.skillsWalk().Follow,
 	}
 	if s.IsProjectMode() {
 		installOpts.AuditProjectRoot = s.projectRoot
 	}
+	isAgent := body.Kind == "agent"
+	if isAgent {
+		installOpts.SourceDir, installOpts.SourceFollow = s.agentsSource(), nil
+	}
+
 	for _, sel := range body.Skills {
-		destPath := filepath.Join(s.cfg.Source, body.Into, sel.Name)
-		res, err := install.InstallFromDiscovery(discovery, install.SkillInfo{
-			Name: sel.Name,
-			Path: sel.Path,
-		}, destPath, installOpts)
-		if err != nil {
-			results = append(results, batchResultItem{
-				Name:  sel.Name,
-				Error: err.Error(),
-			})
-			continue
+		skillName := sel.Name
+		if body.Name != "" && len(body.Skills) == 1 {
+			skillName = body.Name
 		}
-		results = append(results, batchResultItem{
-			Name:     sel.Name,
-			Action:   res.Action,
-			Warnings: res.Warnings,
-		})
+
+		if isAgent {
+			// Agent install: copy single .md file to agents source
+			agentsDir := s.agentsSource()
+			if body.Into != "" {
+				agentsDir = filepath.Join(agentsDir, body.Into)
+			}
+			agentInfo := install.AgentInfo{
+				Name:     sel.Name,
+				Path:     sel.Path,
+				FileName: filepath.Base(sel.Path),
+			}
+			res, err := install.InstallAgentFromDiscovery(discovery, agentInfo, agentsDir, installOpts)
+			if err != nil {
+				results = append(results, batchResultItem{
+					Name:  skillName,
+					Error: err.Error(),
+				})
+				continue
+			}
+			results = append(results, batchResultItem{
+				Name:     skillName,
+				Action:   res.Action,
+				Warnings: res.Warnings,
+			})
+		} else {
+			// Skill install: copy directory to skills source
+			destPath := filepath.Join(s.cfg.EffectiveSkillsSource(), body.Into, skillName)
+			res, err := install.InstallFromDiscovery(discovery, install.SkillInfo{
+				Name: sel.Name,
+				Path: sel.Path,
+			}, destPath, installOpts)
+			if err != nil {
+				results = append(results, batchResultItem{
+					Name:  skillName,
+					Error: err.Error(),
+				})
+				continue
+			}
+			results = append(results, batchResultItem{
+				Name:     skillName,
+				Action:   res.Action,
+				Warnings: res.Warnings,
+			})
+		}
 	}
 
 	// Summary for toast
@@ -178,9 +341,16 @@ func (s *Server) handleInstallBatch(w http.ResponseWriter, r *http.Request) {
 			failedSkills = append(failedSkills, r.Name)
 		}
 	}
-	summary := fmt.Sprintf("Installed %d of %d skills", installed, len(body.Skills))
+	kindLabel := "skills"
+	if isAgent {
+		kindLabel = "agents"
+	}
+	summary := fmt.Sprintf("Installed %d of %d %s", installed, len(body.Skills), kindLabel)
 	if firstErr != "" {
 		summary += " (some errors)"
+	}
+	if isAgent && installed > 0 && !s.cfg.HasAgentTarget() {
+		summary += ". Warning: none of your configured targets support agents"
 	}
 
 	status := "ok"
@@ -211,15 +381,14 @@ func (s *Server) handleInstallBatch(w http.ResponseWriter, r *http.Request) {
 
 	// Reconcile config after install
 	if installed > 0 {
-		if s.IsProjectMode() {
-			if rErr := config.ReconcileProjectSkills(s.projectRoot, s.projectCfg, s.registry, s.cfg.Source); rErr != nil {
-				log.Printf("warning: failed to reconcile project skills config: %v", rErr)
+		if isAgent {
+			if st, loadErr := install.LoadMetadataWithMigration(s.agentsSource(), install.MetadataKindAgent); loadErr == nil && st != nil {
+				s.agentsStore = st
 			}
 		} else {
-			if rErr := config.ReconcileGlobalSkills(s.cfg, s.registry); rErr != nil {
-				log.Printf("warning: failed to reconcile global skills config: %v", rErr)
-			}
+			s.reloadSkillsStore()
 		}
+		s.reconcileInstalledSkills(before, s.cfg.EffectiveSkillsSource())
 	}
 
 	writeJSON(w, map[string]any{
@@ -232,17 +401,23 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer s.trackProjectLock()()
+	before := s.skillsStoreOnDisk()
 
 	var body struct {
 		Source    string `json:"source"`
+		Branch    string `json:"branch"`
 		Name      string `json:"name"`
 		Force     bool   `json:"force"`
 		SkipAudit bool   `json:"skipAudit"`
 		Track     bool   `json:"track"`
 		Into      string `json:"into"`
+		Kind      string `json:"kind,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if err := decodeJSON(w, r, &body, defaultJSONBodyLimit); err != nil {
+		if !errors.Is(err, errBodyTooLarge) {
+			writeError(w, http.StatusBadRequest, "invalid JSON body")
+		}
 		return
 	}
 
@@ -250,11 +425,28 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "source is required")
 		return
 	}
+	// A tracked repo's kind is known only after inspecting it; see below.
+	if !body.Track && !s.checkInstallInto(w, body.Into, body.Kind) {
+		return
+	}
 
-	source, err := install.ParseSource(body.Source)
+	source, err := install.ParseSourceWithOptions(body.Source, s.parseOpts())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid source: "+err.Error())
 		return
+	}
+	if body.Branch != "" {
+		source.Branch = body.Branch
+	}
+
+	if s.IsProjectMode() {
+		if err := install.RejectProjectRootLocalInstall(source, s.projectRoot); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else if source.Type == install.SourceTypeLocalPath {
+		// Global metadata has no fixed base for a relative path.
+		source.Raw = source.Path
 	}
 
 	if body.Name != "" {
@@ -263,23 +455,56 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 
 	// Tracked repo install
 	if body.Track {
+		trackedKind, err := install.InferTrackedKind(source, body.Kind)
+		if err != nil {
+			var ambig *install.TrackKindAmbiguousError
+			if errors.As(err, &ambig) {
+				writeCodedError(w, http.StatusBadRequest,
+					"install.track_kind_ambiguous", err.Error(),
+					map[string]string{
+						"skills": strconv.Itoa(ambig.Skills),
+						"agents": strconv.Itoa(ambig.Agents),
+					})
+				return
+			}
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		if !s.checkInstallInto(w, body.Into, trackedKind) {
+			return
+		}
+		trackSourceDir, trackFollow := s.cfg.EffectiveSkillsSource(), s.skillsWalk().Follow
+		if trackedKind == "agent" {
+			trackSourceDir, trackFollow = s.agentsSource(), nil
+		}
+
 		installOpts := install.InstallOptions{
 			Name:           body.Name,
+			Kind:           trackedKind,
 			Force:          body.Force,
+			AuditOverride:  body.Force,
 			SkipAudit:      body.SkipAudit,
 			Into:           body.Into,
+			Branch:         body.Branch,
 			AuditThreshold: s.auditThreshold(),
+			SourceDir:      trackSourceDir,
+			SourceFollow:   trackFollow,
 		}
 		if s.IsProjectMode() {
 			installOpts.AuditProjectRoot = s.projectRoot
 		}
-		result, err := install.InstallTrackedRepo(source, s.cfg.Source, install.InstallOptions{
+		result, err := install.InstallTrackedRepo(source, trackSourceDir, install.InstallOptions{
 			Name:             installOpts.Name,
+			Kind:             installOpts.Kind,
 			Force:            installOpts.Force,
+			AuditOverride:    installOpts.AuditOverride,
 			SkipAudit:        installOpts.SkipAudit,
 			Into:             installOpts.Into,
+			Branch:           installOpts.Branch,
 			AuditThreshold:   installOpts.AuditThreshold,
 			AuditProjectRoot: installOpts.AuditProjectRoot,
+			SourceFollow:     installOpts.SourceFollow,
 		})
 		if err != nil {
 			s.writeOpsLog("install", "error", start, map[string]any{
@@ -295,20 +520,16 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Reconcile config after tracked repo install
-		if s.IsProjectMode() {
-			if rErr := config.ReconcileProjectSkills(s.projectRoot, s.projectCfg, s.registry, s.cfg.Source); rErr != nil {
-				log.Printf("warning: failed to reconcile project skills config: %v", rErr)
-			}
-		} else {
-			if rErr := config.ReconcileGlobalSkills(s.cfg, s.registry); rErr != nil {
-				log.Printf("warning: failed to reconcile global skills config: %v", rErr)
-			}
+		if trackedKind == "skill" {
+			s.reloadSkillsStore()
+			s.reconcileInstalledSkills(before, s.cfg.EffectiveSkillsSource())
 		}
 
 		args := map[string]any{
 			"source":      body.Source,
 			"mode":        s.installLogMode(),
 			"tracked":     true,
+			"kind":        trackedKind,
 			"force":       body.Force,
 			"threshold":   s.auditThreshold(),
 			"scope":       "ui",
@@ -328,7 +549,9 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
 			"repoName":   result.RepoName,
 			"skillCount": result.SkillCount,
+			"agentCount": result.AgentCount,
 			"skills":     result.Skills,
+			"agents":     result.Agents,
 			"action":     result.Action,
 			"warnings":   result.Warnings,
 		})
@@ -337,25 +560,28 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 
 	// Cross-path duplicate detection
 	if !body.Force && source.CloneURL != "" {
-		if err := install.CheckCrossPathDuplicate(s.cfg.Source, source.CloneURL, body.Into); err != nil {
+		if err := install.CheckCrossPathDuplicate(s.cfg.EffectiveSkillsSource(), source.CloneURL, body.Into); err != nil {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
 	}
 
 	// Regular install
-	destPath := filepath.Join(s.cfg.Source, body.Into, source.Name)
+	destPath := filepath.Join(s.cfg.EffectiveSkillsSource(), body.Into, source.Name)
 	if body.Into != "" {
-		if err := os.MkdirAll(filepath.Join(s.cfg.Source, body.Into), 0755); err != nil {
+		if err := sourcefs.MkdirAllIn(s.cfg.EffectiveSkillsSource(), body.Into, s.skillsWalk().Follow); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create into directory: "+err.Error())
 			return
 		}
 	}
 
 	result, err := install.Install(source, destPath, install.InstallOptions{
+		SourceFollow:   s.skillsWalk().Follow,
 		Name:           body.Name,
 		Force:          body.Force,
+		AuditOverride:  body.Force,
 		SkipAudit:      body.SkipAudit,
+		Branch:         body.Branch,
 		AuditThreshold: s.auditThreshold(),
 		AuditProjectRoot: func() string {
 			if s.IsProjectMode() {
@@ -378,15 +604,8 @@ func (s *Server) handleInstall(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reconcile config after single install
-	if s.IsProjectMode() {
-		if rErr := config.ReconcileProjectSkills(s.projectRoot, s.projectCfg, s.registry, s.cfg.Source); rErr != nil {
-			log.Printf("warning: failed to reconcile project skills config: %v", rErr)
-		}
-	} else {
-		if rErr := config.ReconcileGlobalSkills(s.cfg, s.registry); rErr != nil {
-			log.Printf("warning: failed to reconcile global skills config: %v", rErr)
-		}
-	}
+	s.reloadSkillsStore()
+	s.reconcileInstalledSkills(before, s.cfg.EffectiveSkillsSource())
 
 	okArgs := map[string]any{
 		"source":           body.Source,

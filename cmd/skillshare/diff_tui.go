@@ -2,10 +2,14 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+
+	"skillshare/internal/textdiff"
+	"skillshare/internal/theme"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -29,42 +33,106 @@ type diffExpandMsg struct {
 // diffMinSplitWidth is the minimum terminal width for horizontal split.
 const diffMinSplitWidth = tuiMinSplitWidth
 
-// --- List item ---
+// --- List items ---
 
 type diffTargetItem struct {
 	result targetDiffResult
 }
 
-func (i diffTargetItem) Title() string {
-	r := i.result
-	if r.errMsg != "" {
-		return fmt.Sprintf("%s %s", tc.Red.Render("✗"), r.name)
-	}
-	if r.synced {
-		return fmt.Sprintf("%s %s", tc.Green.Render("✓"), r.name)
-	}
-	return fmt.Sprintf("%s %s", tc.Yellow.Render("!"), r.name)
+// diffExtraItem wraps an extraDiffResult for the bubbletea list.
+type diffExtraItem struct {
+	result extraDiffResult
 }
 
-func (i diffTargetItem) Description() string {
+// row returns the row's text and its right column.
+func (i diffExtraItem) row() (string, string) {
 	r := i.result
-	if r.errMsg != "" {
-		return "error"
+	switch {
+	case r.errMsg != "":
+		return theme.Danger().Render("✗") + " " + r.extraName, theme.Danger().Render("error")
+	case r.synced:
+		return theme.Success().Render("✓") + " " + r.extraName, theme.Dim().Render("in sync")
 	}
-	if r.synced {
-		return "synced"
+	return theme.Warning().Render("!") + " " + r.extraName, theme.Dim().Render(countNoun(len(r.items), "difference"))
+}
+
+func (i diffExtraItem) FilterValue() string { return i.result.extraName }
+
+// diffSeparatorItem is a non-selectable visual separator / group header.
+type diffSeparatorItem struct {
+	label string
+	count int  // 0 = no count displayed
+	space bool // true = empty spacer row
+}
+
+func (s diffSeparatorItem) FilterValue() string { return "" }
+
+// diffItemDelegate renders targets and extras as one-line rows and
+// separators as group rows.
+type diffItemDelegate struct{}
+
+func (diffItemDelegate) Height() int                             { return 1 }
+func (diffItemDelegate) Spacing() int                            { return 0 }
+func (diffItemDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
+
+func (d diffItemDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
+	var left, right string
+	switch v := item.(type) {
+	case diffSeparatorItem:
+		if !v.space {
+			renderGroupRow(w, groupItem{label: v.label}, m.Width())
+		}
+		return
+	case diffTargetItem:
+		left, right = v.row()
+	case diffExtraItem:
+		left, right = v.row()
+	default:
+		return
+	}
+	renderPrefixRow(w, alignRow(left, right, m.Width()-rowIndent), m.Width(), index == m.Index())
+}
+
+// skipDiffSeparator advances the list selection past diffSeparatorItem entries.
+func skipDiffSeparator(l *list.Model, direction int) {
+	items := l.Items()
+	idx := l.Index()
+	n := len(items)
+	for idx >= 0 && idx < n {
+		if _, isSep := items[idx].(diffSeparatorItem); !isSep {
+			break
+		}
+		idx += direction
+	}
+	if idx >= 0 && idx < n {
+		l.Select(idx)
+	}
+}
+
+// row returns the row's text and its right column: what differs.
+func (i diffTargetItem) row() (string, string) {
+	r := i.result
+	switch {
+	case r.errMsg != "":
+		return theme.Danger().Render("✗") + " " + r.name, theme.Danger().Render("error")
+	case r.synced:
+		return theme.Success().Render("✓") + " " + r.name, theme.Dim().Render("in sync")
 	}
 	var parts []string
 	if r.syncCount > 0 {
-		parts = append(parts, fmt.Sprintf("%d sync", r.syncCount))
+		parts = append(parts, fmt.Sprintf("%d to sync", r.syncCount))
 	}
 	if r.localCount > 0 {
 		parts = append(parts, fmt.Sprintf("%d local", r.localCount))
 	}
-	if len(parts) == 0 {
-		return "0 diff(s)"
+	if n := r.keptCount(); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d kept", n))
 	}
-	return strings.Join(parts, ", ")
+	desc := "differs"
+	if len(parts) > 0 {
+		desc = strings.Join(parts, " · ")
+	}
+	return theme.Warning().Render("!") + " " + r.name, theme.Dim().Render(desc)
 }
 
 func (i diffTargetItem) FilterValue() string { return i.result.name }
@@ -77,7 +145,8 @@ type diffTUIModel struct {
 	termHeight int
 
 	// Data — sorted: error → diff → synced
-	allItems []targetDiffResult
+	allItems  []targetDiffResult
+	allExtras []extraDiffResult
 
 	// Target list
 	targetList list.Model
@@ -104,9 +173,11 @@ type diffTUIModel struct {
 	cachedIdx   int
 	cachedItems []copyDiffEntry
 	cachedCats  []actionCategory
+
+	showKeys bool // ? swaps the detail panel for the full key list
 }
 
-func newDiffTUIModel(results []targetDiffResult) diffTUIModel {
+func newDiffTUIModel(results []targetDiffResult, extrasSlice ...[]extraDiffResult) diffTUIModel {
 	// Sort: error first, then diffs, then synced
 	sorted := make([]targetDiffResult, len(results))
 	copy(sorted, results)
@@ -119,56 +190,45 @@ func newDiffTUIModel(results []targetDiffResult) diffTUIModel {
 		return ri.name < rj.name
 	})
 
-	listItems := make([]list.Item, len(sorted))
-	for i, r := range sorted {
-		listItems[i] = diffTargetItem{result: r}
+	var extras []extraDiffResult
+	if len(extrasSlice) > 0 {
+		extras = extrasSlice[0]
 	}
 
-	delegate := list.NewDefaultDelegate()
-	configureDelegate(&delegate, true)
-
-	tl := list.New(listItems, delegate, 0, 0)
-	var errN, diffN, syncN int
+	// Build list items with group headers
+	var listItems []list.Item
+	listItems = append(listItems, diffSeparatorItem{label: "Targets", count: len(sorted)})
 	for _, r := range sorted {
-		switch {
-		case r.errMsg != "":
-			errN++
-		case !r.synced:
-			diffN++
-		default:
-			syncN++
+		listItems = append(listItems, diffTargetItem{result: r})
+	}
+	// Append extras with spacer + separator
+	if len(extras) > 0 {
+		listItems = append(listItems, diffSeparatorItem{space: true})
+		listItems = append(listItems, diffSeparatorItem{label: "Extras", count: len(extras)})
+		for _, r := range extras {
+			listItems = append(listItems, diffExtraItem{result: r})
 		}
 	}
-	var titleParts []string
-	if errN > 0 {
-		titleParts = append(titleParts, fmt.Sprintf("%d err", errN))
-	}
-	if diffN > 0 {
-		titleParts = append(titleParts, fmt.Sprintf("%d diff", diffN))
-	}
-	if syncN > 0 {
-		titleParts = append(titleParts, fmt.Sprintf("%d ok", syncN))
-	}
-	tl.Title = fmt.Sprintf("Diff — %s", strings.Join(titleParts, ", "))
-	tl.Styles.Title = tc.ListTitle
+
+	tl := list.New(listItems, diffItemDelegate{}, 0, 0)
+	tl.SetShowTitle(false)
 	tl.SetShowStatusBar(false)
 	tl.SetFilteringEnabled(false)
 	tl.SetShowHelp(false)
 	tl.SetShowPagination(false)
+	skipDiffSeparator(&tl, 1)
 
-	fi := textinput.New()
-	fi.Prompt = "/ "
-	fi.PromptStyle = tc.Filter
-	fi.Cursor.Style = tc.Filter
+	fi := newTUIFilterInput("type to match a target or extra")
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
-	sp.Style = tc.SpinnerStyle
+	sp.Style = theme.Accent()
 
 	return diffTUIModel{
 		allItems:    sorted,
+		allExtras:   extras,
 		targetList:  tl,
-		matchCount:  len(sorted),
+		matchCount:  len(listItems),
 		filterInput: fi,
 		loadSpinner: sp,
 	}
@@ -215,8 +275,10 @@ func (m diffTUIModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.termWidth = msg.Width
 		m.termHeight = msg.Height
 		lw := diffListWidth(m.termWidth)
-		h := m.diffPanelHeight()
-		m.targetList.SetSize(lw, h)
+		if m.termWidth < diffMinSplitWidth {
+			lw = m.termWidth
+		}
+		m.targetList.SetSize(lw, m.diffPanelHeight())
 		m.refreshDetailCache()
 		return m, nil
 
@@ -253,32 +315,33 @@ func (m diffTUIModel) handleDiffKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Filter mode
 	if m.filtering {
-		switch key {
-		case "esc":
-			m.filtering = false
-			m.filterText = ""
-			m.filterInput.SetValue("")
-			m.applyDiffFilter()
-			return m, nil
-		case "enter":
-			m.filtering = false
-			return m, nil
-		}
-		var cmd tea.Cmd
-		m.filterInput, cmd = m.filterInput.Update(msg)
-		newVal := m.filterInput.Value()
-		if newVal != m.filterText {
-			m.filterText = newVal
-			m.applyDiffFilter()
-		}
+		cmd := handleTUIFilterKey(msg, &m.filtering, &m.filterText, &m.filterInput, m.applyDiffFilter)
 		return m, cmd
 	}
 
 	// Normal keys
 	switch key {
-	case "q", "esc", "ctrl+c":
+	case "q", "ctrl+c":
 		m.quitting = true
 		return m, tea.Quit
+
+	case "esc":
+		switch {
+		case m.showKeys:
+			m.showKeys = false
+		case m.filterText != "":
+			m.filterText = ""
+			m.filterInput.SetValue("")
+			m.applyDiffFilter()
+		default:
+			m.quitting = true
+			return m, tea.Quit
+		}
+		return m, nil
+
+	case "?":
+		m.showKeys = !m.showKeys
+		return m, nil
 
 	case "/":
 		m.filtering = true
@@ -337,7 +400,14 @@ func (m diffTUIModel) handleDiffKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.targetList, cmd = m.targetList.Update(msg)
 
+	// Skip separator items
 	if m.targetList.Index() != prevIdx {
+		direction := 1
+		if m.targetList.Index() < prevIdx {
+			direction = -1
+		}
+		skipDiffSeparator(&m.targetList, direction)
+
 		m.detailScroll = 0
 		m.expandedSkill = ""
 		m.expandedDiff = ""
@@ -354,13 +424,22 @@ func (m diffTUIModel) handleDiffKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *diffTUIModel) applyDiffFilter() {
 	needle := strings.ToLower(m.filterText)
 	if needle == "" {
-		items := make([]list.Item, len(m.allItems))
-		for i, r := range m.allItems {
-			items[i] = diffTargetItem{result: r}
+		var items []list.Item
+		items = append(items, diffSeparatorItem{label: "Targets", count: len(m.allItems)})
+		for _, r := range m.allItems {
+			items = append(items, diffTargetItem{result: r})
 		}
-		m.matchCount = len(m.allItems)
+		if len(m.allExtras) > 0 {
+			items = append(items, diffSeparatorItem{space: true})
+			items = append(items, diffSeparatorItem{label: "Extras", count: len(m.allExtras)})
+			for _, r := range m.allExtras {
+				items = append(items, diffExtraItem{result: r})
+			}
+		}
+		m.matchCount = len(items)
 		m.targetList.SetItems(items)
 		m.targetList.ResetSelected()
+		skipDiffSeparator(&m.targetList, 1)
 		m.cachedItems = nil // invalidate cache
 		return
 	}
@@ -368,6 +447,11 @@ func (m *diffTUIModel) applyDiffFilter() {
 	for _, r := range m.allItems {
 		if strings.Contains(strings.ToLower(r.name), needle) {
 			matched = append(matched, diffTargetItem{result: r})
+		}
+	}
+	for _, r := range m.allExtras {
+		if strings.Contains(strings.ToLower(r.extraName), needle) {
+			matched = append(matched, diffExtraItem{result: r})
 		}
 	}
 	m.matchCount = len(matched)
@@ -381,11 +465,15 @@ func (m *diffTUIModel) applyDiffFilter() {
 func diffListWidth(_ int) int { return 40 }
 
 func diffDetailWidth(termWidth int) int {
-	return max(termWidth-diffListWidth(termWidth)-3, 30)
+	return max(termWidth-diffListWidth(termWidth), 30)
 }
 
 func (m diffTUIModel) diffPanelHeight() int {
-	return max(m.termHeight-4, 10)
+	bodyHeight := max(m.termHeight-frameChrome, 6)
+	if m.termWidth >= diffMinSplitWidth {
+		return bodyHeight
+	}
+	return max(bodyHeight/2, 4) // narrow: the details sit below the list
 }
 
 // --- Views ---
@@ -394,117 +482,235 @@ func (m diffTUIModel) View() string {
 	if m.quitting {
 		return ""
 	}
-
-	if m.termWidth >= diffMinSplitWidth {
-		return m.viewDiffHorizontal()
+	bodyHeight := max(m.termHeight-frameChrome, 6)
+	title := m.renderTitleLine()
+	if m.termWidth < diffMinSplitWidth {
+		detailHeight := max(bodyHeight-m.diffPanelHeight()-1, 4)
+		detail := lipgloss.NewStyle().Height(detailHeight).MaxHeight(detailHeight).PaddingLeft(1).
+			Render(m.renderRight(m.termWidth-2, detailHeight))
+		return title + "\n\n" + m.targetList.View() + "\n\n" + detail + "\n" + m.renderBottom()
 	}
-	return m.viewDiffVertical()
-}
-
-func (m diffTUIModel) viewDiffHorizontal() string {
-	var b strings.Builder
-
-	panelHeight := m.diffPanelHeight()
 	leftWidth := diffListWidth(m.termWidth)
 	rightWidth := diffDetailWidth(m.termWidth)
-
-	// Detail
-	detailStr, scrollInfo := wrapAndScroll(m.buildDiffDetail(), rightWidth-1, m.detailScroll, panelHeight)
-
-	body := renderHorizontalSplit(m.targetList.View(), detailStr, leftWidth, rightWidth, panelHeight)
-	b.WriteString(body)
-	b.WriteString("\n")
-
-	// Filter bar
-	b.WriteString(m.renderDiffFilterBar())
-
-	// Help
-	b.WriteString(tc.Help.Render(appendScrollInfo("↑↓ navigate  / filter  Enter expand  Ctrl+d/u scroll  q quit", scrollInfo)))
-	b.WriteString("\n")
-
-	return b.String()
+	return title + "\n\n" +
+		renderFrameSplit(m.targetList.View(), m.renderRight(rightWidth-2, bodyHeight), leftWidth, rightWidth, bodyHeight) + "\n" +
+		m.renderBottom()
 }
 
-func (m diffTUIModel) viewDiffVertical() string {
-	var b strings.Builder
-
-	b.WriteString(m.targetList.View())
-	b.WriteString("\n")
-
-	b.WriteString(m.renderDiffFilterBar())
-
-	// Detail below list
-	detailHeight := max(m.termHeight/3, 6)
-	detailStr, scrollInfo := wrapAndScroll(m.buildDiffDetail(), m.termWidth, m.detailScroll, detailHeight)
-	b.WriteString(detailStr)
-	b.WriteString("\n")
-
-	b.WriteString(tc.Help.Render(appendScrollInfo("↑↓ navigate  / filter  Enter expand  Ctrl+d/u scroll  q quit", scrollInfo)))
-	b.WriteString("\n")
-
-	return b.String()
+// renderTitleLine renders the target and extra counts and how many differ.
+func (m diffTUIModel) renderTitleLine() string {
+	var errN, diffN, keptN, syncN int
+	for _, r := range m.allItems {
+		switch {
+		case r.errMsg != "":
+			errN++
+		case r.synced:
+			syncN++
+		case r.syncCount == 0 && r.keptCount() > 0:
+			keptN++
+		default:
+			diffN++
+		}
+	}
+	facts := []string{countNoun(len(m.allItems), "target")}
+	if len(m.allExtras) > 0 {
+		facts = append(facts, countNoun(len(m.allExtras), "extra"))
+	}
+	if syncN > 0 {
+		facts = append(facts, formatNumber(syncN)+" in sync")
+	}
+	// Colored facts go last; a colored fact ends the dim run of facts.
+	if diffN > 0 {
+		facts = append(facts, theme.Warning().Render(formatNumber(diffN)+" differ"))
+	}
+	if keptN > 0 {
+		facts = append(facts, theme.Warning().Render(formatNumber(keptN)+" kept under old name"))
+	}
+	if errN > 0 {
+		facts = append(facts, theme.Danger().Render(countNoun(errN, "error")))
+	}
+	return renderFrameTitle(m.termWidth, "diff", facts, nil)
 }
 
-func (m diffTUIModel) renderDiffFilterBar() string {
-	pag := renderPageInfoFromPaginator(m.targetList.Paginator)
-	return renderTUIFilterBar(
-		m.filterInput.View(), m.filtering, m.filterText,
-		m.matchCount, len(m.allItems), 0, "targets", pag,
-	)
+// renderRight renders the detail panel, or the key list while ? is on.
+func (m diffTUIModel) renderRight(width, height int) string {
+	if m.showKeys {
+		return renderKeysPanel(diffKeyGroups)
+	}
+	detail, _ := wrapAndScroll(m.buildDiffDetail(), width, m.detailScroll, height)
+	return detail
+}
+
+// renderBottom renders the note line and the key line; the filter input
+// takes over the key line in place.
+func (m diffTUIModel) renderBottom() string {
+	var line string
+	switch {
+	case m.filtering:
+		line = renderFilterLine(m.termWidth, m.filterInput.View(), m.matchCount)
+	case m.showKeys:
+		line = renderKeyLine(m.termWidth, []keyHint{{"?/esc", "close"}}, "")
+	default:
+		filter := keyHint{"/", "filter"}
+		if m.filterText != "" {
+			filter = keyHint{"esc", "clear filter"}
+		}
+		enter := keyHint{"enter", "show files"}
+		if m.expandedSkill != "" {
+			enter = keyHint{"enter", "hide files"}
+		}
+		hints := []keyHint{{"↑↓", "move"}, filter, enter, {"ctrl+d/u", "scroll"}, {"?", "keys"}}
+		line = renderKeyLine(m.termWidth, hints, "")
+	}
+	return "\n" + line
+}
+
+// diffKeyGroups lists every key for the ? panel.
+var diffKeyGroups = []keyGroup{
+	{"Move", []keyHint{
+		{"↑↓", "move"},
+		{"←→", "page"},
+		{"/", "filter"},
+		{"enter", "show or hide the file-level diff"},
+		{"ctrl+d/u", "scroll the details"},
+		{"esc", "clear the filter, then quit"},
+		{"q", "quit"},
+	}},
 }
 
 // --- Detail renderer ---
 
+func (m diffTUIModel) buildExtraDetail(selected diffExtraItem) string {
+	r := selected.result
+	var b strings.Builder
+
+	row := func(label, value string) {
+		b.WriteString(theme.Dim().Width(10).Render(label))
+		b.WriteString(value)
+		b.WriteString("\n")
+	}
+
+	b.WriteString(theme.Primary().Bold(true).Render(r.extraName))
+	b.WriteString("\n\n")
+	row("Target", shortenPath(r.targetPath))
+	row("Mode", r.mode)
+	b.WriteString("\n")
+
+	if r.errMsg != "" {
+		b.WriteString(theme.Danger().Render("✗") + " " + r.errMsg)
+		b.WriteString("\n")
+		return b.String()
+	}
+	if r.synced {
+		b.WriteString(theme.Success().Render("✓") + " In sync")
+		b.WriteString("\n")
+		return b.String()
+	}
+
+	b.WriteString(theme.Primary().Bold(true).Render(countNoun(len(r.items), "difference")))
+	b.WriteString("\n")
+	hasLocal := false
+	for _, item := range r.items {
+		var prefix string
+		var style lipgloss.Style
+		switch item.action {
+		case "add":
+			prefix, style = "+ ", theme.Success()
+		case "remove":
+			prefix, style = "- ", theme.Danger()
+		case "modify":
+			prefix, style = "~ ", theme.Accent()
+			if item.reason == "not a symlink (local file)" {
+				hasLocal = true
+			}
+		default:
+			prefix, style = "  ", theme.Dim()
+		}
+		b.WriteString(style.Render(prefix+item.file) + "  " + theme.Dim().Render(item.reason))
+		b.WriteString("\n")
+	}
+
+	// Next Steps
+	b.WriteString("\n")
+	b.WriteString(theme.Primary().Bold(true).Render("Next"))
+	b.WriteString("\n")
+	b.WriteString("skillshare sync extras")
+	b.WriteString("\n")
+	if hasLocal {
+		b.WriteString("skillshare extras collect " + r.extraName)
+		b.WriteString("\n")
+	}
+
+	return b.String()
+}
+
 func (m diffTUIModel) buildDiffDetail() string {
-	item, ok := m.targetList.SelectedItem().(diffTargetItem)
-	if !ok {
+	selectedItem := m.targetList.SelectedItem()
+	switch selected := selectedItem.(type) {
+	case diffExtraItem:
+		return m.buildExtraDetail(selected)
+	case diffSeparatorItem:
+		return ""
+	case diffTargetItem:
+		// handled below
+	default:
 		return ""
 	}
+	item := selectedItem.(diffTargetItem)
 	r := item.result
 
 	var b strings.Builder
 
 	row := func(label, value string) {
-		b.WriteString(tc.Label.Render(label))
-		b.WriteString(tc.Value.Render(value))
+		b.WriteString(theme.Dim().Width(10).Render(label))
+		b.WriteString(value)
 		b.WriteString("\n")
 	}
 
-	row("Target:  ", r.name)
-	row("Mode:    ", r.mode)
+	b.WriteString(theme.Primary().Bold(true).Render(r.name))
+	b.WriteString("\n\n")
+	row("Mode", r.mode)
 	if len(r.include) > 0 {
-		row("Include: ", strings.Join(r.include, ", "))
+		row("Include", strings.Join(r.include, ", "))
 	}
 	if len(r.exclude) > 0 {
-		row("Exclude: ", strings.Join(r.exclude, ", "))
+		row("Exclude", strings.Join(r.exclude, ", "))
 	}
 	if !r.srcMtime.IsZero() {
-		row("Source:   ", r.srcMtime.Format("2006-01-02 15:04"))
+		row("Source", "changed "+r.srcMtime.Format("2006-01-02 15:04"))
 	}
 	if !r.dstMtime.IsZero() {
-		row("Target:  ", r.dstMtime.Format("2006-01-02 15:04"))
+		row("Target", "changed "+r.dstMtime.Format("2006-01-02 15:04"))
 	}
 
 	b.WriteString("\n")
 
 	// Error
 	if r.errMsg != "" {
-		b.WriteString(tc.Red.Render("  " + r.errMsg))
+		b.WriteString(theme.Danger().Render("✗") + " " + r.errMsg)
 		b.WriteString("\n")
 		return b.String()
 	}
 
 	// Fully synced
 	if r.synced {
-		b.WriteString(tc.Green.Render("  ✓ Fully synced"))
+		b.WriteString(theme.Success().Render("✓") + " In sync")
 		b.WriteString("\n")
 		return b.String()
 	}
 
 	// Loading spinner
 	if m.loading {
-		b.WriteString(fmt.Sprintf("  %s Loading diff...\n", m.loadSpinner.View()))
+		b.WriteString(m.loadSpinner.View() + " Loading the diff…\n")
 		return b.String()
+	}
+
+	// Build agent name set for [A] badge rendering
+	agentNames := make(map[string]bool, len(m.cachedItems))
+	for _, item := range m.cachedItems {
+		if item.kind == "agent" {
+			agentNames[item.name] = true
+		}
 	}
 
 	// Use cached sorted categories (refreshed on selection change)
@@ -519,28 +725,34 @@ func (m diffTUIModel) buildDiffDetail() string {
 		var kindStyle lipgloss.Style
 		switch cat.kind {
 		case "new", "restore":
-			kindStyle = tc.Green
+			kindStyle = theme.Success()
 		case "modified":
-			kindStyle = tc.Cyan
-		case "override":
-			kindStyle = tc.Yellow
+			kindStyle = theme.Accent()
+		case "override", "kept":
+			kindStyle = theme.Warning()
 		case "orphan":
-			kindStyle = tc.Red
+			kindStyle = theme.Danger()
 		case "local":
-			kindStyle = tc.Dim
+			kindStyle = theme.Dim()
 		case "warn":
-			kindStyle = tc.Red
+			kindStyle = theme.Danger()
 		default:
-			kindStyle = tc.Dim
+			kindStyle = theme.Dim()
 		}
 
-		header := fmt.Sprintf("  %s %d %s:", cat.label, n, skillWord)
+		header := fmt.Sprintf("%s %d %s", cat.label, n, skillWord)
 		b.WriteString(kindStyle.Render(header))
 		b.WriteString("\n")
 
 		if cat.expand {
 			for _, name := range cat.names {
-				b.WriteString(tc.Dim.Render("    " + name))
+				if agentNames[name] {
+					b.WriteString("  " + name + theme.Dim().Render("  agent"))
+				} else if cat.kind == "kept" {
+					b.WriteString("  " + findDiffItem(m.cachedItems, name).label())
+				} else {
+					b.WriteString("  " + name)
+				}
 				b.WriteString("\n")
 			}
 		}
@@ -550,22 +762,22 @@ func (m diffTUIModel) buildDiffDetail() string {
 	if m.expandedSkill != "" {
 		if len(m.expandedFiles) > 0 {
 			b.WriteString("\n")
-			b.WriteString(tc.Separator.Render(fmt.Sprintf("── %s files ──", m.expandedSkill)))
+			b.WriteString(theme.Primary().Bold(true).Render(m.expandedSkill + " files"))
 			b.WriteString("\n")
 			for _, f := range m.expandedFiles {
 				var icon string
 				var style lipgloss.Style
 				switch f.Action {
 				case "add":
-					icon, style = "+", tc.Green
+					icon, style = "+", theme.Success()
 				case "delete":
-					icon, style = "-", tc.Red
+					icon, style = "-", theme.Danger()
 				case "modify":
-					icon, style = "~", tc.Cyan
+					icon, style = "~", theme.Accent()
 				default:
-					icon, style = "?", tc.Dim
+					icon, style = "?", theme.Dim()
 				}
-				b.WriteString(style.Render(fmt.Sprintf("  %s %s", icon, f.RelPath)))
+				b.WriteString(style.Render(icon) + " " + f.RelPath)
 				b.WriteString("\n")
 			}
 		}
@@ -573,25 +785,25 @@ func (m diffTUIModel) buildDiffDetail() string {
 		// Unified diff content
 		if m.expandedDiff != "" {
 			b.WriteString("\n")
-			b.WriteString(tc.Separator.Render(fmt.Sprintf("── %s diff ──", m.expandedSkill)))
+			b.WriteString(theme.Primary().Bold(true).Render(m.expandedSkill + " diff"))
 			b.WriteString("\n")
 			for _, line := range strings.Split(strings.TrimRight(m.expandedDiff, "\n"), "\n") {
 				switch {
 				case strings.HasPrefix(line, "+ "):
-					b.WriteString(tc.Green.Render(line))
+					b.WriteString(theme.Success().Render(line))
 				case strings.HasPrefix(line, "- "):
-					b.WriteString(tc.Red.Render(line))
+					b.WriteString(theme.Danger().Render(line))
 				case strings.HasPrefix(line, "--- "):
-					b.WriteString(tc.Cyan.Render(line))
+					b.WriteString(theme.Accent().Render(line))
 				default:
-					b.WriteString(tc.Dim.Render(line))
+					b.WriteString(theme.Dim().Render(line))
 				}
 				b.WriteString("\n")
 			}
 		}
 		if len(m.expandedFiles) == 0 && m.expandedDiff == "" {
 			b.WriteString("\n")
-			b.WriteString(tc.Dim.Render("  (No file-level diff available)"))
+			b.WriteString(theme.Dim().Render("(No file-level diff available)"))
 			b.WriteString("\n")
 		}
 	}
@@ -604,13 +816,15 @@ func (m diffTUIModel) buildDiffDetail() string {
 			hints = append(hints, "sync")
 		case "override":
 			hints = append(hints, "sync --force")
+		case "kept":
+			hints = append(hints, "sync  "+theme.Dim().Render(keptSyncHint))
 		case "local":
 			hints = append(hints, "collect")
 		}
 	}
 	if len(hints) > 0 {
 		b.WriteString("\n")
-		b.WriteString(tc.Title.Render("── Next Steps ──"))
+		b.WriteString(theme.Primary().Bold(true).Render("Next"))
 		b.WriteString("\n")
 		seen := map[string]bool{}
 		for _, h := range hints {
@@ -618,7 +832,7 @@ func (m diffTUIModel) buildDiffDetail() string {
 				continue
 			}
 			seen[h] = true
-			b.WriteString(tc.Cyan.Render(fmt.Sprintf("  → skillshare %s", h)))
+			b.WriteString("skillshare " + h)
 			b.WriteString("\n")
 		}
 	}
@@ -657,7 +871,7 @@ func expandDiffCmd(entry *copyDiffEntry) tea.Cmd {
 				defer wg.Done()
 				src := filepath.Join(entry.srcDir, fe.RelPath)
 				dst := filepath.Join(entry.dstDir, fe.RelPath)
-				results[idx] = generateUnifiedDiff(src, dst)
+				results[idx] = textdiff.Files(dst, src)
 			}(i, f)
 		}
 		wg.Wait()
@@ -681,8 +895,8 @@ func expandDiffCmd(entry *copyDiffEntry) tea.Cmd {
 
 // --- Entry point ---
 
-func runDiffTUI(results []targetDiffResult) error {
-	model := newDiffTUIModel(results)
+func runDiffTUI(results []targetDiffResult, extrasResults ...[]extraDiffResult) error {
+	model := newDiffTUIModel(results, extrasResults...)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	_, err := p.Run()
 	return err

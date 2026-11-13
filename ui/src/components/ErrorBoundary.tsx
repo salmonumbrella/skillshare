@@ -1,7 +1,7 @@
 import { Component, type ReactNode } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import Card from './Card';
-import HandButton from './HandButton';
+import Button from './Button';
 
 interface Props {
   children: ReactNode;
@@ -28,19 +28,17 @@ export class ErrorBoundary extends Component<Props, State> {
               <div>
                 <h2
                   className="text-xl font-bold text-pencil mb-2"
-                  style={{ fontFamily: 'var(--font-heading)' }}
                 >
                   Something went wrong
                 </h2>
                 <p
                   className="text-pencil-light mb-4"
-                  style={{ fontFamily: 'var(--font-hand)' }}
                 >
                   {this.state.error?.message || 'An unexpected error occurred.'}
                 </p>
-                <HandButton variant="secondary" onClick={() => window.location.reload()}>
+                <Button variant="secondary" onClick={() => window.location.reload()}>
                   Reload page
-                </HandButton>
+                </Button>
               </div>
             </div>
           </Card>

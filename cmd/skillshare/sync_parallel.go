@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	gosync "sync"
 	"time"
@@ -11,9 +9,10 @@ import (
 	"github.com/pterm/pterm"
 
 	"skillshare/internal/config"
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/sync"
+	"skillshare/internal/theme"
 	"skillshare/internal/ui"
-	"skillshare/internal/utils"
 )
 
 // syncTargetResult captures all output data for one target's sync operation.
@@ -28,6 +27,8 @@ type syncTargetResult struct {
 	warnings []string // prune warnings etc.
 	infos    []string // extra info lines (symlink mode hints)
 	errMsg   string   // non-empty if target failed
+	// skillsOff marks a target with skills switched off: nothing was synced.
+	skillsOff bool
 }
 
 const syncMaxWorkers = 8
@@ -51,7 +52,7 @@ func newSyncProgress(names []string) *syncProgress {
 		names:   names,
 		states:  make([]string, len(names)),
 		details: make([]string, len(names)),
-		frames:  []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"},
+		frames:  []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
 		isTTY:   ui.IsTTY(),
 	}
 	for i := range sp.states {
@@ -91,18 +92,13 @@ func (sp *syncProgress) render() {
 		var line string
 		switch sp.states[i] {
 		case "queued":
-			line = fmt.Sprintf("  %s  %s", ui.DimText(name), ui.DimText("queued"))
+			line = "  " + theme.Dim().Render(name)
 		case "syncing":
-			spin := pterm.Cyan(sp.frames[sp.frame])
-			detail := sp.details[i]
-			if detail == "" {
-				detail = "syncing..."
-			}
-			line = fmt.Sprintf("  %s %s  %s", spin, pterm.Cyan(name), ui.DimText(detail))
+			line = fmt.Sprintf("%s %s  %s", theme.Accent().Render(sp.frames[sp.frame]), name, theme.Dim().Render(sp.details[i]))
 		case "done":
-			line = fmt.Sprintf("  %s %s  %s", pterm.Green("✓"), name, ui.DimText(sp.details[i]))
+			line = fmt.Sprintf("%s %s  %s", theme.Success().Render(ui.MarkOK), name, theme.Dim().Render(sp.details[i]))
 		case "error":
-			line = fmt.Sprintf("  %s %s  %s", pterm.Red("✗"), name, ui.DimText(sp.details[i]))
+			line = fmt.Sprintf("%s %s  %s", theme.Danger().Render(ui.MarkFail), name, theme.Dim().Render(sp.details[i]))
 		}
 		lines = append(lines, line)
 	}
@@ -115,12 +111,9 @@ func (sp *syncProgress) startTarget(name string) {
 	for i, n := range sp.names {
 		if n == name {
 			sp.states[i] = "syncing"
-			sp.details[i] = "syncing..."
+			sp.details[i] = "syncing"
 			break
 		}
-	}
-	if !sp.isTTY {
-		fmt.Printf("  %s: syncing...\n", name)
 	}
 }
 
@@ -151,14 +144,6 @@ func (sp *syncProgress) doneTarget(name string, r syncTargetResult) {
 		}
 		break
 	}
-	if !sp.isTTY {
-		for i, n := range sp.names {
-			if n == name {
-				fmt.Printf("  %s: %s\n", name, sp.details[i])
-				break
-			}
-		}
-	}
 }
 
 func (sp *syncProgress) stop() {
@@ -175,147 +160,138 @@ type syncTargetEntry struct {
 	name   string
 	target config.TargetConfig
 	mode   string
+	// configErr fails the target without syncing it: its settings are invalid.
+	configErr error
+	// sourceIncomplete means a followed source link is unavailable: link and
+	// copy, but prune nothing.
+	sourceIncomplete bool
 }
 
 // collectSyncResult runs sync for one target and returns a result struct.
 // Does NOT print any UI output — all output data is captured in the result.
-func collectSyncResult(name string, target config.TargetConfig, source, mode string, skills []sync.DiscoveredSkill, dryRun, force bool, progress *syncProgress) syncTargetResult {
+func collectSyncResult(entry syncTargetEntry, source string, skills []sync.DiscoveredSkill, ignorePatterns []string, dryRun, force bool, progress *syncProgress, projectRoot string) syncTargetResult {
+	name, target, mode := entry.name, entry.target, entry.mode
+	sc := target.SkillsConfig()
 	r := syncTargetResult{
 		name:    name,
 		mode:    mode,
-		include: target.Include,
-		exclude: target.Exclude,
+		include: sc.Include,
+		exclude: sc.Exclude,
+	}
+	if !sc.IsEnabled() {
+		r.skillsOff = true
+		r.message = "skills off"
+		r.include, r.exclude = nil, nil
+		return r
+	}
+
+	opts := sync.SkillRunOptions{
+		Source: source, ProjectRoot: projectRoot, IgnorePatterns: ignorePatterns,
+		DryRun: dryRun, Force: force, SourceIncomplete: entry.sourceIncomplete,
+	}
+	if progress != nil {
+		opts.OnProgress = func(cur, total int, skill string) {
+			progress.updateTarget(name, fmt.Sprintf("%d/%d %s", cur, total, skill))
+		}
+	}
+	run := sync.SyncSkillTarget(sync.SkillTarget{Name: name, Target: target, Mode: mode}, skills, opts)
+	if run.Err != nil {
+		r.errMsg = run.Err.Error()
+		return r
 	}
 
 	switch mode {
 	case "merge":
-		collectMergeSyncResult(&r, name, target, source, skills, dryRun, force)
+		collectMergeSyncResult(&r, run, dryRun)
 	case "copy":
-		collectCopySyncResult(&r, name, target, source, skills, dryRun, force, progress)
+		collectCopySyncResult(&r, run, dryRun)
 	default:
-		collectSymlinkSyncResult(&r, name, target, source, dryRun, force)
+		collectSymlinkSyncResult(&r, run, sc.Path)
 	}
 
 	return r
 }
 
-func collectMergeSyncResult(r *syncTargetResult, name string, target config.TargetConfig, source string, skills []sync.DiscoveredSkill, dryRun, force bool) {
-	result, err := sync.SyncTargetMergeWithSkills(name, target, skills, source, dryRun, force)
-	if err != nil {
-		r.errMsg = err.Error()
-		return
-	}
+func collectMergeSyncResult(r *syncTargetResult, run sync.SkillTargetResult, dryRun bool) {
+	linkedCount := len(run.Linked)
+	updatedCount := len(run.Updated)
+	skippedCount := len(run.Skipped) + len(run.LocalDirs)
+	removedCount := len(run.Pruned)
+	r.stats = syncModeStats{linked: linkedCount, local: skippedCount, updated: updatedCount, pruned: removedCount}
 
-	pruneResult, pruneErr := sync.PruneOrphanLinksWithSkills(sync.PruneOptions{
-		TargetPath: target.Path, SourcePath: source, Skills: skills,
-		Include: target.Include, Exclude: target.Exclude, TargetName: name,
-		DryRun: dryRun, Force: force,
-	})
-	if pruneErr != nil {
-		r.warnings = append(r.warnings, fmt.Sprintf("%s: prune failed: %v", name, pruneErr))
-	}
+	r.message = syncCounts("no skills",
+		countPart{linkedCount, "linked"}, countPart{skippedCount, "local"},
+		countPart{updatedCount, "updated"}, countPart{removedCount, "pruned"})
 
-	r.stats = mergeStats(result, pruneResult)
-
-	// Build message (same logic as reportMergeResult)
-	linkedCount := len(result.Linked)
-	updatedCount := len(result.Updated)
-	skippedCount := len(result.Skipped)
-	removedCount := 0
-	if pruneResult != nil {
-		removedCount = len(pruneResult.Removed)
-		skippedCount += len(pruneResult.LocalDirs)
-	}
-
-	if linkedCount > 0 || updatedCount > 0 || removedCount > 0 {
-		r.message = fmt.Sprintf("merged (%d linked, %d local, %d updated, %d pruned)",
-			linkedCount, skippedCount, updatedCount, removedCount)
-	} else if skippedCount > 0 {
-		r.message = fmt.Sprintf("merged (%d local skills preserved)", skippedCount)
-	} else {
-		r.message = "merged (no skills)"
-	}
-
-	if pruneResult != nil {
-		r.warnings = append(r.warnings, pruneResult.Warnings...)
-	}
+	r.infos = append(r.infos, dirCreatedInfos(run.DirCreated, dryRun)...)
+	r.warnings = append(r.warnings, run.UnmatchedWarnings()...)
+	r.warnings = append(r.warnings, run.Warnings...)
 }
 
-func collectCopySyncResult(r *syncTargetResult, name string, target config.TargetConfig, source string, skills []sync.DiscoveredSkill, dryRun, force bool, progress *syncProgress) {
-	onProgress := func(cur, total int, skill string) {
-		if progress != nil {
-			progress.updateTarget(name, fmt.Sprintf("%d/%d %s", cur, total, skill))
-		}
-	}
+func collectCopySyncResult(r *syncTargetResult, run sync.SkillTargetResult, dryRun bool) {
+	copiedCount := len(run.Linked)
+	updatedCount := len(run.Updated)
+	skippedCount := len(run.Skipped)
+	keptCount := len(run.KeptLocal)
+	removedCount := len(run.Pruned)
+	r.stats = syncModeStats{linked: copiedCount, local: skippedCount, updated: updatedCount, pruned: removedCount}
 
-	result, err := sync.SyncTargetCopyWithSkills(name, target, skills, source, dryRun, force, onProgress)
-	if err != nil {
-		r.errMsg = err.Error()
-		return
-	}
+	r.message = syncCounts("no skills",
+		countPart{copiedCount, "copied"}, countPart{skippedCount - keptCount, "up to date"}, countPart{keptCount, "local"},
+		countPart{updatedCount, "updated"}, countPart{removedCount, "pruned"})
 
-	pruneResult, pruneErr := sync.PruneOrphanCopiesWithSkills(target.Path, skills, target.Include, target.Exclude, name, dryRun)
-	if pruneErr != nil {
-		r.warnings = append(r.warnings, fmt.Sprintf("%s: prune failed: %v", name, pruneErr))
-	}
-
-	r.stats = copyStats(result, pruneResult)
-
-	// Build message (same logic as reportCopyResult)
-	copiedCount := len(result.Copied)
-	updatedCount := len(result.Updated)
-	skippedCount := len(result.Skipped)
-	removedCount := 0
-	if pruneResult != nil {
-		removedCount = len(pruneResult.Removed)
-	}
-
-	if copiedCount > 0 || updatedCount > 0 || removedCount > 0 {
-		r.message = fmt.Sprintf("copied (%d new, %d skipped, %d updated, %d pruned)",
-			copiedCount, skippedCount, updatedCount, removedCount)
-	} else if skippedCount > 0 {
-		r.message = fmt.Sprintf("copied (%d skipped, up to date)", skippedCount)
-	} else {
-		r.message = "copied (no skills)"
-	}
-
-	if pruneResult != nil {
-		r.warnings = append(r.warnings, pruneResult.Warnings...)
-	}
+	r.infos = append(r.infos, dirCreatedInfos(run.DirCreated, dryRun)...)
+	r.warnings = append(r.warnings, run.UnmatchedWarnings()...)
+	r.warnings = append(r.warnings, run.Warnings...)
 }
 
-func collectSymlinkSyncResult(r *syncTargetResult, name string, target config.TargetConfig, source string, dryRun, force bool) {
-	status := sync.CheckStatus(target.Path, source)
+type countPart struct {
+	n     int
+	label string
+}
 
-	if status == sync.StatusConflict && !force {
-		link, err := utils.ResolveLinkTarget(target.Path)
-		if err != nil {
-			link = "(unable to resolve target)"
+// syncCounts describes a target's result by its non-zero counts, the first
+// in full and the rest dimmed: "4 linked · 1 pruned". With no counts it is empty.
+func syncCounts(empty string, parts ...countPart) string {
+	var out []string
+	for _, p := range parts {
+		if p.n > 0 {
+			out = append(out, fmt.Sprintf("%d %s", p.n, p.label))
 		}
-		r.errMsg = fmt.Sprintf("conflict - symlink points to %s (use --force to override)", link)
-		return
 	}
-
-	if status == sync.StatusConflict && force && !dryRun {
-		os.Remove(target.Path)
+	if len(out) == 0 {
+		return empty
 	}
-
-	if err := sync.SyncTarget(name, target, source, dryRun); err != nil {
-		r.errMsg = err.Error()
-		return
+	if len(out) == 1 {
+		return out[0]
 	}
+	return out[0] + " " + theme.Dim().Render("· "+strings.Join(out[1:], " · "))
+}
 
-	switch status {
+// dirCreatedInfos notes a target directory the sync created or would create.
+func dirCreatedInfos(dir string, dryRun bool) []string {
+	if dir == "" {
+		return nil
+	}
+	verb := "Created"
+	if dryRun {
+		verb = "Will create"
+	}
+	return []string{fmt.Sprintf("%s target directory: %s", verb, dir)}
+}
+
+func collectSymlinkSyncResult(r *syncTargetResult, run sync.SkillTargetResult, path string) {
+	switch run.SymlinkStatus {
 	case sync.StatusLinked:
 		r.message = "already linked"
 	case sync.StatusNotExist:
 		r.message = "symlink created"
-		r.warnings = append(r.warnings, fmt.Sprintf("Symlink mode: deleting files in %s will delete from source!", target.Path))
-		r.infos = append(r.infos, fmt.Sprintf("Use 'skillshare target remove %s' to safely unlink", name))
+		r.warnings = append(r.warnings, fmt.Sprintf("Symlink mode: deleting files in %s will delete from source!", path))
+		r.infos = append(r.infos, fmt.Sprintf("Use 'skillshare target remove %s' to safely unlink", r.name))
 	case sync.StatusHasFiles:
 		r.message = "files migrated and linked"
-		r.warnings = append(r.warnings, fmt.Sprintf("Symlink mode: deleting files in %s will delete from source!", target.Path))
-		r.infos = append(r.infos, fmt.Sprintf("Use 'skillshare target remove %s' to safely unlink", name))
+		r.warnings = append(r.warnings, fmt.Sprintf("Symlink mode: deleting files in %s will delete from source!", path))
+		r.infos = append(r.infos, fmt.Sprintf("Use 'skillshare target remove %s' to safely unlink", r.name))
 	case sync.StatusBroken:
 		r.message = "broken link fixed"
 	case sync.StatusConflict:
@@ -323,27 +299,35 @@ func collectSymlinkSyncResult(r *syncTargetResult, name string, target config.Ta
 	}
 }
 
-// renderSyncResults renders all collected sync target results after parallel execution.
+// renderSyncResults prints one row per target, with its filters, warnings
+// and notes under it.
 func renderSyncResults(results []syncTargetResult) {
+	names := make([]string, len(results))
+	for i, r := range results {
+		names[i] = r.name
+	}
+	width := ui.RowWidth(names...)
 	for _, r := range results {
-		if r.errMsg != "" {
-			ui.Error("%s: %s", r.name, r.errMsg)
+		switch {
+		case r.errMsg != "":
+			ui.Row(ui.MarkFail, r.name, r.errMsg, width)
+			continue
+		case r.skillsOff:
+			ui.Row(ui.MarkNone, r.name, theme.Dim().Render(r.message), width)
 			continue
 		}
-
-		ui.Success("%s: %s", r.name, r.message)
-
+		ui.Row(ui.MarkOK, r.name, r.message, width)
 		if len(r.include) > 0 {
-			ui.Info("  include: %s", strings.Join(r.include, ", "))
+			ui.Note("include: " + strings.Join(r.include, ", "))
 		}
 		if len(r.exclude) > 0 {
-			ui.Info("  exclude: %s", strings.Join(r.exclude, ", "))
+			ui.Note("exclude: " + strings.Join(r.exclude, ", "))
 		}
 		for _, warn := range r.warnings {
-			ui.Warning("  %s", warn)
+			fmt.Printf("  %s %s\n", theme.Warning().Render(ui.MarkWarn), warn)
 		}
 		for _, info := range r.infos {
-			ui.Info("  %s", info)
+			ui.Note(info)
 		}
 	}
 }
@@ -352,13 +336,13 @@ func renderSyncResults(results []syncTargetResult) {
 // Targets sharing the same resolved path are grouped and run sequentially within one
 // goroutine to avoid race conditions (e.g., two targets trying to create the same symlink).
 // Returns results (indexed by position) and count of failed targets.
-func runParallelSync(entries []syncTargetEntry, source string, skills []sync.DiscoveredSkill, dryRun, force bool) ([]syncTargetResult, int) {
+func runParallelSync(entries []syncTargetEntry, source string, skills []sync.DiscoveredSkill, ignorePatterns []string, dryRun, force bool, projectRoot string) ([]syncTargetResult, int) {
 	names := make([]string, len(entries))
 	for i, e := range entries {
 		names[i] = e.name
 	}
 	progress := newSyncProgress(names)
-	results, failedTargets := runParallelSyncCore(entries, source, skills, dryRun, force, progress)
+	results, failedTargets := runParallelSyncCore(entries, source, skills, ignorePatterns, dryRun, force, progress, projectRoot)
 	progress.stop()
 	renderSyncResults(results)
 	return results, failedTargets
@@ -366,13 +350,13 @@ func runParallelSync(entries []syncTargetEntry, source string, skills []sync.Dis
 
 // runParallelSyncQuiet executes sync for multiple targets without any UI output.
 // Used for --json mode where only structured output should go to stdout.
-func runParallelSyncQuiet(entries []syncTargetEntry, source string, skills []sync.DiscoveredSkill, dryRun, force bool) ([]syncTargetResult, int) {
-	return runParallelSyncCore(entries, source, skills, dryRun, force, nil)
+func runParallelSyncQuiet(entries []syncTargetEntry, source string, skills []sync.DiscoveredSkill, ignorePatterns []string, dryRun, force bool, projectRoot string) ([]syncTargetResult, int) {
+	return runParallelSyncCore(entries, source, skills, ignorePatterns, dryRun, force, nil, projectRoot)
 }
 
 // runParallelSyncCore is the shared implementation for parallel sync.
 // When progress is nil, no UI output is produced (quiet/JSON mode).
-func runParallelSyncCore(entries []syncTargetEntry, source string, skills []sync.DiscoveredSkill, dryRun, force bool, progress *syncProgress) ([]syncTargetResult, int) {
+func runParallelSyncCore(entries []syncTargetEntry, source string, skills []sync.DiscoveredSkill, ignorePatterns []string, dryRun, force bool, progress *syncProgress, projectRoot string) ([]syncTargetResult, int) {
 	type indexedEntry struct {
 		idx   int
 		entry syncTargetEntry
@@ -380,7 +364,7 @@ func runParallelSyncCore(entries []syncTargetEntry, source string, skills []sync
 	groups := make(map[string][]indexedEntry)
 	var groupOrder []string
 	for i, e := range entries {
-		p := canonicalPath(e.target.Path)
+		p := canonicalPath(e.target.SkillsConfig().Path)
 		if _, seen := groups[p]; !seen {
 			groupOrder = append(groupOrder, p)
 		}
@@ -402,7 +386,12 @@ func runParallelSyncCore(entries []syncTargetEntry, source string, skills []sync
 				if progress != nil {
 					progress.startTarget(m.entry.name)
 				}
-				r := collectSyncResult(m.entry.name, m.entry.target, source, m.entry.mode, skills, dryRun, force, progress)
+				r := syncTargetResult{name: m.entry.name, mode: m.entry.mode}
+				if m.entry.configErr != nil {
+					r.errMsg = invalidConfigMessage(m.entry.configErr)
+				} else {
+					r = collectSyncResult(m.entry, source, skills, ignorePatterns, dryRun, force, progress, projectRoot)
+				}
 				if progress != nil {
 					progress.doneTarget(m.entry.name, r)
 				}
@@ -429,25 +418,5 @@ func runParallelSyncCore(entries []syncTargetEntry, source string, skills []sync
 // but skills/ hasn't been created yet), we resolve the longest existing ancestor
 // and re-append the remaining segments so that symlink aliases still converge.
 func canonicalPath(p string) string {
-	cleaned := filepath.Clean(p)
-	abs, err := filepath.Abs(cleaned)
-	if err != nil {
-		return cleaned
-	}
-	// Fast path: entire path exists and can be resolved.
-	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-		return resolved
-	}
-	// Slow path: walk up to the nearest existing ancestor, resolve it,
-	// then re-append the non-existent tail segments.
-	parent, tail := filepath.Dir(abs), filepath.Base(abs)
-	for parent != abs {
-		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
-			return filepath.Join(resolved, tail)
-		}
-		abs = parent
-		tail = filepath.Join(filepath.Base(parent), tail)
-		parent = filepath.Dir(parent)
-	}
-	return abs
+	return sourcewalk.Canonical(p)
 }

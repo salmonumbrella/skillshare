@@ -1,130 +1,92 @@
 @import "tailwindcss";
+@import "./components.css";
 @custom-variant dark (&:where(.dark, .dark *));
 
-@theme {
-  /* Hand-Drawn Color Palette */
-  --color-paper: #fdfbf7;
-  --color-paper-warm: #faf6ee;
-  --color-pencil: #2d2d2d;
-  --color-pencil-light: #5a5a5a;
-  --color-muted: #e5e0d8;
-  --color-muted-dark: #8a8478;
-  --color-accent: #ff4d4d;
-  --color-accent-dark: #e03e3e;
-  --color-blue: #2d5da1;
-  --color-blue-light: #4a7ec4;
-  --color-postit: #fff9c4;
-  --color-postit-dark: #fff3a0;
-  --color-success: #2e8b57;
-  --color-success-light: #d4edda;
-  --color-warning: #d4870e;
-  --color-warning-light: #fff3cd;
-  --color-danger: #c0392b;
-  --color-danger-light: #f8d7da;
-  --color-info: #2d5da1;
-  --color-info-light: #d6e4f0;
-  --color-surface: #ffffff;
+/* Tailwind colour, font, radius and shadow names resolve to the design tokens in components.css,
+   so every utility follows the active style (Clean / Playful) and mode (light / dark).
+   The pencil / paper / muted names are kept as aliases for markup not yet moved to the new names. */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-side: var(--side);
+  --color-surface: var(--surface);
+  --color-sunken: var(--sunken);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-line: var(--line);
+  --color-line-2: var(--line-2);
+  --color-line-soft: var(--line-soft);
+  --color-sel: var(--sel);
+  --color-sel-ink: var(--sel-ink);
+  --color-pri: var(--pri);
+  --color-on-pri: var(--on-pri);
+  --color-ok: var(--ok);
+  --color-ok-bg: var(--ok-bg);
+  --color-warn: var(--warn);
+  --color-warn-bg: var(--warn-bg);
+  --color-bad: var(--bad);
+  --color-bad-bg: var(--bad-bg);
+  --color-diff-add: var(--diff-add);
+  --color-diff-add-bg: var(--diff-add-bg);
+  --color-diff-del: var(--diff-del);
+  --color-diff-del-bg: var(--diff-del-bg);
+  --color-link: var(--accent);
+  --color-link-bg: var(--accent-bg);
 
-  /* Typography */
-  --font-hand: 'Inter', sans-serif;
-  --font-heading: 'Inter', sans-serif;
+  /* Old names, still used by the audit and config panels; each maps onto a token above. */
+  --color-paper: var(--bg);
+  --color-paper-warm: var(--side);
+  --color-pencil: var(--ink);
+  --color-pencil-light: var(--ink-2);
+  --color-muted: var(--line-soft);
+  --color-muted-dark: var(--ink-3);
+  --color-border-light: var(--sunken);
+  --color-accent: var(--accent);
+  --color-accent-dark: var(--accent);
+  --color-accent-light: var(--accent-bg);
+  --color-blue: var(--accent);
+  --color-blue-light: var(--accent);
+  --color-info: var(--accent);
+  --color-info-light: var(--accent-bg);
+  --color-success: var(--ok);
+  --color-success-light: var(--ok-bg);
+  --color-warning: var(--warn);
+  --color-warning-light: var(--warn-bg);
+  --color-danger: var(--bad);
+  --color-danger-light: var(--bad-bg);
 
-  /* Shadows (hard offset, no blur) */
-  --shadow-sm: 3px 3px 0px 0px rgba(45, 45, 45, 0.12);
-  --shadow-md: 4px 4px 0px 0px #2d2d2d;
-  --shadow-lg: 8px 8px 0px 0px #2d2d2d;
-  --shadow-hover: 2px 2px 0px 0px #2d2d2d;
-  --shadow-accent: 4px 4px 0px 0px #ff4d4d;
-  --shadow-blue: 4px 4px 0px 0px #2d5da1;
+  --font-sans: var(--f);
+  --font-hand: var(--f);
+  --font-heading: var(--fh);
+  --font-mono: var(--fm);
 
-  /* Post-it note colors (light) */
-  --color-postit-1-bg: #fff9c4;
-  --color-postit-1-border: #e6d95a;
-  --color-postit-2-bg: #bbdefb;
-  --color-postit-2-border: #64b5f6;
-  --color-postit-3-bg: #f8bbd0;
-  --color-postit-3-border: #f06292;
-  --color-postit-4-bg: #ffe0b2;
-  --color-postit-4-border: #ffb74d;
-  --color-postit-5-bg: #d1c4e9;
-  --color-postit-5-border: #9575cd;
-  --color-postit-6-bg: #c8e6c9;
-  --color-postit-6-border: #81c784;
-  --color-tracked-1-bg: #e8f5e9;
-  --color-tracked-1-border: #2e7d32;
-  --color-tracked-2-bg: #c8e6c9;
-  --color-tracked-2-border: #388e3c;
-  --color-tracked-3-bg: #dcedc8;
-  --color-tracked-3-border: #558b2f;
+  --radius-sm: var(--r-tag);
+  --radius-md: var(--r-ctl);
+  --radius-lg: var(--r-box);
+  --radius-btn: var(--r-btn);
+  --radius-full: 9999px;
+
+  --shadow-sm: var(--sh-box);
+  --shadow-md: var(--sh-box);
+  --shadow-lg: var(--sh-float);
+  --shadow-hover: var(--sh-box);
+  --shadow-accent: var(--sh-box);
+  --shadow-blue: var(--sh-box);
 }
 
-/* Dark theme overrides — aligned with website [data-theme='dark'] */
-.dark {
-  --color-paper: #1a1816;
-  --color-paper-warm: #2a2725;
-  --color-pencil: #f0ece1;
-  --color-pencil-light: #ccc8bc;
-  --color-muted: #4a4542;
-  --color-muted-dark: #9a918a;
-  --color-accent: #ff6b6b;
-  --color-accent-dark: #e05555;
-  --color-blue: #e8a84c;
-  --color-blue-light: #f0be6e;
-  --color-postit: rgba(232, 168, 76, 0.22);
-  --color-postit-dark: rgba(240, 190, 110, 0.28);
-  --color-success: #6dca8e;
-  --color-success-light: rgba(109, 202, 142, 0.2);
-  --color-warning: #f0b850;
-  --color-warning-light: rgba(240, 184, 80, 0.2);
-  --color-danger: #f06860;
-  --color-danger-light: rgba(240, 104, 96, 0.2);
-  --color-info: #7db8e8;
-  --color-info-light: rgba(125, 184, 232, 0.2);
-  --color-surface: #3a3633;
-
-  --shadow-sm: 3px 3px 0px 0px rgba(0, 0, 0, 0.4);
-  --shadow-md: 4px 4px 0px 0px rgba(0, 0, 0, 0.55);
-  --shadow-lg: 8px 8px 0px 0px rgba(0, 0, 0, 0.55);
-  --shadow-hover: 2px 2px 0px 0px rgba(0, 0, 0, 0.4);
-  --shadow-accent: 4px 4px 0px 0px rgba(255, 107, 107, 0.5);
-  --shadow-blue: 4px 4px 0px 0px rgba(232, 168, 76, 0.5);
-
-  /* Post-it note colors (dark — muted/translucent) */
-  --color-postit-1-bg: rgba(255, 249, 196, 0.12);
-  --color-postit-1-border: rgba(230, 217, 90, 0.5);
-  --color-postit-2-bg: rgba(187, 222, 251, 0.12);
-  --color-postit-2-border: rgba(100, 181, 246, 0.5);
-  --color-postit-3-bg: rgba(248, 187, 208, 0.12);
-  --color-postit-3-border: rgba(240, 98, 146, 0.5);
-  --color-postit-4-bg: rgba(255, 224, 178, 0.12);
-  --color-postit-4-border: rgba(255, 183, 77, 0.5);
-  --color-postit-5-bg: rgba(209, 196, 233, 0.12);
-  --color-postit-5-border: rgba(149, 117, 205, 0.5);
-  --color-postit-6-bg: rgba(200, 230, 201, 0.12);
-  --color-postit-6-border: rgba(129, 199, 132, 0.5);
-  --color-tracked-1-bg: rgba(232, 245, 233, 0.12);
-  --color-tracked-1-border: rgba(46, 125, 50, 0.6);
-  --color-tracked-2-bg: rgba(200, 230, 201, 0.12);
-  --color-tracked-2-border: rgba(56, 142, 60, 0.6);
-  --color-tracked-3-bg: rgba(220, 237, 200, 0.12);
-  --color-tracked-3-border: rgba(85, 139, 47, 0.6);
+/* ── Theme transition (user-initiated only) ── */
+html.theme-transitioning,
+html.theme-transitioning > body,
+html.theme-transitioning .ss-side,
+html.theme-transitioning main,
+html.theme-transitioning :is(.ss-box, .ss-list, .ss-btn, .ss-tag, .ss-inp, .ss-dlg, .ss-nv) {
+  transition: background-color 0.2s ease, border-color 0.2s ease,
+              box-shadow 0.2s ease, color 0.2s ease, border-radius 0.2s ease;
 }
 
-/* Wobbly border-radius values as CSS custom properties (not theme tokens) */
-:root {
-  --radius-wobbly: 255px 15px 225px 15px / 15px 225px 15px 255px;
-  --radius-wobbly-sm: 125px 10px 115px 10px / 10px 115px 10px 125px;
-  --radius-wobbly-md: 185px 12px 165px 12px / 12px 165px 12px 185px;
-  --radius-wobbly-btn: 255px 25px 225px 25px / 25px 225px 25px 255px;
-}
-
-/* Base styles */
-body {
-  background-color: var(--color-paper);
-  color: var(--color-pencil);
-  font-family: var(--font-hand);
-  background-image: radial-gradient(var(--color-muted) 1px, transparent 1px);
-  background-size: 24px 24px;
+/* Promote toast above the tour overlay */
+.tour-active [data-toast-container] {
+  z-index: 80 !important;
 }
 
 /* Scrollbar styling */
@@ -133,202 +95,144 @@ body {
   height: 8px;
 }
 
+/* The track stays transparent and inset: a painted track draws a square strip over rounded, scrolling frames */
 ::-webkit-scrollbar-track {
-  background: var(--color-paper);
+  background: transparent;
+}
+
+:not(html)::-webkit-scrollbar-track {
+  margin: 8px;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background-color: var(--color-muted-dark);
-  border-radius: var(--radius-wobbly-sm);
-  border: 2px solid var(--color-paper);
+  background-color: var(--ink-3);
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 
 /* Selection color */
 ::selection {
-  background-color: var(--color-postit);
-  color: var(--color-pencil);
-}
-
-/* Markdown prose overrides for hand-drawn theme */
-.prose-hand {
-  h1, h2, h3, h4, h5, h6 {
-    font-family: var(--font-heading);
-    color: var(--color-pencil);
-    font-weight: 700;
-  }
-  h1 { font-size: 1.5rem; margin-bottom: 0.75rem; }
-  h2 { font-size: 1.25rem; margin-bottom: 0.5rem; margin-top: 1.5rem; }
-  h3 { font-size: 1.1rem; margin-bottom: 0.25rem; margin-top: 1rem; }
-  p { color: var(--color-pencil-light); font-size: 1rem; margin-bottom: 0.75rem; line-height: 1.7; }
-  ul, ol { color: var(--color-pencil-light); font-size: 1rem; margin-bottom: 0.75rem; padding-left: 1.25rem; }
-  ul { list-style-type: disc; }
-  ol { list-style-type: decimal; }
-  li { margin-bottom: 0.25rem; }
-  code {
-    background-color: var(--color-paper-warm);
-    color: var(--color-blue);
-    padding: 0.12rem 0.45rem;
-    border-radius: 6px;
-    font-size: 0.875rem;
-    font-family: 'Courier New', monospace;
-    border: 1px dashed var(--color-muted-dark);
-    box-shadow: 1px 1px 0 rgba(45, 45, 45, 0.08);
-  }
-  pre {
-    position: relative;
-    background: linear-gradient(145deg, #202b3e, #1a2232);
-    color: #eaf2ff;
-    padding: 2rem 1rem 1rem;
-    border: 2px solid #101827;
-    border-radius: var(--radius-wobbly-sm);
-    overflow-x: auto;
-    margin-bottom: 1rem;
-    box-shadow: var(--shadow-md);
-  }
-  pre::before {
-    content: 'code';
-    position: absolute;
-    top: 0.5rem;
-    left: 0.75rem;
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    padding: 0.08rem 0.45rem;
-    border-radius: 999px;
-    border: 1px dashed rgba(255, 255, 255, 0.6);
-    color: #f6fbff;
-    background: rgba(255, 255, 255, 0.14);
-    font-family: 'Courier New', monospace;
-  }
-  pre::-webkit-scrollbar {
-    height: 7px;
-  }
-  pre::-webkit-scrollbar-track {
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 999px;
-  }
-  pre::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.45);
-    border-radius: 999px;
-  }
-  pre code {
-    display: block;
-    background: transparent;
-    padding: 0;
-    border: none;
-    box-shadow: none;
-    color: inherit;
-    font-size: 0.9rem;
-    line-height: 1.65;
-    font-family: 'SFMono-Regular', Menlo, Consolas, 'Courier New', monospace;
-  }
-  a {
-    color: var(--color-blue);
-    text-decoration: underline;
-    text-decoration-style: wavy;
-    text-underline-offset: 3px;
-  }
-  a:hover {
-    color: var(--color-accent);
-  }
-  hr {
-    border-color: var(--color-muted);
-    border-style: dashed;
-    margin: 1.5rem 0;
-  }
-  blockquote {
-    border-left: 3px solid var(--color-blue);
-    padding-left: 1rem;
-    color: var(--color-pencil-light);
-    font-style: italic;
-    background: var(--color-paper-warm);
-    padding: 0.75rem 1rem;
-    border-radius: 0 8px 8px 0;
-  }
-  table {
-    width: 100%;
-    border-collapse: separate;
-    border-spacing: 0;
-    margin-bottom: 1rem;
-    border: 2px solid var(--color-pencil);
-    border-radius: 10px;
-    overflow: hidden;
-    background: var(--color-paper-warm);
-    box-shadow: var(--shadow-sm);
-  }
-  thead tr {
-    background: var(--color-postit);
-  }
-  th, td {
-    border-bottom: 1px dashed var(--color-muted-dark);
-    border-right: 1px dashed var(--color-muted-dark);
-    padding: 0.5rem 0.75rem;
-    text-align: left;
-    vertical-align: top;
-    font-size: 0.95rem;
-    color: var(--color-pencil);
-  }
-  th:last-child, td:last-child {
-    border-right: none;
-  }
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
+  background-color: var(--sel);
+  color: var(--sel-ink);
 }
 
 /* Animation keyframes */
-@keyframes wobble {
-  0%, 100% { transform: rotate(0deg); }
-  25% { transform: rotate(-1deg); }
-  75% { transform: rotate(1deg); }
-}
-
-@keyframes sketch-in {
-  0% { opacity: 0; transform: scale(0.95) rotate(-2deg); }
-  100% { opacity: 1; transform: scale(1) rotate(0deg); }
-}
-
-@keyframes bounce-gentle {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-4px); }
-}
-
-@keyframes pencil-draw {
-  0% { width: 0; }
-  100% { width: 100%; }
-}
-
-@keyframes spin-slow {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
-}
-
-@keyframes pulse-gentle {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.6; }
-}
-
 @keyframes fadeInUp {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
 }
 
-.animate-sketch-in {
-  animation: sketch-in 0.3s ease-out;
+.animate-fade-in {
+  animation: fadeInUp 0.2s ease-out;
 }
 
-.animate-wobble {
-  animation: wobble 0.5s ease-in-out;
+/* Dropdown open animation: grows out of its trigger (set transform-origin on the menu). */
+@keyframes dropdownIn {
+  from { opacity: 0; transform: translateY(-4px) scale(0.96); }
+  to { opacity: 1; transform: none; }
 }
 
-.animate-bounce-gentle {
-  animation: bounce-gentle 2s ease-in-out infinite;
+.animate-dropdown-in {
+  animation: dropdownIn 0.2s cubic-bezier(0.22, 0.9, 0.24, 1);
+}
+/* Closing only fades; useMenuPresence keeps the menu mounted for these 0.12s. */
+@keyframes dropdownOut {
+  to { opacity: 0; }
+}
+.animate-dropdown-out {
+  animation: dropdownOut 0.12s ease-out forwards;
 }
 
-.animate-spin-slow {
-  animation: spin-slow 3s linear infinite;
+/* Dialog entrance */
+@keyframes dialogIn {
+  from { opacity: 0; transform: scale(0.97) translateY(4px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+.animate-dialog-in {
+  animation: dialogIn 0.2s ease-out;
+}
+/* Reduced motion keeps each entrance's fade and drops its movement. It sits before the step rules
+   so their own reduced-motion `animation: none` still wins on a dialog changing step. */
+@keyframes fadeIn {
+  from { opacity: 0; }
+}
+/* A toast rises 12px from the bottom edge. */
+@keyframes toastIn {
+  from { opacity: 0; transform: translateY(12px); }
+}
+.animate-toast-in {
+  animation: toastIn 0.32s cubic-bezier(0.22, 0.9, 0.24, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in, .animate-dropdown-in, .animate-dialog-in, .animate-toast-in { animation-name: fadeIn; }
 }
 
-.animate-pulse-gentle {
-  animation: pulse-gentle 1.5s ease-in-out infinite;
+/* Page entry: navigation is frequent, so only a short fade softens the swap, with no movement. */
+.animate-page-in {
+  animation: fadeIn 0.12s ease-out;
+}
+
+/* A dialog changing step: the new content slides in from the side it was reached from. */
+@keyframes stepFwd {
+  from { opacity: 0; transform: translateX(16px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes stepBack {
+  from { opacity: 0; transform: translateX(-16px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+/* After .animate-dialog-in, so it also replaces the entrance of a dialog opened from another dialog. */
+.animate-step-fwd { animation: stepFwd 0.18s ease-out; }
+.animate-step-back { animation: stepBack 0.18s ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .animate-step-fwd, .animate-step-back { animation: none; }
+}
+
+/* Skeleton shimmer */
+@keyframes skeleton-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.animate-skeleton {
+  background: linear-gradient(90deg, var(--line-soft) 25%, var(--sunken) 37%, var(--line-soft) 63%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.8s ease-in-out infinite;
+}
+
+/* Toast exit: back down the way it came in. Toast.tsx EXIT_DURATION matches the duration. */
+@keyframes toastOut {
+  to { opacity: 0; transform: translateY(8px) scale(0.97); }
+}
+@keyframes toastFadeOut {
+  to { opacity: 0; }
+}
+.animate-toast-out {
+  animation: toastOut 0.2s ease-out forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-toast-out { animation-name: toastFadeOut; }
+}
+
+/* Toast progress bar */
+@keyframes toastProgress {
+  from { width: 100%; }
+  to { width: 0%; }
+}
+
+/* $ARGUMENTS token highlight (shared across editor + detail pages) */
+.arg-token {
+  display: inline-block;
+  background: var(--warn-bg);
+  color: var(--warn);
+  font-family: var(--fm);
+  font-weight: 700;
+  padding: 0 5px;
+  border-radius: var(--r-tag);
+  border: 1px solid var(--warn);
+  font-size: 0.9em;
 }

@@ -9,22 +9,42 @@ Show differences between source and targets.
 ```bash
 skillshare diff              # All targets (interactive TUI)
 skillshare diff claude       # Specific target
+skillshare diff agents       # Agent targets only
 skillshare diff --stat       # File-level changes
 skillshare diff --patch      # Full unified diff
 ```
 
-![diff demo](/img/diff-demo.png)
+```text
+skillshare diff --no-tui
+
+claude, claude-work, gemini, opencode, universal
+  New       remotion-captions
+
+cursor
+  Local only  cursor-shortcuts
+  New         remotion-captions
+
+Extras
+✓ commands  ~/.claude/commands · in sync
+✓ rules     ~/.claude/rules · in sync
+✓ rules     ~/.cursor/rules · in sync
+✓ team      ~/.codex · in sync
+✓ team      ~/.claude · in sync
+✓ team      ~/.gemini · in sync
+✓ team      ~/notes · in sync
+
+! 6 targets: 6 to sync
+
+Next
+  skillshare sync     apply the changes
+  skillshare collect  copy local-only skills into source
+```
+
+Ambiguous agent variants appear as `(skill selection)` skip rows with a diagnostic. Use `include`/`exclude` or a source-local target override to select the desired variant. These rows explain skipped selection; they are not changes that sync can apply.
 
 ## Interactive TUI
 
-On a TTY, `diff` launches an interactive TUI with a left-right panel layout:
-
-- **Left panel** — Target list with status icons (`✓` synced, `!` has diffs, `✗` error)
-- **Right panel** — Detail view for the selected target (mode, filters, categorized diffs)
-- Press **Enter** to expand file-level diff for a skill
-- Press **/** to filter targets, **Ctrl+d/u** to scroll detail, **q** to quit
-
-Use `--no-tui` for plain text output, or pipe to disable TUI automatically.
+On a TTY, `diff` opens an interactive view: targets on the left, and what differs for the selected target on the right, down to file-level diffs. The keys are listed at the bottom of the screen. Use `--no-tui`, or pipe the output, for plain text.
 
 ## When to Use
 
@@ -37,17 +57,18 @@ Use `--no-tui` for plain text output, or pipe to disable TUI automatically.
 
 ```
 claude
-  + New 2 skills:
-      missing-skill
-      another-skill
-  ! Local Override 1 skill:
-      local-copy
-  ← Local Only 1 skill:
-      my-local-skill
+  Local override  local-copy
+  Local only      my-local-skill
+  New             another-skill, missing-skill
 
-  2 new, 1 local override, 1 local only
+✓ cursor    in sync
 
-cursor: fully synced
+! 2 targets: 1 to sync, 1 in sync
+
+Next
+  skillshare sync          apply the changes
+  skillshare sync --force  also replace local copies
+  skillshare collect       copy local-only skills into source
 ```
 
 ### Grouped Multi-Target Output
@@ -55,30 +76,29 @@ cursor: fully synced
 When multiple targets have identical diff results, they are grouped into a single block to reduce noise:
 
 ```
-claude, agents
-  + New 2 skills:
-      skill-1
-      skill-2
+agents, claude
+  New       skill-1, skill-2
 
 cursor
-  + New 1 skill:
-      skill-1
+  New       skill-1
 
-codex, copilot: fully synced
+✓ codex, copilot  in sync
 ```
 
 Targets with different results (e.g. due to `include`/`exclude` filters) are still shown separately.
 
-## Symbols
+## Labels
 
-| Symbol | Label | Meaning | Action |
-|--------|-------|---------|--------|
-| `+` | New | In source, missing in target | `sync` will add it |
-| `+` | Restore | Was in target, deleted | `sync` will restore it |
-| `~` | Modified | Content changed (copy mode) | `sync` will update it |
-| `!` | Local Override | Local copy instead of symlink | `sync --force` to replace |
-| `-` | Orphan | In manifest but not in source | `sync` will prune it |
-| `←` | Local Only | Only in target, not in source | `collect` to import |
+| Label | Meaning | Action |
+|-------|---------|--------|
+| New | In source, missing in target | `sync` will add it |
+| Restore | Was in target, deleted | `sync` will restore it |
+| Modified | Content or target naming changed (copy mode), or an unedited copy-mode copy that merge sync replaces with a link | `sync` will update it |
+| Renamed | Managed entry still under the name an earlier `target_naming` gave it | `sync` will rename it |
+| Local only, skill kept under old name | A local folder holds the name the current `target_naming` gives a skill, so the skill stays under its old managed entry, shown as `name (stays at old-name)` | Rename or remove the folder, then `sync` |
+| Local override | Local copy instead of symlink (including a copy-mode copy you edited) | `sync --force` to replace |
+| Orphan | In manifest but not in source | `sync` will prune it |
+| Local only | Only in target, not in source | `collect` to import |
 
 ## File-Level Details
 
@@ -92,11 +112,10 @@ skillshare diff --stat
 
 ```
 claude
-  ~ Modified 1 skill:
-      my-skill
-        + new-file.md
-        ~ SKILL.md
-        - old-file.md
+  Modified  my-skill
+            + new-file.md (120 bytes)
+            ~ SKILL.md (840 → 912 bytes)
+            - old-file.md (64 bytes)
 ```
 
 ### `--patch`
@@ -109,11 +128,11 @@ skillshare diff --patch
 
 ```
 claude
-  ~ Modified 1 skill:
-      my-skill
-        --- SKILL.md
-        - old line
-        + new line
+  Modified  my-skill
+            ~ SKILL.md (840 → 912 bytes)
+            --- SKILL.md
+            - old line
+            + new line
 ```
 
 Both `--stat` and `--patch` imply `--no-tui` (plain text output).
@@ -139,7 +158,7 @@ For targets using copy mode:
 
 For targets using symlink mode:
 - Simply checks if symlink points to correct source
-- Shows "Fully synced" or warns about wrong symlink
+- Shows "in sync" or warns about wrong symlink
 
 ## Use Cases
 
@@ -159,7 +178,7 @@ Discover skills you created directly in a target:
 
 ```bash
 skillshare diff claude
-# Shows: ← Local Only 1 skill: my-local-skill
+# Shows: Local only  my-local-skill
 
 skillshare collect claude  # Import to source
 ```
@@ -182,6 +201,20 @@ skillshare status          # Shows "needs sync"
 skillshare diff claude     # See exactly what's different
 skillshare sync            # Fix it
 ```
+
+## Agent Diff {#agent-diff}
+
+Use the `agents` keyword to diff only agent targets:
+
+```bash
+skillshare diff agents             # All agent-capable targets
+skillshare diff agents claude      # Specific target
+skillshare diff agents --json      # JSON output
+```
+
+Agent diff shows missing agents (need sync), orphan symlinks (need prune), and local-only agent files. Only targets with an `agents` path configuration are included. See [Agents — Supported Targets](/docs/understand/agents#supported-targets) for the full list.
+
+---
 
 ## Options
 
@@ -208,8 +241,10 @@ skillshare diff --json
       "mode": "merge",
       "synced": false,
       "items": [
-        {"action": "link", "name": "missing-skill", "reason": "not in target", "is_sync": true},
-        {"action": "update", "name": "local-copy", "reason": "local override", "is_sync": true}
+        {"action": "add", "name": "missing-skill", "kind": "skill", "reason": "source only", "is_sync": true},
+        {"action": "modify", "name": "local-copy", "kind": "skill", "reason": "local copy (sync --force to replace)", "is_sync": true},
+        {"action": "remove", "name": "my-own-skill", "kind": "skill", "reason": "local only", "is_sync": false},
+        {"action": "kept", "name": "prototype", "kind": "skill", "reason": "local folder; the skill stays at _emil-design__skills__prototype", "is_sync": false}
       ],
       "include": [],
       "exclude": []
@@ -218,6 +253,10 @@ skillshare diff --json
   "duration": "0.045s"
 }
 ```
+
+`synced` is `true` when `sync` has nothing to do for the target. Items with `"is_sync": false`, such as folders that exist only in the target, are still listed but do not make it `false`. The text output likewise counts a target with only local-only folders as in sync.
+
+`action` is `add`, `modify`, `remove`, or `kept`. `kept` means a local folder holds the name the current `target_naming` gives the skill, so the skill stays under its old name and sync leaves the folder alone.
 
 ## See Also
 

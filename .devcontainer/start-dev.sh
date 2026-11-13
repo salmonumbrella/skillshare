@@ -36,6 +36,9 @@ fi
 if [ -x /workspace/.devcontainer/install-ssenv-shortcuts.sh ]; then
   /workspace/.devcontainer/install-ssenv-shortcuts.sh
 fi
+if [ -x /workspace/.devcontainer/ensure-agent-clis.sh ]; then
+  /workspace/.devcontainer/ensure-agent-clis.sh || true
+fi
 
 # Auto-detect GITHUB_TOKEN from gh CLI if not already set
 # (via .env, remoteEnv, or manual export).
@@ -48,10 +51,10 @@ if [ -z "${GITHUB_TOKEN:-}" ] && command -v gh &>/dev/null; then
 fi
 
 echo "Dev servers ready:"
-echo "  ui          # global-mode dashboard → :5173"
-echo "  ui -p       # project-mode dashboard → :5173"
+echo "  ui          # global-mode dashboard → :45173"
+echo "  ui -p       # project-mode dashboard → :45173"
 echo "  ui stop     # stop dashboard"
-echo "  docs        # documentation site → :3000"
+echo "  docs        # documentation site → :48888"
 echo "  docs stop   # stop docs"
 echo "  ss ...      # instant mode (go run, no manual rebuild)"
 echo "  ssenv ...   # isolated HOME environments (create/use/enter/list/reset/delete)"

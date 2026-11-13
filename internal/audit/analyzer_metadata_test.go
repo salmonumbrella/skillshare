@@ -54,6 +54,12 @@ func TestParseFrontmatterNameDesc(t *testing.T) {
 			wantDesc: "",
 		},
 		{
+			name:     "BOM before the opening delimiter",
+			content:  "\ufeff---\nname: my-skill\ndescription: A useful tool\n---\n# Content",
+			wantName: "my-skill",
+			wantDesc: "A useful tool",
+		},
+		{
 			name:     "empty description",
 			content:  "---\nname: test\n---\n",
 			wantName: "test",
@@ -117,6 +123,27 @@ func TestCheckPublisherMismatch(t *testing.T) {
 			skillN:  "my-tool",
 			desc:    "A great tool for coding",
 			repoURL: "https://github.com/someone/skills.git",
+			wantNil: true,
+		},
+		{
+			name:    "trigger text: from any docx is not a publisher claim",
+			skillN:  "officecli-docx",
+			desc:    "Use this skill any time a .docx file is involved -- as input from any document.",
+			repoURL: "https://github.com/iOfficeAI/OfficeCLI.git",
+			wantNil: true,
+		},
+		{
+			name:    "trigger text: from CSV data is not a publisher claim",
+			skillN:  "officecli-data-dashboard",
+			desc:    "Create dashboards from CSV/tabular data in Excel format.",
+			repoURL: "https://github.com/iOfficeAI/OfficeCLI.git",
+			wantNil: true,
+		},
+		{
+			name:    "trigger text: from human-friendly names is not a publisher claim",
+			skillN:  "asc-id-resolver",
+			desc:    "Resolve App Store Connect IDs from human-friendly names using asc.",
+			repoURL: "https://github.com/rudrankriyam/asc-skills.git",
 			wantNil: true,
 		},
 		{
@@ -246,19 +273,23 @@ func TestIsWellKnownOrg(t *testing.T) {
 }
 
 func TestMetadataAnalyzer_Integration(t *testing.T) {
-	// Create a temp skill directory with SKILL.md and .skillshare-meta.json
-	dir := t.TempDir()
+	// Create a nested skill directory: root/evil-skill/SKILL.md
+	// with centralized metadata at root/.metadata.json
+	root := t.TempDir()
+	dir := filepath.Join(root, "evil-skill")
+	os.MkdirAll(dir, 0755)
 
-	// Write SKILL.md claiming "from Acme Corp"
 	skillContent := "---\nname: evil-skill\ndescription: Official formatter from Acme Corp\n---\n# Evil\n"
 	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillContent), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	// Write meta pointing to a different org
-	meta := metaJSON{RepoURL: "https://github.com/evil-fork/skills.git"}
-	metaData, _ := json.Marshal(meta)
-	if err := os.WriteFile(filepath.Join(dir, ".skillshare-meta.json"), metaData, 0644); err != nil {
+	// Write centralized metadata in parent directory
+	store := metadataStoreJSON{Entries: map[string]metaJSON{
+		"evil-skill": {RepoURL: "https://github.com/evil-fork/skills.git"},
+	}}
+	storeData, _ := json.Marshal(store)
+	if err := os.WriteFile(filepath.Join(root, metadataFileName), storeData, 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -298,6 +329,40 @@ func TestMetadataAnalyzer_Integration(t *testing.T) {
 	}
 }
 
+func TestMetadataAnalyzer_Integration_DeepNestedSkill(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "a", "b", "c", "d", "evil-skill")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	skillContent := "---\nname: evil-skill\ndescription: Official formatter from Acme Corp\n---\n# Evil\n"
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(skillContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	store := metadataStoreJSON{Entries: map[string]metaJSON{
+		"a/b/c/d/evil-skill": {RepoURL: "https://github.com/evil-fork/skills.git"},
+	}}
+	storeData, _ := json.Marshal(store)
+	if err := os.WriteFile(filepath.Join(root, metadataFileName), storeData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &metadataAnalyzer{}
+	ctx := &AnalyzeContext{
+		SkillPath:   dir,
+		DisabledIDs: map[string]bool{},
+	}
+	findings, err := a.Analyze(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) < 2 {
+		t.Fatalf("expected deep nested skill to resolve metadata, got %d findings", len(findings))
+	}
+}
+
 func TestMetadataAnalyzer_NoMeta(t *testing.T) {
 	// Skill without .skillshare-meta.json — should produce no findings
 	dir := t.TempDir()
@@ -320,14 +385,18 @@ func TestMetadataAnalyzer_NoMeta(t *testing.T) {
 }
 
 func TestMetadataAnalyzer_DisabledRules(t *testing.T) {
-	dir := t.TempDir()
+	root := t.TempDir()
+	dir := filepath.Join(root, "test-skill")
+	os.MkdirAll(dir, 0755)
 	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"),
 		[]byte("---\nname: test\ndescription: Official tool from Acme Corp\n---\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	meta := metaJSON{RepoURL: "https://github.com/evil-fork/skills.git"}
-	metaData, _ := json.Marshal(meta)
-	if err := os.WriteFile(filepath.Join(dir, ".skillshare-meta.json"), metaData, 0644); err != nil {
+	store := metadataStoreJSON{Entries: map[string]metaJSON{
+		"test-skill": {RepoURL: "https://github.com/evil-fork/skills.git"},
+	}}
+	storeData, _ := json.Marshal(store)
+	if err := os.WriteFile(filepath.Join(root, metadataFileName), storeData, 0644); err != nil {
 		t.Fatal(err)
 	}
 

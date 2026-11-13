@@ -18,7 +18,12 @@ skillshare upgrade --skill      # Skill only
 - The built-in skillshare skill needs updating
 - After `doctor` reports an available update
 
-![upgrade demo](/img/upgrade-demo.png)
+```text
+skillshare upgrade --skill --dry-run
+  Skill     v0.21.12 → v0.21.13 · would download
+
+Dry run — nothing was written
+```
 
 ## What Happens
 
@@ -55,6 +60,18 @@ You can also use Homebrew directly:
 brew upgrade skillshare
 ```
 
+## Nix Users {#nix-users}
+
+If you installed with Nix, `skillshare upgrade` leaves the CLI alone, because replacing a file in the Nix store would corrupt it. When a newer version exists, it tells you how to get it instead. For `nix profile add`, that is:
+
+```bash
+nix profile upgrade skillshare
+```
+
+When a NixOS, Home Manager or overlay configuration provides skillshare, update skillshare in that configuration (for a flake input, `nix flake update skillshare`) and rebuild. The dashboard's upgrade button shows the same advice.
+
+`skillshare upgrade --skill` still updates the built-in skill.
+
 ## Examples
 
 ```bash
@@ -89,9 +106,34 @@ skillshare sync  # Distribute to all targets
 
 The `skillshare` executable itself. Downloads from GitHub releases.
 
+The archive is verified against the release's `checksums.txt` before your running binary is
+replaced, so a damaged or mismatched download stops the upgrade instead of installing itself.
+The current binary stays untouched, and the error names the mismatch.
+
+In a terminal, the download shows how much has arrived, so a slow connection does not
+look like a hang. The Web UI assets below show the same.
+
+```
+Downloading v0.21.4...  3.2 MB / 9.1 MB
+```
+
+The install script now defaults to `~/.local/bin`, where normal updates do not need `sudo`. Existing installations keep their current location.
+
+If the binary is in a protected directory (e.g., `/usr/local/bin`), skillshare asks `sudo` to replace only the binary — no manual prefix needed. The built-in skill, UI assets, and logs are still written as you, so don't run the whole upgrade with `sudo`: that leaves root-owned files in your skills source, and a later `git pull` fails with `Permission denied`.
+
+If an earlier upgrade already left such files, updating the built-in skill fails with `permission denied`, and the error shows the command that gives the skills source back to you, for example:
+
+```bash
+sudo chown -R "$(id -un)" ~/.config/skillshare/skills
+```
+
+When there is no terminal to ask for a password on (the dashboard's **Update now** button, CI), the upgrade stops right away and tells you to run `skillshare upgrade` in a terminal instead of waiting for input. Cached `sudo` credentials and `NOPASSWD` setups still upgrade without a prompt.
+
 ### Web UI Assets
 
 After upgrading, skillshare pre-downloads the Web UI frontend assets for the new version. These are cached at `~/.cache/skillshare/ui/<version>/` and served when you run `skillshare ui`.
+
+The pre-download keeps both the new version's assets and the pre-upgrade CLI version's assets, so an already-running UI server can still load its files. Other cached versions are removed. Restart the app or UI server between upgrades: a second upgrade without a restart can remove the oldest server's assets.
 
 If the pre-download fails (e.g. network issues), the assets will be downloaded on the next `skillshare ui` launch instead.
 

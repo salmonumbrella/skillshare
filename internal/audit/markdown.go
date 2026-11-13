@@ -8,20 +8,29 @@ import (
 
 // MarkdownOptions carries summary statistics for the Markdown report header.
 type MarkdownOptions struct {
-	Scanned    int
-	Passed     int
-	Warning    int
-	Failed     int
-	Critical   int
-	High       int
-	Medium     int
-	Low        int
-	Info       int
-	ScanErrors int
-	RiskScore  int
-	RiskLabel  string
-	Threshold  string
-	Mode       string
+	Scanned        int
+	Passed         int
+	Warning        int
+	Failed         int
+	Critical       int
+	High           int
+	Medium         int
+	Low            int
+	Info           int
+	Accepted       int // accepted earlier with --force; left out of the severity counts
+	BinaryFiles    int
+	SkippedFiles   int
+	OversizedFiles int
+	ScanErrors     int
+	RiskScore      int
+	RiskLabel      string
+	Threshold      string
+	Mode           string
+
+	MinSeverity string // display-only, normalized severity; empty shows all
+
+	SourceWarnings []string // source links the scan did not follow
+	Incomplete     bool     // a source link could not be read, so its skills went unscanned
 
 	AvgAnalyzability float64
 	Profile          string
@@ -35,6 +44,12 @@ func ToMarkdown(results []*Result, opts MarkdownOptions) string {
 
 	writeHeader(&b, opts)
 	writeSummaryTable(&b, opts)
+	writeCoverageTable(&b, results)
+	writeSourceLinkWarnings(&b, opts)
+	if opts.MinSeverity != "" {
+		visible, hidden := DisplayCounts(results, opts.MinSeverity)
+		fmt.Fprintf(&b, "\nFindings: %d visible, %d hidden (minimum %s).\n", visible, hidden, opts.MinSeverity)
+	}
 
 	// Partition results into failed, warning, and clean.
 	var failed, warned, clean []*Result
@@ -42,9 +57,9 @@ func ToMarkdown(results []*Result, opts MarkdownOptions) string {
 		switch {
 		case r.IsBlocked:
 			failed = append(failed, r)
-		case len(r.Findings) > 0:
+		case len(DisplayFindings(r.Findings, opts.MinSeverity)) > 0:
 			warned = append(warned, r)
-		default:
+		case len(r.Findings) == 0:
 			clean = append(clean, r)
 		}
 	}
@@ -64,10 +79,10 @@ func ToMarkdown(results []*Result, opts MarkdownOptions) string {
 	if hasFindings {
 		b.WriteString("\n## Findings\n")
 		for _, r := range failed {
-			writeSkillSection(&b, r, true)
+			writeSkillSection(&b, r, true, opts.MinSeverity)
 		}
 		for _, r := range warned {
-			writeSkillSection(&b, r, false)
+			writeSkillSection(&b, r, false, opts.MinSeverity)
 		}
 	}
 
@@ -104,6 +119,9 @@ func writeSummaryTable(b *strings.Builder, opts MarkdownOptions) {
 	fmt.Fprintf(b, "| Failed | %d |\n", opts.Failed)
 	fmt.Fprintf(b, "| Severity | C:%d H:%d M:%d L:%d I:%d |\n",
 		opts.Critical, opts.High, opts.Medium, opts.Low, opts.Info)
+	if opts.Accepted > 0 {
+		fmt.Fprintf(b, "| Accepted | %d |\n", opts.Accepted)
+	}
 	if threatsLine := formatCategoryBreakdownPlain(opts.ByCategory); threatsLine != "" {
 		fmt.Fprintf(b, "| Threats | %s |\n", threatsLine)
 	}
@@ -111,8 +129,44 @@ func writeSummaryTable(b *strings.Builder, opts MarkdownOptions) {
 		strings.ToUpper(opts.RiskLabel), opts.RiskScore)
 	fmt.Fprintf(b, "| Analyzability | %.0f%% avg |\n",
 		opts.AvgAnalyzability*100)
+	if opts.SkippedFiles > 0 {
+		fmt.Fprintf(b, "| Skipped files | %d (%d binary, %d oversized) |\n", opts.SkippedFiles, opts.BinaryFiles, opts.OversizedFiles)
+	}
 	if opts.ScanErrors > 0 {
 		fmt.Fprintf(b, "| Scan Errors | %d |\n", opts.ScanErrors)
+	}
+}
+
+// writeCoverageTable keeps partial coverage visible even for clean resources.
+func writeCoverageTable(b *strings.Builder, results []*Result) {
+	var rows []*Result
+	for _, r := range results {
+		if r.SkippedFiles > 0 {
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].SkillName < rows[j].SkillName })
+	b.WriteString("\n## File coverage by resource\n\n| Resource | Skipped | Binary | Oversized |\n|---|---:|---:|---:|\n")
+	for _, r := range rows {
+		fmt.Fprintf(b, "| %s | %d | %d | %d |\n", escapeMarkdownTable(r.SkillName), r.SkippedFiles, r.BinaryFiles, r.OversizedFiles)
+	}
+}
+
+// writeSourceLinkWarnings keeps an incomplete scan visible: the tables and the
+// display floor describe only what was scanned.
+func writeSourceLinkWarnings(b *strings.Builder, opts MarkdownOptions) {
+	if len(opts.SourceWarnings) == 0 {
+		return
+	}
+	b.WriteString("\n## Source links not followed\n\n")
+	if opts.Incomplete {
+		b.WriteString("**Incomplete scan:** a source link could not be read, so the skills behind it were not scanned.\n\n")
+	}
+	for _, w := range opts.SourceWarnings {
+		fmt.Fprintf(b, "- %s\n", w)
 	}
 }
 
@@ -127,7 +181,7 @@ func findingLocation(f Finding) string {
 	return f.File
 }
 
-func writeSkillSection(b *strings.Builder, r *Result, blocked bool) {
+func writeSkillSection(b *strings.Builder, r *Result, blocked bool, minSeverity string) {
 	symbol := "!"
 	if blocked {
 		symbol = "✗"
@@ -149,11 +203,18 @@ func writeSkillSection(b *strings.Builder, r *Result, blocked bool) {
 		fmt.Fprintf(b, "> **ALLOWED** — max severity %s < threshold %s\n\n", maxSev, threshold)
 	}
 
+	findings := DisplayFindings(r.Findings, minSeverity)
+	if minSeverity != "" {
+		fmt.Fprintf(b, "Findings: %d visible, %d hidden.\n\n", len(findings), len(r.Findings)-len(findings))
+	}
+
 	// Findings table — also track whether any snippets exist.
-	b.WriteString("| # | Rule ID | Severity | Pattern | Analyzer | Category | Message | Location |\n")
-	b.WriteString("|---|---------|----------|---------|----------|----------|---------|----------|\n")
+	if len(findings) > 0 {
+		b.WriteString("| # | Rule ID | Severity | Pattern | Analyzer | Category | Message | Location |\n")
+		b.WriteString("|---|---------|----------|---------|----------|----------|---------|----------|\n")
+	}
 	hasSnippets := false
-	for i, f := range r.Findings {
+	for i, f := range findings {
 		if f.Snippet != "" {
 			hasSnippets = true
 		}
@@ -176,7 +237,7 @@ func writeSkillSection(b *strings.Builder, r *Result, blocked bool) {
 			escapeMarkdownTable(f.Pattern),
 			escapeMarkdownTable(analyzer),
 			escapeMarkdownTable(category),
-			escapeMarkdownTable(f.Message),
+			escapeMarkdownTable(markdownMessage(f)),
 			escapeMarkdownTable(findingLocation(f)),
 		)
 	}
@@ -184,7 +245,7 @@ func writeSkillSection(b *strings.Builder, r *Result, blocked bool) {
 	// Snippets in collapsible details.
 	if hasSnippets {
 		b.WriteString("\n<details>\n<summary>Snippets</summary>\n\n")
-		for _, f := range r.Findings {
+		for _, f := range findings {
 			if f.Snippet == "" {
 				continue
 			}
@@ -204,6 +265,14 @@ func writeSkillSection(b *strings.Builder, r *Result, blocked bool) {
 	}
 
 	b.WriteString("\n---\n")
+}
+
+// markdownMessage is a finding's message, marked when it was accepted earlier.
+func markdownMessage(f Finding) string {
+	if f.Acknowledged {
+		return f.ExplainedMessage() + " (accepted earlier)"
+	}
+	return f.ExplainedMessage()
 }
 
 // escapeSnippetLine replaces newlines so that indented code blocks stay single-line.

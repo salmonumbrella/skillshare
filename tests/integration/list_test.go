@@ -4,9 +4,12 @@ package integration
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"skillshare/internal/install"
 	"skillshare/internal/testutil"
 )
 
@@ -27,7 +30,7 @@ targets: {}
 	result.AssertSuccess(t)
 	result.AssertOutputContains(t, "skill-one")
 	result.AssertOutputContains(t, "skill-two")
-	result.AssertOutputContains(t, "Installed skills")
+	result.AssertOutputContains(t, "2 skills")
 }
 
 func TestList_Empty_ShowsMessage(t *testing.T) {
@@ -51,11 +54,10 @@ func TestList_Verbose_ShowsDetails(t *testing.T) {
 	// Create skill with metadata
 	sb.CreateSkill("meta-skill", map[string]string{
 		"SKILL.md": "# Meta Skill",
-		".skillshare-meta.json": `{
-  "source": "github.com/user/repo/path/to/skill",
-  "type": "github-subdir",
-  "installed_at": "2024-01-15T10:30:00Z"
-}`,
+	})
+	writeListMeta(t, sb.SourcePath, "meta-skill", &install.MetadataEntry{
+		Source: "github.com/user/repo/path/to/skill",
+		Type:   "github-subdir",
 	})
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
@@ -101,7 +103,7 @@ func TestList_Help_ShowsUsage(t *testing.T) {
 	result := sb.RunCLI("list", "--help")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Usage:")
+	result.AssertOutputContains(t, "Usage  skillshare")
 	result.AssertOutputContains(t, "--verbose")
 	result.AssertOutputContains(t, "--type")
 	result.AssertOutputContains(t, "--sort")
@@ -187,11 +189,10 @@ func TestList_ShowsSourceInfo(t *testing.T) {
 	// Create skill with metadata (installed)
 	sb.CreateSkill("installed-skill", map[string]string{
 		"SKILL.md": "# Installed",
-		".skillshare-meta.json": `{
-  "source": "github.com/example/repo",
-  "type": "github",
-  "installed_at": "2024-01-15T10:30:00Z"
-}`,
+	})
+	writeListMeta(t, sb.SourcePath, "installed-skill", &install.MetadataEntry{
+		Source: "github.com/example/repo",
+		Type:   "github",
 	})
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
@@ -298,11 +299,10 @@ func TestList_FilterByType_Local(t *testing.T) {
 	// GitHub skill (has metadata with source)
 	sb.CreateSkill("from-github", map[string]string{
 		"SKILL.md": "# GitHub",
-		".skillshare-meta.json": `{
-  "source": "github.com/user/repo",
-  "type": "github",
-  "installed_at": "2024-06-01T00:00:00Z"
-}`,
+	})
+	writeListMeta(t, sb.SourcePath, "from-github", &install.MetadataEntry{
+		Source: "github.com/user/repo",
+		Type:   "github",
 	})
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
@@ -326,11 +326,10 @@ func TestList_FilterByType_Github(t *testing.T) {
 	// GitHub skill (has metadata with source)
 	sb.CreateSkill("from-github", map[string]string{
 		"SKILL.md": "# GitHub",
-		".skillshare-meta.json": `{
-  "source": "github.com/user/repo",
-  "type": "github",
-  "installed_at": "2024-06-01T00:00:00Z"
-}`,
+	})
+	writeListMeta(t, sb.SourcePath, "from-github", &install.MetadataEntry{
+		Source: "github.com/user/repo",
+		Type:   "github",
 	})
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
@@ -350,19 +349,21 @@ func TestList_SortNewest(t *testing.T) {
 
 	sb.CreateSkill("old-skill", map[string]string{
 		"SKILL.md": "# Old",
-		".skillshare-meta.json": `{
-  "source": "github.com/user/old",
-  "type": "github",
-  "installed_at": "2023-01-01T00:00:00Z"
-}`,
+	})
+	oldTime, _ := time.Parse(time.RFC3339, "2023-01-01T00:00:00Z")
+	writeListMeta(t, sb.SourcePath, "old-skill", &install.MetadataEntry{
+		Source:      "github.com/user/old",
+		Type:        "github",
+		InstalledAt: oldTime,
 	})
 	sb.CreateSkill("new-skill", map[string]string{
 		"SKILL.md": "# New",
-		".skillshare-meta.json": `{
-  "source": "github.com/user/new",
-  "type": "github",
-  "installed_at": "2025-12-01T00:00:00Z"
-}`,
+	})
+	newTime, _ := time.Parse(time.RFC3339, "2025-12-01T00:00:00Z")
+	writeListMeta(t, sb.SourcePath, "new-skill", &install.MetadataEntry{
+		Source:      "github.com/user/new",
+		Type:        "github",
+		InstalledAt: newTime,
 	})
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
@@ -423,11 +424,10 @@ func TestList_SearchWithFilter(t *testing.T) {
 	// GitHub skill with "react" in source
 	sb.CreateSkill("react-remote", map[string]string{
 		"SKILL.md": "# React Remote",
-		".skillshare-meta.json": `{
-  "source": "github.com/user/react-kit",
-  "type": "github",
-  "installed_at": "2024-06-01T00:00:00Z"
-}`,
+	})
+	writeListMeta(t, sb.SourcePath, "react-remote", &install.MetadataEntry{
+		Source: "github.com/user/react-kit",
+		Type:   "github",
 	})
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
@@ -449,8 +449,11 @@ func TestList_JSON_OutputsValidJSON(t *testing.T) {
 
 	sb.CreateSkill("alpha", map[string]string{"SKILL.md": "# Alpha"})
 	sb.CreateSkill("beta", map[string]string{
-		"SKILL.md":              "# Beta",
-		".skillshare-meta.json": `{"source":"github.com/user/repo","type":"github","installed_at":"2024-06-01T00:00:00Z"}`,
+		"SKILL.md": "# Beta",
+	})
+	writeListMeta(t, sb.SourcePath, "beta", &install.MetadataEntry{
+		Source: "github.com/user/repo",
+		Type:   "github",
 	})
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
@@ -519,48 +522,175 @@ func TestList_JSON_Empty(t *testing.T) {
 	}
 }
 
-// --- --no-tui tests ---
+// --- --status tests ---
 
-func TestList_NoTUI_ShowsPlainText(t *testing.T) {
+// setupStatusSandbox creates one enabled and one disabled skill ("off-skill"
+// is disabled through .skillignore) and writes the config.
+func setupStatusSandbox(t *testing.T) *testutil.Sandbox {
+	t.Helper()
 	sb := testutil.NewSandbox(t)
+	sb.CreateSkill("on-skill", map[string]string{"SKILL.md": "# On"})
+	sb.CreateSkill("off-skill", map[string]string{"SKILL.md": "# Off"})
+	sb.WriteFile(filepath.Join(sb.SourcePath, ".skillignore"), "off-skill\n")
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+	return sb
+}
+
+func TestList_FilterByStatus_Enabled(t *testing.T) {
+	sb := setupStatusSandbox(t)
 	defer sb.Cleanup()
 
-	sb.CreateSkill("my-skill", map[string]string{
-		"SKILL.md": "---\nname: my-skill\n---\n# My Skill",
-	})
+	result := sb.RunCLI("list", "--no-tui", "--status", "enabled")
 
-	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+	result.AssertSuccess(t)
+	result.AssertOutputContains(t, "on-skill")
+	result.AssertOutputNotContains(t, "off-skill")
+	result.AssertAnyOutputContains(t, "1 of 2 skills (status: enabled)")
+}
 
-	result := sb.RunCLI("list", "--no-tui")
-	if result.ExitCode != 0 {
-		t.Errorf("expected exit code 0, got %d\n\tstdout: %s\n\tstderr: %s", result.ExitCode, result.Stdout, result.Stderr)
-	}
-	if !strings.Contains(result.Stdout, "my-skill") {
-		t.Errorf("expected output to contain 'my-skill', got:\n%s", result.Stdout)
+func TestList_FilterByStatus_Disabled(t *testing.T) {
+	sb := setupStatusSandbox(t)
+	defer sb.Cleanup()
+
+	result := sb.RunCLI("list", "--no-tui", "--status=disabled")
+
+	result.AssertSuccess(t)
+	result.AssertOutputContains(t, "off-skill")
+	result.AssertOutputNotContains(t, "on-skill")
+	result.AssertAnyOutputContains(t, "1 of 2 skills (status: disabled)")
+}
+
+func TestList_FilterByStatus_All_EqualsDefault(t *testing.T) {
+	sb := setupStatusSandbox(t)
+	defer sb.Cleanup()
+
+	def := sb.RunCLI("list", "--json")
+	def.AssertSuccess(t)
+	explicit := sb.RunCLI("list", "--json", "--status", "all")
+	explicit.AssertSuccess(t)
+
+	if def.Stdout != explicit.Stdout {
+		t.Errorf("--status all differs from default:\ndefault:\n%s\nexplicit:\n%s", def.Stdout, explicit.Stdout)
 	}
 }
 
-func TestList_NoTUI_WithPattern(t *testing.T) {
+func TestList_FilterByStatus_JSON(t *testing.T) {
+	sb := setupStatusSandbox(t)
+	defer sb.Cleanup()
+
+	result := sb.RunCLI("list", "--json", "--status", "enabled")
+	result.AssertSuccess(t)
+
+	var skills []map[string]interface{}
+	if err := json.Unmarshal([]byte(result.Stdout), &skills); err != nil {
+		t.Fatalf("invalid JSON output: %v\nOutput: %s", err, result.Stdout)
+	}
+	if len(skills) != 1 {
+		t.Fatalf("expected 1 skill, got %d", len(skills))
+	}
+	if skills[0]["name"] != "on-skill" {
+		t.Errorf("expected on-skill, got %v", skills[0]["name"])
+	}
+}
+
+func TestList_FilterByStatus_NoMatch(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
 
-	sb.CreateSkill("react-helper", map[string]string{
-		"SKILL.md": "---\nname: react-helper\n---\n# React",
+	sb.CreateSkill("on-skill", map[string]string{"SKILL.md": "# On"})
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	result := sb.RunCLI("list", "--no-tui", "--status", "disabled")
+	result.AssertSuccess(t)
+	result.AssertAnyOutputContains(t, `No skills matching status "disabled"`)
+
+	jsonResult := sb.RunCLI("list", "--json", "--status", "disabled")
+	jsonResult.AssertSuccess(t)
+	if strings.TrimSpace(jsonResult.Stdout) != "[]" {
+		t.Errorf("expected empty JSON array, got %q", jsonResult.Stdout)
+	}
+}
+
+func TestList_FilterByStatus_CombinesWithPattern(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	sb.CreateSkill("react-on", map[string]string{"SKILL.md": "# On"})
+	sb.CreateSkill("react-off", map[string]string{"SKILL.md": "# Off"})
+	sb.CreateSkill("vue-off", map[string]string{"SKILL.md": "# Vue"})
+	sb.WriteFile(filepath.Join(sb.SourcePath, ".skillignore"), "react-off\nvue-off\n")
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	result := sb.RunCLI("list", "--no-tui", "react", "--status", "disabled")
+
+	result.AssertSuccess(t)
+	result.AssertOutputContains(t, "react-off")
+	result.AssertOutputNotContains(t, "react-on")
+	result.AssertOutputNotContains(t, "vue-off")
+}
+
+func TestList_FilterByStatus_HidesTrackedReposSummary(t *testing.T) {
+	sb := setupStatusSandbox(t)
+	defer sb.Cleanup()
+
+	result := sb.RunCLI("list", "--no-tui", "--status", "enabled")
+
+	result.AssertSuccess(t)
+	result.AssertOutputNotContains(t, "Tracked repos")
+}
+
+func TestList_Agents_FilterByStatus(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	agentsDir := createAgentSource(t, sb, map[string]string{
+		"tutor.md":    "# Tutor agent",
+		"reviewer.md": "# Reviewer agent",
 	})
-	sb.CreateSkill("vue-helper", map[string]string{
-		"SKILL.md": "---\nname: vue-helper\n---\n# Vue",
-	})
+	sb.WriteFile(filepath.Join(agentsDir, ".agentignore"), "reviewer.md\n")
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	result := sb.RunCLI("list", "agents", "--no-tui", "--status", "disabled")
+
+	result.AssertSuccess(t)
+	result.AssertOutputContains(t, "reviewer")
+	result.AssertOutputNotContains(t, "tutor")
+}
+
+func TestList_InvalidStatus(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
 
-	result := sb.RunCLI("list", "--no-tui", "react")
-	if result.ExitCode != 0 {
-		t.Errorf("expected exit code 0, got %d", result.ExitCode)
+	result := sb.RunCLI("list", "--status", "bogus")
+
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "invalid status")
+	result.AssertAnyOutputContains(t, "all, enabled, or disabled")
+}
+
+// writeListMeta writes a metadata entry to the centralized .metadata.json in sourceDir.
+func writeListMeta(t *testing.T, sourceDir, skillName string, entry *install.MetadataEntry) {
+	t.Helper()
+	store, err := install.LoadMetadata(sourceDir)
+	if err != nil {
+		t.Fatalf("writeListMeta: load: %v", err)
 	}
-	if !strings.Contains(result.Stdout, "react-helper") {
-		t.Errorf("expected output to contain 'react-helper'")
+	store.Set(skillName, entry)
+	if err := store.Save(sourceDir); err != nil {
+		t.Fatalf("writeListMeta: save: %v", err)
 	}
-	if strings.Contains(result.Stdout, "vue-helper") {
-		t.Errorf("should not contain 'vue-helper' when filtered")
-	}
+}
+
+func TestList_TrackedRepoGitStatusError_ShowsUnknown(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	makeTrackedRepoWithBrokenStatus(t, sb.SourcePath, "_broken-repo")
+	sb.WriteConfig(`source: ` + sb.SourcePath + "\ntargets: {}\n")
+
+	result := sb.RunCLI("list", "--no-tui")
+	result.AssertSuccess(t)
+	result.AssertRowContains(t, "_broken-repo", "git status unknown")
+	result.AssertAnyOutputContains(t, "failed to check git status")
 }

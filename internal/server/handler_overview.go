@@ -2,26 +2,44 @@ package server
 
 import (
 	"net/http"
-	"os"
 	"path/filepath"
-	"strings"
 
 	"skillshare/internal/git"
 	"skillshare/internal/install"
+	"skillshare/internal/resource"
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/sync"
 	"skillshare/internal/utils"
 	versioncheck "skillshare/internal/version"
 )
 
 type trackedRepoItem struct {
-	Name       string `json:"name"`
-	SkillCount int    `json:"skillCount"`
-	Dirty      bool   `json:"dirty"`
+	Name         string `json:"name"`
+	SkillCount   int    `json:"skillCount"`
+	VariantCount int    `json:"variantCount"`
+	Dirty        bool   `json:"dirty"`
 }
 
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
+	// Snapshot config under RLock, then release before I/O.
+	s.mu.RLock()
+	source := s.cfg.EffectiveSkillsSource()
+	walk := s.skillsWalk()
+	agentsSource := s.agentsSource()
+	extrasSource := s.cfg.EffectiveExtrasSource()
+	if s.IsProjectMode() {
+		extrasSource = s.projectCfg.EffectiveExtrasSource(s.projectRoot)
+	}
+	cfgMode := s.cfg.Mode
+	targetCount := len(s.cfg.Targets)
+	projectRoot := s.projectRoot
+	configDir := filepath.Dir(s.configPath())
+	s.mu.RUnlock()
+
+	isProjectMode := projectRoot != ""
+
 	// Count skills
-	skills, err := sync.DiscoverSourceSkills(s.cfg.Source)
+	skills, err := sync.DiscoverSourceSkills(source, walk)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -29,63 +47,75 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 
 	// Count top-level source entries (for display)
 	topLevelCount := 0
-	entries, _ := os.ReadDir(s.cfg.Source)
+	entries, _ := sourcewalk.ReadDir(source, walk)
 	for _, e := range entries {
 		if e.IsDir() && !utils.IsHidden(e.Name()) {
 			topLevelCount++
 		}
 	}
 
-	mode := s.cfg.Mode
+	mode := cfgMode
 	if mode == "" {
 		mode = "merge"
 	}
 
 	// Tracked repos
-	trackedRepos := buildTrackedRepos(s.cfg.Source, skills)
+	trackedRepos := buildTrackedRepos(source, skills, walk)
 
+	// Count agents
+	agentCount := 0
+	if agentsSource != "" {
+		if agents, discoverErr := (resource.AgentKind{}).Discover(agentsSource); discoverErr == nil {
+			agentCount = len(agents)
+		}
+	}
+
+	counts := sync.CountSkills(skills)
 	resp := map[string]any{
-		"source":        s.cfg.Source,
-		"skillCount":    len(skills),
+		"source":        source,
+		"skillCount":    counts.Skills,
+		"variantCount":  counts.Variants,
+		"agentCount":    agentCount,
 		"topLevelCount": topLevelCount,
-		"targetCount":   len(s.cfg.Targets),
+		"targetCount":   targetCount,
 		"mode":          mode,
 		"version":       versioncheck.Version,
 		"trackedRepos":  trackedRepos,
-		"isProjectMode": s.IsProjectMode(),
+		"isProjectMode": isProjectMode,
+		"configDir":     configDir,
 	}
-	if s.IsProjectMode() {
-		resp["projectRoot"] = s.projectRoot
+	if agentsSource != "" {
+		resp["agentsSource"] = agentsSource
+	}
+	if extrasSource != "" {
+		resp["extrasSource"] = extrasSource
+	}
+	if isProjectMode {
+		resp["projectRoot"] = projectRoot
 	}
 
 	writeJSON(w, resp)
 }
 
-func buildTrackedRepos(sourceDir string, skills []sync.DiscoveredSkill) []trackedRepoItem {
-	repoNames, err := install.GetTrackedRepos(sourceDir)
+func buildTrackedRepos(sourceDir string, skills []sync.DiscoveredSkill, walk sourcewalk.Options) []trackedRepoItem {
+	repoNames, err := install.GetTrackedRepos(sourceDir, walk)
 	if err != nil || len(repoNames) == 0 {
 		return []trackedRepoItem{}
 	}
 
+	_, counts := sync.CountSkillsByRepo(skills)
 	items := make([]trackedRepoItem, 0, len(repoNames))
 	for _, repoName := range repoNames {
 		repoPath := filepath.Join(sourceDir, repoName)
-
-		// Count skills belonging to this repo
-		skillCount := 0
-		for _, sk := range skills {
-			if sk.IsInRepo && strings.HasPrefix(sk.RelPath, repoName+"/") {
-				skillCount++
-			}
-		}
 
 		// Check git dirty status
 		dirty, _ := git.IsDirty(repoPath)
 
 		items = append(items, trackedRepoItem{
-			Name:       repoName,
-			SkillCount: skillCount,
-			Dirty:      dirty,
+			Name:         repoName,
+			SkillCount:   counts[repoName].Skills,
+			VariantCount: counts[repoName].Variants,
+			Dirty:        dirty,
 		})
 	}
 	return items

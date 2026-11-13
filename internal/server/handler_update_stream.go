@@ -16,8 +16,19 @@ import (
 //   - "result" → updateResultItem                 after each item is updated
 //   - "done"   → {"results":…,"summary":…}       final payload
 //
-// Query params: names (comma-separated), force, skipAudit
+// Query params: names (comma-separated), kind (skill or agent), force, skipAudit
 func (s *Server) handleUpdateStream(w http.ResponseWriter, r *http.Request) {
+	// Agents are updated by name only; nothing updates them all at once.
+	kind := r.URL.Query().Get("kind")
+	if kind != "" && kind != "skill" && kind != "agent" {
+		writeError(w, http.StatusBadRequest, "invalid kind: "+kind)
+		return
+	}
+	if kind == "agent" && r.URL.Query().Get("names") == "" {
+		writeError(w, http.StatusBadRequest, "names are required for agents")
+		return
+	}
+
 	safeSend, ok := initSSE(w)
 	if !ok {
 		return
@@ -29,14 +40,22 @@ func (s *Server) handleUpdateStream(w http.ResponseWriter, r *http.Request) {
 	force := r.URL.Query().Get("force") == "true"
 	skipAudit := r.URL.Query().Get("skipAudit") == "true"
 
+	// Snapshot source under RLock, then release before slow I/O.
+	s.mu.RLock()
+	source := s.cfg.EffectiveSkillsSource()
+	walk := s.skillsWalk()
+	s.mu.RUnlock()
+
 	// Collect items to update based on "names" query param.
 	// If names is empty, update all updatable items.
 	namesParam := r.URL.Query().Get("names")
 
 	type updateItem struct {
-		name   string
-		isRepo bool
-		path   string
+		name    string
+		isRepo  bool
+		agent   bool
+		path    string
+		invalid bool // the name would resolve outside the source; reported, never touched
 	}
 
 	var items []updateItem
@@ -48,45 +67,44 @@ func (s *Server) handleUpdateStream(w http.ResponseWriter, r *http.Request) {
 			if name == "" {
 				continue
 			}
-			// Check if it's a tracked repo
-			repoName := name
-			if !strings.HasPrefix(repoName, "_") {
-				repoName = "_" + name
+			if !validSourceName(name) {
+				items = append(items, updateItem{name: name, invalid: true})
+				continue
 			}
-			repoPath := filepath.Join(s.cfg.Source, repoName)
-			if install.IsGitRepo(repoPath) {
+			if kind == "agent" {
+				items = append(items, updateItem{name: name, agent: true})
+				continue
+			}
+			// A tracked repo (a _-prefixed checkout; an unprefixed one is a regular skill)
+			if repoName, repoPath := install.FindTrackedCheckoutUnlessSkill(source, name); repoPath != "" {
 				items = append(items, updateItem{name: repoName, isRepo: true, path: repoPath})
 				continue
 			}
-			// Check original name as repo
-			origPath := filepath.Join(s.cfg.Source, name)
-			if install.IsGitRepo(origPath) {
-				items = append(items, updateItem{name: name, isRepo: true, path: origPath})
-				continue
-			}
 			// Regular skill
-			skillPath := filepath.Join(s.cfg.Source, name)
+			skillPath := filepath.Join(source, name)
 			items = append(items, updateItem{name: name, isRepo: false, path: skillPath})
 		}
 	} else {
 		// Update all: tracked repos + regular skills
-		repos, err := install.GetTrackedRepos(s.cfg.Source)
+		repos, err := install.GetTrackedRepos(source, walk)
 		if err == nil {
 			for _, repo := range repos {
 				items = append(items, updateItem{
 					name:   repo,
 					isRepo: true,
-					path:   filepath.Join(s.cfg.Source, repo),
+					path:   filepath.Join(source, repo),
 				})
 			}
 		}
-		skills, err := getServerUpdatableSkills(s.cfg.Source)
+		s.mu.RLock()
+		skills, err := getServerUpdatableSkills(source, s.skillsStore, walk)
+		s.mu.RUnlock()
 		if err == nil {
 			for _, skill := range skills {
 				items = append(items, updateItem{
 					name:   skill,
 					isRepo: false,
-					path:   filepath.Join(s.cfg.Source, skill),
+					path:   filepath.Join(source, skill),
 				})
 			}
 		}
@@ -115,10 +133,15 @@ func (s *Server) handleUpdateStream(w http.ResponseWriter, r *http.Request) {
 
 		// Lock per-item for write operations
 		s.mu.Lock()
-		if item.isRepo {
-			result = s.updateTrackedRepo(item.name, item.path, force, skipAudit)
-		} else {
-			result = s.updateRegularSkill(item.name, item.path, skipAudit)
+		switch {
+		case item.invalid:
+			result = updateResultItem{Name: item.name, Action: "error", Message: "invalid skill name: " + item.name}
+		case item.agent:
+			result = s.updateSingleByKind(item.name, "agent", force, skipAudit)
+		case item.isRepo:
+			result = s.updateTrackedRepo(item.name, item.path, s.cfg.EffectiveSkillsSource(), force, skipAudit, walk.Follow)
+		default:
+			result = s.updateRegularSkill(item.name, item.path, force, skipAudit, walk.Follow)
 		}
 		s.mu.Unlock()
 
@@ -140,6 +163,8 @@ func (s *Server) handleUpdateStream(w http.ResponseWriter, r *http.Request) {
 		safeSend("result", result)
 	}
 
+	// Surface tracked repos declared in metadata but absent on disk (issue #212).
+	// Only relevant for the update-all flow, not targeted updates.
 	// Write ops log
 	s.mu.Lock()
 	status := "ok"

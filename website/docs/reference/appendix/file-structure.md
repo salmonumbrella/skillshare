@@ -11,12 +11,13 @@ Directory layout and file locations for skillshare.
 ```
 ~/.config/skillshare/        # XDG_CONFIG_HOME
 ├── config.yaml              # Configuration file
-├── registry.yaml            # Installed skill registry (auto-managed)
 ├── audit-rules.yaml         # Custom audit rules (optional)
-├── skills/                  # Source directory (skills)
+├── mcp.yaml                 # MCP servers, if sources.mcp points here (optional)
+├── skills/                  # Skills source (skills + metadata)
+│   ├── .metadata.json       # Installed skill metadata (auto-managed)
+│   ├── .skillignore         # Optional: exclude skills from sync
 │   ├── my-skill/            # Regular skill
 │   │   ├── SKILL.md         # Skill definition (required)
-│   │   └── .skillshare-meta.json # Install metadata (auto-generated)
 │   ├── code-review/         # Another skill
 │   │   └── SKILL.md
 │   └── _team-skills/        # Tracked repository
@@ -27,6 +28,10 @@ Directory layout and file locations for skillshare.
 │       └── backend/
 │           └── api/
 │               └── SKILL.md
+├── agents/                  # Agents source (single .md files)
+│   ├── .agentignore         # Optional: exclude agents from sync
+│   ├── reviewer.md          # Agent file
+│   └── auditor.md           # Another agent
 ├── rules/                   # Extras source (if configured)
 │   ├── coding.md
 │   └── testing.md
@@ -36,20 +41,32 @@ Directory layout and file locations for skillshare.
 ~/.local/share/skillshare/   # XDG_DATA_HOME
 ├── backups/                 # Backup directory
 │   ├── 2026-01-20_15-30-00/
-│   │   ├── claude/
+│   │   ├── claude/          # Skills backup for claude
+│   │   ├── claude-agents/   # Agents backup for claude
 │   │   └── cursor/
 │   └── 2026-01-19_10-00-00/
 │       └── claude/
-└── trash/                   # Uninstalled skills (7-day retention)
+└── trash/                   # Uninstalled skills/agents (7-day retention)
     ├── my-skill_2026-01-20_15-30-00/
     │   └── SKILL.md
     └── old-skill_2026-01-19_10-00-00/
         └── SKILL.md
 
 ~/.local/state/skillshare/   # XDG_STATE_HOME
-└── logs/                    # Operation logs (JSONL)
-    ├── operations.log       # install, sync, update, etc.
-    └── audit.log            # Security audit scans
+├── projects/                # Machine-local project registrations and locks
+│   ├── <config-identity>.yaml # Local project registry
+│   └── <config-identity>.lock # Serializes project mutations
+├── plugins/<config-path-hash>/
+│   ├── state.json           # Machine-local plugin receipts and migration hints
+│   └── .operation.lock      # Serializes plugin mutations for this config
+├── logs/                    # Operation logs (JSONL)
+│   ├── operations.log       # install, sync, update, etc.
+│   └── audit.log            # Security audit scans
+├── mcp/                     # MCP sync state (auto-managed)
+│   ├── state.json           # Which native entries Skillshare owns
+│   ├── tool-pins.json       # Tool definition hashes recorded by mcp check --live
+│   └── backups/             # Agent files before each write (newest 20 per file)
+└── plugins/                 # Reviewed local copies of plugin sources
 
 ~/.cache/skillshare/         # XDG_CACHE_HOME      
 ├── version-check.json       # Version check cache (24h TTL)
@@ -58,6 +75,8 @@ Directory layout and file locations for skillshare.
         ├── index.html
         └── assets/
 ```
+
+On Windows, project registrations and their locks default to `%LOCALAPPDATA%\skillshare\state\projects\`. An explicit `XDG_STATE_HOME` places them under `$XDG_STATE_HOME/skillshare/projects/` on every platform. Keep this directory local to the machine; see [shared and local registrations](../commands/project.md#local-registrations).
 
 ---
 
@@ -84,10 +103,13 @@ XDG_CONFIG_HOME=/custom/path → /custom/path/skillshare/config.yaml
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/runkids/skillshare/main/schemas/config.schema.json
 source: ~/.config/skillshare/skills
+agents_source: ~/.config/skillshare/agents  # Optional; defaults to <source parent>/agents
 mode: merge
 targets:
   claude:
     path: ~/.claude/skills
+    agents:                                 # Optional; enables agent sync for this target
+      path: ~/.claude/agents
   cursor:
     path: ~/.cursor/skills
 ignore:
@@ -99,28 +121,53 @@ See [Configuration](/docs/reference/targets/configuration) for full reference.
 
 ---
 
-## Registry File
+## Metadata File
 
 ### Location
 
 ```
-~/.config/skillshare/registry.yaml
+~/.config/skillshare/skills/.metadata.json
 ```
 
-Stores metadata about installed and tracked skills. **Auto-managed** by `install`, `uninstall`, and `update` — don't edit manually.
+Stores metadata about installed and tracked skills. Lives inside the source directory so it can be synced via git for multi-machine setups. The agents source keeps its own `.metadata.json` with the same format. In project mode, `.skillshare/skills/.metadata.json` and `.skillshare/agents/.metadata.json` are added to `.gitignore`: they describe this machine's installs, and teammates share `config.yaml` and `skills.lock.json` instead. **Auto-managed** by `install`, `uninstall`, and `update` — don't edit manually.
 
 ### Contents
 
-```yaml
-# yaml-language-server: $schema=https://raw.githubusercontent.com/runkids/skillshare/main/schemas/registry.schema.json
-skills:
-  - name: pdf
-    source: anthropics/skills/skills/pdf
-  - name: _team-skills
-    source: github.com/team/skills
+```json
+{
+  "version": 1,
+  "entries": {
+    "pdf": {
+      "source": "anthropics/skills/skills/pdf",
+      "type": "github-subdir",
+      "installed_at": "2026-11-01T10:00:00Z",
+      "repo_url": "https://github.com/anthropics/skills.git",
+      "subdir": "skills/pdf",
+      "version": "a1b2c3d",
+      "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+      "file_hashes": { "SKILL.md": "sha256:…" }
+    },
+    "_team-skills": {
+      "source": "github.com/team/skills",
+      "tracked": true
+    }
+  },
+  "audit_accepted": { "pdf": ["…"] },
+  "target_overrides": { "_team-skills/frontend/ui": ["claude"] }
+}
 ```
 
-Each entry records the skill name and its install source. Tracked repos (prefixed with `_`) include the full repository URL for `update` and `check` operations.
+Each key under `entries` is the skill's path relative to the source directory.
+
+| Field | Purpose |
+|---|---|
+| `source`, `type`, `repo_url`, `subdir`, `branch` | Where the skill came from, so `update` and `check` know what to fetch |
+| `kind`, `tracked`, `group` | `kind` is `agent` for agent entries and omitted for skills; `tracked` marks a tracked repo (prefixed with `_`); `group` is the folder an entry was installed into |
+| `version`, `commit`, `tree_hash` | The installed revision; `commit` is the full SHA, which project mode pins in `skills.lock.json` |
+| `file_hashes` | Per-file hashes that `audit` uses to detect changed files |
+| `installed_at`, `layout` | Install time, and whether a local install is a single file or a directory |
+| `audit_accepted` | Audit findings you accepted with `--force`, kept when an entry is rewritten |
+| `target_overrides` | Targets set from the dashboard for skills inside a tracked repo, so the repo's `SKILL.md` stays untouched |
 
 ---
 
@@ -141,9 +188,9 @@ Each entry records the skill name and its install source. Tracked repos (prefixe
 
 ```
 skills/
+├── .metadata.json                # Centralized skill metadata (auto-managed)
 ├── skill-name/                   # Skill directory
 │   ├── SKILL.md                  # Required: skill definition
-│   ├── .skillshare-meta.json     # Optional: install metadata
 │   ├── examples/                 # Optional: example files
 │   └── templates/                # Optional: code templates
 ├── frontend/                     # Category folder (via --into or manual)
@@ -175,38 +222,105 @@ Instructions for the AI...
 
 See [Skill Format](/docs/understand/skill-format) for details.
 
-### .skillignore (Optional, repo-level)
+### .skillignore (Optional) {#skillignore-optional}
 
-A file in the **root of a skill repository** that excludes skills from discovery during `skillshare install`:
+Excludes skills from discovery. Supports two locations:
 
-```text
-# Hide internal tooling from discovery
+**Repo-level** — at the root of a tracked skill repository. Affects install discovery and all post-install commands (`doctor`, `status`, `list`, `sync`, etc.):
+
+```text title="_team-skills/.skillignore"
+# Hide vendored packages from discovery
+.venv
+node_modules
+
+# Exclude internal tooling
 validation-scripts
-scaffold-template
 prompt-eval-*
-
-# Exclude an entire group directory
-internal-tools
 ```
 
-One pattern per line. Patterns match against skill paths — a group name like `internal-tools` excludes all skills under that directory, while `internal-tools/helper` excludes only a specific skill. Also supports trailing wildcard (`prefix-*`). Lines starting with `#` are comments. Only applies to discovery — already-installed skills are not affected.
+**Source-root** — at your source directory root (`~/.config/skillshare/skills/.skillignore`). Applies globally to all skills (tracked and non-tracked):
 
-### .skillshare-meta.json (Auto-generated)
+```text title="~/.config/skillshare/skills/.skillignore"
+# Temporarily mute a skill
+my-experimental-skill
 
-Metadata about where the skill was installed from:
-
-```json
-{
-  "source": "github.com/org/repo/path/to/skill",
-  "type": "github",
-  "installed_at": "2026-01-20T15:30:00Z",
-  "repo_url": "https://github.com/org/repo.git",
-  "subdir": "path/to/skill",
-  "version": "abc1234"
-}
+# Exclude all drafts
+draft-*
 ```
 
-**Don't edit this file manually.** It's used by `skillshare update` and `skillshare check`.
+Uses [gitignore syntax](https://git-scm.com/docs/gitignore) — one pattern per line. Supports `*` (single segment), `**` (any depth), `?`, `[abc]` (character class), `!pattern` (negation), `/pattern` (anchored), `pattern/` (directory-only), and `\#`/`\!` (escaped literals). Lines starting with `#` are comments. A group name like `internal-tools` excludes all skills under that directory; `internal-tools/helper` excludes only a specific skill. Both layers apply — if either matches, the skill is excluded.
+
+:::tip
+`.skillignore` is one of three filtering layers. See [Filtering Skills](/docs/how-to/daily-tasks/filtering-skills) for all scenarios including per-target filters and SKILL.md `targets`.
+:::
+
+### .skillignore.local (Optional) {#skillignorelocal-optional}
+
+A local-only override file that works alongside `.skillignore`. Place it in the same directory as a `.skillignore` (source root or tracked repo root). Patterns from `.skillignore.local` are appended after `.skillignore`, so negation patterns (`!pattern`) can override the base file:
+
+```text title="_team-skills/.skillignore.local"
+# The repo's .skillignore blocks private-*, but I need my own
+!private-mine
+```
+
+This file should **not** be committed to version control — add it to `.gitignore`. It exists so that a repo consumer can locally override the repo maintainer's `.skillignore` without modifying it.
+
+When active, `sync -v`, `status`, and `doctor` display a `.local active` indicator.
+
+
+---
+
+## Agent Files
+
+Agents are a separate resource kind from skills. They live in a sibling source directory and are synced to agent-capable targets (Claude, Cursor, Augment, OpenCode).
+
+### Agent source directory
+
+```
+~/.config/skillshare/agents/      # Global mode
+.skillshare/agents/               # Project mode
+```
+
+The agents source is created automatically by `skillshare init` alongside `skills/`. You can override the global location with the `agents_source` config field; project mode always uses `.skillshare/agents/`.
+
+### Agent file format
+
+Each agent is a single Markdown file with frontmatter:
+
+```markdown title="~/.config/skillshare/agents/reviewer.md"
+---
+name: reviewer
+description: Reviews pull requests for security and style issues.
+---
+
+# Reviewer
+
+Instructions for the AI agent...
+```
+
+Agent filenames must use only `a-z`, `0-9`, `_`, `-`, `.`. Unlike skills, agents are **single files** — they do not contain subdirectories.
+
+See [Agents](/docs/understand/agents) for the full file format and discovery rules.
+
+### .agentignore (Optional)
+
+Excludes agents from sync. Lives at the agents source root:
+
+```text title="~/.config/skillshare/agents/.agentignore"
+# Hide drafts
+draft-*
+
+# Disable a specific agent
+experimental-reviewer
+```
+
+Uses [gitignore syntax](https://git-scm.com/docs/gitignore). The same pattern rules as `.skillignore` apply (`*`, `**`, `!negation`, `#` comments, etc.). Disabled agents remain in the source directory but are excluded from sync.
+
+`skillshare disable <agent>` and `skillshare enable <agent>` add/remove entries automatically.
+
+### .agentignore.local (Optional)
+
+A local-only override file (same pattern as `.skillignore.local`). Place it next to `.agentignore`. Patterns are appended after `.agentignore`, so `!negation` patterns can re-enable agents the base file disables. Should not be committed to version control.
 
 ---
 
@@ -313,6 +427,18 @@ Entire directory is symlinked:
 ~/.claude/skills -> ~/.config/skillshare/skills/
 ```
 
+### Copies in place of file links (Windows)
+
+On Windows without Developer Mode, agent targets and directory extras in `merge` mode get copies instead of file links. The target directory then has a `.skillshare-manifest.json` that records a checksum for each copy, so later syncs can update or prune them and leave your own files alone:
+```
+~/.claude/agents/
+├── reviewer.md                # Copy of the source agent
+├── local-agent.md             # User-created, preserved
+└── .skillshare-manifest.json  # Tracks copied agents + checksums
+```
+
+A single-file extra (such as a shared `AGENTS.md`) records its copy in skillshare's [extras backup folder](../commands/extras.md#single-file-extras) instead of the target directory.
+
 ---
 
 ## Tracked Repositories
@@ -360,11 +486,13 @@ See [Environment Variables](./environment-variables.md#xdg_config_home) for deta
 | Item | Path |
 |------|------|
 | Config | `~/.config/skillshare/config.yaml` |
-| Registry | `~/.config/skillshare/registry.yaml` |
-| Source | `~/.config/skillshare/skills/` |
+| Metadata | `~/.config/skillshare/skills/.metadata.json` |
+| Skills source | `~/.config/skillshare/skills/` |
+| Agents source | `~/.config/skillshare/agents/` |
 | Backups | `~/.local/share/skillshare/backups/` |
 | Trash | `~/.local/share/skillshare/trash/` |
 | Logs | `~/.local/state/skillshare/logs/` |
+| Project registrations and locks | `~/.local/state/skillshare/projects/` |
 | Version cache | `~/.cache/skillshare/version-check.json` |
 | UI cache | `~/.cache/skillshare/ui/{version}/` |
 | Link type | Symlinks |
@@ -374,14 +502,16 @@ See [Environment Variables](./environment-variables.md#xdg_config_home) for deta
 | Item | Path |
 |------|------|
 | Config | `%AppData%\skillshare\config.yaml` |
-| Registry | `%AppData%\skillshare\registry.yaml` |
-| Source | `%AppData%\skillshare\skills\` |
+| Metadata | `%AppData%\skillshare\skills\.metadata.json` |
+| Skills source | `%AppData%\skillshare\skills\` |
+| Agents source | `%AppData%\skillshare\agents\` |
 | Backups | `%AppData%\skillshare\backups\` |
 | Trash | `%AppData%\skillshare\trash\` |
 | Logs | `%AppData%\skillshare\logs\` |
+| Project registrations and locks | `%LOCALAPPDATA%\skillshare\state\projects\` |
 | Version cache | `%AppData%\skillshare\version-check.json` |
 | UI cache | `%AppData%\skillshare\ui\{version}\` |
-| Link type | NTFS Junctions |
+| Link type | NTFS Junctions for folders; symlinks for single files (need Developer Mode, otherwise copied) |
 
 ## XDG Base Directory Layout
 
@@ -389,9 +519,9 @@ skillshare follows the [XDG Base Directory Specification](https://specifications
 
 | XDG Variable | Default Path | skillshare Uses For |
 |-------------|-------------|---------------------|
-| `XDG_CONFIG_HOME` | `~/.config` | `skillshare/config.yaml`, `skillshare/registry.yaml`, `skillshare/skills/` |
+| `XDG_CONFIG_HOME` | `~/.config` | `skillshare/config.yaml`, `skillshare/skills/` (includes `.metadata.json`), `skillshare/agents/` |
 | `XDG_DATA_HOME` | `~/.local/share` | `skillshare/backups/`, `skillshare/trash/` |
-| `XDG_STATE_HOME` | `~/.local/state` | `skillshare/logs/` |
+| `XDG_STATE_HOME` | `~/.local/state` | `skillshare/logs/`, `skillshare/projects/` |
 | `XDG_CACHE_HOME` | `~/.cache` | `skillshare/ui/` (downloaded web dashboard) |
 
 ### Windows Paths
@@ -401,6 +531,7 @@ skillshare follows the [XDG Base Directory Specification](https://specifications
 | Config + Skills | `%AppData%\skillshare\` |
 | Data (backups, trash) | `%AppData%\skillshare\` |
 | State (logs) | `%AppData%\skillshare\` |
+| Project registrations and locks | `%LOCALAPPDATA%\skillshare\state\projects\` |
 | Cache (UI) | `%AppData%\skillshare\` |
 
 ### Migration Note
@@ -413,4 +544,5 @@ If upgrading from a version before the XDG split, skillshare automatically migra
 
 - [Configuration](/docs/reference/targets/configuration) — Config file details
 - [Skill Format](/docs/understand/skill-format) — SKILL.md format
+- [Agents](/docs/understand/agents) — Agent file format and discovery
 - [Tracked Repositories](/docs/understand/tracked-repositories) — Tracked repos

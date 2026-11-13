@@ -8,19 +8,32 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"skillshare/internal/config"
+	"skillshare/internal/utils"
 )
 
 // ExtraResult holds the result of an extras sync operation.
 type ExtraResult struct {
-	Synced  int      // Files synced (new + already correct)
-	Skipped int      // Files skipped (local conflict, no --force)
-	Pruned  int      // Orphan files removed
-	Errors  []string // Non-fatal error messages
+	Preserved    int           // Skipped files whose identical local content was kept
+	Synced       int           // Files synced (new + already correct)
+	Skipped      int           // Files skipped (local conflict, no --force)
+	Pruned       int           // Orphan files removed
+	Errors       []string      // Non-fatal error messages
+	Warnings     []string      // Non-fatal warnings (e.g. flatten collisions)
+	FileWarnings []FileWarning // Structured single-file warnings for API consumers
 }
 
+// reservedMetadataFile is skillshare's per-directory install-tracking store
+// (mirrors install.MetadataFileName, duplicated here to avoid an import cycle).
+// It is internal bookkeeping, not user content, so it must never be synced or
+// transformed into a target directory.
+const reservedMetadataFile = ".metadata.json"
+
 // DiscoverExtraFiles recursively walks sourcePath and returns relative paths
-// of all regular files. Directories named ".git" are skipped. Results are
-// sorted for deterministic output.
+// of all regular files. Directories named ".git" and skillshare's reserved
+// .metadata.json bookkeeping file are skipped. Results are sorted for
+// deterministic output.
 func DiscoverExtraFiles(sourcePath string) ([]string, error) {
 	info, err := os.Stat(sourcePath)
 	if err != nil {
@@ -44,6 +57,9 @@ func DiscoverExtraFiles(sourcePath string) ([]string, error) {
 			}
 			return nil
 		}
+		if fi.Name() == reservedMetadataFile {
+			return nil // skillshare's internal tracking store, never sync it
+		}
 		rel, relErr := filepath.Rel(sourcePath, path)
 		if relErr != nil {
 			return nil
@@ -59,32 +75,176 @@ func DiscoverExtraFiles(sourcePath string) ([]string, error) {
 	return files, nil
 }
 
-// SyncExtra synchronises extra files from sourcePath into targetPath.
+// ExtraSyncOptions holds the run flags of one extras sync or collect.
+type ExtraSyncOptions struct {
+	DryRun bool
+	Force  bool
+	// ProjectRoot decides relative links; empty in global mode.
+	ProjectRoot string
+}
+
+// syncExtraDir synchronises the files of a directory extra from sourcePath
+// into targetPath, the resolved path of target.
 //
 // Supported modes:
 //   - "merge" (default): per-file symlink from target to source
 //   - "copy":            per-file copy
 //   - "symlink":         entire directory symlink
 //
-// When dryRun is true the function counts what would happen but makes no
+// When spec is non-nil, the sync is routed through syncExtraTransform
+// (transform/extension mode). Only the source files that pass target's include
+// and exclude (see FilterExtraFiles) are synced; files filtered out count as
+// absent, so merge prunes their links like links to deleted source files.
+// When opts.DryRun is true the function counts what would happen but makes no
 // filesystem changes.
-func SyncExtra(sourcePath, targetPath, mode string, dryRun, force bool) (*ExtraResult, error) {
+func syncExtraDir(sourcePath, targetPath, mode string, target config.ExtraTargetConfig, spec *ExtensionSpec, opts ExtraSyncOptions) (*ExtraResult, error) {
+	if spec != nil {
+		// Transform extensions emit generated files into the target, so only
+		// copy semantics apply. Reject merge/symlink here so the API and the
+		// CLI (validateExtensionMode) enforce the same contract.
+		if mode != "" && mode != "copy" {
+			return nil, fmt.Errorf("extension %q requires copy mode, got %q", spec.Name, mode)
+		}
+		return syncExtraTransform(sourcePath, targetPath, target, spec, opts.DryRun, opts.Force)
+	}
 	if mode == "" {
 		mode = "merge"
+	}
+	if target.Flatten && mode == "symlink" {
+		return nil, fmt.Errorf("flatten cannot be used with symlink mode")
+	}
+	if mode == "symlink" && (len(target.Include) > 0 || len(target.Exclude) > 0) {
+		return nil, fmt.Errorf("include and exclude cannot be used with symlink mode")
 	}
 
 	switch mode {
 	case "symlink":
-		return syncExtraSymlinkMode(sourcePath, targetPath, dryRun, force)
+		return syncExtraSymlinkMode(sourcePath, targetPath, opts.DryRun, opts.Force, opts.ProjectRoot)
 	case "merge", "copy":
-		return syncExtraPerFile(sourcePath, targetPath, mode, dryRun, force)
+		return syncExtraPerFile(sourcePath, targetPath, mode, target, opts.DryRun, opts.Force, opts.ProjectRoot)
 	default:
 		return nil, fmt.Errorf("unsupported extras sync mode: %q", mode)
 	}
 }
 
+// syncExtraTransform applies an extension to every source file and writes the
+// transformed output into targetPath using copy semantics. Output files are
+// renamed per spec.OutputExt. It does not prune output-looking orphans because
+// copy targets do not carry ownership metadata.
+func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTargetConfig, spec *ExtensionSpec, dryRun, force bool) (*ExtraResult, error) {
+	result := &ExtraResult{}
+
+	files, warnings, err := DiscoverExtraTargetFiles(sourcePath, "", target)
+	if err != nil {
+		return nil, err
+	}
+	result.Warnings = warnings
+	absSrc, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve source path: %w", err)
+	}
+
+	seen := make(map[string]string) // flatten: basename → original rel
+	for _, rel := range files {
+		srcFile := filepath.Join(absSrc, rel)
+		tgtRel := rel
+		if target.Flatten {
+			base := filepath.Base(rel)
+			if prev, ok := seen[base]; ok {
+				result.Skipped++
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("flatten conflict: %s skipped (%s already synced from %s)", rel, base, prev))
+				continue
+			}
+			seen[base] = rel
+			tgtRel = base
+		}
+		tgtRel = ApplyOutputExt(tgtRel, spec.OutputExt)
+		tgtFile := filepath.Join(targetPath, tgtRel)
+
+		// Dry-run reports the outcome without spawning the extension and without
+		// touching the filesystem. The transformed output can only be produced by
+		// a subprocess, and a preview must never execute arbitrary extension code,
+		// so content can't be compared here. An existing real file or directory is
+		// therefore conservatively reported as a conflict requiring --force —
+		// matching the non-dry-run skip path below — while a missing target, a
+		// leftover symlink, or --force would be (re)written and counts as synced.
+		if dryRun {
+			if info, lstatErr := os.Lstat(tgtFile); lstatErr == nil &&
+				!utils.IsLinkMode(tgtFile, info.Mode()) && !force {
+				result.Skipped++
+			} else {
+				result.Synced++
+			}
+			continue
+		}
+
+		env := map[string]string{
+			"SS_SRC_PATH":   srcFile,
+			"SS_REL_PATH":   rel,
+			"SS_TARGET_DIR": targetPath,
+			"SS_MODE":       "sync",
+		}
+
+		out, runErr := runExtension(spec, srcFile, env)
+		if runErr != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", rel, runErr))
+			continue
+		}
+
+		// Conflict/force contract, mirroring syncOneExtraFile copy semantics:
+		// only leftover symlinks auto-replace; real files and directories are
+		// never destroyed without --force.
+		if info, lstatErr := os.Lstat(tgtFile); lstatErr == nil {
+			switch {
+			case utils.IsLinkMode(tgtFile, info.Mode()):
+				// Leftover symlink from a different mode: safe to replace.
+				// os.Remove drops the link itself without following it.
+				if rmErr := os.Remove(tgtFile); rmErr != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("%s: failed to remove conflicting symlink: %v", rel, rmErr))
+					continue
+				}
+			case info.IsDir():
+				// A real directory is never silently destroyed; require --force,
+				// then replace it wholesale with the generated file.
+				if !force {
+					result.Skipped++
+					continue
+				}
+				if rmErr := os.RemoveAll(tgtFile); rmErr != nil {
+					result.Errors = append(result.Errors, fmt.Sprintf("%s: failed to remove conflicting directory: %v", rel, rmErr))
+					continue
+				}
+			default:
+				// Regular file: idempotent if identical, otherwise needs --force.
+				if existing, readErr := os.ReadFile(tgtFile); readErr == nil && bytes.Equal(existing, out) {
+					result.Synced++
+					continue
+				}
+				if !force {
+					result.Skipped++
+					continue
+				}
+				// With --force, WriteFile overwrites the file in place below.
+			}
+		}
+
+		if mkErr := os.MkdirAll(filepath.Dir(tgtFile), 0755); mkErr != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: create target dir: %v", rel, mkErr))
+			continue
+		}
+		if wErr := os.WriteFile(tgtFile, out, 0644); wErr != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: write target: %v", rel, wErr))
+			continue
+		}
+		result.Synced++
+	}
+
+	return result, nil
+}
+
 // syncExtraSymlinkMode symlinks the entire source directory to the target path.
-func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool) (*ExtraResult, error) {
+func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool, projectRoot string) (*ExtraResult, error) {
 	result := &ExtraResult{}
 
 	absSrc, err := filepath.Abs(sourcePath)
@@ -96,12 +256,25 @@ func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool) (*E
 	info, lstatErr := os.Lstat(targetPath)
 	if lstatErr == nil {
 		// Something exists at targetPath
-		if info.Mode()&os.ModeSymlink != 0 {
+		if utils.IsLinkMode(targetPath, info.Mode()) {
 			// Already a symlink — check if correct
 			dest, readErr := os.Readlink(targetPath)
 			if readErr == nil {
-				absDest, _ := filepath.Abs(dest)
+				absDest := resolveReadlink(dest, targetPath)
 				if absDest == absSrc {
+					relative := shouldUseRelative(projectRoot, absSrc, targetPath)
+					if !linkNeedsReformat(dest, relative) {
+						result.Synced = 1
+						return result, nil
+					}
+					// Correct target but wrong format (abs↔rel) — recreate
+					if dryRun {
+						result.Synced = 1
+						return result, nil
+					}
+					if err := reformatLink(targetPath, absSrc, relative); err != nil {
+						return nil, fmt.Errorf("failed to reformat directory symlink: %w", err)
+					}
 					result.Synced = 1
 					return result, nil
 				}
@@ -112,7 +285,9 @@ func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool) (*E
 				return result, nil
 			}
 			if !dryRun {
-				os.Remove(targetPath)
+				if err := os.Remove(targetPath); err != nil {
+					return nil, fmt.Errorf("failed to remove wrong symlink: %w", err)
+				}
 			}
 		} else {
 			// Real file/dir
@@ -134,7 +309,8 @@ func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool) (*E
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
 		return nil, fmt.Errorf("failed to create parent directory: %w", err)
 	}
-	if err := os.Symlink(absSrc, targetPath); err != nil {
+	relative := shouldUseRelative(projectRoot, absSrc, targetPath)
+	if err := createLink(targetPath, absSrc, relative); err != nil {
 		return nil, fmt.Errorf("failed to create directory symlink: %w", err)
 	}
 	result.Synced = 1
@@ -142,48 +318,107 @@ func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool) (*E
 }
 
 // syncExtraPerFile handles merge (symlink) and copy modes on a per-file basis.
-func syncExtraPerFile(sourcePath, targetPath, mode string, dryRun, force bool) (*ExtraResult, error) {
+// Merge copies instead when file links are unavailable; those copies are
+// tracked so later syncs keep them updated and pruned like links.
+func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTargetConfig, dryRun, force bool, projectRoot string) (*ExtraResult, error) {
 	result := &ExtraResult{}
 
-	files, err := DiscoverExtraFiles(sourcePath)
+	var copies *copyTracker
+	if mode == "merge" {
+		copies = loadCopyTracker(targetPath)
+		if !canCreateFileLink() {
+			mode = "copy"
+			result.Warnings = append(result.Warnings, FileLinkFallbackWarning)
+		}
+	}
+
+	files, warnings, err := DiscoverExtraTargetFiles(sourcePath, "", target)
 	if err != nil {
 		return nil, err
 	}
+	result.Warnings = append(result.Warnings, warnings...)
 
 	absSrc, err := filepath.Abs(sourcePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve source path: %w", err)
 	}
 
+	seen := make(map[string]string) // basename → original rel path (flatten only)
+
+	// Compute once for entire batch — all files share the same source/target root.
+	relative := shouldUseRelative(projectRoot, sourcePath, targetPath)
+
 	for _, rel := range files {
 		srcFile := filepath.Join(absSrc, rel)
-		tgtFile := filepath.Join(targetPath, rel)
+		tgtRel := rel
+		if target.Flatten {
+			base := filepath.Base(rel)
+			if prev, exists := seen[base]; exists {
+				result.Skipped++
+				result.Warnings = append(result.Warnings,
+					fmt.Sprintf("flatten conflict: %s skipped (%s already synced from %s)", rel, base, prev))
+				continue
+			}
+			seen[base] = rel
+			tgtRel = base
+		}
+		tgtFile := filepath.Join(targetPath, tgtRel)
 
-		synced, skipped, syncErr := syncOneExtraFile(srcFile, tgtFile, mode, dryRun, force)
+		synced, skipped, syncErr := syncOneExtraFile(srcFile, tgtFile, mode, dryRun, force, relative, copies, tgtRel)
 		if syncErr != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", rel, syncErr))
 			continue
 		}
 		result.Synced += synced
 		result.Skipped += skipped
+		if skipped > 0 {
+			if info, err := os.Lstat(tgtFile); err == nil && info.Mode().IsRegular() && contentEqual(srcFile, tgtFile) {
+				result.Preserved += skipped
+			}
+		}
 	}
 
-	// Prune orphans (only when not dry-run)
+	// Prune merge-mode symlink orphans (only when not dry-run). Copy targets do
+	// not carry ownership metadata, so sync must not delete local files that are
+	// absent from the current source set.
 	if !dryRun {
 		sourceSet := make(map[string]bool, len(files))
-		for _, f := range files {
-			sourceSet[f] = true
+		if target.Flatten {
+			for base := range seen {
+				sourceSet[base] = true
+			}
+		} else {
+			for _, f := range files {
+				sourceSet[f] = true
+			}
 		}
-		pruned, pruneErrors := pruneExtraOrphans(targetPath, sourceSet, mode)
-		result.Pruned = pruned
-		result.Errors = append(result.Errors, pruneErrors...)
+		if mode == "merge" {
+			pruned, pruneErrors := pruneExtraOrphans(targetPath, sourcePath, sourceSet, mode)
+			result.Pruned = pruned
+			result.Errors = append(result.Errors, pruneErrors...)
+		}
+		if copies != nil {
+			removed, err := copies.pruneOrphans(sourceSet, false)
+			if err != nil {
+				result.Errors = append(result.Errors, err.Error())
+			}
+			for _, rel := range removed {
+				cleanEmptyParents(filepath.Dir(filepath.Join(targetPath, rel)), targetPath)
+				result.Pruned++
+			}
+			if err := copies.save(); err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("failed to update manifest: %v", err))
+			}
+		}
 	}
 
 	return result, nil
 }
 
 // syncOneExtraFile syncs a single file. Returns (synced, skipped, error).
-func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force bool) (int, int, error) {
+// copies, when set, tracks copies made in place of merge-mode links under
+// the target-relative name tgtRel.
+func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force, relative bool, copies *copyTracker, tgtRel string) (int, int, error) {
 	// Ensure parent directory exists
 	if !dryRun {
 		if err := os.MkdirAll(filepath.Dir(tgtFile), 0755); err != nil {
@@ -194,37 +429,44 @@ func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force bool) (int, i
 	// Check if target already exists
 	info, lstatErr := os.Lstat(tgtFile)
 	if lstatErr == nil {
-		// Target exists
-		if mode == "merge" && info.Mode()&os.ModeSymlink != 0 {
-			// It's a symlink — check if it points to our source
+		isSymlink := utils.IsSymlinkOrJunction(tgtFile)
+
+		// Already correct? → skip (idempotent)
+		if mode == "merge" && isSymlink && fileLinkUsable(tgtFile) {
 			dest, readErr := os.Readlink(tgtFile)
 			if readErr == nil {
-				absDest, _ := filepath.Abs(dest)
+				absDest := resolveReadlink(dest, tgtFile)
 				if absDest == srcFile {
-					// Already correct symlink
+					if !linkNeedsReformat(dest, relative) {
+						return 1, 0, nil
+					}
+					// Correct target but wrong format — recreate
+					if !dryRun {
+						if err := reformatLink(tgtFile, srcFile, relative); err != nil {
+							return 0, 0, fmt.Errorf("failed to reformat symlink: %w", err)
+						}
+					}
 					return 1, 0, nil
 				}
 			}
-			// Wrong symlink — treat as conflict
 		}
-
-		if mode == "copy" && info.Mode()&os.ModeSymlink == 0 && !info.IsDir() {
-			// Regular file — check if content matches source (idempotent)
+		if mode == "copy" && !isSymlink && !info.IsDir() {
 			srcInfo, srcErr := os.Stat(srcFile)
-			if srcErr == nil && srcInfo.Size() == info.Size() {
-				if contentEqual(srcFile, tgtFile) {
-					return 1, 0, nil
+			if srcErr == nil && srcInfo.Size() == info.Size() && contentEqual(srcFile, tgtFile) {
+				if copies != nil && !copies.owns(tgtRel) {
+					return 0, 1, nil
 				}
+				return 1, 0, nil
 			}
-			// Content differs — treat as conflict
 		}
 
-		// Conflict: target exists and is not our symlink / matching copy
-		if !force {
+		// Symlinks left over from a different mode are safe to replace, and so
+		// are unedited copies made in place of merge-mode links.
+		autoReplace := isSymlink || (copies != nil && !info.IsDir() && copies.owns(tgtRel))
+		if !autoReplace && !force {
 			return 0, 1, nil
 		}
 
-		// Force: remove and replace
 		if !dryRun {
 			if err := os.Remove(tgtFile); err != nil {
 				return 0, 0, fmt.Errorf("failed to remove conflicting file: %w", err)
@@ -238,12 +480,18 @@ func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force bool) (int, i
 
 	switch mode {
 	case "merge":
-		if err := os.Symlink(srcFile, tgtFile); err != nil {
+		if err := createLink(tgtFile, srcFile, relative); err != nil {
 			return 0, 0, fmt.Errorf("failed to create symlink: %w", err)
+		}
+		if copies != nil {
+			copies.forget(tgtRel)
 		}
 	case "copy":
 		if err := copyFile(srcFile, tgtFile); err != nil {
 			return 0, 0, fmt.Errorf("failed to copy file: %w", err)
+		}
+		if copies != nil {
+			copies.record(tgtRel)
 		}
 	}
 
@@ -251,10 +499,10 @@ func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force bool) (int, i
 }
 
 // pruneExtraOrphans walks the target directory and removes files that have no
-// corresponding source. In merge mode only symlinks are pruned; user-created
-// local files are preserved. Empty parent directories are cleaned up.
-// Hidden files (names starting with ".") are skipped.
-func pruneExtraOrphans(targetPath string, sourceFiles map[string]bool, mode string) (pruned int, errors []string) {
+// corresponding source. In merge mode only symlinks into sourcePath are pruned;
+// user-created local files and links elsewhere are preserved. Empty parent
+// directories are cleaned up. Hidden files (names starting with ".") are skipped.
+func pruneExtraOrphans(targetPath, sourcePath string, sourceFiles map[string]bool, mode string) (pruned int, errors []string) {
 	// Collect paths to prune (walk first, delete after to avoid mutation during walk)
 	var toRemove []string
 
@@ -264,6 +512,12 @@ func pruneExtraOrphans(targetPath string, sourceFiles map[string]bool, mode stri
 		}
 		if info.IsDir() {
 			if info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			// A directory occupying a claimed output path is a skipped conflict
+			// (the source wanted a file there but we refused to clobber it).
+			// Leave its contents entirely untouched — never prune inside it.
+			if rel, relErr := filepath.Rel(targetPath, path); relErr == nil && sourceFiles[rel] {
 				return filepath.SkipDir
 			}
 			return nil
@@ -287,7 +541,7 @@ func pruneExtraOrphans(targetPath string, sourceFiles map[string]bool, mode stri
 		// Source doesn't exist — candidate for pruning
 		if mode == "merge" {
 			// In merge mode, only prune symlinks (don't delete user's local files)
-			if info.Mode()&os.ModeSymlink == 0 {
+			if !utils.IsLinkMode(path, info.Mode()) || !prunableLink(path, sourcePath) {
 				return nil
 			}
 		}
@@ -308,6 +562,160 @@ func pruneExtraOrphans(targetPath string, sourceFiles map[string]bool, mode stri
 	}
 
 	return pruned, errors
+}
+
+// PruneExtraTarget removes all skillshare-managed files from a single extra
+// target directory. It is used when a target is removed from an extra: in
+// merge mode only symlinks into sourcePath are deleted (the user's own files
+// and links are preserved); in copy mode callers should prefer
+// PruneExtraTargetFiles with a managed file set. Empty parent directories are
+// cleaned up. An empty mode is treated as "merge".
+func PruneExtraTarget(targetPath, sourcePath, mode string) (pruned int, errors []string) {
+	if mode == "" {
+		mode = "merge"
+	}
+	// An empty source set means "nothing should remain" — every managed file
+	// under the target is an orphan and gets pruned.
+	return pruneExtraOrphans(targetPath, sourcePath, map[string]bool{}, mode)
+}
+
+// PruneExtraTargetFiles removes the files known to be managed in a removed
+// target. Copy targets use the managed file set so local files in the same
+// directory survive. Merge targets keep the existing symlink-only pruning
+// behavior. Symlink targets remove only the target symlink itself.
+func PruneExtraTargetFiles(targetPath, sourcePath, mode string, managedFiles map[string]bool) (pruned int, errors []string) {
+	if mode == "" {
+		mode = "merge"
+	}
+
+	switch mode {
+	case "merge":
+		return PruneExtraTarget(targetPath, sourcePath, mode)
+	case "copy":
+		return pruneExtraManagedFiles(targetPath, managedFiles)
+	case "symlink":
+		return pruneExtraSymlinkTarget(targetPath)
+	default:
+		return 0, []string{fmt.Sprintf("unsupported extras sync mode: %q", mode)}
+	}
+}
+
+// ClearExtraTarget removes what skillshare put at one target: a single-file
+// target goes back to how it was, links into sourceDir go in merge mode, the
+// managedFiles go in copy mode, and in symlink mode the target goes only when
+// it is a link to sourceDir. kept reports a symlink-mode target left in place
+// because it is something else.
+func ClearExtraTarget(file, sourceDir, targetPath, as, mode string, managedFiles map[string]bool) (pruned int, kept bool, errors []string) {
+	if file != "" {
+		changed, err := RestoreExtraTarget(NewExtraFile(sourceDir, file, targetPath, as, mode))
+		if err != nil {
+			return 0, false, []string{err.Error()}
+		}
+		if changed {
+			return 1, false, nil
+		}
+		return 0, false, nil
+	}
+	if mode == "symlink" && !LinksTo(targetPath, sourceDir) {
+		// Only a missing target is safe to forget; any other error must stop
+		// the caller before it drops the target from the config.
+		if _, err := os.Lstat(targetPath); err == nil {
+			return 0, true, nil
+		} else if !os.IsNotExist(err) {
+			return 0, false, []string{err.Error()}
+		}
+		return 0, false, nil
+	}
+	pruned, errors = PruneExtraTargetFiles(targetPath, sourceDir, mode, managedFiles)
+	return pruned, false, errors
+}
+
+// LinksTo reports whether link is a symlink to dir, comparing the link text
+// too, so a link whose folder has since moved or been deleted still counts.
+func LinksTo(link, dir string) bool {
+	// ResolveLinkTarget also resolves a real directory, so check the link itself
+	// first; it handles Windows junctions, which Readlink can't read.
+	if !utils.IsSymlinkOrJunction(link) {
+		return false
+	}
+	dest, err := utils.ResolveLinkTarget(link)
+	if err != nil {
+		return false
+	}
+	if abs, absErr := filepath.Abs(dir); absErr == nil && utils.PathsEqual(dest, filepath.Clean(abs)) {
+		return true
+	}
+	real, err := filepath.EvalSymlinks(link)
+	src, srcErr := filepath.EvalSymlinks(dir)
+	return err == nil && srcErr == nil && utils.PathsEqual(real, src)
+}
+
+func pruneExtraManagedFiles(targetPath string, managedFiles map[string]bool) (pruned int, errors []string) {
+	if len(managedFiles) == 0 {
+		return 0, nil
+	}
+	if _, err := os.Lstat(targetPath); err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, []string{fmt.Sprintf("prune %s: %v", targetPath, err)}
+	}
+
+	var toRemove []string
+	_ = filepath.Walk(targetPath, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			errors = append(errors, fmt.Sprintf("prune %s: %v", path, walkErr))
+			return nil
+		}
+		if info.IsDir() {
+			if info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			if rel, relErr := filepath.Rel(targetPath, path); relErr == nil && managedFiles[rel] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(info.Name(), ".") {
+			return nil
+		}
+		rel, relErr := filepath.Rel(targetPath, path)
+		if relErr != nil {
+			return nil
+		}
+		if managedFiles[rel] {
+			toRemove = append(toRemove, path)
+		}
+		return nil
+	})
+
+	for _, path := range toRemove {
+		if err := os.Remove(path); err != nil {
+			errors = append(errors, fmt.Sprintf("prune %s: %v", path, err))
+			continue
+		}
+		pruned++
+		cleanEmptyParents(filepath.Dir(path), targetPath)
+	}
+
+	return pruned, errors
+}
+
+func pruneExtraSymlinkTarget(targetPath string) (pruned int, errors []string) {
+	info, err := os.Lstat(targetPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, []string{fmt.Sprintf("prune %s: %v", targetPath, err)}
+	}
+	if !utils.IsLinkMode(targetPath, info.Mode()) {
+		return 0, []string{fmt.Sprintf("prune %s: target is not a symlink", targetPath)}
+	}
+	if err := os.Remove(targetPath); err != nil {
+		return 0, []string{fmt.Sprintf("prune %s: %v", targetPath, err)}
+	}
+	return 1, nil
 }
 
 // contentEqual returns true if two files have identical content.
@@ -341,6 +749,74 @@ func contentEqual(a, b string) bool {
 	}
 }
 
+// EffectiveMode returns the mode to use for sync, defaulting to "merge".
+func EffectiveMode(mode string) string {
+	if mode == "" {
+		return "merge"
+	}
+	return mode
+}
+
+// FlattenRel returns the target-relative path for a source file under flatten mode.
+// When flatten is true, it uses only the basename and tracks seen basenames to skip
+// collisions (first-wins, matching sync behavior). Returns ("", false) for collisions.
+func FlattenRel(rel string, flatten bool, seen map[string]bool) (tgtRel string, ok bool) {
+	if !flatten {
+		return rel, true
+	}
+	base := filepath.Base(rel)
+	if seen[base] {
+		return "", false
+	}
+	seen[base] = true
+	return base, true
+}
+
+// CheckSyncStatus compares source files against the target directory and
+// returns a status string: "synced" or "drift". When outputExt is non-empty a
+// transform extension is in effect, so the expected target file carries the
+// transformed extension (e.g. foo.md → foo.toml) instead of the source name.
+func CheckSyncStatus(sourceFiles []string, sourceDir, targetDir, mode string, flatten bool, outputExt string) string {
+	if mode == "merge" && !canCreateFileLink() {
+		mode = "copy"
+	}
+	seen := make(map[string]bool)
+	for _, rel := range sourceFiles {
+		tgtRel, ok := FlattenRel(rel, flatten, seen)
+		if !ok {
+			continue
+		}
+		tgtRel = ApplyOutputExt(tgtRel, outputExt)
+		targetFile := filepath.Join(targetDir, tgtRel)
+		sourceFile := filepath.Join(sourceDir, rel)
+
+		tInfo, err := os.Lstat(targetFile)
+		if err != nil {
+			return "drift"
+		}
+
+		switch mode {
+		case "symlink", "merge":
+			if utils.IsSymlinkOrJunction(targetFile) {
+				link, readErr := os.Readlink(targetFile)
+				if readErr != nil || filepath.Clean(resolveReadlink(link, targetFile)) != filepath.Clean(sourceFile) || !fileLinkUsable(targetFile) {
+					return "drift"
+				}
+			} else {
+				return "drift"
+			}
+		case "copy":
+			if !tInfo.Mode().IsRegular() {
+				return "drift"
+			}
+			if outputExt == "" && !contentEqual(sourceFile, targetFile) {
+				return "drift"
+			}
+		}
+	}
+	return "synced"
+}
+
 // cleanEmptyParents removes empty directories from dir up to (but not
 // including) stopAt.
 func cleanEmptyParents(dir, stopAt string) {
@@ -352,4 +828,154 @@ func cleanEmptyParents(dir, stopAt string) {
 		os.Remove(dir)
 		dir = filepath.Dir(dir)
 	}
+}
+
+// ExtraCollectResult holds results from collecting extra files.
+type ExtraCollectResult struct {
+	Collected int
+	Skipped   int
+	Errors    []string
+}
+
+// CollectExtraFiles scans targetDir for non-symlink local files,
+// copies them to sourceDir, and replaces originals with symlinks.
+// In copy mode the target files are left in place, since copy-mode
+// targets hold real files rather than symlinks.
+// When force is true, files that already exist in source are overwritten
+// (identical content is still skipped).
+// When flatten is true, collected files are placed in the source root
+// (basename only) rather than preserving the target subdirectory structure.
+// Files that include and exclude leave out of the target are skipped.
+// targetDir is the resolved path of target.
+func CollectExtraFiles(sourceDir, targetDir string, target config.ExtraTargetConfig, opts ExtraSyncOptions) (*ExtraCollectResult, error) {
+	mode := target.Mode
+	result := &ExtraCollectResult{}
+	// Without file links the collected files stay in place, as copies.
+	if !canCreateFileLink() {
+		mode = "copy"
+	}
+
+	if _, err := os.Stat(targetDir); os.IsNotExist(err) {
+		return nil, fmt.Errorf("target directory does not exist: %s", targetDir)
+	}
+
+	// Ensure source directory exists
+	if !opts.DryRun {
+		if err := os.MkdirAll(sourceDir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create source directory: %w", err)
+		}
+	}
+
+	// Source paths claimed this run: with flatten, two target files can share
+	// a basename, and the second must not overwrite the first.
+	claimed := make(map[string]bool)
+	filter := newExtraFilter(target.Include, target.Exclude)
+
+	err := filepath.Walk(targetDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+
+		// Skip directories and .git
+		if info.IsDir() {
+			if info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// filepath.Walk follows symlinks, so check via Lstat to detect them
+		linfo, err := os.Lstat(path)
+		if err != nil {
+			return nil
+		}
+		if utils.IsLinkMode(path, linfo.Mode()) {
+			result.Skipped++
+			return nil
+		}
+		if info.Name() == ManifestFile {
+			return nil // skillshare's copy tracking, not user content
+		}
+
+		rel, err := filepath.Rel(targetDir, path)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("cannot compute relative path: %s", path))
+			return nil
+		}
+
+		destRel := rel
+		if target.Flatten {
+			destRel = filepath.Base(rel)
+		}
+		// A file the target's filters leave out would be pruned again by the
+		// next sync, so it stays where it is.
+		if !filter.keeps(destRel) {
+			result.Skipped++
+			return nil
+		}
+		destPath := filepath.Join(sourceDir, destRel)
+		if claimed[destPath] {
+			result.Errors = append(result.Errors, fmt.Sprintf("skipped %s: %s already collected from another file", rel, destRel))
+			return nil
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("read failed: %v", err))
+			return nil
+		}
+
+		// Skip if already exists in source, unless forcing a changed file
+		if _, err := os.Stat(destPath); err == nil {
+			existing, readErr := os.ReadFile(destPath)
+			if !opts.Force || (readErr == nil && bytes.Equal(existing, content)) {
+				result.Skipped++
+				return nil
+			}
+		}
+
+		claimed[destPath] = true
+		if opts.DryRun {
+			result.Collected++
+			return nil
+		}
+
+		// Create parent directory
+		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("mkdir failed: %v", err))
+			return nil
+		}
+
+		// Write to source dir
+		if err := os.WriteFile(destPath, content, info.Mode().Perm()); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("write failed: %v", err))
+			return nil
+		}
+
+		if mode == "copy" {
+			result.Collected++
+			return nil
+		}
+
+		// Remove original and create symlink
+		if err := os.Remove(path); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("remove original failed: %v", err))
+			return nil
+		}
+
+		relative := shouldUseRelative(opts.ProjectRoot, destPath, path)
+		if err := createLink(path, destPath, relative); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("symlink failed: %v", err))
+			return nil
+		}
+
+		result.Collected++
+		return nil
+	})
+
+	if err != nil {
+		return result, fmt.Errorf("walk error: %w", err)
+	}
+
+	return result, nil
 }

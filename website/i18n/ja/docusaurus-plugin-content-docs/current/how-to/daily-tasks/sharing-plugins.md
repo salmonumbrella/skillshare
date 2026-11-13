@@ -1,0 +1,125 @@
+---
+sidebar_position: 9
+---
+
+# ツール間でプラグインを管理する
+
+プラグインには、skills、MCP 接続、hooks、スクリプト、その他連携して動作するファイルを含めることが
+できます。skillshare はそのパッケージをそのまま維持し、どのツールがそれを受け取るかを選択させます。
+始めるのに YAML を書く必要はありません。
+
+## 最初のプラグインを追加する
+
+ダッシュボードで **Plugins → Add plugin** を開きます。
+
+1. GitHub リポジトリ（`owner/repo`）、HTTPS Git URL、またはローカルディレクトリを貼り付けます。
+2. Source に複数含まれている場合はプラグインを選択し、対応するツールを選びます。
+3. 変更内容をレビューして適用します。
+
+![Add plugin ダイアログ: 見つかった plugin と、対応・非対応の Target](/img/plugins-add-dialog.png)
+
+ほとんどのユーザーは、リポジトリと Target のチェックボックスだけで十分です。**Advanced options** では
+リリースを選ぶための Git ref を追加できます。Discovery は各 Target のコンポーネントと互換性を別々に
+表示します。OpenCode のエントリが検出できず非対応と表示された場合、その行の **Set entry path** を
+使うとビルド済みファイルを指定し、すでに選択した内容を保持したまま Source を再検索します。安全な
+相対リポジトリのシンボリックリンクは保持されます。
+
+同じガイド付きフローはターミナルからも利用できます。
+
+```bash
+skillshare plugin add
+```
+
+Claude Code、Codex、Copilot、Antigravity CLI、Grok、Pi、または OpenCode CLI は、**skillshare の
+バックエンドが動作している場所**にインストールされている必要があります。
+Codex の場合、Codex デスクトップ app に同梱の CLI も対象です。Codex が別の場所にあるマシンでは [`SKILLSHARE_CODEX_CLI`](/docs/reference/appendix/environment-variables#skillshare_codex_cli) を設定してください。
+Cursor と Antigravity
+デスクトップは代わりに、それぞれのローカルプラグインディレクトリに完全なファイルを受け取ります。
+コンテナ内で動作しているダッシュボードは、ホストマシンにのみインストールされているプラグインを
+管理できません。ローカルの CLI を使うか、ネイティブクライアントと並べて skillshare を実行してください。
+
+インストール Target は **Claude Code、Codex、Cursor、Antigravity Desktop、Antigravity CLI、
+GitHub Copilot CLI、Pi、OpenCode** です。Grok は Import 前にネイティブなインストールと信頼設定が
+必要です。Kimi、Hermes、Devin のフォーマットは検出可能ですが、自動インストールは利用できず、
+インターフェースがその理由を説明します。Target 向けに公開されているフォーマットを選んでください。
+skillshare はツール間でプラグインを変換しません。Project mode は Claude、Antigravity Desktop、
+Pi、OpenCode に対応しています。Antigravity Desktop（`antigravity` または `agy`）と CLI
+（`antigravity-cli`）は別々の store を使います。実行するほうを選んでください。
+
+## すでに何かインストール済みの場合
+
+**Import installed** を選び、ネイティブなインストールを選択します。Import はそれを記録するだけで、
+再インストールしたり、その認証をコピーしたり、その Agent 内で有効かどうかを変更したりすることは
+ありません。Import は Claude、Codex、Copilot、Antigravity CLI、Grok、Pi、OpenCode で利用できます。
+Cursor と Antigravity のローカルパッケージには **Add plugin** を使ってください。
+複数まとめてインポートするには、チェックを入れて（Agent の見出しでも可）**Import selected** を選びます。
+1 つずつ順にインポートされ、ダイアログは開いたままです。リソースフィルターのあるインストールは、確認を経て個別にインポートされます。
+
+```bash
+skillshare plugin import review@team --from claude --no-tui
+```
+
+論理的に1つのパッケージが、ツールごとに異なるネイティブな配布形式を使っている場合は、同じ `--name`
+と適切な Target を使ってそれぞれの配布形式を add/import してください。skillshare は表示名から
+同等性を推測することはありません。
+
+インポートはローカルのインストールを記録します。別のマシンでは native-only 宣言を sync がスキップし、ローカルでのインポートが必要と表示します。ネイティブクライアントでインストール後、同じ `--name` でローカル ID をインポートしてください。ダッシュボードのパッケージ選択と TUI の名前付き候補も利用できます。既存のソース宣言へのインポートは共有ソースと他のマシンのインストールを変えません。
+
+[Plugins](/docs/reference/commands/plugin#host-state)
+
+## Sync する場所を選ぶ
+
+管理対象の各バインディングにはチェックボックスがあります。このチェックボックスは**この Target を
+Sync に含める**ことを意味し、「その Agent 内で有効にする」ことを意味するものではありません。
+
+- チェックしてから Sync すると、不足しているプラグインがインストールされます。
+- プラグインの行を開くと、その Source がパッケージを持っている他の Agent がチェックなしで一覧表示
+  されます。1つにチェックを入れると、インストールのプレビューが開きます。Source が提供できない
+  Agent は行の末尾にまとめてカウントされ、その数をクリックすると理由が表示されます。
+- Agent を 1 つもチェックせずにプラグインを追加できます。Skillshare に残り **Agent 未選択** と表示され、行で Agent をチェックするまで何もインストールされません。
+- チェックを外してから Sync すると、その管理対象のインストールが削除されます。
+- パッケージの定義は残るため、後で再び Target を選択できます。
+- Claude または Codex 内で無効化されたプラグインは無効のままです。そのツール内のネイティブな設定で
+  管理してください。
+
+ダッシュボードでは、Plugins ページの右上にある **Sync** ボックスに、次の Sync で各 Agent に対して
+インストールまたは削除される内容が一覧表示されます。そのボタンはプレビューを開きます。確認するまで
+Agent 内は何も変わりません。プラグインの一覧はすぐに表示されますが、ボックス下の **Agents** 列は
+各 Agent の CLI が応答するたびに埋まっていきます。
+実行後、ボックスには結果が表示されます。失敗が先頭で、その後に他の変更が続き、同じ結果になった Agent は 1 行にまとめられます。変わらなかったものは 1 行の **Unchanged** にまとめられ、開くと plugin ごとに 1 行ずつ、Pi パッケージは別に表示されます。プレビューも同じように、行う変更の下に変わらないものをまとめます。一覧には、Pi がインストールしたパッケージから読み取った、すべての Pi パッケージのインストール済みバージョンが表示されます。
+
+```bash
+skillshare plugin disable review --target codex --no-tui
+skillshare sync plugins --dry-run
+skillshare sync plugins --no-tui
+```
+
+プラグインのメニューには **View files** があります。これは、その Source のレビュー済みローカルコピーを
+Markdown をレンダリングした状態で読み取り専用表示するものです。インポートされたプラグインには
+ローカルコピーがないため、この項目はありません。
+
+プラグインは通常の skills や MCP の Sync とは別物です。バンドルされたコンポーネントが、独立した
+skillshare の Source にコピーされることはありません。
+
+## 更新と復旧 {#updates-and-recovery}
+
+Plugins ページは開いたときに更新を確認し、**Check updates** でいつでも再確認できます。plugin はすべて同時に確認され、各行は自分の確認が終わった時点で結果を表示し、ヘッダーには確認済みの数が表示されます。確認できなかった plugin（Agent の CLI が 60 秒以内に応答しない場合を含む）には **Check failed** が表示され、マウスを重ねると理由がわかります。source に新しいバージョンがある行には `old → new` が表示され、ヘッダーのボタンは **Update N** になります。これを押すと、更新のある plugin をすべて一覧にした 1 つのダイアログが開きます。初期状態ではすべてチェック済みで、各 plugin がインストールされている Agent も表示されます。plugin や Agent のチェックを外すと、その分は更新されません。**Update N plugins** は選んだものを 1 つずつ実行し、各行を待機中、更新中、更新済み、失敗、スキップのいずれかで表示します。**Stop after this one** は実行中の plugin を終えたところで止め、残りは更新しません。失敗した行には、更新できた Agent と失敗した Agent がエラーとともに表示され、**Retry** は失敗した Agent だけに再送します。結果はページに反映されるため、再度チェックする必要はありません。チェック後に source が変わっていた場合は何もインストールされないので、もう一度チェックして新しいバージョンを確認してください。ただし Pi の npm パッケージは例外で、Pi は npm が latest とするバージョンをインストールします。すべて最新のときは、ダイアログに各 plugin が Agent とバージョン付きで一覧表示されます。
+
+Claude はネイティブな CLI 経由で更新できます。Codex はレビュー済みのスナップショットからプラグインを再度 add します。ただし Codex で無効化されている場合は、add で再び有効になってしまうため更新しません。Import した Codex プラグインは marketplace のアップグレードで更新されます。Cursor と Antigravity は、ローカルの編集がないか確認した後、管理対象のローカルコピーを置き換えます。Pi と OpenCode はレビュー済みのスナップショットを更新します。Oh My Pi は自身のインストールを削除してからレビュー済みの commit を再度インストールし、OMP のネイティブ upgrade は実行しません。Copilot と Antigravity CLI は既知の有効状態を保持しながらレビュー済みの Source を更新できます。Grok の更新はネイティブツール側にとどまり、ダイアログではそうしたインストールを **Update inside the Agent** の下に分けて表示します。インポートされたパッケージの制限についてはコマンドリファレンスを参照してください。互換性のある plugin を提供しなくなった source は **Cannot update** に表示されます。update が接続できない Target は理由とともに失敗として報告され、その plugin のほかの Agent は通常どおり更新されます。
+
+Pi の npm パッケージには比較できる source がないため、チェックではインストール済みバージョンを npm の最新バージョンと比べます。
+
+1つの Target が失敗した場合、結果は成功した部分を保持します。ネイティブクライアントの認証や設定の
+問題を解決してから、その Target を再度 Sync してください。
+
+```bash
+skillshare sync plugins review --target claude --no-tui
+```
+
+スナップショットは skillshare が所有します。その内容が外部で編集されていた場合、skillshare はまず
+その編集を保持できるよう置き換えをブロックします。Source のダイジェストは変更を検出しますが、
+すべてのネイティブインストールやインポートされた marketplace がマシン間で再現可能であることを
+保証するものではありません。
+
+自動化、scope の詳細、すべてのフラグについては [plugin](/docs/reference/commands/plugin) を参照して
+ください。

@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # Devcontainer: launch dashboard (API backend + Vite frontend).
-# Usage: ui          # global mode → http://localhost:5173
-#        ui -p       # project mode (~/demo-project) → http://localhost:5173
+# Usage: ui          # global mode → http://localhost:45173
+#        ui -p       # project mode (~/demo-project) → http://localhost:45173
 #        ui stop     # stop API + Vite
 set -euo pipefail
 
-PORT=19420
-VITE_PORT=5173
+# Uncommon ports so the devcontainer does not fight other projects for 5173/19420.
+PORT=49420
+VITE_PORT=45173
 PIDDIR=/tmp/dev-servers
 LOGDIR=/tmp
 mkdir -p "$PIDDIR"
+
+# virtiofs doesn't reliably deliver inotify events, so Vite silently misses file
+# saves and HMR stops firing. Force polling-based watching (vite.config reads this).
+export CHOKIDAR_USEPOLLING="${CHOKIDAR_USEPOLLING:-true}"
 
 # Resolve pnpm
 PNPM_BIN=""
@@ -25,6 +30,55 @@ fi
 
 is_port_open() {
   timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/$1" 2>/dev/null
+}
+
+# Find PIDs listening on a given port via /proc/net/tcp6.
+# Works without fuser/lsof/ss (often missing in containers).
+pids_on_port() {
+  local port="$1"
+  local hex_port
+  hex_port=$(printf '%04X' "$port")
+  local inodes=""
+  # Collect socket inodes for LISTEN (0A) entries on this port
+  while read -r _ local_addr _ state _ _ _ _ _ inode _; do
+    if [ "$state" = "0A" ] && [[ "$local_addr" == *":$hex_port" ]]; then
+      inodes="$inodes $inode"
+    fi
+  done < /proc/net/tcp6 2>/dev/null
+  [ -z "$inodes" ] && return
+  # Map inodes to PIDs
+  for pid_dir in /proc/[0-9]*/fd; do
+    local pid="${pid_dir#/proc/}"
+    pid="${pid%/fd}"
+    for fd in "$pid_dir"/*; do
+      local target
+      target=$(readlink "$fd" 2>/dev/null) || continue
+      for ino in $inodes; do
+        if [[ "$target" == *"socket:[$ino]"* ]]; then
+          echo "$pid"
+        fi
+      done
+    done
+  done 2>/dev/null | sort -u
+}
+
+# Kill all processes listening on a port (fuser replacement).
+kill_port() {
+  local port="$1"
+  if command -v fuser &>/dev/null; then
+    fuser -k "$port/tcp" 2>/dev/null || true
+    return
+  fi
+  local pids
+  pids=$(pids_on_port "$port")
+  [ -z "$pids" ] && return
+  for pid in $pids; do
+    kill "$pid" 2>/dev/null || true
+  done
+  sleep 0.3
+  for pid in $pids; do
+    kill -9 "$pid" 2>/dev/null || true
+  done
 }
 
 kill_pid_file() {
@@ -53,32 +107,50 @@ done
 if [ "$ACTION" = "stop" ]; then
   kill_pid_file "$PIDDIR/api.pid"
   pkill -f 'skillshare.* ui' 2>/dev/null || true
-  fuser -k $PORT/tcp 2>/dev/null || true
+  kill_port $PORT
   kill_pid_file "$PIDDIR/vite.pid"
-  fuser -k $VITE_PORT/tcp 2>/dev/null || true
+  kill_port $VITE_PORT
   echo "  api + vite stopped"
   exit 0
 fi
 
 # ── start ──
 
-# Stop old API.
+# Stop old API: PID file → pkill pattern → port-level kill.
 kill_pid_file "$PIDDIR/api.pid"
 pkill -f 'skillshare.* ui' 2>/dev/null || true
-fuser -k $PORT/tcp 2>/dev/null || true
+kill_port $PORT
 for _ in 1 2 3 4 5 6; do
   is_port_open $PORT || break
   sleep 0.5
 done
+if is_port_open $PORT; then
+  echo "  api          FAILED: port $PORT still in use after cleanup" >&2
+  pids=$(pids_on_port $PORT)
+  if [ -n "$pids" ]; then
+    echo "               Processes holding port: $pids" >&2
+    echo "               Fix: kill -9 $pids" >&2
+  fi
+  exit 1
+fi
 
 # Start API via air (hot-reload).
-# Air always builds from /workspace. For project mode, SKILLSHARE_UI_EXEC_PREFIX
+# Air always builds from /workspace. For project mode, a launcher script
 # changes the cwd before exec'ing the binary (skillshare ui -p uses os.Getwd()).
+# Note: air's full_bin does NOT run through sh -c, so shell operators like
+# "cd ... &&" in SKILLSHARE_UI_EXEC_PREFIX don't work. A wrapper script is required.
 export SKILLSHARE_UI_HOST=0.0.0.0
 MODE_FLAG="-${MODE:0:1}"
 export SKILLSHARE_UI_FLAGS="${MODE_FLAG} --port ${PORT}"
 if [ "$MODE" = "project" ]; then
-  export SKILLSHARE_UI_EXEC_PREFIX="cd $HOME/demo-project && /workspace/"
+  export SKILLSHARE_UI_PROJECT_DIR="$HOME/demo-project"
+  cat > /tmp/ui-project-launcher.sh << 'LAUNCHER'
+#!/bin/bash
+cd "$SKILLSHARE_UI_PROJECT_DIR" || exit 1
+exec "$@"
+LAUNCHER
+  chmod +x /tmp/ui-project-launcher.sh
+  export SKILLSHARE_UI_EXEC_PREFIX="/tmp/ui-project-launcher.sh /workspace/"
 fi
 # Resolve air binary (go install puts it in GOPATH/bin, not GOROOT/bin).
 AIR_BIN=""
@@ -87,7 +159,7 @@ for p in "$(go env GOPATH)/bin/air" /go/bin/air /usr/local/go/bin/air; do
 done
 if [ -z "$AIR_BIN" ]; then
   echo "  air          not found — installing..." >&2
-  go install github.com/air-verse/air@latest
+  go install github.com/air-verse/air@v1.67.1  # v1.67.2+ needs go >= 1.26
   AIR_BIN="$(go env GOPATH)/bin/air"
 fi
 
@@ -101,7 +173,10 @@ done
 if is_port_open $PORT; then
   printf " ready (%s mode, hot-reload)\n" "$MODE"
 else
-  echo " slow start (check $LOGDIR/api-dev.log)"
+  printf " FAILED\n" >&2
+  echo "               Port $PORT not reachable after 30s." >&2
+  echo "               Check log: cat $LOGDIR/api-dev.log" >&2
+  echo "               Retry:     ui stop && ui ${MODE_FLAG}" >&2
 fi
 
 # Ensure Vite is running.

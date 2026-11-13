@@ -2,25 +2,29 @@ package main
 
 import (
 	"fmt"
+	"time"
 
-	"skillshare/internal/config"
 	"skillshare/internal/install"
+	"skillshare/internal/projectdir"
 	"skillshare/internal/ui"
-	appversion "skillshare/internal/version"
 )
 
 func cmdInstallProject(args []string, root string) (installLogSummary, error) {
-	summary := installLogSummary{
-		Mode: "project",
-	}
-
 	parsed, showHelp, err := parseInstallArgs(args)
 	if showHelp {
 		printInstallHelp()
-		return summary, nil
+		return installLogSummary{Mode: "project"}, nil
 	}
 	if err != nil {
-		return summary, err
+		return installLogSummary{Mode: "project"}, err
+	}
+	applyInstallJSONDefaults(parsed)
+	return cmdInstallProjectParsed(parsed, root)
+}
+
+func cmdInstallProjectParsed(parsed *installArgs, root string) (installLogSummary, error) {
+	summary := installLogSummary{
+		Mode: "project",
 	}
 	summary.DryRun = parsed.opts.DryRun
 	summary.Tracked = parsed.opts.Track
@@ -28,10 +32,8 @@ func cmdInstallProject(args []string, root string) (installLogSummary, error) {
 	summary.Into = parsed.opts.Into
 	summary.SkipAudit = parsed.opts.SkipAudit
 
-	if !projectConfigExists(root) {
-		if err := performProjectInit(root, projectInitOptions{}); err != nil {
-			return summary, err
-		}
+	if err := ensureProjectConfig(root); err != nil {
+		return summary, err
 	}
 
 	runtime, err := loadProjectRuntime(root)
@@ -42,22 +44,35 @@ func cmdInstallProject(args []string, root string) (installLogSummary, error) {
 		parsed.opts.AuditThreshold = runtime.config.Audit.BlockThreshold
 	}
 	parsed.opts.AuditProjectRoot = root
+	parsed.opts.SourceFollow = runtime.skillsWalk().Follow
 	summary.AuditThreshold = parsed.opts.AuditThreshold
 
 	if parsed.sourceArg == "" {
 		hasSourceFlags := parsed.opts.Name != "" || parsed.opts.Into != "" ||
-			parsed.opts.Track || len(parsed.opts.Skills) > 0 ||
-			len(parsed.opts.Exclude) > 0 || parsed.opts.All || parsed.opts.Yes || parsed.opts.Update
-		if hasSourceFlags {
-			return summary, fmt.Errorf("flags --name, --into, --track, --skill, --exclude, --all, --yes, and --update require a source argument")
+			parsed.opts.Track || parsed.opts.HasSkillFilter() || parsed.opts.HasAgentFilter() ||
+			len(parsed.opts.Exclude) > 0 || parsed.opts.Update || parsed.opts.Branch != "" ||
+			parsed.opts.Kind != ""
+		if hasSourceFlags || ((parsed.opts.All || parsed.opts.Yes) && !parsed.jsonOutput) {
+			return summary, fmt.Errorf("flags --name, --into, --track, --skill, --agent, --kind, --exclude, --all, --yes, --branch, and --update require a source argument")
 		}
 		summary.Source = "project-config"
 		return installFromProjectConfig(runtime, parsed.opts)
 	}
 
-	cfg := &config.Config{Source: runtime.sourcePath}
+	// A forced reinstall moves a skill that is already pinned.
+	if !parsed.opts.DryRun {
+		defer trackProjectLock(runtime)()
+	}
+
+	cfg := configFromProjectRuntime(runtime)
 	source, resolvedFromMeta, err := resolveInstallSource(parsed.sourceArg, parsed.opts, cfg)
+	if err == nil && parsed.opts.Branch != "" {
+		source.Branch = parsed.opts.Branch
+	}
 	if err != nil {
+		return summary, err
+	}
+	if err := install.RejectProjectRootLocalInstall(source, root); err != nil {
 		return summary, err
 	}
 
@@ -68,7 +83,7 @@ func cmdInstallProject(args []string, root string) (installLogSummary, error) {
 			return summary, err
 		}
 		if !parsed.opts.DryRun {
-			return summary, reconcileProjectRemoteSkills(runtime)
+			return summary, reconcileProjectInstalledSkills(runtime)
 		}
 		return summary, nil
 	}
@@ -83,7 +98,7 @@ func cmdInstallProject(args []string, root string) (installLogSummary, error) {
 		return summary, nil
 	}
 
-	return summary, reconcileProjectRemoteSkills(runtime)
+	return summary, reconcileProjectInstalledSkills(runtime)
 }
 
 func installFromProjectConfig(runtime *projectRuntime, opts install.InstallOptions) (installLogSummary, error) {
@@ -95,12 +110,17 @@ func installFromProjectConfig(runtime *projectRuntime, opts install.InstallOptio
 
 	ctx := &projectInstallContext{runtime: runtime}
 
+	lock, err := install.LoadLock(projectdir.Resolve(runtime.root))
+	if err != nil {
+		return summary, err
+	}
+	opts.Lock = lock
+
 	if len(ctx.ConfigSkills()) == 0 {
-		ui.Info("No remote skills defined in .skillshare/config.yaml")
+		ui.Done(ui.MarkNone, "No remote skills defined in .skillshare/config.yaml", 0)
 		return summary, nil
 	}
 
-	ui.Logo(appversion.Version)
 	total := len(ctx.ConfigSkills())
 	spinner := ui.StartSpinner(fmt.Sprintf("Installing %d skill(s) from config...", total))
 
@@ -122,9 +142,13 @@ func installFromProjectConfig(runtime *projectRuntime, opts install.InstallOptio
 		return summary, nil
 	}
 
-	spinner.Success(fmt.Sprintf("Installed %d skill(s)", result.Installed))
-	ui.SectionLabel("Next Steps")
-	ui.Info("Run 'skillshare sync' to create symlinks")
+	spinner.Stop()
+	fmt.Println()
+	if err := allSkillsFailedError(len(result.InstalledSkills)+result.Skipped, result.Failures); err != nil {
+		return summary, err
+	}
+	ui.Done(ui.MarkOK, buildConfigInstallSummary(result), time.Since(spinner.Started()))
+	ui.Next("skillshare sync", "link them into your targets")
 
 	return summary, nil
 }

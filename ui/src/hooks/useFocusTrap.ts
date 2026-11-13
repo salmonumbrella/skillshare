@@ -32,8 +32,8 @@ export function useFocusTrap(active: boolean) {
     };
 
     el.addEventListener('keydown', handler);
-    const focusable = el.querySelectorAll<HTMLElement>(selector);
-    focusable[0]?.focus();
+    // A field inside that took focus itself (autoFocus) keeps it.
+    if (!el.contains(document.activeElement)) el.querySelector<HTMLElement>(selector)?.focus();
     return () => el.removeEventListener('keydown', handler);
   }, [active]);
 

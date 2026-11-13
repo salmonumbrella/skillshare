@@ -3,74 +3,143 @@
 package sync
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
+	gosync "sync"
+
+	"skillshare/internal/utils"
 )
 
 // createLink creates a directory junction on Windows (no admin required).
-// Falls back to symlink if junction fails.
-func createLink(targetPath, sourcePath string) error {
-	// Ensure absolute paths for junction
+// If relative is true, first tries os.Symlink with a relative path
+// (requires Developer Mode). Falls back to junction with absolute paths.
+// A file source only gets a symlink: a junction to a file cannot be read.
+func createLink(linkPath, sourcePath string, relative bool, sourceRoot ...string) error {
 	absSource, err := filepath.Abs(sourcePath)
 	if err != nil {
 		return fmt.Errorf("failed to resolve source path: %w", err)
 	}
-	absTarget, err := filepath.Abs(targetPath)
+	absTarget, err := filepath.Abs(linkPath)
 	if err != nil {
 		return fmt.Errorf("failed to resolve target path: %w", err)
 	}
 
-	// Pre-flight checks with clear error messages
-	if _, err := os.Stat(absSource); os.IsNotExist(err) {
+	srcInfo, statErr := os.Stat(absSource)
+	if os.IsNotExist(statErr) {
 		return fmt.Errorf("source directory does not exist: %s", absSource)
 	}
+	isFile := statErr == nil && !srcInfo.IsDir()
 
 	if info, err := os.Lstat(absTarget); err == nil {
-		if info.Mode()&os.ModeSymlink != 0 {
+		if utils.IsLinkMode(absTarget, info.Mode()) {
 			return fmt.Errorf("target already exists as a junction/symlink: %s", absTarget)
 		}
 		return fmt.Errorf("target already exists: %s", absTarget)
 	}
 
-	// Try junction first (no admin required)
-	var stderr bytes.Buffer
-	cmd := exec.Command("cmd", "/c", "mklink", "/J", absTarget, absSource)
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err == nil {
+	// If relative requested, try os.Symlink with relative path first
+	if relative {
+		// Resolve real paths: OS resolves relative symlinks from the
+		// real parent directory, not the lexical one.
+		linkDir := evalOrClean(filepath.Dir(absTarget))
+		src := linkSourcePath(absSource, sourceRoot)
+		rel, relErr := filepath.Rel(linkDir, src)
+		if relErr == nil {
+			if symlinkErr := os.Symlink(rel, linkPath); symlinkErr == nil {
+				return nil
+			}
+		}
+	}
+
+	if isFile {
+		if symlinkErr := os.Symlink(absSource, absTarget); symlinkErr == nil {
+			return nil
+		}
+		return fmt.Errorf("failed to create file link\n  symlink: requires Administrator or Developer Mode\n  target: %s\n  source: %s", absTarget, absSource)
+	}
+
+	// Try junction (no admin required, but requires absolute paths)
+	junctionErr := utils.CreateJunction(absTarget, absSource)
+	if junctionErr == nil {
 		return nil
 	}
 
-	junctionErr := strings.TrimSpace(stderr.String())
-
-	// Fallback to symlink (requires admin/developer mode)
+	// Fallback to symlink with absolute path
 	if symlinkErr := os.Symlink(absSource, absTarget); symlinkErr == nil {
 		return nil
 	}
 
-	// Both methods failed - provide helpful error message
-	errMsg := "failed to create link"
-	if junctionErr != "" {
-		errMsg = fmt.Sprintf("%s\n  junction error: %s", errMsg, junctionErr)
-	} else {
-		errMsg = fmt.Sprintf("%s\n  junction: mklink /J command failed", errMsg)
-	}
+	errMsg := fmt.Sprintf("failed to create link\n  junction error: %s", junctionErr)
 	errMsg = fmt.Sprintf("%s\n  symlink: requires Administrator or Developer Mode", errMsg)
 	errMsg = fmt.Sprintf("%s\n  target: %s\n  source: %s", errMsg, absTarget, absSource)
 
 	return errors.New(errMsg)
 }
 
-// isJunctionOrSymlink checks if path is a junction or symlink
-func isJunctionOrSymlink(path string) bool {
+// canCreateRelativeLink probes whether the OS can create relative symlinks.
+// On Windows this requires Developer Mode; without it createLink falls back
+// to junctions which are always absolute.
+var relativeProbe struct {
+	once gosync.Once
+	ok   bool
+}
+
+func canCreateRelativeLink() bool {
+	relativeProbe.once.Do(func() {
+		dir, err := os.MkdirTemp("", "ss-relprobe-*")
+		if err != nil {
+			return
+		}
+		defer os.RemoveAll(dir)
+		target := filepath.Join(dir, "t")
+		if err := os.Mkdir(target, 0755); err != nil {
+			return
+		}
+		link := filepath.Join(dir, "l")
+		relativeProbe.ok = os.Symlink("t", link) == nil
+	})
+	return relativeProbe.ok
+}
+
+// platformCanCreateFileLink probes whether the OS can create file symlinks,
+// which requires Developer Mode (or Administrator) on Windows.
+var fileLinkProbe struct {
+	once gosync.Once
+	ok   bool
+}
+
+func platformCanCreateFileLink() bool {
+	fileLinkProbe.once.Do(func() {
+		dir, err := os.MkdirTemp("", "ss-fileprobe-*")
+		if err != nil {
+			return
+		}
+		defer os.RemoveAll(dir)
+		target := filepath.Join(dir, "t")
+		if err := os.WriteFile(target, nil, 0644); err != nil {
+			return
+		}
+		fileLinkProbe.ok = os.Symlink(target, filepath.Join(dir, "l")) == nil
+	})
+	return fileLinkProbe.ok
+}
+
+// fileLinkUsable reports whether a link to a file source can be read through:
+// it must be a real symlink resolving to a file. A junction (never a symlink
+// on Go 1.23+) to a file looks right to Readlink but cannot be opened.
+func fileLinkUsable(path string) bool {
 	info, err := os.Lstat(path)
-	if err != nil {
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
 		return false
 	}
-	// Both junctions and symlinks have ModeSymlink on Windows
-	return info.Mode()&os.ModeSymlink != 0
+	target, err := os.Stat(path)
+	return err == nil && !target.IsDir()
+}
+
+// isJunctionOrSymlink checks if path is a junction or symlink. Since Go 1.23
+// only symlinks have ModeSymlink; junctions are reported as ModeIrregular.
+func isJunctionOrSymlink(path string) bool {
+	return utils.IsSymlinkOrJunction(path)
 }

@@ -36,6 +36,23 @@ No single layer catches everything. Combine manual review, automated scanning, c
 | **Custom Rules** | `audit-rules.yaml` | Organization-specific patterns (internal secrets, allowlists) |
 | **CI/CD** | Pipeline gate | Block PRs that introduce risky skills |
 
+### Shared Source and Execution Boundaries
+
+In merge mode, each managed target skill links to its source. In symlink mode, the whole source directory is linked. An edit to the shared file is visible to every target linked to it. This keeps instructions consistent, but also means an unwanted edit can affect several tools. Copy mode creates separate files; refreshing them with `sync` can distribute the same unwanted content.
+
+Keep shared skill changes in reviewed Git commits, limit write access to their repositories, and re-audit after updates or unexpected local edits. Review the diff and use backups or Git history to recover when needed. A previous clean scan does not certify later edits or guarantee that every instruction is safe.
+
+| Boundary | What it controls | What it does not control |
+|----------|------------------|--------------------------|
+| `audit` | Detects known patterns and blocks install/update at the configured finding severity | AI command execution or every semantic prompt-injection attack |
+| `.skillignore` and target filters | Select which skills are discovered or synced in merge/copy mode | File permissions, access to `~/.ssh` or `~/.aws`, or an AI tool's shell access |
+| Git review and project lockfile | Review shared changes and reproduce recorded remote skill commits | Whether the recorded instructions are safe or how a model follows them |
+| AI tool permissions and sandbox | Restrict file, shell and network access where the tool supports it | Skill catalog curation or source version management |
+
+Set execution approvals and sandbox restrictions in each AI tool, which enforces runtime command permissions. A private hub controls catalog distribution through its host's access controls; selecting an internal catalog alone does not prevent users from installing other sources.
+
+Audit blocking uses finding severity (`HIGH`, `CRITICAL`, etc.). The aggregate 0–100 risk score helps prioritize review and is reported separately; it is not the block threshold.
+
 ### Supply-Chain Security Lifecycle
 
 Security checkpoints depend on how a skill is installed (`--track` vs regular install):
@@ -46,7 +63,7 @@ flowchart TD
         I1["skillshare install &lt;source&gt;"] --> I2{"Install mode"}
         I2 -- "Regular skill" --> I3{"Audit scan"}
         I3 -- "At/above threshold" --> I4["Blocked (unless --force) ✗"]
-        I3 -- "Pass / --force" --> I5["Write .skillshare-meta.json<br/>(sha256 per file)"]
+        I3 -- "Pass / --force" --> I5["Record in .metadata.json<br/>(sha256 per file)"]
         I5 --> I6["Installed skill ✓"]
         I2 -- "Tracked repo (--track)" --> I7["Clone repo with .git"]
         I7 --> I8{"Audit full repo<br/>(same threshold)"}
@@ -55,10 +72,10 @@ flowchart TD
     end
 
     subgraph UPDATE ["Phase 2 — Update"]
-        U1["skillshare update _repo"] --> U2["git pull"]
-        U2 --> U3{"Post-update audit<br/>(threshold gate)"}
-        U3 -- "At/above threshold" --> U4["Rollback<br/>(auto in CI/non-TTY)"]
-        U3 -- "Clean" --> U5["Tracked repo updated ✓"]
+        U1["skillshare update _repo"] --> U2["git pull in isolated candidate"]
+        U2 --> U3{"Audit candidate<br/>(threshold gate)"}
+        U3 -- "At/above threshold" --> U4["Reject candidate<br/>(checkout unchanged)"]
+        U3 -- "Clean / approved" --> U5["Publish audited revision ✓"]
 
         R1["skillshare update &lt;skill&gt;"] --> R2["Reinstall from source"]
         R2 --> R3{"Install-time audit<br/>(threshold gate)"}
@@ -106,7 +123,7 @@ flowchart TD
 **Key design:**
 - **Regular skill install/update** — audit runs before acceptance; successful installs/updates write `file_hashes` metadata
 - **Tracked repo install gate** — fresh `--track` installs are audited across the whole cloned repository before acceptance
-- **Tracked repo update gate** — `skillshare update` audits after `git pull`; findings at/above threshold trigger rollback automatically in non-interactive mode
+- **Tracked repo update gate** — `skillshare update` pulls and audits an isolated candidate; rejection leaves the active checkout unchanged, and approval publishes the exact audited revision
 - **Integrity verification scope** — `content-*` hash checks run only when `file_hashes` metadata exists
 
 ## Security Checklist
@@ -171,7 +188,7 @@ rules:
 
 For the full custom rules reference (merge semantics, disabling rules, exclude patterns), see [`audit rules` — Custom Rules](/docs/reference/commands/audit-rules#custom-rules).
 
-### Periodic Scanning
+### Periodic Scanning {#periodic-scanning}
 
 Rules evolve — a skill that was clean at install time may match new rules added later. Schedule periodic scans:
 
@@ -187,7 +204,7 @@ Rules evolve — a skill that was clean at install time may match new rules adde
 ```bash
 # Fail the pipeline if any skill has HIGH+ findings
 skillshare audit --threshold high
-# Exit code: 0 = clean, 1 = findings found
+# Exit code: 0 = below threshold, 1 = findings, 2 = error
 ```
 
 ### Real-World Example: Skill Hub PR Validation
@@ -206,22 +223,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install skillshare
-        run: |
-          curl -fsSL https://skillshare.runkids.cc/install.sh | sh
-
-      - name: Audit new skills
-        run: skillshare audit --threshold high
-
-      - name: Fail if audit failed
-        if: failure()
-        run: exit 1
+      - uses: runkids/setup-skillshare@v1
+        with:
+          source: ./skills
+          audit: true
+          audit-threshold: high
 ```
 
 For the full workflow (including PR comment reporting and artifact upload), see the [validate-pr.yml source](https://github.com/runkids/skillshare-hub/blob/main/.github/workflows/validate-pr.yml).
 
-For more CI/CD patterns (JSON output with `jq`, GitHub Actions with artifact upload, SARIF upload), see the [CI/CD Skill Validation recipe](/docs/how-to/recipes/ci-cd-skill-validation).
+For more CI/CD patterns (SARIF upload, strict profiles, manual setup), see the [CI/CD Skill Validation recipe](/docs/how-to/recipes/ci-cd-skill-validation).
 
 ## See Also
 

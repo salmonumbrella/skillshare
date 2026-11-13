@@ -1,5 +1,5 @@
 ---
-sidebar_position: 7
+sidebar_position: 8
 ---
 
 # Declarative Skill Manifest
@@ -12,26 +12,43 @@ Use the declarative manifest when you want reproducible skill setups across mach
 
 ## What Is a Skill Manifest?
 
-The `skills:` section in `registry.yaml` serves as a **portable declaration** of your skill collection. Instead of manually installing skills one by one, you list them in the registry and run `skillshare install` to bring everything up.
+A skill manifest is a **portable declaration** of your skill collection. Instead of manually installing skills one by one, you list them in a manifest file and run `skillshare install` to bring everything up.
+
+The manifest location depends on the mode:
+
+| Mode | Manifest location | Committable? |
+|------|------------------|-------------|
+| **Project** | `.skillshare/config.yaml` (`skills:` section) | Yes — commit to share with team |
+| **Global** | `~/.config/skillshare/skills/.metadata.json` | No — personal machine state |
+
+### Project Mode Manifest
+
+In project mode, `skills:` lives in `config.yaml` alongside `targets:`:
 
 ```yaml
-# ~/.config/skillshare/registry.yaml (global)
-# or .skillshare/registry.yaml (project)
+# .skillshare/config.yaml
+targets:
+  - claude
+  - cursor
+
 skills:
   - name: react-best-practices
     source: anthropics/skills/skills/react-best-practices
-    group: frontend                          # installed into frontend/
+    group: frontend
   - name: _team-skills
     source: my-org/shared-skills
     tracked: true
-    group: devops                            # installed into devops/
   - name: commit
-    source: anthropics/skills/skills/commit  # no group → root level
+    source: anthropics/skills/skills/commit
 ```
 
-:::note Migration from config.yaml
-In older versions, `skills:` lived inside `config.yaml`. Skillshare automatically migrates it to `registry.yaml` on first load — no manual action required.
-:::
+This file is committed to git — teammates clone the repo and run `skillshare install -p` to install all listed skills.
+
+The manifest records *what* to install. The exact commit each skill resolved to is recorded next to it in `.skillshare/skills.lock.json`, which is written automatically and should be committed too. With both files, `skillshare install -p` gives every teammate the same commit even after upstream moves on. See [Lockfile](./project-skills.md#lockfile).
+
+### Global Mode Manifest
+
+In global mode, skill records are stored in `.metadata.json` (the centralized metadata store). This file also contains runtime tracking data (hashes, timestamps) and is auto-managed.
 
 ## How It Works
 
@@ -40,30 +57,33 @@ In older versions, `skills:` lived inside `config.yaml`. Skillshare automaticall
 Running `skillshare install` with **no arguments** reads the manifest and installs all listed skills:
 
 ```bash
-# Global mode — installs all skills from ~/.config/skillshare/registry.yaml
+# Global mode — installs all skills from ~/.config/skillshare/skills/.metadata.json
 skillshare install
 
-# Project mode — installs from .skillshare/registry.yaml
+# Project mode — installs all skills from .skillshare/config.yaml skills: section
 skillshare install -p
 
 # Preview without installing
 skillshare install --dry-run
 ```
 
-Skills that already exist are skipped automatically.
+Skills that already exist are skipped automatically. In project mode, a skill whose installed commit differs from the lockfile is brought to the locked commit instead.
 
 ### Automatic Reconciliation
 
 The manifest stays in sync with your actual skill collection:
 
-- **`skillshare install <source>`** — adds the installed skill to `registry.yaml` automatically
-- **`skillshare uninstall <name>...`** — removes the entry from `registry.yaml` automatically
+- **`skillshare install <source>`** — adds the installed skill to the manifest automatically
+- **`skillshare uninstall <name>...`** — removes the entry from the manifest automatically
+- **`skillshare move <name>... <folder>`** — updates the entry's `group` (project mode) or moves its `.metadata.json` record (global mode)
 
-You never need to edit the manifest manually (though you can).
+In project mode, `config.yaml` and `skills.lock.json` are updated. In global mode, `.metadata.json` is updated. You never need to edit the manifest manually (though you can).
+
+An entry for a skill this machine has not installed yet (for example on a fresh clone) is kept, so `skillshare install` can still install it; it leaves the manifest only when you uninstall the skill or delete its installed folder.
 
 ## Skill Entry Fields
 
-Each entry in the `skills:` list in `registry.yaml` has these fields:
+Each entry in the `skills:` list has these fields:
 
 | Field | Required | Description |
 |-------|----------|-------------|
@@ -93,7 +113,7 @@ skillshare sync   # distribute to all targets
 New team members get the same AI context in one command:
 
 ```bash
-# .skillshare/registry.yaml is committed to the repo
+# .skillshare/config.yaml skills: section is committed to the repo
 git clone <project-repo>
 cd <project-repo>
 skillshare install -p   # installs all declared skills
@@ -102,29 +122,31 @@ skillshare sync -p      # links to project targets
 
 ### Open-Source Bootstrap
 
-Project maintainers declare recommended skills:
+Project maintainers declare recommended skills in `config.yaml`:
 
 ```yaml
-# .skillshare/registry.yaml
+# .skillshare/config.yaml
+targets:
+  - claude
+  - cursor
+
 skills:
   - name: react-best-practices
     source: anthropics/skills/skills/react-best-practices
     group: frontend
   - name: commit
     source: anthropics/skills/skills/commit
-  - name: project-conventions
-    source: ./skills/project-conventions
 ```
 
 :::info Group field and `--into`
 When you install with `--into`, the group is recorded automatically:
 
 ```bash
-skillshare install anthropics/skills/skills/pdf --into frontend
-# registry.yaml will contain: name: pdf, group: frontend
+skillshare install anthropics/skills/skills/pdf --into frontend -p
+# config.yaml will contain: name: pdf, group: frontend
 ```
 
-Running `skillshare install` (no args) recreates the same directory structure from the manifest.
+Running `skillshare install -p` (no args) recreates the same directory structure from the manifest.
 :::
 
 Contributors clone and run `skillshare install -p` to get project-specific AI context immediately.
@@ -132,11 +154,33 @@ Contributors clone and run `skillshare install -p` to get project-specific AI co
 ## Workflow Summary
 
 ```
-1. Install skills normally      →  registry.yaml auto-updates
+Project mode:
+1. Install skills normally      →  config.yaml skills: auto-updates
+2. Commit config.yaml and skills.lock.json via git  →  same skills, same commits for the team
+3. Run `skillshare install -p`  →  reproduce on clone
+4. Run `skillshare sync`        →  distribute to all targets
+
+Global mode:
+1. Install skills normally      →  .metadata.json auto-updates
 2. Push/pull config via git     →  portable across machines
 3. Run `skillshare install`     →  reproduce on new machine
 4. Run `skillshare sync`        →  distribute to all targets
 ```
+
+## Extras Configuration
+
+In addition to skills, `config.yaml` can declare **extras** — non-skill resources (rules, commands, prompts) synced to separate directories. Extras are configured in the `extras:` section of `config.yaml` (both global and project):
+
+```yaml
+extras:
+  - name: rules
+    targets:
+      - path: ~/.claude/rules
+      - path: ~/.cursor/rules
+        mode: copy
+```
+
+See [sync extras](/docs/reference/commands/sync#sync-extras) for details.
 
 ## Related
 

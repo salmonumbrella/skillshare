@@ -10,11 +10,12 @@ import (
 	"skillshare/internal/ui"
 )
 
-func cmdDiffProject(root, targetName string, opts diffRenderOpts, start time.Time) error {
-	if !projectConfigExists(root) {
-		if err := performProjectInit(root, projectInitOptions{}); err != nil {
-			return err
-		}
+func cmdDiffProject(root, targetName string, kind resourceKindFilter, opts diffRenderOpts, start time.Time) error {
+	if kind == kindAgents {
+		return diffProjectAgents(root, targetName, opts, start)
+	}
+	if err := ensureProjectConfig(root); err != nil {
+		return err
 	}
 
 	runtime, err := loadProjectRuntime(root)
@@ -26,7 +27,7 @@ func cmdDiffProject(root, targetName string, opts diffRenderOpts, start time.Tim
 	if !opts.jsonOutput {
 		spinner = ui.StartSpinner("Discovering skills")
 	}
-	discovered, err := sync.DiscoverSourceSkills(runtime.sourcePath)
+	discovered, err := sync.DiscoverSourceSkills(runtime.sourcePath, runtime.skillsWalk())
 	if err != nil {
 		if spinner != nil {
 			spinner.Fail("Discovery failed")
@@ -34,7 +35,7 @@ func cmdDiffProject(root, targetName string, opts diffRenderOpts, start time.Tim
 		return fmt.Errorf("failed to discover skills: %w", err)
 	}
 	if spinner != nil {
-		spinner.Success(fmt.Sprintf("Discovered %d skills", len(discovered)))
+		spinner.Stop()
 	}
 
 	targets := make([]config.ProjectTargetEntry, len(runtime.config.Targets))
@@ -54,12 +55,12 @@ func cmdDiffProject(root, targetName string, opts diffRenderOpts, start time.Tim
 		}
 	}
 
-	// Pre-filter skills per target and compute total for progress bar
+	// Resolve each target once, preserving selection diagnostics for the preview.
 	type resolvedTarget struct {
-		name     string
-		target   config.TargetConfig
-		mode     string
-		filtered []sync.DiscoveredSkill
+		name       string
+		target     config.TargetConfig
+		mode       string
+		resolution *sync.TargetSkillResolution
 	}
 	var resolved []resolvedTarget
 	totalSkills := 0
@@ -69,16 +70,21 @@ func cmdDiffProject(root, targetName string, opts diffRenderOpts, start time.Tim
 		if !ok {
 			return fmt.Errorf("target '%s' not resolved", entry.Name)
 		}
-		filtered, err := sync.FilterSkills(discovered, target.Include, target.Exclude)
+		sc := target.SkillsConfig()
+		// Skills off: nothing is synced, so there is nothing to compare.
+		if !sc.IsEnabled() {
+			continue
+		}
+		resolution, err := sync.ResolveTargetSkillsForTarget(entry.Name, sc, discovered)
 		if err != nil {
 			return fmt.Errorf("target %s has invalid include/exclude config: %w", entry.Name, err)
 		}
-		mode := target.Mode
+		mode := sc.Mode
 		if mode == "" {
 			mode = "merge"
 		}
-		resolved = append(resolved, resolvedTarget{entry.Name, target, mode, filtered})
-		totalSkills += len(filtered)
+		resolved = append(resolved, resolvedTarget{entry.Name, target, mode, resolution})
+		totalSkills += len(resolution.Skills)
 		if mode == "copy" {
 			hasCopyMode = true
 		}
@@ -94,6 +100,7 @@ func cmdDiffProject(root, targetName string, opts diffRenderOpts, start time.Tim
 	}
 
 	results := make([]targetDiffResult, len(resolved))
+	ignorePatterns := sync.EffectiveFileIgnorePatterns(runtime.config.Ignore)
 	sem := make(chan struct{}, 8)
 	var wg gosync.WaitGroup
 	for i, rt := range resolved {
@@ -103,7 +110,7 @@ func cmdDiffProject(root, targetName string, opts diffRenderOpts, start time.Tim
 			defer wg.Done()
 			defer func() { <-sem }()
 			progress.startTarget(rt.name)
-			r := collectTargetDiff(rt.name, rt.target, runtime.sourcePath, rt.mode, rt.filtered, progress)
+			r := collectTargetDiff(rt.name, rt.target, runtime.sourcePath, rt.mode, rt.resolution, ignorePatterns, progress)
 			progress.doneTarget(rt.name, r)
 			results[idx] = r
 		}(i, rt)
@@ -112,12 +119,24 @@ func cmdDiffProject(root, targetName string, opts diffRenderOpts, start time.Tim
 
 	progress.stop()
 
+	// Extras diff (always included when extras are configured)
+	var extrasResults []extraDiffResult
+	if len(runtime.config.Extras) > 0 {
+		extrasResults = collectExtrasDiff(runtime.config.Extras, func(extra config.ExtraConfig) string {
+			return config.ResolveExtrasSourceDirProject(extra, runtime.config.EffectiveExtrasSource(root), root)
+		})
+	}
+
+	// Merge agent diffs into skill results so they appear together
+	results = mergeAgentDiffsProject(root, results, targetName)
+
 	if opts.jsonOutput {
-		return diffOutputJSON(results, start)
+		return diffOutputJSONWithExtras(results, extrasResults, start)
 	}
 	if shouldLaunchTUI(opts.noTUI, nil) && len(results) > 0 {
-		return runDiffTUI(results)
+		return runDiffTUI(results, extrasResults)
 	}
-	renderGroupedDiffs(results, opts)
+	opts.noTargets = len(runtime.config.Targets) == 0
+	renderGroupedDiffs(results, extrasResults, opts)
 	return nil
 }

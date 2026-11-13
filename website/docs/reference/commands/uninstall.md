@@ -21,7 +21,15 @@ skillshare uninstall team-repo             # Remove tracked repository (_ prefix
 - Batch-remove an entire group of skills at once
 - Remove **all** skills at once with `--all`
 
-![uninstall demo](/img/uninstall-demo.png)
+```text
+$ skillshare uninstall css-review
+  frontend/css-review  ~/.config/skillshare/skills/frontend/css-review · 1 file
+✓ Uninstall frontend/css-review → trash, kept 7 days
+
+Next
+  skillshare sync                               remove it from claude, cursor
+  skillshare trash restore frontend/css-review  undo
+```
 
 ## What Happens
 
@@ -44,7 +52,7 @@ flowchart TD
 | `--dry-run, -n` | Preview without making changes |
 | `--project, -p` | Use project-level config in current directory |
 | `--global, -g` | Use global config (`~/.config/skillshare`) |
-| `--json` | Output as JSON (implies `--force`, skips confirmation) |
+| `--json` | Output JSON and skip confirmation; dirty tracked repositories still require `--force` |
 | `--help, -h` | Show help |
 
 ## JSON Output
@@ -68,6 +76,8 @@ Combine with `--dry-run` to preview:
 ```bash
 skillshare uninstall --all --json --dry-run
 ```
+
+When every skill fails to uninstall, the command exits non-zero and the `error` field names each skill with its reason; when only some fail, they are listed in `failed` with their reasons and the command exits 0. `uninstall agents --json` exits non-zero when any agent fails, lists the failed names in `failed`, and gives each reason in `error`. JSON output works in project mode (`-p`) too.
 
 ## Multiple Skills
 
@@ -94,6 +104,10 @@ Glob matching is case-insensitive: `"Core-*"` matches `core-auth`, `CORE-DB`, et
 :::note Top-level matching only
 Glob patterns match against **top-level directory names** in the source folder. Nested skills (e.g. `frontend/react-hooks`) are not matched by `"react-*"` — use `--group frontend` to target skills within a subdirectory.
 :::
+
+`--group` refuses a [followed source link](../targets/configuration.md#follow_source_links) such as `_dev-skills`, because it would move every skill out of the real checkout. Use `skillshare unlink _dev-skills` to remove the link entry, or name the skills (`skillshare uninstall _dev-skills/foo`) to trash them from the checkout.
+
+If the linked folder itself contains `SKILL.md`, uninstall refuses that root skill: moving it would remove the link and hide all nested skills. Use [`unlink`](./unlink.md) to remove only the link; the checkout stays untouched.
 
 ## Remove All
 
@@ -126,7 +140,7 @@ Uninstalling group (5 skills)
 → Name: feature-radar
 → Path: ~/.config/skillshare/skills/feature-radar
 
-Are you sure you want to uninstall this group? [y/N]:
+? Uninstall group feature-radar? moved to trash for 7 days   Yes   No
 ```
 
 The `--group` flag removes all skills under a directory using **prefix matching**:
@@ -159,13 +173,19 @@ skillshare uninstall frontend/hooks -G frontend --force  # hooks removed once
 For tracked repositories (folders starting with `_`):
 
 - Checks for uncommitted changes (use `--force` to override)
+- Fails with `failed to check git status` when skillshare cannot read the repo's git status; other items in the batch are still removed, and `--force` skips the check
 - Automatically removes the entry from `.gitignore`
 - The `_` prefix is optional when uninstalling
+- A repo installed with `--into` is named by its path, such as `devops/_team-skills`
+- For `--into` repos, the final `_` is optional too: `devops/team-skills` resolves to `devops/_team-skills`. An existing skill or folder at the typed path takes precedence; use the explicit `_` path to remove the repo. Ambiguous short names fail and require the full path.
+- A skill or folder inside a tracked repo cannot be removed on its own, even with `--force`; the command fails with `inside a tracked repo; uninstall the repo instead`. Skills below a followed source link can still be removed one at a time
 
 ```bash
 skillshare uninstall _team-skills        # With prefix
 skillshare uninstall team-skills         # Without prefix (auto-detected)
 skillshare uninstall _team-skills --force # Force remove with uncommitted changes
+skillshare uninstall devops/_team-skills # Repo installed with --into devops
+skillshare uninstall devops/team-skills  # Same repo, unless this path already exists
 ```
 
 ## Examples
@@ -208,42 +228,48 @@ Uninstalled skills are **moved to trash**, not permanently deleted:
 Single skill (verbose):
 
 ```
-✓ Uninstalled skill: my-skill
-ℹ Moved to trash (7 days): ~/.local/share/skillshare/trash/my-skill_2026-01-20_15-30-00
-ℹ Reinstall: skillshare install github.com/user/repo/my-skill
+  my-skill  ~/.config/skillshare/skills/my-skill · 2 files
+✓ Uninstall my-skill → trash, kept 7 days
+
+Next
+  skillshare sync                                   remove it from claude, cursor
+  skillshare trash restore my-skill                 undo
+  skillshare install github.com/user/repo/my-skill  reinstall it later
 ```
 
 Multiple skills (batch):
 
 ```
-✓ Uninstalled 4 skill(s) (0.1s)
-
-── Removed ─────────────────────────────
-✓ pdf        skill
-✓ tdd        skill
-✓ security   group, 2 skills
+Failed
 ✗ bad-skill  failed to move to trash: ...
 
-── Next Steps ──────────────────────────
-ℹ Moved to trash (7 days).
-ℹ Run 'skillshare sync' to update all targets
+Removed
+✓ pdf       skill
+✓ tdd       skill
+✓ security  group, 2 skills
+
+! Uninstalled 3, 1 failed · 0.1s
+
+Next
+  skillshare sync        remove them from claude, cursor
+  skillshare trash list  restore any of them within 7 days
 ```
 
 Large batches use a condensed format:
 
 ```
-✓ Uninstalled 920, failed 2 (1.2s)
+Failed
+✗ bad-a     failed to move to trash: permission denied
+✗ bad-b     failed to move to trash: permission denied
 
-── Failed ──────────────────────────────
-✗ bad-a  failed to move to trash: permission denied
-✗ bad-b  failed to move to trash: permission denied
-
-── Removed ─────────────────────────────
+Removed
 ✓ 920 uninstalled
 
-── Next Steps ──────────────────────────
-ℹ Moved to trash (7 days).
-ℹ Run 'skillshare sync' to update all targets
+! Uninstalled 920, 2 failed · 1.2s
+
+Next
+  skillshare sync        remove them from claude, cursor
+  skillshare trash list  restore any of them within 7 days
 ```
 
 To restore an accidentally uninstalled skill:
@@ -260,7 +286,7 @@ Run `skillshare sync` to remove the skill from all targets:
 
 ```bash
 skillshare uninstall old-skill
-skillshare sync  # Remove from Claude, Cursor, etc.
+skillshare sync  # Remove from Claude, Pi, etc.
 ```
 
 ## Project Mode
@@ -279,8 +305,10 @@ In project mode, uninstall:
 - Moves the skill directory to `.skillshare/trash/` (kept 7 days)
 - Removes the skill's entry from `.skillshare/config.yaml` `skills:` list (for remote skills)
 - Removes the entry from `.skillshare/.gitignore` (for remote/tracked skills)
-- For tracked repos: checks for uncommitted changes (use `--force` to override)
+- Removes the skill's pin from `.skillshare/skills.lock.json` (for a group, every pin under it)
+- For tracked repos: checks for uncommitted changes, and fails when the git status cannot be read (use `--force` to override both)
 - The `_` prefix is optional — auto-detected
+- Repos installed with `--into` work as in global mode: `devops/team-skills -p` resolves to `devops/_team-skills`, and a skill or folder inside a tracked repo cannot be removed on its own
 
 ```bash
 skillshare uninstall pdf -p
@@ -288,9 +316,22 @@ skillshare sync
 git add .skillshare/ && git commit -m "Remove pdf skill"
 ```
 
+## Agent Support
+
+Use `--kind agent` to uninstall agents instead of skills:
+
+```bash
+skillshare uninstall --kind agent tutor              # Remove an agent
+skillshare uninstall --kind agent tutor reviewer -f   # Remove multiple agents
+skillshare uninstall --kind agent --all               # Remove all agents
+```
+
+Agent uninstall follows the same trash-and-retain behavior as skills (moved to trash, kept 7 days). See [Agents](/docs/understand/agents) for background.
+
 ## See Also
 
 - [install](/docs/reference/commands/install) — Install skills
 - [list](/docs/reference/commands/list) — List installed skills
 - [trash](/docs/reference/commands/trash) — Manage trashed skills
 - [Project Skills](/docs/understand/project-skills) — Project mode concepts
+- [Agents](/docs/understand/agents) — Agent concepts

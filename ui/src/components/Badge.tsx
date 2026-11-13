@@ -1,28 +1,16 @@
-import { wobbly } from '../design';
-
 interface BadgeProps {
   children: React.ReactNode;
   variant?: 'default' | 'success' | 'warning' | 'danger' | 'info' | 'accent';
+  size?: 'sm' | 'md';
+  dot?: boolean;
 }
 
-const variants: Record<string, string> = {
-  default: 'bg-muted text-pencil-light border-pencil-light',
-  success: 'bg-success-light text-success border-success',
-  warning: 'bg-warning-light text-warning border-warning',
-  danger: 'bg-danger-light text-danger border-danger',
-  info: 'bg-info-light text-blue border-blue',
-  accent: 'bg-accent/10 text-accent border-accent',
-};
+const variants = { default: '', success: 'ok', warning: 'warn', danger: 'bad', info: 'inf', accent: 'warn' };
 
-export default function Badge({ children, variant = 'default' }: BadgeProps) {
+export default function Badge({ children, variant = 'default', size = 'sm', dot = false }: BadgeProps) {
   return (
-    <span
-      className={`inline-flex items-center px-2.5 py-1 border text-sm font-[var(--font-hand)] ${variants[variant]}`}
-      style={{
-        borderRadius: wobbly.sm,
-        fontFamily: 'var(--font-hand)',
-      }}
-    >
+    <span className={`ss-tag ${variants[variant]} ${size === 'md' ? 'h-[22px] px-2 text-xs' : ''}`}>
+      {dot && <span className="w-1.5 h-1.5 rounded-full bg-current" />}
       {children}
     </span>
   );

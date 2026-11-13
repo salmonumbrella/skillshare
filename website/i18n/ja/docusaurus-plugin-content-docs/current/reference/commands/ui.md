@@ -1,0 +1,313 @@
+---
+sidebar_position: 1
+---
+
+# ui
+
+視覚的な Skill 管理のための Web ダッシュボードを起動します。
+
+リモート検索（`GET /api/search`）とインストールのプレビュー（`GET /api/preview`）は変更操作と同じ origin チェックを使い、別サイトからのブラウザー要求は取得前に拒否します。ブラウザーの origin/fetch ヘッダーを持たない直接クライアントは引き続き対応します。GitHub API の認証情報は HTTPS の `api.github.com` と `raw.githubusercontent.com`（既定ポートまたは 443）に限定され、別 origin へのリダイレクト時は認証情報を削除します。
+
+```bash
+skillshare ui                  # フォアグラウンドで実行
+skillshare ui start            # バックグラウンドサーバーを起動（既存があれば再利用）
+skillshare ui stop             # バックグラウンドサーバーを停止
+```
+
+デフォルトブラウザで `http://127.0.0.1:19420` を開きます。
+
+## モード
+
+| モード | 動作 |
+|------|------|
+| `skillshare ui`（デフォルト） | UI サーバーをフォアグラウンドで実行。`Ctrl+C` で停止 |
+| `skillshare ui start` | UI サーバーをバックグラウンドプロセスとして起動し、シェルの制御を返す。再度 `start` を実行した場合、既存のプロセスが正常であればそれを再利用 |
+| `skillshare ui stop` | `skillshare ui start` で起動したバックグラウンド UI サーバーを停止 |
+
+## 使うタイミング
+
+- Skill、Target、sync を視覚的な Web インターフェースで管理したい
+- CLI フラグを覚えずに Skill を閲覧・インストールしたい
+- 視覚的な検出結果レポート付きでセキュリティ監査を実行したい
+- CLI に不慣れなチームメンバーとダッシュボードビューを共有したい
+
+## フラグ
+
+| フラグ | デフォルト | 説明 |
+|------|---------|-------------|
+| `-p`, `--project` | | Project mode で実行（`.skillshare/` を使用） |
+| `-g`, `--global` | | グローバルモードで実行（`~/.config/skillshare/` を使用） |
+| `--port <port>` | `19420` | HTTP サーバーのポート |
+| `--host <host>` | `127.0.0.1` | バインドアドレス（Docker の場合は `0.0.0.0` を使用） |
+| `-b`, `--base-path <path>` | | リバースプロキシ用のサブパス（例: `/skillshare`） |
+| `--trusted-origin <url>` | | ダッシュボードが応答するもう 1 つのアドレス。リバースプロキシ（[reverse proxy](#reverse-proxy)）の背後なら `https://tools.example.com` など。複数指定する場合は繰り返します |
+| `--no-open` | `false` | ブラウザを自動的に開かない |
+| `--app` | `false` | 可能な場合、ダッシュボードをデスクトップ風の Chromium アプリウィンドウとして開く（`start` モードのみ） |
+| `--clear-cache` | | フォアグラウンド形式の場合: キャッシュされた UI アセットをクリアして終了。`start` と組み合わせた場合: キャッシュをクリアしてからバックグラウンドで起動 |
+
+:::tip 自動検出
+カレントディレクトリに `.skillshare/config.yaml` が存在する場合、ダッシュボードは自動的に Project mode で起動します。グローバルモードを強制するには `-g` を使用してください。
+:::
+
+## 例
+
+```bash
+# デフォルト: localhost:19420 でブラウザを開く（フォアグラウンド）
+skillshare ui
+
+# Project mode（.skillshare/ の Skill を管理）
+skillshare ui -p
+
+# カスタムポート
+skillshare ui --port 8080
+
+# Docker / リモートアクセス
+skillshare ui --host 0.0.0.0 --no-open
+
+# バックグラウンドで起動し、シェルに制御を戻す
+skillshare ui start
+
+# デスクトップ風のクロームレスアプリウィンドウとして起動
+skillshare ui start --app
+
+# バックグラウンドサーバーを停止（記憶されている host/port を使用）
+skillshare ui stop
+
+# キャッシュされた UI アセットをクリアしてからバックグラウンドで新規起動
+skillshare ui start --clear-cache
+```
+
+## ダッシュボードのページ
+
+サイドバーはページをタスクごとにグループ化します: sync すること、管理しているもの、同期先、メンテナンス。名前の下の行にはモードとそのフォルダ（例: `Global · ~/.config/skillshare`）が表示されます。
+
+一部のページは、対応が必要な場合にサイドバーに件数を表示します。この件数は、ダッシュボードのタブが開いている間、15 秒ごとに更新されます。
+
+- **Sync**: sync によって適用される変更
+- **Git Sync**: 未コミットのファイル、またはツリーがクリーンな場合はまだプッシュされていないコミット
+- **Audit**: 直近のスキャンでブロックされた Skill と Agent（スキャンを実行した後に表示）
+
+| ページ | 説明 |
+|------|-------------|
+| **Dashboard** | Skill、Agent、Extras、MCP サーバー、Hook、Plugin、Target の件数、および対応が必要な項目。コミットされていない変更がある、または git ステータスを読み取れない tracked repo をアンインストールすると、理由を示して再確認し、repo をそのままゴミ箱へ移動します（`uninstall --force` と同じ） |
+| **Sync** | 書き込む前に、Target ごとにすべての変更をプレビュー。含める項目を選択（Skills、Agents、Extras、MCP）。Target 内で編集されたファイルは、**Force** がオンでない限り保持される。Target にのみ存在する項目は、ここから Source に collect し戻せる。各 sync は最初に Target フォルダをバックアップする。Target が失敗しても他の Target は sync される。失敗した Target は、その部分（Skills、Agents、Extras、Config）とエラーとともに他の警告より上に一覧表示され、よくある原因（別の場所を指す symlink、権限不足、読み取り専用のファイルシステム、存在しないファイルやフォルダー、無効な Target 設定）にはわかりやすい説明も付き、別の場所を指す Skills の symlink には **Force をオンにする** が表示され、変更一覧でもその Target に印が付く。すべての Target が失敗した場合も、同じように一覧表示される。**前回の同期** カードには、直近の sync で失敗した Target が表示される。同じ変更を受け取る Target は 1 枚のカードにまとめられ、Skill がフォルダごとに並ぶ。**Discard all** は確認のあと、まだどの Target にも届いていない Skill をゴミ箱に移す。Target の `include` フィルターがどの Skill にも一致しないときは、その Target に Skill が届かないことを知らせる通知が表示され、**Edit filter** でそのフィルターを設定している場所を開ける。Git Sync でも pull のあとに同じ通知が表示される |
+| **Git Sync** | Source リポジトリのコミットとプッシュ、remote にまだないコミットのプッシュ、プルを実行。ページを開くと remote から fetch するため、**Pull** には remote にあるコミット数が表示される。プルはリポジトリのスコープ（`skills`、`agents`、`extras`、または `root`）が保持するものを sync する。詳細は [`pull`](/docs/reference/commands/pull) を参照。**Sync both ways** はローカルの変更をコミットし、プルしてマージし、target を sync してからプッシュする（[`push --pull`](/docs/reference/commands/push#push-and-pull-together) と同じ）。コンフリクトが発生した場合はプッシュ前に停止する。remote に新しいコミットがあるためにプッシュが拒否された場合、エラーに **Pull** が表示される。最初のプルが remote とマージできない場合、remote ブランチでローカルファイルを置き換える force pull を提案する |
+| **Hubs** | スキル ページから移動。内蔵の hub、保存済みの hub、自分の Hub（**自分の**）を一覧表示し、選ぶとその Skill を絞り込んでインストールできる。**Hub を追加・作成** は既存の hub の追加、新しい Hub の作成、`skillshare-hub.json` の読み込みを行う。自分の Hub は **編集** で変更し、**共有** でインデックスをダウンロードして `hub add` コマンドを作る。保存済みと内蔵の hub は **更新** で、2 分間のキャッシュを待たずに一覧を読み直す。[`hub`](/docs/reference/commands/hub) を参照 |
+| **Skills** / **Agents** | インストール済みの項目、**Updates** タブ、**Trash** タブ。Skills にはさらに、Target のコンテキストに Skill が追加するトークン数を見積もる **Analyze** タブがある。**Install** は GitHub を検索するか、URL やパスからインストールする。メニューには作成ウィザードを開く **New skill** と **Link folder** もある。config にまだインストールされていないエントリがあるときは、**Updates** タブとインストールダイアログに **Install all** が表示され、引数なしの [`install`](/docs/reference/commands/install) と同じように動く。チェックのあと、ソース repo から削除された Skill が **Prune** と **Prune all** 付きで表示され、ゴミ箱に移せる。**Link folder** は [`link`](/docs/reference/commands/link) と同様にフォルダを Skill の source にリンクする。パス、任意のリンク名、`follow_source_links` が無効の間はそれを有効にするチェックボックスを受け付け、拒否されたフォルダにはコマンドと同じ理由を表示する。リンクしたフォルダはリンクアイコンとリンク先フォルダ付きの独立したグループとして表示される。その行のアイコンボタン（ホバーするとリンクアイコンがリンク解除アイコンに変わる）は確認後、[`unlink`](/docs/reference/commands/unlink) と同様にリンクを解除する。フォルダ自体には触れず、リンクは **Trash** タブから復元できる。リンクしたフォルダ内の Skill は個別にアンインストールでき、そのフォルダから trash へ移動される。リンクしたフォルダには **Update repo** と **Uninstall repo** はない。一覧とカードビューは **Folder**（tracked repo、`frontend/react` のようなフォルダ、または **Root**）でフィルタでき、**Folder** でグループ化もできる。Root が先頭で、残りのフォルダは名前の A→Z 順。リストビューでは、別のスキルのフォルダ内にあるスキルはそのスキルの下に表示されます。パッケージ名の後ろにある件数ボタンで、そのスキルが下に開き、淡いツリー線でパッケージとつながります（パッケージは最初は折りたたまれています）。さらに深いパッケージはもう一段インデントされます。検索中は一致を含むパッケージが開き、`1 / 3` のような件数を表示し、名前の一致部分を強調します。検索中に閉じたパッケージは検索が変わると再び開き、それ以前に開いていたパッケージはそのまま残ります。ページ送りは最上位の行だけを数えます。各行には frontmatter の `description` が 1 行で表示され、行にキーボードフォーカスがあるときは全文が表示されます。**グループと並び順** → **表示** → **説明** で非表示にできます。**すべて展開** / **すべて折りたたむ** はパッケージも開閉し、選択バーは選択中で表示されていない項目の数を示します。詳細ページを開くのは名前のクリックだけです。パッケージをアンインストールすると、そのフォルダ内のスキルも trash に移動され、確認ダイアログにその数が表示されます。**tree** ビューは左に source のフォルダ、右に詳細を表示する。フォルダや Skill をクリックして選択し、Cmd/Ctrl クリックで選択に追加、Shift クリックで範囲選択、Skill をダブルクリックで開く。右側では、選択したものすべてを 1 つのスイッチで有効・無効にし（`.skillignore.local` の `!` ルールが有効のまま保つ項目は、理由とともに失敗として報告されます）、targets を設定し（tracked repo とそのサブフォルダも含む）、各 Skill を個別のスイッチ付きで一覧する。tracked repo では **Update repo** と **Uninstall repo** も使える。`disable-model-invocation: true` を持つ Skill は、一覧・タイル・詳細ページで **manual only** タグが付く。これは [`list`](/docs/reference/commands/list) で `m` キーが切り替えるのと同じ状態。リモートの既定ブランチ以外から入れた skill（`install --branch`）は、一覧、タイル、**Updates** タブにそのブランチがタグで表示される。リモートソースから入れた skill の詳細ページ（tracked repo は除く。こちらは **Git Sync** でブランチを切り替える）では、**Branch** にソースのブランチが並ぶ。ホストを問わず、どの Git リモート（HTTPS でも SSH でも）でも使える。ブランチを選ぶと確認のうえ、update と同じセキュリティ監査とローカル変更チェックを通してそのブランチから再インストールする。そのブランチにこの skill がなければ、現在のインストールはそのまま残る。プロジェクトでは、切り替えに成功するとそのブランチが `.skillshare/config.yaml` にも記録され、チームメイトもそのブランチからインストールする。Skill エディタでは、**Add field** が各フロントマターフィールドの説明を表示する。**Sync skills** / **Sync agents** はプレビューしてから、その種類だけをすべての Target に sync する。update、アンインストール、collect の後に表示される **Sync Now** からも同じダイアログが開く。ファイルブラウザーは、たどられた source リンク自体が Skill のルートである場合も、そのリンクを通して `SKILL.md` と添付ファイルを一覧表示します。 |
+| **Extras** | **フォルダー**: Skill と一緒に sync される rules、commands、その他のフォルダ。**Edit target** で Target のフォルダ、ファイル名、モード、flatten、[ファイルフィルター](./extras.md#choosing-files)をプレビューしながら変更できる。**Edit extra** で Extra の名前を変えたり、別のソースフォルダを指定したりできる。**AGENTS.md**: global モードでは共有 `AGENTS.md` と、それを使う Target。Project では Project の `./AGENTS.md` と、各 Target がそれを読み込めるか。[1 つの AGENTS.md をツール間で共有する](../../how-to/daily-tasks/sharing-instructions.md)を参照  **Memory**: [メモリ共有ガイド](../../how-to/daily-tasks/sharing-memory.md)（英語スクリーンショット）。ノートの検索、プレビュー、編集、削除、INDEX リンク、競合時の下書き保持、Backup Files の履歴と復元、**Connect to agents** → **Review changes** → **Apply changes**。設定状態は読み取り済みを示しません |
+| **MCP** | サーバーごとに 1 行表示され、sync 先の Agent がチップとして並び、行のカウントボタンでそれらのトグルを開く。**サーバーを追加** は URL、コマンド、貼り付けたスニペット、またはファイルを受け付ける。**target からインポート** はインストール済みの Agent が既に持っているものを読み込む。各サーバーのメニューには **各 Agent に書き込まれる設定を表示** があり、source とすべての Agent のファイルを一覧表示し、選んだものを未保存の編集を含めて表示する。コンフリクトでは **その Agent からインポート** か **ソースで上書き** を選べる。サーバーのダイアログの **ツール** セクションでは [ツールポリシー](./mcp.md#tool-policy) を設定する。保存済みかどうかに関係なくダイアログの現在の設定でサーバーを一度起動し、ツールをチェックできる一覧にする **ツールを読み込む**、`*` パターン用の **除外ルール** の行がある。ポリシーの一部を適用しない選択中の Agent がそれぞれ表示され、ポリシーを設定すると行にタグが付く。Pi サーバーでは、ダイアログに [Pi の内蔵 MCP](./mcp.md#pi) の設定もあり、ツールの公開方法とその他の Pi 設定を扱い、後者は [`piOptions`](./mcp.md#pi-options) を JSON で受け付ける。説明は情報アイコンのツールチップに表示される。**デフォルト** は `mcp.targets` を編集する。Sync ボックスの **Sync MCP** は保留中の変更を一覧表示し、MCP の設定ファイルだけを書き込み、それぞれのバックアップを保存する。その下では [**チェック**](./mcp.md#check-servers-before-an-agent-starts-them) がサーバーをチェックし、**バックアップと復元** でそれらのバックアップをプレビューして復元できる。 |
+| **Plugins** | Plugin ごとに 1 行表示され、その Agent がトグルとして並ぶ。行を展開すると、そのソースが対応する他の Agent も一覧され、いずれかにチェックを入れるとインストールのプレビューが表示される。行のメニューから sync、update、削除ができ、Skillshare がレビューしたローカルコピーを読み取り専用で閲覧する **View files** も開ける。[Manage plugins across tools](/docs/how-to/daily-tasks/sharing-plugins) を参照 |
+| **Targets** | ステータス付きの Target 一覧。**ターゲットを追加** では **別のアカウント** も選べます。すでに使っている Agent の 2 つ目の config フォルダで、書き込み先のプレビューが付きます。各 Target のページで include/exclude フィルタを編集し、ローカルのみの Skill を Source に collect し戻せる。フィルタのプレビュー上部の検索ボックスで行を名前で絞り込み、一致した部分を強調表示できる。変わるのは表示だけで、フィルタ自体は変わらない。Project のページと Extras の **Edit target** ダイアログも同じプレビューと検索を使う。**Syncing** 列には各 Target が受け取るものがリンクとして並ぶ。**Skills**、**Agents**、**MCP**、**Hooks** とその数、Pi の **Extensions**、そして共有 `AGENTS.md` が接続済みの Target の指示ファイルで、クリックすると Target ページの該当タブが開く。MCP 設定ファイルを持つ Target には **MCP** タブがあり、サーバーごとに 1 行で選ぶ。クリックするとすぐ保存され、**Sync all targets** ですべての Target の MCP ファイルに書き込まれる。各 Target には、そのファイル名のタブ（**CLAUDE.md**、**GEMINI.md**、**AGENTS.md** など）もあり、読み込み順を表示し、ファイルを編集し、`AGENTS.md` に変換できる |
+| **Projects** | global mode のみ。global config が sync する project フォルダーで、`config.yaml` の [`projects`](/docs/reference/targets/configuration#projects)、このマシンだけに保存された project（**このマシン** と表示）、[`mcp.projects`](./mcp.md#projects-in-the-dashboard) から一覧される。同じ project はターミナルから [`skillshare project`](./project.md) でも管理できる。**プロジェクトを追加** はフォルダー、その target、sync する内容を指定し、ダイアログ下部の **保存先** で **このマシンのみ** を選ばない限り `config.yaml` に保存する（[`projects_storage`](/docs/reference/targets/configuration#projects-storage) が `machine-local` のときはこちらが既定）。編集は project が保存されている場所に保存される。保存済みの project を移すには `skillshare project localize` または `share` を使う。このマシンが上書きしている project を削除すると、このマシンのコピーだけを削除するか、`config.yaml` 側も削除するかを確認する。各 project には **Skills** と **Agents** タブがあり、フィルター、プレビュー、書き込まれるフォルダーを表示する。**MCP** タブでは、そのフォルダー内で global サーバーをオフにしたり、その project 独自のサーバーを追加したりでき、それらのサーバー用の **チェック** もある。**Sync project** はプレビューしてから、その project の skills、agents、MCP だけを sync する。すでに project フォルダーを指している Target は変換できる |
+| **Audit** | Skill と Agent のセキュリティスキャン。重大度別の検出結果を表示。[たどる source link](/docs/reference/targets/configuration#follow_source_links) を読み取れなかった場合は、Skills / Agents タブの横に **スキャン未完了** と表示され、部分的なスキャンが完全なスキャンと誤認されないようになる。このときスキャン後は問題なしではなく警告を表示し、ダッシュボードの **Needs attention** にも表示される。**Rules** タブでは、カテゴリごとにすべてのルールを閲覧できる: ルールをオフにする、重大度を変更する、カテゴリ全体に重大度を適用する、スキャンプロファイル（`default`、`strict`、`permissive`）を選ぶ、カスタム `audit-rules.yaml` のエディタを開く、のいずれかができる |
+| **Settings** | タブ分け: **General**（Source パス、sync モード、外観）、**Backup**（Target フォルダのスナップショット、`AGENTS.md` などのファイルの以前のバージョン、MCP 設定のバックアップ。[`backup`](./backup.md#dashboard) を参照）、**Log**（操作履歴）、**Health**（[`doctor`](/docs/reference/commands/doctor) と同じチェック）、**Extensions**（sync 時のファイル変換）、**Files**（`config.yaml`、`.skillignore`、`.agentignore` の直接編集。`.skillignore.local` または `.agentignore.local` がある場合は、ファイルの後に適用されて上書きできるため、エディタの上にそのルールを表示します） |
+
+変更一覧の横の **変更を破棄** は、確認後に選択した Git スコープ内の追跡中のファイルとステージング領域を最後のコミットに戻し、未追跡のファイルとフォルダーを削除します。Git に無視されたファイル、入れ子になった Git リポジトリ、`root` スコープの `config.yaml` は保持されます。コミット履歴の変更やリモートへのプッシュは行わず、この操作は元に戻せません。**ドライラン** はファイルを変更せずプレビューします。変更を破棄するには、リポジトリに最初のコミットが必要です。
+
+Git の競合比較ではファイル全体のバージョンを選びます。ファイルごとにローカルかリモートを選ぶか、**すべてローカルを保持**／**すべてリモートを保持**で一括選択し、適用前に個別の選択を変更できます。削除された側を選ぶと、そのファイルはマージで削除されます。両方のコミット履歴は保持され、キャンセルしてもファイルは変わりません。
+
+**Updates** タブでは、プログレスバーに更新の進行状況が表示され、更新中の行が示されます。ブロックされた更新や失敗した更新は別のセクションに表示されます。更新が成功すると、その種類の同期に未反映の変更があるか確認します。**Sync Now** は適用する変更がある場合にだけ表示され、変更がなければ同期不要と表示されます。既存の symlink は更新された source の内容をすでに読み取れます。同期の確認に失敗した場合は、最新状態と表示する代わりにエラーと **Retry** が表示されます。 たどられた Git チェックアウトは、リンク名とターゲットパスを含む情報行として表示されます。`skillshare update --all` と同様、このタブではチェック、更新、強制再試行を行いません。チェックアウトは自分で管理するか、CLI で名前を指定して更新してください。
+
+`/collect`、`/install`、`/search`、`/trash`、`/analyze`、`/backup`、`/log`、`/doctor` などの古いリンクは、新しい場所にリダイレクトされます。
+
+**Files** タブでは、エディタの横にパネルが表示されます。`config.yaml` の場合、カーソル位置のフィールドが何をするか、ファイルの構造、未保存の変更が表示されます。ignore ファイルの場合、現在のパターンが何を隠しているかが一覧表示されます。`Cmd+S` / `Ctrl+S` で保存します。**Audit -> Rules -> Edit YAML** のルールエディタには同じパネルに加え、貼り付けた行に対してルールの正規表現を実行する **Test** タブがあります。
+
+### テーマシステム
+
+ダッシュボードは、サイドバーの **Theme** ボタンで切り替え可能な 2 つのビジュアルスタイルと 3 つのカラーモードに対応しています。
+
+| 設定 | 選択肢 | デフォルト |
+|---------|---------|---------|
+| **Style** | `Clean`（プロフェッショナル）、`Playful`（太いアウトライン、ハードシャドウ、手書き風の見出し） | Playful |
+| **Mode** | `Light`、`Dark`、`System`（OS の設定に従う） | Light |
+
+テーマの設定はセッションをまたいで localStorage に保持されます。
+
+### Project mode の違い
+
+Project mode（`-p`）で実行すると、ダッシュボードは以下のように適応します。
+
+- **サイドバー** に名前の下に `Project · <project path>` が表示される
+- **Git Sync ページ** は非表示（Project の Skill は Project 自体の git を使用するため）
+- **Sync** は `skillshare sync -p` と同様、Agent の Target フォルダのみバックアップする
+- **Backup タブ** は Settings 内で非表示（代わりにバージョン管理を使用すること）
+- **Tracked Repos セクション** は Dashboard から非表示（該当しないため）
+- **Settings -> Files** は、グローバル版の代わりに `.skillshare/config.yaml` と Project レベルの `.skillignore` を表示する
+- **Available targets** は Project レベルの Target（例: プロジェクトルートからの相対パス `.claude/skills/`）を一覧する
+- **Targets** は Project の MCP サーバーを数えて切り替え、Project 自身のファイル（`.mcp.json` など）に書き込む。Claude Code、OpenCode、Kilo Code、Pi では **MCP** タブに、グローバルサーバーをこの Project でオフにするスイッチも表示される
+- **Install** は Project 設定の `skills:` エントリを自動的に整合させる
+- **Extras -> AGENTS.md** は共有ファイルではなく Project の `./AGENTS.md` を編集し、自身のファイルしか読まない Target 向けに小さな修正を提案する
+
+## UI プレビュー
+
+<div style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: '1rem'}}>
+  <img src="/img/web-install-demo.png" alt="インストールの流れ" />
+  <img src="/img/web-dashboard-demo.png" alt="ダッシュボードの概要" />
+  <img src="/img/web-skills-demo.png" alt="スキル一覧" />
+  <img src="/img/web-skill-detail-demo.png" alt="スキルの詳細画面" />
+  <img src="/img/web-sync-demo.png" alt="同期操作" />
+  <img src="/img/web-search-skills-demo.png" alt="GitHub の検索画面" />
+  <img src="/img/web-projects-demo.png" alt="プロジェクトフォルダーを一覧表示する Projects ページ" />
+</div>
+
+## REST API
+
+Web ダッシュボードは `/api/` に REST API を公開しています。すべてのエンドポイントは JSON を返します。
+
+| メソッド | パス | 説明 |
+|--------|------|-------------|
+| GET | `/api/overview` | Skill/Target の件数、モード、バージョン、設定フォルダ（`configDir`） |
+| GET | `/api/skills` | メタデータ付きですべての Skill を一覧 |
+| GET | `/api/skills/{name}` | Skill の詳細 + SKILL.md の内容 |
+| GET | `/api/skills/templates` | Skill 作成に利用可能なパターンとカテゴリを取得 |
+| POST | `/api/skills` | 新しい Skill を作成（name、pattern、category、scaffoldDirs） |
+| DELETE | `/api/skills/{name}` | Skill をアンインストール |
+| GET | `/api/targets` | ステータス、include/exclude フィルタ、Target ごとの想定件数付きで Target を一覧 |
+| POST | `/api/targets` | Target を追加 |
+| DELETE | `/api/targets/{name}` | Target を削除 |
+| POST | `/api/sync` | sync を実行（`dryRun`、`force`、`kind`、`project` に対応。`project` は宣言済みの project ルートで、sync をその project の Target に限定する）。`dryRun` が指定されていない限り、まず Target をバックアップする |
+| POST | `/api/git/commit` | Source リポジトリからプッシュせずにローカル git commit を作成 |
+| POST | `/api/git/discard` | 設定された Git スコープ内の未コミットの変更を破棄（グローバルモードのみ。リポジトリに最初のコミットが必要）。`dryRun` に対応。Git に無視されたファイル、入れ子になった Git リポジトリ、`root` スコープの `config.yaml` を保持 |
+| GET | `/api/git/status` | まだプッシュされていないコミット（`ahead`）と、最後の fetch 時点でまだプルしていない upstream のコミット（`behind`）を含む、Source リポジトリの状態。fetch は行わない |
+| POST | `/api/push` | 変更をコミットしてからプッシュ。初回プッシュ時は upstream を設定する。remote にこのリポジトリにないコミットがある場合、`409` とエラーコード `push_rejected` で失敗する。プルしてから再度プッシュする |
+| POST | `/api/pull` | プルしてから、リポジトリのスコープが保持するものを sync する。分岐した履歴はマージされる。`.metadata.json` の競合は自動で解決され、それ以外の競合ではマージを取り消して失敗する。最初のプルがマージできない場合、エラーコード `merge_failed` で失敗する。`force: true` で再試行すると、remote ブランチでローカルファイルを置き換える。`alwaysSync: true` を指定すると、新しく取得したものがなくても target を sync する。ブランチのない remote では `400 remote_empty` を返す |
+| GET | `/api/diff` | Source と Target 間の差分 |
+| GET | `/api/search?q=` | GitHub で Skill を検索 |
+| POST | `/api/install` | ソースから Skill をインストール |
+| GET | `/api/audit` | すべての Skill をセキュリティ脅威についてスキャン。たどる source link を読み取れなかった場合は、`audit --format json` と同じく `warnings` と `incomplete: true` を加える。以前に `--force` で承認した検出結果は `acknowledged: true` を持ち、重大度ではなく `summary.accepted` に数える |
+| GET | `/api/audit/rules` | カスタム監査ルールの YAML を取得 |
+| PUT | `/api/audit/rules` | カスタム監査ルールを保存（正規表現を検証） |
+| POST | `/api/audit/rules` | スターター用の audit-rules.yaml を作成 |
+| GET | `/api/audit/rules/compiled` | 組み込みルールとカスタムルールをマージした後のすべてのルール、および有効なプロファイル |
+| POST | `/api/audit/rules/toggle` | ルールまたはパターン全体を有効化・無効化・再評価 |
+| POST | `/api/audit/rules/reset` | カスタムルールを削除し、組み込みのデフォルトに戻す |
+| PATCH | `/api/audit/policy` | `blockThreshold`、`profile`、またはその両方を設定 |
+| GET | `/api/log` | オプションのフィルタ付きでログエントリを一覧 |
+| GET | `/api/config` | 設定を YAML として取得 |
+| PUT | `/api/config` | 設定 YAML を更新 |
+| GET | `/api/skillignore` | `.skillignore` の内容、ある場合は `.skillignore.local` の内容、ignore の統計を取得 |
+| PUT | `/api/skillignore` | `.skillignore` の内容を更新 |
+| GET | `/api/doctor` | すべてのヘルスチェックを実行（JSON） |
+| GET | `/api/doctor/stream` | すべてのヘルスチェックを Server-Sent Events で実行。チェックが見つかるたびに `check` イベントを送り、最後に `/api/doctor` と同じ JSON を `done` で送る |
+| GET | `/api/health` | 死活監視プローブ。サーバーの準備ができると `200` を返す |
+| GET | `/api/version` | 現在/最新バージョン、アップグレードの可否、Nix でのインストールでは CLI を更新するコマンド（`nixUpgradeCommand`） |
+| POST | `/api/upgrade` | `skillshare upgrade` をその場で実行（バイナリが開発ビルドの場合は `devMode: true` を返し、Nix でのインストールで新しい CLI が待機中の場合はコード `upgrade.nix` の `409` を返す） |
+| POST | `/api/restart` | ローカル UI サーバーを再起動。任意の `{ "clearCache": true }` ボディでキャッシュされた UI アセットを先にクリア |
+
+## インプレースアップグレード
+
+ダッシュボードが新しい CLI リリースが利用可能であることを検出すると、**Update** ダイアログと **Doctor** ページの *Version* カードの両方に **Update now** ボタンが表示されます。
+
+1. UI が `POST /api/upgrade` を呼び出し、ホスト上で `skillshare upgrade` を実行します。
+2. 新しいバイナリが配置されると、UI が `POST /api/restart` を呼び出してローカルサーバーを再起動します。
+3. ブラウザは `GET /api/health` をポーリングし、新しいサーバーの準備ができ次第、自動的にリロードします。
+
+skillshare を Nix でインストールしている場合も、エンドポイントは組み込みの skillshare Skill を更新しますが、CLI の更新は Nix に任せます。新しい CLI がある場合は `409`（`upgrade.nix`）を返し、ダイアログに Nix での更新方法が表示されます。クリックする前から、ダイアログには Nix で CLI を更新する方法が表示されます。`nix profile` でのインストールでは `nix profile upgrade skillshare`、それ以外では Nix 設定の再ビルドです。[upgrade](./upgrade.md#nix-users) を参照してください。
+
+実行中のバイナリが開発ビルド（`version == "dev"`）である場合、upgrade エンドポイントは `devMode: true` を返し、UI はディスク上の何も変更せずに再起動をシミュレートします。
+
+自動リロードが完了しない場合、ダイアログは `skillshare ui start` を実行してバックグラウンドサーバーを復旧するよう案内します。
+
+## リバースプロキシ {#reverse-proxy}
+
+共有サーバー（ホームラボ、社内ツールプラットフォームなど）でダッシュボードを実行し、リバースプロキシの背後に置く場合は、ブラウザで開くアドレスを `--trusted-origin` で渡し、`--base-path` を使って他のサービスと並ぶサブパスの下で配信できます。
+
+```bash
+skillshare ui --base-path /skillshare --host 0.0.0.0 --trusted-origin https://tools.example.com --no-open
+```
+
+または環境変数を使う場合:
+
+```bash
+SKILLSHARE_UI_BASE_PATH=/skillshare SKILLSHARE_UI_TRUSTED_ORIGINS=https://tools.example.com skillshare ui --host 0.0.0.0 --no-open
+```
+
+ダッシュボードが応答するのは、`localhost`、`http://192.168.1.20:19420` のような IP アドレス、`--host` で指定した名前、そして各 trusted origin のみです。それ以外のドメイン名は 403 になります。DNS rebinding 攻撃は、攻撃者が管理するドメイン名をあなたのマシンに向けるためです。各 origin はスキームとホスト、既定以外のポートならポートも含めて指定します（例: `https://tools.example.com`、`http://nas.local:8080`）。`--trusted-origin` を繰り返すか、`SKILLSHARE_UI_TRUSTED_ORIGINS` にカンマ区切りで指定します。trusted なアドレスに到達できる人は、Agent が実行するコマンドを書き込む MCP、Hooks、Plugins ページを含むダッシュボード全体を使えます。自分で管理しているアドレスだけを列挙し、プロキシで到達できる相手を制限してください。
+
+### Nginx
+
+```nginx
+location /skillshare/ {
+    proxy_pass http://127.0.0.1:19420;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
+
+### Caddy
+
+```
+handle_path /skillshare/* {
+    reverse_proxy 127.0.0.1:19420
+}
+```
+
+両方の例のように、ブラウザの `Host` ヘッダーをポートも含めてそのまま渡してください。ダッシュボードは `Host` を trusted origin と照合し、リクエストの `Origin` が `Host` と一致しない場合、ダッシュボードは変更を拒否します。これにより、他の Web サイトがブラウザ経由で変更を行うことを防ぎます。Caddy はデフォルトで `Host` を保持します。`header_up Host` で書き換えないでください。
+
+:::tip
+`--base-path` を使わない場合、ダッシュボードは従来どおり動作します — `localhost:19420` への直接アクセスに追加の設定は不要です。
+:::
+
+## Docker での使用
+
+Docker 内で Web UI を使うには（初回の UI ダウンロードにネットワークアクセスが必要）:
+
+```bash
+make playground
+
+# コンテナ内で:
+skillshare ui --host 0.0.0.0 --no-open
+```
+
+その後、ホストマシンで `http://localhost:19420` を開きます（ポート 19420 は自動的にマッピングされます）。
+
+## Project mode
+
+Web ダッシュボードは Project レベルの Skill を完全にサポートしています。
+
+```bash
+cd my-project
+skillshare ui -p
+```
+
+または `.skillshare/config.yaml` が存在する場合は、単に `skillshare ui`（自動検出）でも構いません。
+
+ダッシュボードは `.skillshare/config.yaml` を読み書きし、Project ローカルの Target に sync し、インストール後にリモートの Skill エントリを整合させます — CLI と同様です。
+
+## ランタイム UI ダウンロード
+
+`skillshare ui` は、初回起動時に対応する GitHub Release からビルド済みの UI アセットを自動的にダウンロードします。アセットは `~/.cache/skillshare/ui/<version>/`（`XDG_CACHE_HOME` を尊重）にキャッシュされるため、以降の起動は即座かつオフラインで行われます。
+
+- **初回実行** には UI アセット（約 2 MB）をダウンロードするためのインターネット接続が必要です
+- **以降の実行** はキャッシュされたアセットを使用します — ネットワーク不要
+- **アップグレード時**、`skillshare upgrade` は新しい UI を事前ダウンロードし、新しいバージョンとアップグレード前のバージョンのキャッシュを保持します。それ以外のキャッシュ済みバージョンはクリーンアップされます
+- **キャッシュを手動でクリアする** には `skillshare ui --clear-cache` を実行してください
+
+## Homebrew に関する補足
+
+すべてのインストール方法（Homebrew、Nix、インストーラースクリプト、手動バイナリ）はランタイム UI ダウンロードを使用します。`skillshare ui` を実行すると、初回起動時に GitHub から UI アセットが自動的にダウンロードされます。以降はキャッシュされたアセットがオフラインで使用されます。
+
+ダウンロード済みの UI キャッシュをクリアするには:
+
+```bash
+skillshare ui --clear-cache
+```
+
+## アーキテクチャ
+
+Web UI は、対応する GitHub Release からランタイムにダウンロードされ、ディスクキャッシュ（`~/.cache/skillshare/ui/<version>/`）から配信される単一ページの React アプリケーションです。
+
+```
+skillshare ui
+  ├── Go HTTP server (net/http)
+  │   ├── /api/*    → REST API handlers
+  │   └── /*        → Cached React SPA (runtime download)
+  └── Browser opens http://127.0.0.1:19420
+```
+
+## 関連項目
+
+- [status](/docs/reference/commands/status) — CLI のステータスチェック
+- [sync](/docs/reference/commands/sync) — CLI の sync コマンド
+- [Project Setup](/docs/how-to/sharing/project-setup) — Project mode のセットアップガイド
+- [Docker Sandbox](/docs/how-to/advanced/docker-sandbox) — Docker で UI を実行

@@ -22,7 +22,7 @@ skillshare tui off      # Disable TUI for all commands (plain text output)
 
 ## Behavior
 
-When TUI is disabled, commands that normally launch an interactive interface (`list`, `log`, `search`, `audit rules`, `trash`, `restore`, `diff`) fall back to plain text output — equivalent to passing `--no-tui` on every command.
+When TUI is disabled, commands that normally launch an interactive interface (`list`, `log`, `search`, `audit rules`, `trash`, `restore`, `diff`, `target list`, `mcp`) fall back to plain text output — equivalent to passing `--no-tui` on every command.
 
 | State | Meaning |
 |-------|---------|
@@ -40,20 +40,21 @@ The `--no-tui` flag on individual commands always takes priority over the global
 
 ```
 $ skillshare tui
-ℹ TUI: on (default)
+  TUI       on · default
 
 $ skillshare tui off
-✔ TUI disabled
+✓ TUI disabled
 
 $ skillshare tui
-ℹ TUI: off
+  TUI       off
 
 $ skillshare tui on
-✔ TUI enabled
+✓ TUI enabled
 ```
 
 ## See Also
 
 - [list](./list.md) — List skills (uses TUI when enabled)
 - [log](./log.md) — View operation log (uses TUI when enabled)
+- [target](./target.md) — Target list (uses TUI when enabled)
 - [audit rules](./audit-rules.md) — Audit rules browser (uses TUI when enabled)

@@ -1,14 +1,16 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"path/filepath"
+	"os"
 	"strings"
 	"time"
 
-	"skillshare/internal/audit"
 	"skillshare/internal/config"
 	"skillshare/internal/install"
+	"skillshare/internal/sourcefs"
+	"skillshare/internal/sourcewalk"
 	"skillshare/internal/trash"
 	"skillshare/internal/ui"
 )
@@ -17,29 +19,28 @@ import (
 // projectRoot == "" means global mode.
 type updateContext struct {
 	sourcePath  string
+	registryDir string // cached SourceRoot result for global mode
 	projectRoot string
 	opts        *updateOptions
+	parseOpts   install.ParseOptions
+	follow      *sourcewalk.Follow // writes pass through followed source links; nil follows none
 }
 
 func (uc *updateContext) isProject() bool {
 	return uc.projectRoot != ""
 }
 
-func (uc *updateContext) auditScanFn() auditScanFunc {
-	if uc.isProject() {
-		return func(path string) (*audit.Result, error) {
-			return audit.ScanSkillForProject(path, uc.projectRoot)
-		}
-	}
-	return audit.ScanSkill
-}
-
 func (uc *updateContext) makeInstallOpts() install.InstallOptions {
 	opts := install.InstallOptions{
+		ParseOptions:   uc.parseOpts,
 		Force:          true,
+		AuditOverride:  uc.opts.force,
+		Reinstall:      uc.opts.force,
 		Update:         true,
 		SkipAudit:      uc.opts.skipAudit,
 		AuditThreshold: uc.opts.threshold,
+		SourceDir:      uc.sourcePath,
+		SourceFollow:   uc.follow,
 	}
 	if uc.isProject() {
 		opts.AuditProjectRoot = uc.projectRoot
@@ -48,18 +49,20 @@ func (uc *updateContext) makeInstallOpts() install.InstallOptions {
 }
 
 // executeBatchUpdate runs the 3-phase batch update loop shared by global and
-// project modes. Caller is responsible for header/dry-run message before calling.
-// Returns combined updateResult and any security error.
+// project modes. Returns combined updateResult and any security error.
 func executeBatchUpdate(uc *updateContext, targets []updateTarget) (updateResult, error) {
 	total := len(targets)
 	start := time.Now()
-	fmt.Println()
 
 	var result updateResult
 	var auditEntries []batchAuditEntry
 	var blockedEntries []batchBlockedEntry
 	var staleNames []string
+	var modifiedNames []string
 	var prunedNames []string
+	var missingRepoNames []string
+	var statusFailedEntries []batchBlockedEntry
+	var fetchFailedEntries []batchBlockedEntry
 
 	// Group skills by RepoURL to optimize updates
 	repoGroups := make(map[string][]updateTarget)
@@ -72,7 +75,10 @@ func executeBatchUpdate(uc *updateContext, targets []updateTarget) (updateResult
 			continue
 		}
 		if t.meta != nil && t.meta.RepoURL != "" {
-			repoGroups[t.meta.RepoURL] = append(repoGroups[t.meta.RepoURL], t)
+			// Group by URL+branch: skills installed from a non-default branch
+			// must be re-fetched from that branch, not the remote HEAD.
+			key := urlBranchKey(t.meta.RepoURL, t.meta.Branch)
+			repoGroups[key] = append(repoGroups[key], t)
 		} else {
 			standaloneSkills = append(standaloneSkills, t)
 		}
@@ -99,18 +105,33 @@ func executeBatchUpdate(uc *updateContext, targets []updateTarget) (updateResult
 	if len(trackedRepos) > 0 {
 		phaseCurrent++
 		if phaseTotal > 1 {
-			progressBar.SetHeader(ui.FormatPhaseHeader(phaseCurrent, phaseTotal, "Pulling %d tracked repo(s)...", len(trackedRepos)))
+			progressBar.SetHeader(ui.FormatPhaseHeader(phaseCurrent, phaseTotal, "Pulling %s...", plural(len(trackedRepos), "tracked repo")))
 		}
 	}
 	for _, t := range trackedRepos {
 		progressBar.UpdateTitle(fmt.Sprintf("Updating %s", t.name))
+		// Tracked repo declared in metadata but clone dir is absent (issue #212):
+		// surface it instead of silently skipping (mirrors the single-target path).
+		if _, statErr := os.Stat(t.path); os.IsNotExist(statErr) {
+			result.skipped++
+			missingRepoNames = append(missingRepoNames, t.name)
+			result.items = append(result.items, updateJSONItem{Name: t.name, Type: "repo", Status: "skipped", Error: missingTrackedRepoShortReason})
+			progressBar.Increment()
+			continue
+		}
 		updated, auditResult, err := updateTrackedRepoQuick(uc, t.path)
+		var statusErr *gitStatusError
 		if err != nil {
 			if isSecurityError(err) {
 				result.securityFailed++
 				blockedEntries = append(blockedEntries, batchBlockedEntry{name: t.name, errMsg: err.Error()})
+				result.items = append(result.items, updateJSONItem{Name: t.name, Type: "repo", Status: "security_blocked", Error: err.Error()})
+			} else if errors.As(err, &statusErr) {
+				statusFailedEntries = append(statusFailedEntries, batchBlockedEntry{name: t.name, errMsg: err.Error()})
+				result.items = append(result.items, updateJSONItem{Name: t.name, Type: "repo", Status: "failed", Error: err.Error()})
 			} else {
 				result.skipped++
+				result.items = append(result.items, updateJSONItem{Name: t.name, Type: "repo", Status: "skipped", Error: updateTrackedRepoErrorMessage(t, err)})
 			}
 		} else if updated {
 			result.updated++
@@ -122,6 +143,7 @@ func executeBatchUpdate(uc *updateContext, targets []updateTarget) (updateResult
 		}
 		progressBar.Increment()
 	}
+	result.missingTrackedRepos = missingRepoNames
 
 	// Phase 2: grouped skills (one clone per repo)
 	if len(repoGroups) > 0 {
@@ -131,10 +153,11 @@ func executeBatchUpdate(uc *updateContext, targets []updateTarget) (updateResult
 			groupedCount += len(g)
 		}
 		if phaseTotal > 1 {
-			progressBar.SetHeader(ui.FormatPhaseHeader(phaseCurrent, phaseTotal, "Updating %d grouped skill(s) from %d repo(s)...", groupedCount, len(repoGroups)))
+			progressBar.SetHeader(ui.FormatPhaseHeader(phaseCurrent, phaseTotal, "Updating %s from %s...", plural(groupedCount, "grouped skill"), plural(len(repoGroups), "repo")))
 		}
 	}
-	for repoURL, groupTargets := range repoGroups {
+	for groupKey, groupTargets := range repoGroups {
+		repoURL, branch := splitURLBranch(groupKey)
 		if uc.opts.dryRun {
 			for _, t := range groupTargets {
 				progressBar.UpdateTitle(fmt.Sprintf("Updating %s", t.name))
@@ -154,12 +177,23 @@ func executeBatchUpdate(uc *updateContext, targets []updateTarget) (updateResult
 				result.skipped++
 				continue
 			}
+			if !uc.opts.force && t.meta.LocallyModified(t.path, uc.follow) {
+				modifiedNames = append(modifiedNames, t.name)
+				result.skipped++
+				result.items = append(result.items, updateJSONItem{Name: t.name, Type: "skill", Status: "skipped", Error: modifiedSkillReason})
+				progressBar.Increment()
+				continue
+			}
 			subdir := t.meta.Subdir
 			if subdir == "" {
 				subdir = "."
 			}
 			skillTargetMap[subdir] = t.path
 			pathToTarget[subdir] = t
+		}
+
+		if len(skillTargetMap) == 0 {
+			continue
 		}
 
 		batchOpts := uc.makeInstallOpts()
@@ -172,9 +206,10 @@ func executeBatchUpdate(uc *updateContext, targets []updateTarget) (updateResult
 			}
 		}
 
-		batchResult, err := install.UpdateSkillsFromRepo(repoURL, skillTargetMap, batchOpts)
+		batchResult, err := install.UpdateSkillsFromRepo(repoURL, branch, skillTargetMap, batchOpts)
 		if err != nil {
-			for _, t := range groupTargets {
+			fetchFailedEntries = append(fetchFailedEntries, fetchFailedEntry(repoURL, err))
+			for _, t := range pathToTarget {
 				progressBar.UpdateTitle(fmt.Sprintf("Failed %s: %v", t.name, err))
 				result.skipped++
 				progressBar.Increment()
@@ -207,6 +242,8 @@ func executeBatchUpdate(uc *updateContext, targets []updateTarget) (updateResult
 			} else if res := batchResult.Results[subdir]; res != nil {
 				result.updated++
 				auditEntries = append(auditEntries, batchAuditEntryFromInstallResult(t.name, res))
+			} else if batchResult.Current[subdir] {
+				result.upToDate++
 			} else {
 				result.skipped++
 			}
@@ -225,7 +262,7 @@ func executeBatchUpdate(uc *updateContext, targets []updateTarget) (updateResult
 	if len(standaloneSkills) > 0 {
 		phaseCurrent++
 		if phaseTotal > 1 {
-			progressBar.SetHeader(ui.FormatPhaseHeader(phaseCurrent, phaseTotal, "Updating %d standalone skill(s)...", len(standaloneSkills)))
+			progressBar.SetHeader(ui.FormatPhaseHeader(phaseCurrent, phaseTotal, "Updating %s...", plural(len(standaloneSkills), "standalone skill")))
 		}
 	}
 	for _, t := range standaloneSkills {
@@ -271,27 +308,59 @@ func executeBatchUpdate(uc *updateContext, targets []updateTarget) (updateResult
 	// Render results
 	if !uc.opts.dryRun {
 		displayUpdateBlockedSection(blockedEntries)
+		for _, e := range fetchFailedEntries {
+			ui.Warning("Could not fetch %s: %s", e.name, e.errMsg)
+		}
+		for _, e := range statusFailedEntries {
+			ui.Error("%s: %s", e.name, e.errMsg)
+		}
 		displayPrunedSection(prunedNames)
 		displayStaleWarning(staleNames)
+		displayModifiedWarning(modifiedNames)
+		displayMissingTrackedReposWarning(missingRepoNames)
 		displayUpdateAuditResults(auditEntries, uc.opts.auditVerbose)
 		ui.UpdateSummary(ui.UpdateStats{
 			Updated:        result.updated,
+			UpToDate:       result.upToDate,
 			Skipped:        result.skipped,
 			Pruned:         result.pruned,
 			SecurityFailed: result.securityFailed,
 			Duration:       time.Since(start),
 		})
+	} else {
+		repos := 0
+		for _, t := range targets {
+			if t.isRepo {
+				repos++
+				printUpdateRow(ui.MarkNone, t.name, "would run git pull", 0)
+			} else {
+				printUpdateRow(ui.MarkNone, t.name, "would reinstall", 0)
+			}
+		}
+		var parts []string
+		if repos > 0 {
+			parts = append(parts, plural(repos, "tracked repo"))
+		}
+		if skills := total - repos; skills > 0 {
+			parts = append(parts, plural(skills, "skill"))
+		}
+		fmt.Println()
+		ui.Done(ui.MarkNone, "Would update "+strings.Join(parts, ", "), 0)
+		ui.DryRun()
 	}
 
 	if (result.updated > 0 || result.pruned > 0) && !uc.opts.dryRun {
-		ui.SectionLabel("Next Steps")
-		ui.Info("Run 'skillshare sync' to distribute changes")
+		ui.Next("skillshare sync", "link the changes into your targets")
 	}
 
+	var errs []error
 	if result.securityFailed > 0 {
-		return result, fmt.Errorf("%d repo(s) blocked by security audit", result.securityFailed)
+		errs = append(errs, fmt.Errorf("%d repo(s) blocked by security audit", result.securityFailed))
 	}
-	return result, nil
+	if len(statusFailedEntries) > 0 {
+		errs = append(errs, fmt.Errorf("%d repo(s) failed to check git status", len(statusFailedEntries)))
+	}
+	return result, errors.Join(errs...)
 }
 
 func handleGroupedBatchProgress(progressBar *ui.ProgressBar, line string) bool {
@@ -331,40 +400,87 @@ func pruneSkill(skillPath, name string, uc *updateContext) error {
 	} else {
 		trashDir = trash.TrashDir()
 	}
+	if err := sourcefs.CheckMoveOut(uc.sourcePath, skillPath, uc.follow); err != nil {
+		return err
+	}
 	_, err := trash.MoveToTrash(skillPath, name, trashDir)
 	return err
 }
 
-// pruneRegistry removes pruned skill entries from the registry.
+// pruneRegistry removes pruned skill entries from the metadata store.
 func pruneRegistry(prunedNames []string, uc *updateContext) {
-	var regDir string
-	if uc.isProject() {
-		regDir = filepath.Join(uc.projectRoot, ".skillshare")
-	} else {
-		regDir = filepath.Dir(config.ConfigPath())
-	}
-
-	reg, err := config.LoadRegistry(regDir)
-	if err != nil || len(reg.Skills) == 0 {
+	store, err := install.LoadMetadata(uc.sourcePath)
+	if err != nil {
 		return
 	}
 
-	removedSet := make(map[string]bool, len(prunedNames))
-	for _, n := range prunedNames {
-		removedSet[n] = true
-	}
-
-	updated := make([]config.SkillEntry, 0, len(reg.Skills))
-	for _, s := range reg.Skills {
-		if !removedSet[s.FullName()] {
-			updated = append(updated, s)
+	changed := false
+	for _, name := range prunedNames {
+		if store.Has(name) {
+			store.Remove(name)
+			changed = true
 		}
 	}
 
-	if len(updated) != len(reg.Skills) {
-		reg.Skills = updated
-		if saveErr := reg.Save(regDir); saveErr != nil {
-			ui.Warning("Failed to update registry after prune: %v", saveErr)
+	if uc.isProject() {
+		// The config must not keep declaring a skill its source no longer has.
+		if cfg, cfgErr := config.LoadProject(uc.projectRoot); cfgErr != nil {
+			ui.Warning("Failed to update the project config after prune: %v", cfgErr)
+		} else if forgetErr := config.ForgetProjectSkills(uc.projectRoot, cfg, prunedNames); forgetErr != nil {
+			ui.Warning("Failed to update the project config after prune: %v", forgetErr)
 		}
 	}
+
+	if changed {
+		if saveErr := store.Save(uc.sourcePath); saveErr != nil {
+			ui.Warning("Failed to update metadata after prune: %v", saveErr)
+		}
+	}
+}
+
+// fetchFailedEntry describes a repo group that could not be fetched. A stored
+// HTTPS repo URL can carry a token as userinfo or in its query, and git's error
+// text echoes the URL, so both are redacted before they reach the terminal.
+func fetchFailedEntry(repoURL string, err error) batchBlockedEntry {
+	name, redact := redactRepoURL(repoURL)
+	return batchBlockedEntry{name: name, errMsg: redact.Replace(err.Error())}
+}
+
+// redactRepoURL returns an http(s) repoURL without its userinfo, query and
+// fragment, plus a replacer that removes those parts from text echoing the
+// URL. Userinfo is taken up to the last "@" before the first "/", so a "?" or
+// "#" inside a password cannot hide it while an "@" in the path stays. Other
+// URLs (file, ssh, scp-style, local paths) come back unchanged.
+func redactRepoURL(repoURL string) (string, *strings.Replacer) {
+	scheme, rest, ok := strings.Cut(repoURL, "://")
+	if !ok || !strings.EqualFold(scheme, "http") && !strings.EqualFold(scheme, "https") {
+		return repoURL, strings.NewReplacer()
+	}
+	var pairs []string
+	host, path := rest, ""
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		host, path = rest[:i], rest[i:]
+	}
+	if at := strings.LastIndex(host, "@"); at > 0 {
+		userinfo := host[:at]
+		host = host[at+1:]
+		pairs = append(pairs, userinfo+"@", "")
+		if _, password, ok := strings.Cut(userinfo, ":"); ok && password != "" {
+			pairs = append(pairs, password, "[REDACTED]")
+		}
+	}
+	rest = host + path
+	if i := strings.IndexByte(rest, '#'); i >= 0 {
+		if len(rest)-i > 1 {
+			pairs = append(pairs, rest[i:], "")
+		}
+		rest = rest[:i]
+	}
+	if i := strings.IndexByte(rest, '?'); i >= 0 {
+		if query := rest[i+1:]; query != "" {
+			pairs = append(pairs, rest[i:], "", query, "[REDACTED]")
+		}
+		rest = rest[:i]
+	}
+	return scheme + "://" + rest, strings.NewReplacer(pairs...)
 }

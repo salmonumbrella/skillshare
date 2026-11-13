@@ -1,0 +1,171 @@
+package sync
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"skillshare/internal/config"
+)
+
+// TestPruneExtraTarget_MergeRemovesSymlinksOnly verifies that merge-mode prune
+// deletes skillshare symlinks but preserves the user's own real files.
+func TestPruneExtraTarget_MergeRemovesSymlinksOnly(t *testing.T) {
+	src := t.TempDir()
+	tgt := t.TempDir()
+
+	srcFile := filepath.Join(src, "a.md")
+	if err := os.WriteFile(srcFile, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(tgt, "a.md")
+	if err := os.Symlink(srcFile, link); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(tgt, "local.md")
+	if err := os.WriteFile(local, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	pruned, errs := PruneExtraTarget(tgt, src, "merge")
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if pruned != 1 {
+		t.Errorf("expected 1 pruned, got %d", pruned)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Error("symlink should have been removed")
+	}
+	if _, err := os.Stat(local); err != nil {
+		t.Error("user's local file must be preserved")
+	}
+}
+
+// A link the user made to a file outside the extra's source is not skillshare's.
+func TestPruneExtraTarget_MergeKeepsExternalLinks(t *testing.T) {
+	src := t.TempDir()
+	tgt := t.TempDir()
+
+	extFile := filepath.Join(t.TempDir(), "mine.md")
+	if err := os.WriteFile(extFile, []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(tgt, "mine.md")
+	if err := os.Symlink(extFile, link); err != nil {
+		t.Fatal(err)
+	}
+
+	pruned, errs := PruneExtraTarget(tgt, src, "merge")
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if pruned != 0 {
+		t.Errorf("expected 0 pruned, got %d", pruned)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Error("external link must be preserved")
+	}
+}
+
+func TestSyncExtra_MergeKeepsExternalLinks(t *testing.T) {
+	src, tgt := setupExtrasTest(t, map[string]string{"a.md": "a"})
+
+	extFile := filepath.Join(t.TempDir(), "mine.md")
+	if err := os.WriteFile(extFile, []byte("mine"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(tgt, "mine.md")
+	if err := os.Symlink(extFile, link); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := syncExtraDir(src, tgt, "merge", config.ExtraTargetConfig{}, nil, ExtraSyncOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Pruned != 0 {
+		t.Errorf("expected 0 pruned, got %d", result.Pruned)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Error("external link must be preserved")
+	}
+}
+
+func TestPruneExtraTargetFiles_CopyRemovesManagedOnly(t *testing.T) {
+	tgt := t.TempDir()
+
+	managed := filepath.Join(tgt, "managed.md")
+	if err := os.WriteFile(managed, []byte("managed"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	local := filepath.Join(tgt, "local.md")
+	if err := os.WriteFile(local, []byte("local"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	pruned, errs := PruneExtraTargetFiles(tgt, "", "copy", map[string]bool{"managed.md": true})
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if pruned != 1 {
+		t.Errorf("expected 1 pruned, got %d", pruned)
+	}
+	if _, err := os.Stat(managed); !os.IsNotExist(err) {
+		t.Errorf("managed file should have been removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(local); err != nil {
+		t.Errorf("local file must be preserved, stat err = %v", err)
+	}
+}
+
+func TestPruneExtraTargetFiles_SymlinkRequiresSymlink(t *testing.T) {
+	tgt := t.TempDir()
+	local := filepath.Join(tgt, "local.md")
+	if err := os.WriteFile(local, []byte("local"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	pruned, errs := PruneExtraTargetFiles(tgt, "", "symlink", nil)
+	if pruned != 0 {
+		t.Errorf("expected 0 pruned, got %d", pruned)
+	}
+	if len(errs) != 1 || !strings.Contains(errs[0], "target is not a symlink") {
+		t.Fatalf("expected target-is-not-symlink error, got %v", errs)
+	}
+	if _, err := os.Stat(local); err != nil {
+		t.Errorf("local file must be preserved, stat err = %v", err)
+	}
+}
+
+func TestClearExtraTarget_SymlinkTargetThatCannotBeInspectedReportsError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows reports a path under a file as not-exist, which is safe to forget")
+	}
+	notDir := filepath.Join(t.TempDir(), "file")
+	os.WriteFile(notDir, []byte("x"), 0644)
+
+	_, kept, errs := ClearExtraTarget("", t.TempDir(), filepath.Join(notDir, "docs"), "", "symlink", nil)
+
+	if kept || len(errs) == 0 {
+		t.Errorf("kept = %v, errs = %v; want an error", kept, errs)
+	}
+}
+
+func TestClearExtraTarget_KeepsRealDirectoryThatResolvesToSource(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "docs")
+	os.MkdirAll(src, 0755)
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	_, kept, errs := ClearExtraTarget("", src, filepath.Join(alias, "docs"), "", "symlink", nil)
+
+	if !kept || len(errs) > 0 {
+		t.Errorf("kept = %v, errs = %v; want the real directory kept", kept, errs)
+	}
+}

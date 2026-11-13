@@ -77,6 +77,10 @@ skillshare converts folder paths to flat names using `__` (double underscore) as
 - `list` and `sync` discover nested skills at any depth
 - `check` and `update` also work with nested skills
 
+:::note Agents are not nested
+This page is about organizing **skills**. Agents are always single `.md` files placed directly under `~/.config/skillshare/agents/` (or `.skillshare/agents/` in project mode) — they don't support folder nesting or auto-flattening. To organize agents, use naming conventions (e.g. `frontend-reviewer.md`, `backend-auditor.md`) and `.agentignore` patterns.
+:::
+
 ---
 
 ## Working with Nested Skills
@@ -106,16 +110,12 @@ Detects nested skills and shows relative paths:
 
 ```bash
 $ skillshare check -g
-Checking for updates
-─────────────────────────────────────────
-▸  Source  ~/.config/skillshare/skills
-│
-├─ Items  0 tracked repo(s), 15 skill(s)
+! utils/remotion  update available · github.com/remotion-dev/skills
 
-  ✓ frontend/frontend-design            up to date
-  ✓ frontend/react/react-best-practices up to date
-  ✓ utils/remotion                      up to date
-  ✓ web-dev/accessibility               up to date
+! Updates available for 1 skill, 14 up to date · 2.1s
+
+Next
+  skillshare update --all  pull the updates
 ```
 
 ### update
@@ -142,9 +142,32 @@ When a short name matches multiple skills, skillshare asks you to be more specif
 Please specify the full path
 ```
 
+### enable / disable
+
+Folders make it easy to toggle a whole category on or off at once. `disable`/`enable` accept glob patterns, so point one at the folder:
+
+```bash
+# Disable every skill under frontend/ (any depth)
+skillshare disable "frontend/**"
+
+# Re-enable the whole folder with the same pattern
+skillshare enable "frontend/**"
+
+# Apply to targets
+skillshare sync
+```
+
+This writes a single `frontend/**` line to `.skillignore` and keeps covering anything you add to the folder later. To toggle individual skills instead, pass their names (`skillshare disable frontend/react/react-best-practices`).
+
+:::tip Quote the pattern
+Wrap folder patterns in quotes (`"frontend/**"`) so your shell doesn't expand `*` first.
+:::
+
+See [enable / disable](/docs/reference/commands/enable) and [.skillignore syntax](/docs/reference/filtering#skillignore) for details.
+
 ---
 
-## Install Directly into Folders
+## Install Directly into Folders {#install-directly-into-folders}
 
 Use `--into` to install a skill into a subdirectory in one step — no manual `mv` needed:
 
@@ -159,7 +182,7 @@ skillshare install ~/my-skill --into frontend/react
 
 # Works with --track too
 skillshare install github.com/team/skills --track --into devops
-# → ~/.config/skillshare/skills/devops/_skills/
+# → ~/.config/skillshare/skills/devops/_team-skills/
 
 # Works in project mode
 skillshare install anthropics/skills -s pdf --into tools -p
@@ -169,7 +192,7 @@ skillshare install anthropics/skills -s pdf --into tools -p
 After `skillshare sync`, targets show auto-flattened names:
 - `frontend/pdf/` → `frontend__pdf`
 - `frontend/react/my-skill/` → `frontend__react__my-skill`
-- `devops/_skills/frontend/ui/` → `devops___skills__frontend__ui`
+- `devops/_team-skills/frontend/ui/` → `devops___team-skills__frontend__ui`
 
 :::tip
 `--into` creates intermediate directories automatically. No need to `mkdir` first.
@@ -249,32 +272,33 @@ This gives you:
 
 ---
 
-## Migrating from Flat to Folders
+## Migrating from Flat to Folders {#migrating-from-flat-to-folders}
 
 :::tip New installs
 For new skills, use `--into` to install directly into the right folder — see [Install Directly into Folders](#install-directly-into-folders) above.
 :::
 
-If you already have a flat skill collection:
+Skills you created yourself (with `skillshare new` or by hand) have no install record, so you can move them with `mv`:
 
 ```bash
 cd ~/.config/skillshare/skills
-
-# Create category folders
-mkdir -p frontend/react frontend/react utils web-dev
-
-# Move skills into folders
-mv react-best-practices frontend/react/
-mv react-debug-guides frontend/react/
-mv react-best-practices frontend/react/
-mv remotion utils/
-mv accessibility web-dev/
-
-# Re-sync to update target symlinks
+mkdir -p frontend/react
+mv my-react-notes frontend/react/
 skillshare sync
 ```
 
 After `sync`, targets are updated automatically — old flat symlinks are cleaned up and new flattened names are created.
+
+:::warning Skills installed with `skillshare install`
+Do not move an installed skill with `mv`. Its install record in `.metadata.json` is keyed by its path, so the record stays at the old path until the next `sync`, `install` or **Install missing** recognizes the moved copy (same name, files unchanged since install, only one such copy) and moves it; until then `update` and `uninstall` cannot find the skill, and `.skillignore` lines never follow. Use [`skillshare move`](/docs/reference/commands/move) instead. It moves the skill together with its install record, so nothing is downloaded again:
+
+```bash
+skillshare move react-best-practices frontend/react
+skillshare sync
+```
+
+`move` also takes several skills and whole folders (`skillshare move frontend archive`). Add `--dry-run` to preview. Like `mv`, it does not update your targets until you run `skillshare sync`.
+:::
 
 ---
 

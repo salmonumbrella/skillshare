@@ -1,17 +1,40 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="playful">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="/logo.png" />
-    <link rel="shortcut icon" type="image/png" href="/logo.png" />
+    <link rel="icon" type="image/png" href="./app-icon.png" />
+    <link rel="shortcut icon" type="image/png" href="./app-icon.png" />
+    <link rel="manifest" href="./site.webmanifest" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#f7f6f3" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Skillshare" />
     <title>Skillshare Web Dashboard</title>
+    <!-- Body text uses the system font. Kalam is only for Playful headings. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
-      rel="stylesheet"
-    />
+    <link href="https://fonts.googleapis.com/css2?family=Kalam:wght@400;700&display=swap" rel="stylesheet" />
+    <script>
+      // FOUC prevention: handle Clean theme + dark mode before first paint
+      // Default is Playful (already set on <html>); only remove for explicit Clean
+      // URL ?theme= param overrides localStorage (values: dark, light, playful, clean)
+      (function() {
+        var p = new URLSearchParams(location.search).get('theme');
+        if (p) {
+          p = p.toLowerCase();
+          if (p === 'dark' || p === 'light') localStorage.setItem('skillshare-theme-preference', p);
+          if (p === 'playful' || p === 'clean') localStorage.setItem('skillshare-style', p);
+        }
+        var style = localStorage.getItem('skillshare-style');
+        var pref = localStorage.getItem('skillshare-theme-preference');
+        if (style === 'clean') {
+          document.documentElement.removeAttribute('data-theme');
+        }
+        var dark = pref === 'dark' || (pref === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+        if (dark) document.documentElement.classList.add('dark');
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

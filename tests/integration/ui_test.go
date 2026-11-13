@@ -32,7 +32,8 @@ targets: {}
 	result := sb.RunCLI("ui", "--no-open")
 
 	result.AssertFailure(t)
-	result.AssertAnyOutputContains(t, "run 'skillshare init' first")
+	result.AssertAnyOutputContains(t, "global source directory not found")
+	result.AssertAnyOutputContains(t, "mkdir -p "+missingSource)
 }
 
 func TestUI_ClearCache(t *testing.T) {
@@ -58,4 +59,34 @@ func TestUI_ClearCache(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(sb.Root, ".cache", "skillshare", "ui")); !os.IsNotExist(err) {
 		t.Error("expected UI cache directory to be removed after --clear-cache")
 	}
+}
+
+func TestUI_BasePathFlag_MissingValue(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	result := sb.RunCLI("ui", "--base-path")
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "--base-path requires a value")
+}
+
+func TestUI_BasePathShortFlag_MissingValue(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	result := sb.RunCLI("ui", "-b")
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "--base-path requires a value")
+}
+
+func TestUI_BasePathEnvVar(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	// With env var but no config — should fail on missing config, not on unknown flag
+	sb.SetEnv("SKILLSHARE_UI_BASE_PATH", "/myapp")
+	result := sb.RunCLI("ui", "--no-open")
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "run 'skillshare init' first")
+	result.AssertOutputNotContains(t, "unknown flag")
 }

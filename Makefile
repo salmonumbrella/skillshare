@@ -1,4 +1,4 @@
-.PHONY: help build build-meta build-windows run test test-unit test-int test-docker test-docker-online test-redteam test-redteam-signal test-redteam-rules-signal playground playground-down devc devc-up devc-down devc-restart devc-reset devc-status dev-docker dev-docker-down docker-build docker-build-multiarch lint fmt fmt-check check install clean ui-install ui-build ui-dev build-all
+.PHONY: help build build-meta build-windows run test test-herdr test-unit test-int test-docker test-docker-online test-redteam test-redteam-signal test-redteam-rules-signal playground playground-down devc devc-up devc-down devc-restart devc-reset devc-status dev-docker dev-docker-down docker-build docker-build-multiarch lint fmt fmt-check docs-check check install clean ui-install ui-build ui-dev build-all verify verify-shell verify-down verify-status verify-reset
 
 help:
 	@echo "Common tasks:"
@@ -7,9 +7,11 @@ help:
 	@echo "  make test           # unit + integration tests"
 	@echo "  make test-unit      # unit tests only"
 	@echo "  make test-int       # integration tests only"
+	@echo "  make test-herdr     # Herdr panel mod tests (node)"
 	@echo "  make test-docker    # docker offline sandbox (build + unit + integration)"
 	@echo "  make test-docker-online  # docker online install/update tests"
 	@echo "  make test-redteam   # red team supply-chain security tests"
+	@echo "  make test-redteam-harness  # regression tests for red team assertions and signal checks"
 	@echo "  make test-redteam-signal  # verify red team test fails on intentional mutation"
 	@echo "  make test-redteam-rules-signal  # verify red team test fails when critical builtin rules are disabled"
 	@echo "  make playground     # start playground + enter shell (one step)"
@@ -20,8 +22,14 @@ help:
 	@echo "  make devc-restart   # restart devcontainer"
 	@echo "  make devc-reset     # full reset (remove volumes)"
 	@echo "  make devc-status    # show devcontainer status"
+	@echo "  make verify         # host verify env: real AI CLIs, throwaway config"
+	@echo "  make verify-shell   # enter the verify env shell"
+	@echo "  make verify-down    # stop the verify dashboard"
+	@echo "  make verify-status  # show verify env paths and state"
+	@echo "  make verify-reset   # delete the throwaway HOME"
 	@echo "  make lint           # go vet"
 	@echo "  make fmt            # format Go files"
+	@echo "  make docs-check     # validate AI context routes and budgets"
 	@echo "  make check          # fmt-check + lint + test"
 	@echo "  make ui-dev         # Go API server + Vite dev server (requires local Go)"
 	@echo "  make dev-docker     # Go API in Docker + auto-rebuild (pair with: cd ui && pnpm run dev)"
@@ -35,8 +43,10 @@ help:
 	@echo "  ./scripts/test_install.sh"
 	@echo "  docker compose -f docker-compose.sandbox.yml --profile dev up -d  # start without watch"
 
+BINARY ?= bin/skillshare
+
 build:
-	mkdir -p bin && go build -o bin/skillshare ./cmd/skillshare
+	mkdir -p $(dir $(BINARY)) && go build -o $(BINARY) ./cmd/skillshare
 
 build-meta:
 	./scripts/build.sh
@@ -45,7 +55,7 @@ build-windows:
 	./scripts/build-windows.sh $(SHARED)
 
 run: build
-	./bin/skillshare --help
+	$(BINARY) --help
 
 test:
 	./scripts/test.sh
@@ -62,13 +72,18 @@ test-docker:
 test-docker-online:
 	./scripts/test_docker_online.sh
 
-test-redteam: build
+.PHONY: test-redteam-harness
+
+test-redteam-harness:
+	bash ./scripts/test_redteam_harness.sh
+
+test-redteam: build test-redteam-harness
 	./scripts/red_team_test.sh
 
-test-redteam-signal:
+test-redteam-signal: test-redteam-harness
 	./scripts/test_redteam_signal.sh
 
-test-redteam-rules-signal:
+test-redteam-rules-signal: test-redteam-harness
 	./scripts/test_redteam_rules_signal.sh
 
 playground:
@@ -96,6 +111,21 @@ devc-reset:
 devc-status:
 	./scripts/devc.sh status
 
+verify:
+	./scripts/verify.sh up
+
+verify-shell:
+	./scripts/verify.sh shell
+
+verify-down:
+	./scripts/verify.sh down
+
+verify-status:
+	./scripts/verify.sh status
+
+verify-reset:
+	./scripts/verify.sh reset
+
 dev-docker:
 	docker compose -f docker-compose.sandbox.yml --profile dev watch
 
@@ -117,7 +147,13 @@ fmt:
 fmt-check:
 	test -z "$$(gofmt -l ./cmd ./internal ./tests)"
 
-check: fmt-check lint test
+docs-check:
+	python3 scripts/ai-context.py check
+
+test-herdr:
+	node --test herdr/tests/*.test.mjs
+
+check: docs-check fmt-check lint test test-herdr
 
 install:
 	go install ./cmd/skillshare
@@ -136,4 +172,4 @@ ui-dev:
 build-all: ui-build build
 
 clean:
-	rm -rf bin coverage.out
+	rm -rf bin $(BINARY) coverage.out

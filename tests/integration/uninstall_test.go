@@ -5,9 +5,9 @@ package integration
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	"skillshare/internal/install"
 	"skillshare/internal/testutil"
 )
 
@@ -26,7 +26,7 @@ targets: {}
 	result := sb.RunCLI("uninstall", "my-skill", "--force")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Uninstalled")
+	result.AssertOutputContains(t, "✓ Uninstall ")
 	result.AssertOutputContains(t, "my-skill")
 
 	// Verify skill was removed
@@ -74,31 +74,6 @@ targets: {}
 	}
 }
 
-func TestUninstall_Force_SkipsConfirm(t *testing.T) {
-	sb := testutil.NewSandbox(t)
-	defer sb.Cleanup()
-
-	// Create existing skill
-	sb.CreateSkill("force-skill", map[string]string{"SKILL.md": "# Force"})
-
-	sb.WriteConfig(`source: ` + sb.SourcePath + `
-targets: {}
-`)
-
-	// Without --force, would wait for stdin (but RunCLI provides no input)
-	// With --force, should complete immediately
-	result := sb.RunCLI("uninstall", "force-skill", "--force")
-
-	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Uninstalled")
-
-	// Verify skill was removed
-	skillPath := filepath.Join(sb.SourcePath, "force-skill")
-	if sb.FileExists(skillPath) {
-		t.Error("skill should be removed with --force")
-	}
-}
-
 func TestUninstall_Help_ShowsUsage(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
@@ -106,7 +81,7 @@ func TestUninstall_Help_ShowsUsage(t *testing.T) {
 	result := sb.RunCLI("uninstall", "--help")
 
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Usage:")
+	result.AssertOutputContains(t, "Usage  skillshare")
 	result.AssertOutputContains(t, "--force")
 	result.AssertOutputContains(t, "--dry-run")
 }
@@ -141,7 +116,7 @@ targets: {}
 	// Uninstall by short name (basename only)
 	result := sb.RunCLI("uninstall", "react-best-practices", "--force")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Uninstalled")
+	result.AssertOutputContains(t, "✓ Uninstall ")
 
 	// Verify nested skill was removed
 	skillPath := filepath.Join(sb.SourcePath, "frontend", "react", "react-best-practices")
@@ -165,22 +140,23 @@ targets: {}
 	// Uninstall by full nested path
 	result := sb.RunCLI("uninstall", "backend/go-patterns", "--force")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Uninstalled")
+	result.AssertOutputContains(t, "✓ Uninstall ")
 }
 
 func TestUninstall_ShowsMetadata(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()
 
-	// Create skill with metadata (simulating installed skill)
+	// Create skill with metadata in centralized store (simulating installed skill)
 	sb.CreateSkill("meta-skill", map[string]string{
 		"SKILL.md": "# Meta Skill",
-		".skillshare-meta.json": `{
-  "source": "github.com/user/repo",
-  "type": "github",
-  "installed_at": "2024-01-15T10:30:00Z"
-}`,
 	})
+	metaStore := install.NewMetadataStore()
+	metaStore.Set("meta-skill", &install.MetadataEntry{
+		Source: "github.com/user/repo",
+		Type:   "github",
+	})
+	metaStore.Save(sb.SourcePath)
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
 targets: {}
@@ -413,17 +389,13 @@ func TestUninstall_GroupDir_RemovesConfigEntries(t *testing.T) {
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
 targets: {}
-skills:
-  - name: skill-a
-    source: github.com/org/repo/skill-a
-    group: mygroup
-  - name: skill-b
-    source: github.com/org/repo/skill-b
-    group: mygroup
-  - name: skill-c
-    source: github.com/org/repo/skill-c
-    group: other
 `)
+	// Write metadata directly to .metadata.json
+	store := install.NewMetadataStore()
+	store.Set("skill-a", &install.MetadataEntry{Source: "github.com/org/repo/skill-a", Group: "mygroup"})
+	store.Set("skill-b", &install.MetadataEntry{Source: "github.com/org/repo/skill-b", Group: "mygroup"})
+	store.Set("skill-c", &install.MetadataEntry{Source: "github.com/org/repo/skill-c", Group: "other"})
+	store.Save(sb.SourcePath)
 
 	result := sb.RunCLI("uninstall", "mygroup", "-f")
 	result.AssertSuccess(t)
@@ -433,18 +405,20 @@ skills:
 		t.Error("mygroup directory should be removed")
 	}
 
-	// Registry should no longer contain mygroup skills
-	registryPath := filepath.Join(filepath.Dir(sb.ConfigPath), "registry.yaml")
-	registryContent := sb.ReadFile(registryPath)
-	if strings.Contains(registryContent, "skill-a") {
-		t.Error("registry should not contain skill-a after group uninstall")
+	// Metadata should no longer contain mygroup skills
+	store, err := install.LoadMetadata(sb.SourcePath)
+	if err != nil {
+		t.Fatalf("load metadata: %v", err)
 	}
-	if strings.Contains(registryContent, "skill-b") {
-		t.Error("registry should not contain skill-b after group uninstall")
+	if store.Has("skill-a") {
+		t.Error("metadata should not contain skill-a after group uninstall")
+	}
+	if store.Has("skill-b") {
+		t.Error("metadata should not contain skill-b after group uninstall")
 	}
 	// other group should be untouched
-	if !strings.Contains(registryContent, "skill-c") {
-		t.Error("registry should still contain skill-c from other group")
+	if !store.Has("skill-c") {
+		t.Error("metadata should still contain skill-c from other group")
 	}
 }
 
@@ -462,7 +436,7 @@ targets: {}
 
 	result := sb.RunCLI("uninstall", "fix-review", "security/", "--force")
 	result.AssertSuccess(t)
-	result.AssertOutputContains(t, "Uninstalling 2 groups")
+	result.AssertOutputContains(t, "group, 1 skill")
 	result.AssertAnyOutputContains(t, "Uninstalled 2 groups")
 	result.AssertAnyOutputContains(t, "fix-review")
 	result.AssertAnyOutputContains(t, "security")
@@ -488,31 +462,29 @@ func TestUninstall_GroupDirWithTrailingSlash_RemovesConfigEntries(t *testing.T) 
 
 	sb.WriteConfig(`source: ` + sb.SourcePath + `
 targets: {}
-skills:
-  - name: scan
-    source: github.com/org/repo/scan
-    group: security
-  - name: hardening
-    source: github.com/org/repo/hardening
-    group: security
-  - name: keep
-    source: github.com/org/repo/keep
-    group: other
 `)
+	// Write metadata directly to .metadata.json
+	store := install.NewMetadataStore()
+	store.Set("scan", &install.MetadataEntry{Source: "github.com/org/repo/scan", Group: "security"})
+	store.Set("hardening", &install.MetadataEntry{Source: "github.com/org/repo/hardening", Group: "security"})
+	store.Set("keep", &install.MetadataEntry{Source: "github.com/org/repo/keep", Group: "other"})
+	store.Save(sb.SourcePath)
 
 	result := sb.RunCLI("uninstall", "security/", "-f")
 	result.AssertSuccess(t)
 
-	registryPath := filepath.Join(filepath.Dir(sb.ConfigPath), "registry.yaml")
-	registryContent := sb.ReadFile(registryPath)
-	if strings.Contains(registryContent, "scan") {
-		t.Error("registry should not contain scan after security/ uninstall")
+	store, err := install.LoadMetadata(sb.SourcePath)
+	if err != nil {
+		t.Fatalf("load metadata: %v", err)
 	}
-	if strings.Contains(registryContent, "hardening") {
-		t.Error("registry should not contain hardening after security/ uninstall")
+	if store.Has("scan") {
+		t.Error("metadata should not contain scan after security/ uninstall")
 	}
-	if !strings.Contains(registryContent, "keep") {
-		t.Error("registry should still contain keep from other group")
+	if store.Has("hardening") {
+		t.Error("metadata should not contain hardening after security/ uninstall")
+	}
+	if !store.Has("keep") {
+		t.Error("metadata should still contain keep from other group")
 	}
 }
 
@@ -546,11 +518,13 @@ skills:
 		}
 	}
 
-	// Registry skills should be cleared
-	registryPath := filepath.Join(filepath.Dir(sb.ConfigPath), "registry.yaml")
-	registryContent := sb.ReadFile(registryPath)
-	if strings.Contains(registryContent, "alpha") || strings.Contains(registryContent, "beta") || strings.Contains(registryContent, "gamma") {
-		t.Error("registry should not contain any skills after --all uninstall")
+	// Metadata should be cleared of all skills
+	store, err := install.LoadMetadata(sb.SourcePath)
+	if err != nil {
+		t.Fatalf("load metadata: %v", err)
+	}
+	if store.Has("alpha") || store.Has("beta") || store.Has("gamma") {
+		t.Error("metadata should not contain any skills after --all uninstall")
 	}
 }
 
@@ -569,7 +543,7 @@ func TestUninstall_AllProject(t *testing.T) {
     source: github.com/org/a
   - name: skill-b
     source: github.com/org/b
-targets: {}
+targets: []
 `)
 
 	result := sb.RunCLIInDir(projectRoot, "uninstall", "--all", "--force", "-p")
@@ -680,4 +654,137 @@ targets: {}
 	// Skip summary should appear
 	result.AssertAnyOutputContains(t, "skipped")
 	result.AssertAnyOutputContains(t, "remaining")
+}
+
+func TestUninstall_SkillInsideTrackedRepoIsRefused(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+
+	repoPath := filepath.Join(sb.SourcePath, "_team")
+	skillPath := filepath.Join(repoPath, "foo")
+	os.MkdirAll(skillPath, 0755)
+	os.WriteFile(filepath.Join(skillPath, "SKILL.md"), []byte("# Foo"), 0644)
+	initGitRepo(t, repoPath)
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+
+	result := sb.RunCLI("uninstall", "_team/foo", "--force")
+	result.AssertAnyOutputContains(t, "uninstall the repo instead")
+	if !sb.FileExists(skillPath) {
+		t.Error("a skill inside a tracked repo must stay in the repo's checkout")
+	}
+}
+
+// makeUnreadableTrackedRepo creates a tracked repo whose `git status` fails
+// because its .git directory is empty.
+func makeUnreadableTrackedRepo(t *testing.T, sb *testutil.Sandbox, name string) string {
+	t.Helper()
+	repoPath := filepath.Join(sb.SourcePath, name)
+	if err := os.MkdirAll(filepath.Join(repoPath, ".git"), 0755); err != nil {
+		t.Fatalf("failed to create fake .git dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "SKILL.md"), []byte("# Broken"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return repoPath
+}
+
+func TestUninstall_TrackedRepo_GitStatusErrorBlocksUninstall(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	repoPath := makeUnreadableTrackedRepo(t, sb, "_broken-repo")
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+
+	result := sb.RunCLIWithInput("y\n", "uninstall", "_broken-repo")
+	result.AssertFailure(t)
+	result.AssertAnyOutputContains(t, "failed to check git status")
+
+	if !sb.FileExists(repoPath) {
+		t.Error("tracked repo must stay in place when git status cannot be read")
+	}
+}
+
+func TestUninstall_BatchGitStatusErrorFailsRepoAndKeepsCleanSkills(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	repoPath := makeUnreadableTrackedRepo(t, sb, "_broken-repo")
+	sb.CreateSkill("clean-a", map[string]string{"SKILL.md": "# A"})
+	sb.WriteConfig(`source: ` + sb.SourcePath + `
+targets: {}
+`)
+
+	result := sb.RunCLI("uninstall", "--all", "--json")
+	result.AssertSuccess(t)
+	result.AssertOutputContains(t, "failed to check git status")
+
+	if !sb.FileExists(repoPath) {
+		t.Error("tracked repo must stay in place when git status cannot be read")
+	}
+	if sb.FileExists(filepath.Join(sb.SourcePath, "clean-a")) {
+		t.Error("clean-a should still be removed")
+	}
+}
+
+// A bare name that resolves to a nested skill prunes that skill's metadata,
+// under its full-path key or a legacy basename key.
+func TestUninstall_NestedSkillByBasename_PrunesMetadata(t *testing.T) {
+	for _, key := range []string{"frontend/foo", "foo"} {
+		t.Run(key, func(t *testing.T) {
+			sb := testutil.NewSandbox(t)
+			defer sb.Cleanup()
+
+			sb.CreateSkill("frontend/foo", map[string]string{"SKILL.md": "# Foo"})
+			sb.WriteConfig("source: " + sb.SourcePath + "\ntargets: {}\n")
+			store := install.NewMetadataStore()
+			store.Set(key, &install.MetadataEntry{Source: "github.com/org/repo/foo", Group: "frontend"})
+			store.Save(sb.SourcePath)
+
+			sb.RunCLI("uninstall", "foo", "-f").AssertSuccess(t)
+
+			store, err := install.LoadMetadata(sb.SourcePath)
+			if err != nil {
+				t.Fatalf("load metadata: %v", err)
+			}
+			if store.Has(key) {
+				t.Errorf("metadata entry %q should be pruned", key)
+			}
+		})
+	}
+}
+
+// A top-level skill and a grouped skill may share a basename: uninstalling
+// one keeps the other's metadata and target overrides.
+func TestUninstall_SameBasename_KeepsOtherSkillMetadata(t *testing.T) {
+	for remove, keep := range map[string]string{"foo": "frontend/foo", "frontend/foo": "foo"} {
+		t.Run(remove, func(t *testing.T) {
+			sb := testutil.NewSandbox(t)
+			defer sb.Cleanup()
+
+			sb.CreateSkill("foo", map[string]string{"SKILL.md": "# Foo"})
+			sb.CreateSkill("frontend/foo", map[string]string{"SKILL.md": "# Nested foo"})
+			sb.WriteConfig("source: " + sb.SourcePath + "\ntargets: {}\n")
+			store := install.NewMetadataStore()
+			store.Set("foo", &install.MetadataEntry{Source: "github.com/org/repo/foo"})
+			store.Set("frontend/foo", &install.MetadataEntry{Source: "github.com/org/other/foo", Group: "frontend"})
+			store.SetTargetOverride("foo", []string{"claude"})
+			store.SetTargetOverride("frontend/foo", []string{"cursor"})
+			store.Save(sb.SourcePath)
+
+			sb.RunCLI("uninstall", remove, "-f").AssertSuccess(t)
+
+			store, err := install.LoadMetadata(sb.SourcePath)
+			if err != nil {
+				t.Fatalf("load metadata: %v", err)
+			}
+			if store.Has(remove) || !store.Has(keep) {
+				t.Errorf("expected only %q to remain, got %v", keep, store.List())
+			}
+			if _, ok := store.TargetOverrides[keep]; !ok || len(store.TargetOverrides) != 1 {
+				t.Errorf("expected only the override of %q to remain, got %v", keep, store.TargetOverrides)
+			}
+		})
+	}
 }

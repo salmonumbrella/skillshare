@@ -1,494 +1,325 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import {
-  Puzzle,
-  Target,
-  FolderSync,
-  Info,
-  ArrowRight,
-  RefreshCw,
-  Star,
-  X,
-  Download,
-  GitBranch,
-  AlertTriangle,
-  Check,
-  Package,
-  Zap,
-  ShieldCheck,
-  ShieldAlert,
-} from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  Bot,
+  ChevronRight,
+  CircleArrowUp,
+  CircleCheck,
+  Ellipsis,
+  FilePen,
+  FolderPlus,
+  Github,
+  Info,
+  Package,
+  Plug,
+  Puzzle,
+  RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
+  Star,
+  Trash2,
+  TriangleAlert,
+  Webhook,
+  X,
+} from 'lucide-react';
+import { ApiError, api } from '../api/client';
+import type { AuditAllResponse, CheckResult, LogEntry, Overview, Target } from '../api/client';
+import { pluginsApi } from '../api/plugins';
 import { queryKeys, staleTimes } from '../lib/queryKeys';
-import Card from '../components/Card';
-import Badge from '../components/Badge';
-import Skeleton from '../components/Skeleton';
-import { PageSkeleton } from '../components/Skeleton';
-import StatusBadge from '../components/StatusBadge';
+import { clearAuditCache } from '../lib/auditCache';
+import { auditSourceLinkNote } from '../lib/auditDisplay';
+import { formatLogDetail } from '../lib/logFormat';
+import { formatDateTime, formatRelativeTime, useI18n, useT, plural } from '../i18n';
+import AgentIcon from '../components/AgentIcon';
+import Button from '../components/Button';
 import ConfirmDialog from '../components/ConfirmDialog';
+import PageHeader from '../components/PageHeader';
+import { PageSkeleton } from '../components/Skeleton';
 import { useToast } from '../components/Toast';
-import { api } from '../api/client';
-import type { Target as TargetType, CheckResult, AuditAllResponse } from '../api/client';
 import { useAppContext } from '../context/AppContext';
-import { wobbly, shadows } from '../design';
-import { shortenHome } from '../lib/paths';
+import { useRepoUpdate } from '../hooks/useRepoUpdate';
+import { useUpdatePolicy } from '../hooks/useUpdatePolicy';
+import { useHooksQuery, useMcpQuery, useOverviewQuery } from '../hooks/useSharedQueries';
+import { invalidate } from '../lib/queryEvents';
+import MemoryOverview from '../components/memory/MemoryOverview';
+import { useHeldWhileClosing, useMenuPresence } from '../hooks/usePresence';
 
 const STAR_CTA_DISMISSED_KEY = 'skillshare.dashboard.starCta.dismissed';
 
+type Kind = 'ok' | 'warn' | 'bad' | 'off';
+interface Health {
+  kind: Kind;
+  label: string;
+  detail: string;
+  pending: number;
+}
+
+function useTargetHealth() {
+  const t = useT();
+  return (tgt: Target, sourceSkillCount: number): Health => {
+    // Skills off: nothing is synced into the folder, so there is nothing to count or fall behind.
+    if (tgt.skillsEnabled === false) return { kind: 'ok', label: t('dashboard.targets.inSync'), detail: '', pending: 0 };
+    if (tgt.status === 'not exist') return { kind: 'bad', label: t('dashboard.targets.problem'), detail: t('dashboard.targets.folderMissing'), pending: 0 };
+    if (tgt.status === 'conflict' || tgt.status === 'broken') return { kind: 'bad', label: t('dashboard.targets.problem'), detail: tgt.status, pending: 0 };
+    // Only a symlink target has to give its folder up; merge and copy keep local files, so they are counted below.
+    if (tgt.status === 'has files' && tgt.mode === 'symlink') return { kind: 'warn', label: t('targets.state.migrate'), detail: t('targets.syncing.migrate'), pending: 0 };
+    if (tgt.status === 'unknown') return { kind: 'off', label: tgt.status, detail: '', pending: 0 };
+    const counted = tgt.status === 'has files' || (tgt.mode === 'merge' && tgt.status === 'merged') || (tgt.mode === 'copy' && tgt.status === 'copied');
+    const pending = counted ? Math.max(0, (tgt.expectedSkillCount ?? sourceSkillCount) - tgt.linkedCount) : 0;
+    const linked = tgt.linkedCount > 0
+      ? t(tgt.mode === 'copy' ? 'dashboard.targets.managed' : 'dashboard.targets.linked', { count: tgt.linkedCount })
+      : '';
+    if (pending > 0) {
+      const label = t('dashboard.pending', { count: pending });
+      return { kind: 'warn', label, detail: [linked, label].filter(Boolean).join(' · '), pending };
+    }
+    return { kind: 'ok', label: t('dashboard.targets.inSync'), detail: linked, pending: 0 };
+  };
+}
+
 export default function DashboardPage() {
-  const { data, isPending, error } = useQuery({
-    queryKey: queryKeys.overview,
-    queryFn: () => api.getOverview(),
-    staleTime: staleTimes.overview,
-  });
-  const queryClient = useQueryClient();
-  const [updatingAll, setUpdatingAll] = useState(false);
-  const [showUpdateConfirm, setShowUpdateConfirm] = useState(false);
-  const [showStarCta, setShowStarCta] = useState(() => {
-    if (typeof window === 'undefined') return true;
-    return window.localStorage.getItem(STAR_CTA_DISMISSED_KEY) !== '1';
-  });
-  const { toast } = useToast();
+  const t = useT();
+  const { locale } = useI18n();
   const { isProjectMode } = useAppContext();
+  const { data, isPending, error } = useOverviewQuery();
+  const { data: targetsData } = useQuery({
+    queryKey: queryKeys.targets.all,
+    queryFn: () => api.listTargets(),
+    staleTime: staleTimes.targets,
+  });
+  const { data: extrasData } = useQuery({
+    queryKey: queryKeys.extras,
+    queryFn: () => api.listExtras(),
+    staleTime: staleTimes.extras,
+  });
+  const { data: mcpData } = useMcpQuery();
+  const { data: hooksData } = useHooksQuery({ staleTime: staleTimes.extras });
+  const { data: pluginData } = useQuery({ queryKey: queryKeys.pluginPackages, queryFn: () => pluginsApi.list(false) });
+  const { data: lastSync } = useQuery({
+    queryKey: queryKeys.log('ops', 1, { cmd: 'sync' }),
+    queryFn: () => api.listLog('ops', 1, { cmd: 'sync' }),
+    staleTime: staleTimes.log,
+  });
+  const health = useTargetHealth();
 
   if (isPending) return <PageSkeleton />;
   if (error) {
     return (
-      <Card variant="accent" className="text-center py-8">
-        <p className="text-danger text-lg" style={{ fontFamily: 'var(--font-heading)' }}>
-          Oops! Something went wrong.
-        </p>
-        <p className="text-pencil-light text-sm mt-1">{error.message}</p>
-      </Card>
+      <div className="ss-empty">
+        <TriangleAlert size={24} className="text-bad" />
+        <h3 className="font-semibold text-ink">{t('dashboard.error.title')}</h3>
+        <p className="text-[13px]">{error.message}</p>
+      </div>
     );
   }
   if (!data) return null;
 
-  const handleUpdateAll = async () => {
-    setUpdatingAll(true);
-    try {
-      const res = await api.update({ all: true });
-      const updated = res.results.filter((r) => r.action === 'updated').length;
-      const upToDate = res.results.filter((r) => r.action === 'up-to-date').length;
-      const errors = res.results.filter((r) => r.action === 'error');
-      const blocked = res.results.filter((r) => r.action === 'blocked');
-      if (res.results.length === 0) {
-        toast('No tracked repos or updatable skills found.', 'info');
-      } else {
-        const parts = [`${updated} updated`, `${upToDate} up-to-date`];
-        if (blocked.length > 0) parts.push(`${blocked.length} blocked`);
-        toast(`Update complete: ${parts.join(', ')}.`, blocked.length > 0 ? 'warning' : updated > 0 ? 'success' : 'info');
-      }
-      blocked.forEach((r) => toast(`${r.name}: ${r.message}`, 'error'));
-      errors.forEach((r) => toast(`${r.name}: ${r.message}`, 'error'));
-      await queryClient.invalidateQueries({ queryKey: queryKeys.skills.all });
-      await queryClient.invalidateQueries({ queryKey: queryKeys.overview });
-    } catch (e: unknown) {
-      toast((e as Error).message, 'error');
-    } finally {
-      setUpdatingAll(false);
-    }
-  };
-
-  const dismissStarCta = () => {
-    setShowStarCta(false);
-    if (typeof window === 'undefined') return;
-    window.localStorage.setItem(STAR_CTA_DISMISSED_KEY, '1');
-  };
-
-  const stats = [
-    {
-      label: 'Skills',
-      value: data.skillCount,
-      subtitle: `${data.topLevelCount} top-level`,
-      icon: Puzzle,
-      color: 'text-blue',
-      bg: 'bg-info-light',
-      to: '/skills',
-    },
-    {
-      label: 'Targets',
-      value: data.targetCount,
-      subtitle: 'configured',
-      icon: Target,
-      color: 'text-success',
-      bg: 'bg-success-light',
-      to: '/targets',
-    },
-    {
-      label: 'Sync Mode',
-      value: data.mode,
-      subtitle: 'current mode',
-      icon: FolderSync,
-      color: 'text-warning',
-      bg: 'bg-warning-light',
-      to: '/sync',
-    },
-    {
-      label: 'Version',
-      value: data.version,
-      subtitle: 'skillshare',
-      icon: Info,
-      color: 'text-pencil-light',
-      bg: 'bg-muted',
-      to: '/config',
-    },
+  const targets = targetsData?.targets ?? [];
+  const healths = targets.map((tgt) => health(tgt, targetsData?.sourceSkillCount ?? 0));
+  const synced = healths.filter((h) => h.kind === 'ok').length;
+  const pending = healths.reduce((max, h) => Math.max(max, h.pending), 0);
+  const lastSyncTs = lastSync?.entries[0]?.ts;
+  const counts = [
+    { kind: 'skill', icon: Puzzle, value: data.skillCount, label: t('dashboard.stats.skills'), to: '/skills' },
+    { kind: 'agent', icon: Bot, value: data.agentCount, label: t('dashboard.stats.agents'), to: '/agents' },
+    { kind: 'extra', icon: FolderPlus, value: extrasData?.extras?.length ?? 0, label: t('dashboard.stats.extras'), to: '/extras' },
+    { kind: 'mcp', icon: Plug, value: mcpData ? Object.keys(mcpData.source.servers ?? {}).length : 0, label: t('mcp.title'), to: '/mcp' },
+    { kind: 'hooks', icon: Webhook, value: Object.keys(hooksData?.source.entries ?? {}).length, label: t('hooks.title'), to: '/hooks' },
+    { kind: 'plugin', icon: Package, value: Object.keys(pluginData?.packages ?? {}).length, label: t('plugins.title'), to: '/plugins' },
   ];
 
+  const subtitle = [
+    isProjectMode ? t('dashboard.projectSummary') : '',
+    t(plural('dashboard.summary', targets.length), { synced, total: targets.length }),
+    lastSyncTs ? t('dashboard.lastSync', { time: formatRelativeTime(lastSyncTs, locale) }) : '',
+  ].filter(Boolean).join(' ');
+
   return (
-    <div className="animate-sketch-in">
-      {/* Page header */}
-      <div className="mb-8">
-        <h2
-          className="text-3xl md:text-4xl font-bold text-pencil mb-2"
-          style={{ fontFamily: 'var(--font-heading)' }}
-        >
-          Dashboard
-        </h2>
-        <p className="text-pencil-light text-base">
-          Your skill management overview at a glance
-        </p>
-      </div>
+    <div className="ss-wrap animate-page-in">
+      <PageHeader
+        className="!mb-0"
+        title={t('dashboard.title')}
+        subtitle={subtitle}
+        actions={
+          <span data-tour="quick-actions" className="flex items-center gap-3">
+            {pending > 0 && <span className="ss-st warn">{t('dashboard.pending', { count: pending })}</span>}
+            <Link to="/sync" className="ss-btn pri">
+              <RefreshCw size={15} />
+              {t('layout.nav.sync')}
+            </Link>
+          </span>
+        }
+      />
 
-      {/* Stats grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
-        {stats.map(({ label, value, subtitle, icon: Icon, color, bg, to }, i) => (
-          <Link key={label} to={to}>
-            <Card
-              hover
-              className={i % 2 === 0 ? 'rotate-[-0.5deg]' : 'rotate-[0.5deg]'}
-            >
-              <div className="flex items-start gap-3">
-                <div
-                  className={`w-11 h-11 ${bg} border-2 border-pencil flex items-center justify-center shrink-0`}
-                  style={{ borderRadius: '50%' }}
-                >
-                  <Icon size={20} strokeWidth={2.5} className={color} />
-                </div>
-                <div className="min-w-0">
-                  <p
-                    className="text-sm text-pencil-light uppercase tracking-wider"
-                    style={{ fontFamily: 'var(--font-hand)' }}
-                  >
-                    {label}
-                  </p>
-                  <p
-                    className="text-2xl font-bold text-pencil leading-tight"
-                    style={{ fontFamily: 'var(--font-heading)' }}
-                  >
-                    {value}
-                  </p>
-                  <p className="text-sm text-muted-dark">{subtitle}</p>
-                </div>
-              </div>
-            </Card>
-          </Link>
-        ))}
-      </div>
+      {isProjectMode && (
+        <div className="ss-note inf">
+          <Info size={16} />
+          <div className="flex-1">{t('dashboard.projectNote')}</div>
+        </div>
+      )}
 
-      {/* Source path card */}
-      <Card decoration="tape" className="mb-8">
-        <h3
-          className="text-lg font-bold text-pencil mb-2"
-          style={{ fontFamily: 'var(--font-heading)' }}
-        >
-          Source Directory
-        </h3>
-        <p
-          className="text-base text-pencil-light break-all"
-          style={{ fontFamily: "'Courier New', monospace" }}
-        >
-          {shortenHome(data.source)}
-        </p>
-        <p className="text-sm text-muted-dark mt-2">
-          This is where your skills live. All targets sync from here.
-        </p>
-      </Card>
+      <div data-tour="stats-grid" className="flex flex-col gap-7">
+        <div className="ss-counts ss-only-clean !grid-cols-6">
+          {counts.map(({ kind, icon: Icon, value, label, to }) => (
+            <Link key={kind} to={to}>
+              <span className={`ss-cat ${kind}`}><Icon size={17} /></span>
+              <span className="flex flex-col gap-[3px]">
+                <b>{value}</b>
+                <span className="lbl">{label}</span>
+              </span>
+            </Link>
+          ))}
+        </div>
 
-      {/* Support CTA */}
-      {showStarCta && (
-        <Card variant="postit" className="mb-8">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-start gap-3">
-              <div
-                className="w-10 h-10 bg-warning-light border-2 border-pencil flex items-center justify-center shrink-0"
-                style={{ borderRadius: '50%' }}
-              >
-                <Star size={18} strokeWidth={2.5} className="text-warning" />
-              </div>
-              <div>
-                <h3
-                  className="text-lg font-bold text-pencil"
-                  style={{ fontFamily: 'var(--font-heading)' }}
-                >
-                  Enjoying skillshare?
-                </h3>
-                <p className="text-sm text-pencil-light mt-1">
-                  If skillshare saved you time, please give us a star on GitHub:
-                  {' '}
-                  <a
-                    href="https://github.com/runkids/skillshare"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-blue hover:underline"
-                  >
-                    github.com/runkids/skillshare ⭐
-                  </a>
-                </p>
-              </div>
-            </div>
-            <button
-              type="button"
-              onClick={dismissStarCta}
-              className="shrink-0 p-1 text-pencil-light hover:text-pencil border border-transparent hover:border-muted transition-colors"
-              style={{ borderRadius: wobbly.sm }}
-              aria-label="Dismiss star reminder"
-              title="Dismiss"
-            >
-              <X size={16} strokeWidth={2.5} />
-            </button>
+        <div>
+          <div className="ss-sec ss-only-clean">
+            <h2>{t('dashboard.stats.targets')}</h2>
+            <span className="ss-cnt">{targets.length}</span>
+            <Link to="/targets" className="more">{t('dashboard.targets.manage')}</Link>
           </div>
-        </Card>
-      )}
-
-      {/* Tracked Repositories (hidden in project mode) */}
-      {!isProjectMode && data.trackedRepos && data.trackedRepos.length > 0 && (
-        <TrackedReposSection repos={data.trackedRepos} />
-      )}
-
-      {/* Skill Updates Check */}
-      <SkillUpdatesSection />
-
-      {/* Security Audit */}
-      <SecurityAuditSection />
-
-      {/* Targets Health */}
-      <TargetsHealthSection />
-
-      {/* Version Status */}
-      <VersionStatusSection />
-
-      {/* Quick actions */}
-      <div className="mb-4">
-        <h3
-          className="text-xl font-bold text-pencil mb-4"
-          style={{ fontFamily: 'var(--font-heading)' }}
-        >
-          Quick Actions
-        </h3>
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          <Link to="/sync" className="h-full">
-            <div
-              className="flex items-center gap-3 px-5 py-4 h-full bg-postit border-2 border-pencil transition-all duration-100 hover:translate-x-[2px] hover:translate-y-[2px] cursor-pointer group"
-              style={{
-                borderRadius: wobbly.md,
-                boxShadow: shadows.md,
-              }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLDivElement).style.boxShadow = shadows.hover;
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLDivElement).style.boxShadow = shadows.md;
-              }}
-            >
-              <RefreshCw
-                size={22}
-                strokeWidth={2.5}
-                className="text-pencil group-hover:animate-spin-slow"
-              />
-              <div className="flex-1">
-                <p className="font-medium text-pencil" style={{ fontFamily: 'var(--font-hand)' }}>
-                  Sync Now
-                </p>
-                <p className="text-sm text-pencil-light">Push skills to all targets</p>
-              </div>
-              <ArrowRight size={16} className="text-pencil-light" />
-            </div>
-          </Link>
-
-          <Link to="/audit" className="h-full">
-            <div
-              className="flex items-center gap-3 px-5 py-4 h-full bg-info-light border-2 border-pencil transition-all duration-100 hover:translate-x-[2px] hover:translate-y-[2px] cursor-pointer"
-              style={{
-                borderRadius: wobbly.md,
-                boxShadow: shadows.md,
-              }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLDivElement).style.boxShadow = shadows.hover;
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLDivElement).style.boxShadow = shadows.md;
-              }}
-            >
-              <ShieldCheck size={22} strokeWidth={2.5} className="text-blue" />
-              <div className="flex-1">
-                <p className="font-medium text-pencil" style={{ fontFamily: 'var(--font-hand)' }}>
-                  Security Audit
-                </p>
-                <p className="text-sm text-pencil-light">Scan skills for threats</p>
-              </div>
-              <ArrowRight size={16} className="text-pencil-light" />
-            </div>
-          </Link>
-
-          <Link to="/skills" className="h-full">
-            <div
-              className="flex items-center gap-3 px-5 py-4 h-full bg-success-light border-2 border-pencil transition-all duration-100 hover:translate-x-[2px] hover:translate-y-[2px] cursor-pointer"
-              style={{
-                borderRadius: wobbly.md,
-                boxShadow: shadows.md,
-              }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLDivElement).style.boxShadow = shadows.hover;
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLDivElement).style.boxShadow = shadows.md;
-              }}
-            >
-              <Puzzle size={22} strokeWidth={2.5} className="text-success" />
-              <div className="flex-1">
-                <p className="font-medium text-pencil" style={{ fontFamily: 'var(--font-hand)' }}>
-                  Browse Skills
-                </p>
-                <p className="text-sm text-pencil-light">View and manage your skills</p>
-              </div>
-              <ArrowRight size={16} className="text-pencil-light" />
-            </div>
-          </Link>
-
-          <button
-            onClick={() => setShowUpdateConfirm(true)}
-            disabled={updatingAll}
-            className="text-left w-full h-full"
-          >
-            <div
-              className="flex items-center gap-3 px-5 py-4 h-full bg-warning-light border-2 border-pencil transition-all duration-100 hover:translate-x-[2px] hover:translate-y-[2px] cursor-pointer"
-              style={{
-                borderRadius: wobbly.md,
-                boxShadow: shadows.md,
-                opacity: updatingAll ? 0.6 : 1,
-              }}
-              onMouseEnter={(e) => {
-                (e.currentTarget as HTMLDivElement).style.boxShadow = shadows.hover;
-              }}
-              onMouseLeave={(e) => {
-                (e.currentTarget as HTMLDivElement).style.boxShadow = shadows.md;
-              }}
-            >
-              <Download
-                size={22}
-                strokeWidth={2.5}
-                className={`text-warning ${updatingAll ? 'animate-bounce' : ''}`}
-              />
-              <div className="flex-1">
-                <p className="font-medium text-pencil" style={{ fontFamily: 'var(--font-hand)' }}>
-                  {updatingAll ? 'Updating...' : 'Update All'}
-                </p>
-                <p className="text-sm text-pencil-light">Pull latest for all tracked repos</p>
-              </div>
-              {!updatingAll && <ArrowRight size={16} className="text-pencil-light" />}
-            </div>
-          </button>
-
-          <ConfirmDialog
-            open={showUpdateConfirm}
-            onConfirm={() => {
-              setShowUpdateConfirm(false);
-              handleUpdateAll();
-            }}
-            onCancel={() => setShowUpdateConfirm(false)}
-            title="Update All"
-            message="This will pull the latest changes for all tracked repositories. Continue?"
-            confirmText="Update"
-            cancelText="Cancel"
-          />
+          <div className="ss-list ss-only-clean">
+            {targets.length === 0 && <div className="ss-r text-[13px] text-ink-2">{t('dashboard.targets.noTargets')}</div>}
+            {targets.map((tgt, i) => (
+              <Link key={tgt.name} to={`/targets/${encodeURIComponent(tgt.name)}`} className="ss-r link">
+                <span className="ss-at"><AgentIcon target={tgt.name} size={17} /></span>
+                <span className="flex flex-col min-w-0 flex-1 gap-px">
+                  <span className="font-semibold">{tgt.name}</span>
+                  <span className="font-mono text-xs text-ink-3 truncate">{tgt.path}</span>
+                </span>
+                <span className="w-[100px]">{tgt.skillsEnabled === false ? <span className="ss-tag !text-ink-3 whitespace-nowrap">{t('targets.skillsOff')}</span> : <span className="ss-tag">{tgt.mode}</span>}</span>
+                <span className="w-[190px] text-[13px] text-ink-2 truncate">{healths[i].detail}</span>
+                <span className="w-[96px]"><span className={`ss-st ${healths[i].kind}`}>{healths[i].label}</span></span>
+                <ChevronRight size={15} className="text-ink-3" />
+              </Link>
+            ))}
+          </div>
+          <TargetBoard data={data} targets={targets} healths={healths} counts={counts} />
         </div>
       </div>
 
-      {/* Decorative hand-drawn divider */}
-      <div className="mt-8 flex justify-center">
-        <svg width="120" height="20" viewBox="0 0 120 20" className="text-muted-dark">
-          <path
-            d="M5 10 Q20 2 35 10 Q50 18 65 10 Q80 2 95 10 Q110 18 115 10"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2"
-            strokeLinecap="round"
-          />
-        </svg>
+      {extrasData?.extras.some((extra) => extra.name.toLowerCase() === 'memory' && !extra.file) && <MemoryOverview />}
+
+      <div className="grid grid-cols-[minmax(0,1.45fr)_minmax(0,1fr)] gap-10">
+        <NeedsAttention targets={targets} healths={healths} />
+        <RecentLog />
       </div>
+
+      <div className="grid grid-cols-[minmax(0,1.45fr)_minmax(0,1fr)] gap-10">
+        {(data.trackedRepos?.length ?? 0) > 0 && <TrackedRepos repos={data.trackedRepos} />}
+        <Versions data={data} />
+      </div>
+
+      <StarReminder />
     </div>
   );
 }
 
-/* -- Tracked Repositories Section --------------------- */
+/* ── Playful: source note strung to every target ── */
 
-function TrackedReposSection({ repos }: { repos: { name: string; skillCount: number; dirty: boolean }[] }) {
+const STRING_STYLE: Record<Kind, { stroke: string; width: number; dash?: string }> = {
+  ok: { stroke: '#2D5DA1', width: 2.2 },
+  warn: { stroke: '#B26A00', width: 2.2, dash: '7 6' },
+  bad: { stroke: '#C8372D', width: 2.2, dash: '2 7' },
+  off: { stroke: '#B9AF9A', width: 1.8, dash: '3 6' },
+};
+
+function TargetBoard({ data, targets, healths, counts }: {
+  data: Overview;
+  targets: Target[];
+  healths: Health[];
+  counts: { kind: string; icon: typeof Puzzle; value: number; label: string; to: string }[];
+}) {
+  const t = useT();
+  // ponytail: fixed 1080px canvas like the design; desktop widths only.
+  const height = Math.max(374, 24 + targets.length * 66 + 20);
+  const sx = 340;
+  const sy = height / 2;
+  const dashed = healths.some((h) => h.kind !== 'ok');
   return (
-    <Card className="mb-8">
-      <div className="flex items-center gap-2 mb-4">
-        <GitBranch size={20} strokeWidth={2.5} className="text-blue" />
-        <h3
-          className="text-lg font-bold text-pencil"
-          style={{ fontFamily: 'var(--font-heading)' }}
-        >
-          Tracked Repositories
-        </h3>
-      </div>
-      <div className="space-y-3">
-        {repos.map((repo) => {
-          const displayName = repo.name.replace(/^_/, '');
+    <div className="ss-board ss-only-playful" style={{ height }}>
+      <svg className="strings" width="1080" height={height} viewBox={`0 0 1080 ${height}`} aria-hidden="true">
+        {targets.map((tgt, i) => {
+          const ty = 24 + i * 66 + 27;
+          const s = STRING_STYLE[healths[i].kind];
           return (
-            <div
-              key={repo.name}
-              className="flex items-center justify-between py-2 px-3 bg-paper-warm border border-muted"
-              style={{ borderRadius: wobbly.sm }}
-            >
-              <div className="flex items-center gap-2 min-w-0">
-                <GitBranch size={16} className="text-pencil-light shrink-0" />
-                <span
-                  className="font-medium text-pencil truncate"
-                  style={{ fontFamily: 'var(--font-hand)' }}
-                >
-                  {displayName}
-                </span>
-                <Badge variant="info">{repo.skillCount} skills</Badge>
-              </div>
-              <div className="flex items-center gap-1 shrink-0 ml-2">
-                {repo.dirty ? (
-                  <span className="flex items-center gap-1 text-warning text-sm">
-                    <AlertTriangle size={14} strokeWidth={2.5} />
-                    <span style={{ fontFamily: 'var(--font-hand)' }}>modified</span>
-                  </span>
-                ) : (
-                  <span className="flex items-center gap-1 text-success text-sm">
-                    <Check size={14} strokeWidth={2.5} />
-                    <span style={{ fontFamily: 'var(--font-hand)' }}>clean</span>
-                  </span>
-                )}
-              </div>
-            </div>
+            <path key={tgt.name} d={`M${sx} ${sy} C ${sx + 190} ${sy}, 516 ${ty}, 716 ${ty}`} fill="none" strokeLinecap="round" stroke={s.stroke} strokeWidth={s.width} strokeDasharray={s.dash} />
           );
         })}
+        {dashed && (
+          <>
+            <path d="M468 86 q 26 10 34 40" fill="none" stroke="#5A5A5A" strokeWidth="1.6" strokeLinecap="round" />
+            <path d="M494 118 l 8 8 l 3 -11" fill="none" stroke="#5A5A5A" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          </>
+        )}
+      </svg>
+      <div className="ss-pinnote src flex-col !items-stretch justify-center gap-2.5 !px-5 !py-4" style={{ left: 40, top: sy - 142, width: 300, height: 284 }}>
+        <span className="flex flex-col gap-0.5">
+          <span className="ss-hand !text-[22px] !font-bold !text-ink">{t('dashboard.board.source')}</span>
+          <span className="font-mono text-[11.5px] text-ink-3 truncate">{data.source}</span>
+        </span>
+        <span className="flex flex-col gap-[7px]">
+          {counts.map(({ kind, icon: Icon, value, label, to }) => (
+            <Link key={kind} to={to} className="flex items-center gap-[9px]">
+              <span className={`ss-cat sm ${kind}`}><Icon size={14} /></span>
+              <b className="w-[26px]">{value}</b>
+              <span className="text-[13px] text-ink-2">{label}</span>
+            </Link>
+          ))}
+        </span>
       </div>
-    </Card>
+      <span className="ss-pin blue" style={{ left: sx - 7, top: sy - 7 }} />
+      {targets.map((tgt, i) => {
+        const y = 24 + i * 66;
+        const h = healths[i];
+        return (
+          <span key={tgt.name}>
+            <Link to={`/targets/${encodeURIComponent(tgt.name)}`} className={`ss-pinnote ${h.kind === 'off' ? 'off' : ''}`} style={{ left: 716, top: y, width: 324, height: 54 }}>
+              <AgentIcon target={tgt.name} size={20} />
+              <span className="flex flex-col min-w-0 flex-1 gap-px">
+                <span className="font-semibold">{tgt.name}</span>
+                <span className="font-mono text-[11.5px] text-ink-3 truncate">{tgt.path}</span>
+              </span>
+              <span className={`ss-st ${h.kind}`}>{h.label}</span>
+            </Link>
+            <span className={`ss-pin ${h.kind === 'off' ? 'off' : ''}`} style={{ left: 709, top: y + 20 }} />
+          </span>
+        );
+      })}
+      {dashed && <span className="ss-hand absolute -rotate-3" style={{ left: 372, top: 44 }}>{t('dashboard.board.dashed')}</span>}
+      <span className="ss-hand absolute -rotate-[1.5deg]" style={{ left: 60, top: sy + 149 }}>{t('dashboard.board.caption')}</span>
+    </div>
   );
 }
 
-/* -- Skill Updates Section ---------------------------- */
+/* ── Needs attention ── */
 
-function SkillUpdatesSection() {
-  const [checkData, setCheckData] = useState<CheckResult | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [checked, setChecked] = useState(false);
+function NeedsAttention({ targets, healths }: { targets: Target[]; healths: Health[] }) {
+  const t = useT();
+  const queryClient = useQueryClient();
   const { toast } = useToast();
+  // Shared with TrackedRepos, which offers Update only for a repo this check found behind.
+  const { data: check } = useQuery<CheckResult>({ queryKey: queryKeys.check, queryFn: () => api.check(), enabled: false, staleTime: Infinity });
+  // Updates made elsewhere (Skills page, CLI) never correct this result, so it lives only while the Dashboard is open.
+  useEffect(() => () => queryClient.removeQueries({ queryKey: queryKeys.check }), [queryClient]);
+  const [checking, setChecking] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  // Reads a scan the Audit page (or this page) already ran; never scans on its own.
+  const { data: audit } = useQuery<AuditAllResponse>({
+    queryKey: queryKeys.audit.all('skills'),
+    queryFn: () => api.auditAll('skills'),
+    enabled: false,
+    staleTime: staleTimes.audit,
+  });
 
-  const handleCheck = async () => {
+  const runCheck = async () => {
     setChecking(true);
     try {
-      const result = await api.check();
-      setCheckData(result);
-      setChecked(true);
+      const res = await api.check();
+      queryClient.setQueryData(queryKeys.check, res);
+      if (!res.tracked_repos.some((r) => r.status === 'behind') && !res.skills.some((s) => s.status === 'update_available' || s.status === 'modified')) {
+        toast(t('dashboard.updates.allUpToDate'), 'success');
+      }
     } catch (e: unknown) {
       toast((e as Error).message, 'error');
     } finally {
@@ -496,124 +327,17 @@ function SkillUpdatesSection() {
     }
   };
 
-  const updatableCount = checkData
-    ? checkData.tracked_repos.filter((r) => r.status === 'behind').length +
-      checkData.skills.filter((s) => s.status === 'update_available').length
-    : 0;
-
-  return (
-    <Card className="mb-8">
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <Download size={20} strokeWidth={2.5} className="text-blue" />
-          <h3
-            className="text-lg font-bold text-pencil"
-            style={{ fontFamily: 'var(--font-heading)' }}
-          >
-            Skill Updates
-          </h3>
-          {checked && updatableCount > 0 && (
-            <Badge variant="warning">{updatableCount} available</Badge>
-          )}
-          {checked && updatableCount === 0 && (
-            <Badge variant="success">All up to date</Badge>
-          )}
-        </div>
-        <button
-          onClick={handleCheck}
-          disabled={checking}
-          className="text-sm text-blue hover:underline disabled:opacity-50"
-          style={{ fontFamily: 'var(--font-hand)' }}
-        >
-          {checking ? 'Checking...' : checked ? 'Re-check' : 'Run Check'}
-        </button>
-      </div>
-
-      {!checked && !checking && (
-        <p className="text-pencil-light text-sm">
-          Click "Run Check" to see if any tracked repos or skills have updates available.
-        </p>
-      )}
-
-      {checking && (
-        <div className="space-y-3">
-          <Skeleton className="w-full h-8" />
-          <Skeleton className="w-3/4 h-8" />
-        </div>
-      )}
-
-      {checked && checkData && (
-        <div className="space-y-2">
-          {checkData.tracked_repos.map((repo) => (
-            <div
-              key={repo.name}
-              className="flex items-center justify-between py-2 px-3 bg-paper-warm border border-muted"
-              style={{ borderRadius: wobbly.sm }}
-            >
-              <div className="flex items-center gap-2">
-                <GitBranch size={14} className="text-pencil-light" />
-                <span className="text-pencil text-sm" style={{ fontFamily: 'var(--font-hand)' }}>
-                  {repo.name.replace(/^_/, '')}
-                </span>
-              </div>
-              {repo.status === 'up_to_date' && <Badge variant="success">Up to date</Badge>}
-              {repo.status === 'behind' && <Badge variant="warning">{repo.behind} behind</Badge>}
-              {repo.status === 'dirty' && <Badge variant="default">Modified</Badge>}
-              {repo.status === 'error' && <Badge variant="danger">Error</Badge>}
-            </div>
-          ))}
-          {checkData.skills.map((skill) => (
-            <div
-              key={skill.name}
-              className="flex items-center justify-between py-2 px-3 bg-paper-warm border border-muted"
-              style={{ borderRadius: wobbly.sm }}
-            >
-              <div className="flex items-center gap-2">
-                <Puzzle size={14} className="text-pencil-light" />
-                <span className="text-pencil text-sm" style={{ fontFamily: 'var(--font-hand)' }}>
-                  {skill.name}
-                </span>
-                {skill.source && (
-                  <span className="text-xs text-muted-dark truncate max-w-[200px]">{skill.source}</span>
-                )}
-              </div>
-              {skill.status === 'up_to_date' && <Badge variant="success">Up to date</Badge>}
-              {skill.status === 'update_available' && <Badge variant="warning">Update available</Badge>}
-              {skill.status === 'local' && <Badge variant="default">Local</Badge>}
-              {skill.status === 'error' && <Badge variant="danger">Error</Badge>}
-            </div>
-          ))}
-          {checkData.tracked_repos.length === 0 && checkData.skills.length === 0 && (
-            <p className="text-pencil-light text-sm">No tracked repos or updatable skills found.</p>
-          )}
-        </div>
-      )}
-    </Card>
-  );
-}
-
-/* -- Security Audit Section --------------------------- */
-
-const riskLabelVariant: Record<string, 'success' | 'default' | 'info' | 'warning' | 'danger'> = {
-  clean: 'success',
-  low: 'default',
-  medium: 'info',
-  high: 'warning',
-  critical: 'danger',
-};
-
-function SecurityAuditSection() {
-  const [auditData, setAuditData] = useState<AuditAllResponse | null>(null);
-  const [scanning, setScanning] = useState(false);
-  const [scanned, setScanned] = useState(false);
-  const { toast } = useToast();
-
-  const handleScan = async () => {
+  const runScan = async () => {
     setScanning(true);
     try {
-      const result = await api.auditAll();
-      setAuditData(result);
-      setScanned(true);
+      const res = await api.auditAll('skills');
+      queryClient.setQueryData(queryKeys.audit.all('skills'), res);
+      const note = auditSourceLinkNote(res);
+      if (res.incomplete && note) toast(t(note.key, { count: note.count }), 'warning');
+      else if (res.summary.critical + res.summary.high === 0) {
+        const accepted = res.summary.accepted ?? 0;
+        toast(accepted > 0 ? t(plural('dashboard.security.allClearAccepted', accepted), { count: accepted }) : t('dashboard.security.allClear'), 'success');
+      }
     } catch (e: unknown) {
       toast((e as Error).message, 'error');
     } finally {
@@ -621,322 +345,313 @@ function SecurityAuditSection() {
     }
   };
 
-  const hasCritical = scanned && auditData && auditData.summary.critical > 0;
-  const hasFindings = scanned && auditData && (
-    auditData.summary.critical + auditData.summary.high + auditData.summary.medium +
-    auditData.summary.low + auditData.summary.info
-  ) > 0;
-  const ShieldIcon = hasCritical ? ShieldAlert : ShieldCheck;
-
-  const severityCounts: { label: string; count: number; variant: 'danger' | 'warning' | 'info' | 'default' }[] = scanned && auditData
-    ? [
-        { label: 'CRITICAL', count: auditData.summary.critical, variant: 'danger' },
-        { label: 'HIGH', count: auditData.summary.high, variant: 'warning' },
-        { label: 'MEDIUM', count: auditData.summary.medium, variant: 'info' },
-        { label: 'LOW', count: auditData.summary.low, variant: 'default' },
-        { label: 'INFO', count: auditData.summary.info, variant: 'default' },
-      ]
-    : [];
-
-  return (
-    <Card variant={hasCritical ? 'accent' : 'default'} className="mb-8">
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <ShieldIcon
-            size={20}
-            strokeWidth={2.5}
-            className={hasCritical ? 'text-danger' : 'text-blue'}
-          />
-          <h3
-            className="text-lg font-bold text-pencil"
-            style={{ fontFamily: 'var(--font-heading)' }}
-          >
-            Security Overview
-          </h3>
-          {scanned && auditData && (
-            <Badge variant={riskLabelVariant[auditData.summary.riskLabel] ?? 'default'}>
-              {auditData.summary.riskLabel}
-            </Badge>
-          )}
-        </div>
-        <Link to="/audit" className="text-sm text-blue hover:underline" style={{ fontFamily: 'var(--font-hand)' }}>
-          {scanned ? 'View Details' : 'Run scan'}
-        </Link>
-      </div>
-
-      {!scanned && !scanning && (
-        <div className="flex items-center justify-between">
-          <p className="text-pencil-light text-sm">
-            Scan your installed skills for malicious patterns and security threats.
-          </p>
-          <button
-            onClick={handleScan}
-            className="text-sm text-blue hover:underline disabled:opacity-50 shrink-0 ml-4"
-            style={{ fontFamily: 'var(--font-hand)' }}
-          >
-            Quick Scan
-          </button>
-        </div>
-      )}
-
-      {scanning && (
-        <div className="space-y-3">
-          <Skeleton className="w-full h-8" />
-          <Skeleton className="w-3/4 h-8" />
-        </div>
-      )}
-
-      {scanned && auditData && (
-        <div className="space-y-4">
-          {/* Summary stats row */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <div
-              className="py-2 px-3 bg-paper-warm border border-muted text-center"
-              style={{ borderRadius: wobbly.sm }}
-            >
-              <p className="text-lg font-bold text-pencil" style={{ fontFamily: 'var(--font-heading)' }}>
-                {auditData.summary.total}
-              </p>
-              <p className="text-xs text-pencil-light">Scanned</p>
-            </div>
-            <div
-              className="py-2 px-3 bg-paper-warm border border-muted text-center"
-              style={{ borderRadius: wobbly.sm }}
-            >
-              <p className="text-lg font-bold text-success" style={{ fontFamily: 'var(--font-heading)' }}>
-                {auditData.summary.passed}
-              </p>
-              <p className="text-xs text-pencil-light">Passed</p>
-            </div>
-            <div
-              className="py-2 px-3 bg-paper-warm border border-muted text-center"
-              style={{ borderRadius: wobbly.sm }}
-            >
-              <p className="text-lg font-bold text-warning" style={{ fontFamily: 'var(--font-heading)' }}>
-                {auditData.summary.warning}
-              </p>
-              <p className="text-xs text-pencil-light">Warnings</p>
-            </div>
-            <div
-              className={`py-2 px-3 bg-paper-warm border text-center ${auditData.summary.failed > 0 ? 'border-danger' : 'border-muted'}`}
-              style={{ borderRadius: wobbly.sm }}
-            >
-              <p
-                className={`text-lg font-bold ${auditData.summary.failed > 0 ? 'text-danger' : 'text-pencil'}`}
-                style={{ fontFamily: 'var(--font-heading)' }}
-              >
-                {auditData.summary.failed}
-              </p>
-              <p className="text-xs text-pencil-light">Failed</p>
-            </div>
-          </div>
-
-          {/* Severity breakdown */}
-          {hasFindings ? (
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-sm text-pencil-light" style={{ fontFamily: 'var(--font-hand)' }}>
-                Findings:
-              </span>
-              {severityCounts
-                .filter((s) => s.count > 0)
-                .map((s) => (
-                  <Badge key={s.label} variant={s.variant}>
-                    {s.count} {s.label}
-                  </Badge>
-                ))}
-            </div>
-          ) : (
-            <div className="flex items-center gap-2 text-success">
-              <ShieldCheck size={16} strokeWidth={2.5} />
-              <span className="text-sm font-medium" style={{ fontFamily: 'var(--font-hand)' }}>
-                All Clear — no security findings detected
-              </span>
-            </div>
-          )}
-        </div>
-      )}
-    </Card>
-  );
-}
-
-/* -- Targets Health Section --------------------------- */
-
-function TargetsHealthSection() {
-  const { data, isPending } = useQuery({
-    queryKey: queryKeys.targets.all,
-    queryFn: () => api.listTargets(),
-    staleTime: staleTimes.targets,
+  const rows: { key: string; kind: 'warn' | 'bad'; icon: typeof Puzzle; title: string; sub: string; action: string; to: string }[] = [];
+  if (check) {
+    const names = [
+      ...check.tracked_repos.filter((r) => r.status === 'behind').map((r) => r.name.replace(/^_/, '')),
+      ...check.skills.filter((s) => s.status === 'update_available').map((s) => s.name),
+    ];
+    if (names.length > 0) {
+      rows.push({ key: 'updates', kind: 'warn', icon: CircleArrowUp, title: t('dashboard.attention.updates', { count: names.length }), sub: names.join(', '), action: t('dashboard.trackedRepos.update'), to: '/skills?tab=updates' });
+    }
+    const modified = check.skills.filter((s) => s.status === 'modified').map((s) => s.name);
+    if (modified.length > 0) {
+      rows.push({ key: 'modified', kind: 'warn', icon: FilePen, title: t('dashboard.attention.modified', { count: modified.length }), sub: modified.join(', '), action: t('dashboard.trackedRepos.update'), to: '/skills?tab=updates' });
+    }
+  }
+  if (audit && audit.summary.critical + audit.summary.high > 0) {
+    // Findings accepted earlier with --force are left out of the summary counts, so leave their resources out too.
+    const names = audit.results.filter((r) => r.findings.some((f) => !f.acknowledged && (f.severity === 'CRITICAL' || f.severity === 'HIGH'))).map((r) => r.skillName);
+    rows.push({ key: 'audit', kind: 'bad', icon: ShieldAlert, title: t('dashboard.attention.audit', { count: audit.summary.critical + audit.summary.high }), sub: names.join(', '), action: t('dashboard.attention.review'), to: '/audit' });
+  }
+  const sourceLinkNote = audit?.incomplete && auditSourceLinkNote(audit);
+  if (sourceLinkNote) {
+    rows.push({ key: 'audit-incomplete', kind: 'warn', icon: TriangleAlert, title: t(sourceLinkNote.key, { count: sourceLinkNote.count }), sub: '', action: t('dashboard.attention.review'), to: '/audit' });
+  }
+  targets.forEach((tgt, i) => {
+    if (healths[i].kind !== 'bad') return;
+    const title = tgt.status === 'not exist' ? t('dashboard.attention.targetMissing', { name: tgt.name }) : `${tgt.name}: ${tgt.status}`;
+    rows.push({ key: `target-${tgt.name}`, kind: 'bad', icon: TriangleAlert, title, sub: tgt.path, action: t('dashboard.attention.open'), to: `/targets/${encodeURIComponent(tgt.name)}` });
   });
 
-  const sourceSkillCount = data?.sourceSkillCount ?? 0;
-  const driftTargets = (data?.targets ?? []).filter(
-    (t) => {
-      const expected = t.expectedSkillCount || sourceSkillCount;
-      return (t.mode === 'merge' && t.status === 'merged' || t.mode === 'copy' && t.status === 'copied') && t.linkedCount < expected;
-    }
-  );
-  const maxDrift = driftTargets.reduce(
-    (max, t) => Math.max(max, (t.expectedSkillCount || sourceSkillCount) - t.linkedCount),
-    0
-  );
-
   return (
-    <Card className="mb-8">
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <Target size={20} strokeWidth={2.5} className="text-success" />
-          <h3
-            className="text-lg font-bold text-pencil"
-            style={{ fontFamily: 'var(--font-heading)' }}
-          >
-            Targets Health
-          </h3>
-          {maxDrift > 0 && (
-            <Badge variant="warning">{maxDrift} not synced</Badge>
-          )}
-        </div>
-        <Link to="/targets" className="text-sm text-blue hover:underline" style={{ fontFamily: 'var(--font-hand)' }}>
-          View all
-        </Link>
+    <div>
+      <div className="ss-sec">
+        <h2>{t('dashboard.attention.title')}</h2>
+        {rows.length > 0 && <span className="ss-cnt">{rows.length}</span>}
+        <span className="ml-auto flex items-center gap-4">
+          <button type="button" className="ss-more cursor-pointer disabled:opacity-50" onClick={runCheck} disabled={checking}>
+            {checking ? t('dashboard.updates.checking') : t('dashboard.attention.checkUpdates')}
+          </button>
+          <button type="button" className="ss-more cursor-pointer disabled:opacity-50" onClick={runScan} disabled={scanning}>
+            {t('dashboard.security.quickScan')}
+          </button>
+        </span>
       </div>
-      {isPending ? (
-        <div className="space-y-3">
-          <Skeleton className="w-full h-10" />
-          <Skeleton className="w-full h-10" />
-          <Skeleton className="w-3/4 h-10" />
-        </div>
-      ) : data?.targets && data.targets.length > 0 ? (
-        <>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            {data.targets.map((t: TargetType) => {
-              const expected = t.expectedSkillCount || sourceSkillCount;
-              const hasDrift = (t.mode === 'merge' && t.status === 'merged' || t.mode === 'copy' && t.status === 'copied') && t.linkedCount < expected;
-              return (
-                <Link key={t.name} to="/targets">
-                  <div
-                    className={`flex items-center justify-between py-2 px-3 bg-paper-warm border ${hasDrift ? 'border-warning' : 'border-muted'} hover:border-pencil-light transition-colors`}
-                    style={{ borderRadius: wobbly.sm }}
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <Target size={14} className="text-pencil-light shrink-0" />
-                      <span
-                        className="font-medium text-pencil truncate"
-                        style={{ fontFamily: 'var(--font-hand)' }}
-                      >
-                        {t.name}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2 shrink-0 ml-2">
-                      <StatusBadge status={t.status} />
-                      {hasDrift ? (
-                        <Badge variant="warning">{t.linkedCount}/{expected} synced</Badge>
-                      ) : t.linkedCount > 0 ? (
-                        <span className="text-xs text-muted-dark">{t.linkedCount} {t.mode === 'copy' ? 'managed' : 'linked'}</span>
-                      ) : null}
-                    </div>
-                  </div>
-                </Link>
-              );
-            })}
+      <div className="ss-list">
+        {rows.length === 0 ? (
+          <div className="ss-r text-[13px] text-ink-2">
+            <CircleCheck size={16} className="text-ok" />
+            {t('dashboard.attention.none')}
           </div>
-          {maxDrift > 0 && (
-            <div className="mt-3 flex items-center gap-2 text-warning text-sm" style={{ fontFamily: 'var(--font-hand)' }}>
-              <AlertTriangle size={14} strokeWidth={2.5} />
-              <span>{maxDrift} skill(s) not synced — <Link to="/sync" className="underline hover:text-pencil">go to Sync page</Link></span>
-            </div>
-          )}
-        </>
-      ) : (
-        <p className="text-pencil-light text-sm">No targets configured.</p>
-      )}
-    </Card>
+        ) : rows.map(({ key, kind, icon: Icon, title, sub, action, to }) => (
+          <div key={key} className="ss-r">
+            <span className={`ss-cat sm ${kind}`}><Icon size={14} /></span>
+            <span className="flex flex-col min-w-0 flex-1">
+              <span className="font-semibold">{title}</span>
+              {sub && <span className="font-mono text-[13px] text-ink-2 truncate">{sub}</span>}
+            </span>
+            <Link to={to} className="ss-btn sm">{action}</Link>
+          </div>
+        ))}
+        {(audit?.summary.accepted ?? 0) > 0 && (
+          <div className="ss-r !min-h-[40px] bg-sunken text-[12.5px] text-ink-2">
+            <ShieldCheck size={14} className="shrink-0 text-ok" aria-hidden="true" />
+            <span className="flex-1">{t(plural('dashboard.attention.accepted', audit?.summary.accepted ?? 0), { count: audit?.summary.accepted ?? 0 })}</span>
+            <Link to="/audit" className="font-semibold text-accent hover:underline">{t('dashboard.attention.viewAudit')}</Link>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
-/* -- Version Status Section --------------------------- */
+/* ── Recent operations ── */
 
-function VersionStatusSection() {
-  const { data, isPending } = useQuery({
+function RecentLog() {
+  const t = useT();
+  const { locale } = useI18n();
+  const { data } = useQuery({
+    queryKey: queryKeys.log('ops', 5),
+    queryFn: () => api.listLog('ops', 5),
+    staleTime: staleTimes.log,
+  });
+  const when = (e: LogEntry) => {
+    const d = new Date(e.ts);
+    const age = Date.now() - d.getTime();
+    if (new Date().toDateString() === d.toDateString()) return formatDateTime(d, locale, { hour: '2-digit', minute: '2-digit', hour12: false });
+    if (age < 6 * 24 * 3600 * 1000) return formatDateTime(d, locale, { weekday: 'short' });
+    return formatDateTime(d, locale, { month: 'numeric', day: 'numeric' });
+  };
+  const entries = data?.entries ?? [];
+  return (
+    <div>
+      <div className="ss-sec">
+        <h2>{t('dashboard.recent.title')}</h2>
+        <Link to="/log" className="more">{t('dashboard.recent.openLog')}</Link>
+      </div>
+      <div className="ss-plain">
+        {entries.length === 0 && <div className="ss-r text-[13px] text-ink-2">{t('dashboard.recent.empty')}</div>}
+        {entries.map((e, i) => (
+          <div key={`${e.ts}-${i}`} className="ss-r">
+            <span className="w-11 font-mono text-xs text-ink-3">{when(e)}</span>
+            <span className={`min-w-16 shrink-0 whitespace-nowrap font-semibold ${e.status === 'error' ? 'text-bad' : ''}`}>{e.cmd}</span>
+            <span className="flex-1 min-w-0 truncate text-[13px] text-ink-2">{formatLogDetail(e)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ── Tracked repositories ── */
+
+// Refusals of DELETE /api/repos/{name} that ?force=true overrides, by error code.
+const forceableRefusals = {
+  repo_dirty: 'dashboard.trackedRepos.uninstallConfirm.dirty',
+  repo_status_failed: 'dashboard.trackedRepos.uninstallConfirm.statusFailed',
+} as const;
+
+function TrackedRepos({ repos }: { repos: Overview['trackedRepos'] }) {
+  const t = useT();
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
+  const { updating, update } = useRepoUpdate();
+  const { data: check } = useQuery<CheckResult>({ queryKey: queryKeys.check, queryFn: () => api.check(), enabled: false, staleTime: Infinity });
+  const behind = new Set(check?.tracked_repos.filter((r) => r.status === 'behind').map((r) => r.name));
+  const [menuFor, setMenuFor] = useState<string | null>(null);
+  const menu = useMenuPresence(menuFor !== null);
+  // The repo whose menu is still fading out after menuFor went back to null.
+  const heldMenuFor = useHeldWhileClosing(menuFor, menuFor !== null);
+  const menuShownFor = menu.shown ? heldMenuFor : null;
+  const [toDelete, setToDelete] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [refusal, setRefusal] = useState<keyof typeof forceableRefusals | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!menuFor) return;
+    const close = (e: MouseEvent | KeyboardEvent) => {
+      if (e instanceof KeyboardEvent ? e.key === 'Escape' : !menuRef.current?.contains(e.target as Node)) setMenuFor(null);
+    };
+    document.addEventListener('mousedown', close);
+    document.addEventListener('keydown', close);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      document.removeEventListener('keydown', close);
+    };
+  }, [menuFor]);
+
+  const refresh = async () => {
+    clearAuditCache(queryClient);
+    await invalidate(queryClient, 'reposChanged');
+  };
+
+  const uninstall = async () => {
+    if (!toDelete) return;
+    setDeleting(true);
+    try {
+      await api.deleteRepo(toDelete, refusal !== null);
+      toast(t('dashboard.toast.repoUninstalled', { name: toDelete.replace(/^_/, '') }), 'success');
+      setToDelete(null);
+      await refresh();
+    } catch (e: unknown) {
+      if (e instanceof ApiError && e.code && e.code in forceableRefusals) setRefusal(e.code as keyof typeof forceableRefusals);
+      else toast((e as Error).message, 'error');
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="ss-sec">
+        <h2>{t('dashboard.trackedRepos.title')}</h2>
+        <span className="ss-cnt">{repos.length}</span>
+      </div>
+      <div className="ss-list !overflow-visible">
+        {repos.map((repo) => (
+          <div key={repo.name} className="ss-r">
+            <Github size={15} />
+            <span className="flex flex-col min-w-0 flex-1 gap-px">
+              <span className="font-mono text-[13px] font-semibold truncate">{repo.name.replace(/^_/, '')}</span>
+              <span className="text-[13px] text-ink-2">{t(plural('dashboard.trackedRepos.skillCount', repo.skillCount), { count: repo.skillCount })}{(repo.variantCount ?? repo.skillCount) > repo.skillCount && <>{', '}{t('dashboard.trackedRepos.variantCount', { count: repo.variantCount! })}</>}</span>
+            </span>
+            <span className={`ss-st ${repo.dirty ? 'warn' : 'ok'}`}>
+              {repo.dirty ? t('dashboard.trackedRepos.modified') : t('dashboard.trackedRepos.clean')}
+            </span>
+            {behind.has(repo.name) && (
+              <Button variant="secondary" size="sm" onClick={() => update(repo.name)} loading={updating === repo.name} disabled={updating !== null || deleting}>
+                {t('dashboard.trackedRepos.update')}
+              </Button>
+            )}
+            <div className="relative" ref={menuFor === repo.name ? menuRef : undefined}>
+              <button type="button" className="ss-ib" aria-label={t('dashboard.trackedRepos.actions')} aria-expanded={menuFor === repo.name} onClick={() => setMenuFor(menuFor === repo.name ? null : repo.name)}>
+                <Ellipsis size={16} />
+              </button>
+              {menuShownFor === repo.name && (
+                <div {...menu.exitProps} className={`ss-menu absolute right-0 top-full mt-1 z-20 !w-44 origin-top-right ${menu.motion}`} role="menu">
+                  <button type="button" role="menuitem" className="dng" onClick={() => { setMenuFor(null); setToDelete(repo.name); setRefusal(null); }}>
+                    <Trash2 size={15} />
+                    {t('dashboard.trackedRepos.uninstall')}
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+      <ConfirmDialog
+        open={toDelete !== null}
+        title={t('dashboard.trackedRepos.uninstallConfirm.title')}
+        message={toDelete ? t(refusal ? forceableRefusals[refusal] : 'dashboard.trackedRepos.uninstallConfirm.message', { name: toDelete.replace(/^_/, '') }) : ''}
+        confirmText={t(refusal ? 'resources.uninstall.retryForce' : 'dashboard.trackedRepos.uninstall')}
+        variant="danger"
+        loading={deleting}
+        onConfirm={uninstall}
+        onCancel={() => !deleting && setToDelete(null)}
+      />
+    </div>
+  );
+}
+
+/* ── Versions ── */
+
+function Versions({ data }: { data: Overview }) {
+  const t = useT();
+  const policy = useUpdatePolicy();
+  const { data: v, isPending } = useQuery({
     queryKey: queryKeys.versionCheck,
     queryFn: () => api.getVersionCheck(),
     staleTime: staleTimes.version,
   });
-
+  const ver = (s?: string) => (s && /^\d/.test(s) ? `v${s}` : s);
+  const sources = [data.source, data.agentsSource, data.extrasSource].filter(Boolean);
   return (
-    <Card className="mb-8">
-      <div className="flex items-center gap-2 mb-4">
-        <Package size={20} strokeWidth={2.5} className="text-pencil-light" />
-        <h3
-          className="text-lg font-bold text-pencil"
-          style={{ fontFamily: 'var(--font-heading)' }}
-        >
-          Version Status
-        </h3>
+    <div>
+      <div className="ss-sec">
+        <h2>{t('dashboard.version.title')}</h2>
       </div>
-      {isPending ? (
-        <div className="space-y-3">
-          <Skeleton className="w-full h-8" />
-          <Skeleton className="w-3/4 h-8" />
-        </div>
-      ) : data ? (
-        <div className="space-y-3">
-          {/* CLI Version */}
-          <div
-            className="flex items-center justify-between py-2 px-3 bg-paper-warm border border-muted"
-            style={{ borderRadius: wobbly.sm }}
-          >
-            <div className="flex items-center gap-2">
-              <Zap size={14} className="text-pencil-light" />
-              <span className="text-pencil text-sm" style={{ fontFamily: 'var(--font-hand)' }}>
-                CLI
-              </span>
-              <span
-                className="font-medium text-pencil"
-                style={{ fontFamily: "'Courier New', monospace", fontSize: '0.85rem' }}
-              >
-                {data.cliVersion}
-              </span>
+      <div className="ss-list">
+        {isPending ? (
+          <div className="ss-r"><span className="ss-skel w-2/3" /></div>
+        ) : !v ? (
+          <div className="ss-r text-[13px] text-ink-2">{t('dashboard.version.couldNotCheck')}</div>
+        ) : (
+          <>
+            <div className="ss-r">
+              <span className="w-[120px] font-semibold">{t('dashboard.version.cli')}</span>
+              <span className="flex-1 font-mono text-[13px]">{ver(v.cliVersion)}</span>
+              {policy.data?.enabled === true && (v.cliUpdateAvailable
+                ? <span className="ss-st warn">{t('dashboard.version.update', { version: ver(v.cliLatest) })}</span>
+                : <span className="ss-st ok">{t('dashboard.version.upToDate')}</span>)}
             </div>
-            {data.cliUpdateAvailable ? (
-              <Badge variant="warning">Update: {data.cliLatest}</Badge>
-            ) : (
-              <Badge variant="success">Up to date</Badge>
-            )}
-          </div>
+            <div className="ss-r">
+              <span className="w-[120px] font-semibold">{t('dashboard.version.builtInSkill')}</span>
+              <span className="flex-1 font-mono text-[13px]">{ver(v.skillVersion) || '—'}</span>
+              {policy.data?.enabled === true && (!v.skillVersion
+                ? <span className="ss-st off">{t('dashboard.version.notInstalled')}</span>
+                : v.skillUpdateAvailable
+                  ? <span className="ss-st warn">{t('dashboard.version.update', { version: ver(v.skillLatest) })}</span>
+                  : v.skillLatest
+                    ? <span className="ss-st ok">{t('dashboard.version.upToDate')}</span>
+                    : <span className="ss-st off">{t('dashboard.version.checkFailed')}</span>)}
+            </div>
+          </>
+        )}
+      </div>
+      <div className="mt-2.5 flex flex-col gap-0.5 min-w-0 text-[13px] text-ink-3">
+        <span>{t('dashboard.source.label')}</span>
+        {sources.map((s) => (
+          <span key={s} className="font-mono text-xs truncate">{s}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
 
-          {/* Skill Version */}
-          <div
-            className="flex items-center justify-between py-2 px-3 bg-paper-warm border border-muted"
-            style={{ borderRadius: wobbly.sm }}
-          >
-            <div className="flex items-center gap-2">
-              <Puzzle size={14} className="text-pencil-light" />
-              <span className="text-pencil text-sm" style={{ fontFamily: 'var(--font-hand)' }}>
-                Skill
-              </span>
-              <span
-                className="font-medium text-pencil"
-                style={{ fontFamily: "'Courier New', monospace", fontSize: '0.85rem' }}
-              >
-                {data.skillVersion || 'N/A'}
-              </span>
-            </div>
-            {data.skillVersion ? (
-              data.skillUpdateAvailable ? (
-                <Badge variant="warning">Update: {data.skillLatest}</Badge>
-              ) : data.skillLatest ? (
-                <Badge variant="success">Up to date</Badge>
-              ) : (
-                <Badge variant="default">Check failed</Badge>
-              )
-            ) : (
-              <Badge variant="default">Not installed</Badge>
-            )}
-          </div>
-        </div>
-      ) : (
-        <p className="text-pencil-light text-sm">Could not check versions.</p>
-      )}
-    </Card>
+/* ── Star reminder ── */
+
+function StarReminder() {
+  const t = useT();
+  const [show, setShow] = useState(() => {
+    try {
+      return window.localStorage.getItem(STAR_CTA_DISMISSED_KEY) !== '1';
+    } catch {
+      return true;
+    }
+  });
+  if (!show) return null;
+  const dismiss = () => {
+    setShow(false);
+    try {
+      window.localStorage.setItem(STAR_CTA_DISMISSED_KEY, '1');
+    } catch {
+      // Storage unavailable: the reminder simply comes back next visit.
+    }
+  };
+  return (
+    <div className="flex items-center gap-2 text-[13px] text-ink-2">
+      <Star size={14} />
+      <span>
+        {t('dashboard.starCta.enjoying')}{' '}
+        <a href="https://github.com/runkids/skillshare" target="_blank" rel="noopener noreferrer" className="font-semibold text-ink hover:underline">
+          {t('dashboard.starCta.link')}
+        </a>
+      </span>
+      <button type="button" className="ss-ib !w-6 !h-6" onClick={dismiss} aria-label={t('dashboard.starCta.dismiss')}>
+        <X size={14} />
+      </button>
+    </div>
   );
 }

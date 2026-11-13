@@ -17,6 +17,8 @@ const (
 	PlatformGitLab               // gitlab.com and self-hosted GitLab
 	PlatformBitbucket            // bitbucket.org
 	PlatformAzureDevOps          // dev.azure.com and visualstudio.com
+	PlatformCNB                  // cnb.cool and self-hosted CNB instances
+	PlatformGitea                // gitea.com and self-hosted Gitea instances
 )
 
 // extractHost returns the hostname from a clone URL.
@@ -50,7 +52,7 @@ func detectPlatform(cloneURL string) Platform {
 	if host == "" {
 		return PlatformUnknown
 	}
-	if strings.Contains(host, "github") {
+	if isGitHubLikeHost(host) {
 		return PlatformGitHub
 	}
 	if strings.Contains(host, "gitlab") {
@@ -62,19 +64,28 @@ func detectPlatform(cloneURL string) Platform {
 	if host == "dev.azure.com" || host == "ssh.dev.azure.com" || strings.HasSuffix(host, ".visualstudio.com") {
 		return PlatformAzureDevOps
 	}
+	if strings.Contains(host, "cnb.cool") {
+		return PlatformCNB
+	}
+	if strings.Contains(host, "gitea") {
+		return PlatformGitea
+	}
 	return PlatformUnknown
 }
 
-// resolveToken looks up a token from environment variables based on the
-// detected platform. Platform-specific vars take priority over the generic
-// SKILLSHARE_GIT_TOKEN. Returns empty strings if no token is available or
-// the URL is not HTTPS.
+// resolveToken looks up HTTPS credentials. Provider tokens require a trusted
+// host; platform-name heuristics are only for parsing, never authorization.
+// SKILLSHARE_GIT_TOKEN remains an explicit fallback for any HTTPS source.
 func resolveToken(cloneURL string) (token, username string) {
+	return resolveTokenWithOptions(cloneURL, nil, nil)
+}
+
+func resolveTokenWithOptions(cloneURL string, cnbHosts, giteaHosts []string) (token, username string) {
 	if !isHTTPS(cloneURL) {
 		return "", ""
 	}
 
-	platform := detectPlatform(cloneURL)
+	platform := credentialPlatform(cloneURL, cnbHosts, giteaHosts)
 	switch platform {
 	case PlatformGitHub:
 		if t := os.Getenv("GITHUB_TOKEN"); t != "" {
@@ -98,15 +109,23 @@ func resolveToken(cloneURL string) (token, username string) {
 		if t := os.Getenv("AZURE_DEVOPS_TOKEN"); t != "" {
 			return t, "x-access-token"
 		}
+	case PlatformCNB:
+		if t := os.Getenv("CNB_TOKEN"); t != "" {
+			return t, "cnb"
+		}
+	case PlatformGitea:
+		if t := os.Getenv("GITEA_TOKEN"); t != "" {
+			return t, "x-access-token"
+		}
 	}
 
 	// Generic fallback — use platform-appropriate username, or preserve
-	// existing URL username (e.g. https://myuser@host/... → myuser:token@...).
+	// existing URL username (e.g. https://myuser@host/... authenticates as myuser).
 	if t := os.Getenv("SKILLSHARE_GIT_TOKEN"); t != "" {
 		if u := urlUsername(cloneURL); u != "" {
 			return t, u
 		}
-		switch platform {
+		switch detectPlatformWithOptions(cloneURL, cnbHosts, giteaHosts) {
 		case PlatformGitLab:
 			return t, "oauth2"
 		case PlatformBitbucket:
@@ -118,15 +137,53 @@ func resolveToken(cloneURL string) (token, username string) {
 	return "", ""
 }
 
-// authEnv returns environment variables that inject token authentication
-// via GIT_CONFIG_COUNT/KEY/VALUE (Git 2.31+). This avoids the git -c
-// key=value format which breaks when tokens contain '=' characters.
-// If GIT_CONFIG_COUNT is already set in the environment, the new entry
-// is appended at the next available index to avoid overriding existing
+// credentialPlatform binds provider credentials to their public HTTPS origin,
+// or an explicitly configured CNB/Gitea host, not a provider-looking name.
+func credentialPlatform(rawURL string, cnbHosts, giteaHosts []string) Platform {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || (u.Port() != "" && u.Port() != "443") {
+		return PlatformUnknown
+	}
+	host := strings.ToLower(u.Hostname())
+	switch host {
+	case "github.com", "api.github.com", "raw.githubusercontent.com":
+		return PlatformGitHub
+	case "gitlab.com":
+		return PlatformGitLab
+	case "bitbucket.org":
+		return PlatformBitbucket
+	case "dev.azure.com":
+		return PlatformAzureDevOps
+	case "cnb.cool":
+		return PlatformCNB
+	case "gitea.com":
+		return PlatformGitea
+	}
+	if strings.HasSuffix(host, ".visualstudio.com") {
+		return PlatformAzureDevOps
+	}
+	if hostMatchesAny(host, cnbHosts) {
+		return PlatformCNB
+	}
+	if hostMatchesAny(host, giteaHosts) {
+		return PlatformGitea
+	}
+	return PlatformUnknown
+}
+
+// authEnv returns environment variables that give git the token through a
+// credential helper set via GIT_CONFIG_COUNT/KEY/VALUE (Git 2.31+). The token
+// itself travels only in SKILLSHARE_GIT_AUTH_PASSWORD, never in config or argv.
+// If GIT_CONFIG_COUNT is already set in the environment, the new entries
+// are appended at the next available index to avoid overriding existing
 // git config entries (e.g. from CI pipelines).
 // Returns nil for SSH/file URLs or when no token is available.
 func authEnv(cloneURL string) []string {
-	token, username := resolveToken(cloneURL)
+	return authEnvWithOptions(cloneURL, nil, nil)
+}
+
+func authEnvWithOptions(cloneURL string, cnbHosts, giteaHosts []string) []string {
+	token, username := resolveTokenWithOptions(cloneURL, cnbHosts, giteaHosts)
 	if token == "" {
 		return nil
 	}
@@ -136,31 +193,68 @@ func authEnv(cloneURL string) []string {
 		return nil
 	}
 
+	// Not an insteadOf URL rewrite: git passes the rewritten URL to
+	// git-remote-https as an argument, visible in ps (#565). Not an extraHeader:
+	// it is sent before any 401, so a stale token breaks public repos.
+	// The empty entry clears the user's helpers for this host, so git never
+	// asks their keychain or erases from it.
 	base := existingConfigCount()
-	authed := fmt.Sprintf("https://%s:%s@%s/", username, token, host)
-	original := originalPrefix(cloneURL, host)
+	key := fmt.Sprintf("credential.https://%s.helper", host)
 	return []string{
-		fmt.Sprintf("GIT_CONFIG_COUNT=%d", base+1),
-		fmt.Sprintf("GIT_CONFIG_KEY_%d=url.%s.insteadOf", base, authed),
-		fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", base, original),
+		fmt.Sprintf("GIT_CONFIG_COUNT=%d", base+2),
+		fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", base, key),
+		fmt.Sprintf("GIT_CONFIG_VALUE_%d=", base),
+		fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", base+1, key),
+		fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", base+1, gitCredentialHelper),
+		gitAuthUsernameEnv + "=" + username,
+		gitAuthPasswordEnv + "=" + token,
 	}
 }
 
+const (
+	gitAuthUsernameEnv = "SKILLSHARE_GIT_AUTH_USERNAME"
+	gitAuthPasswordEnv = "SKILLSHARE_GIT_AUTH_PASSWORD"
+	// printf is a shell builtin, so the token never reaches a process argv.
+	gitCredentialHelper = `!f() { if [ "$1" = get ]; then printf 'username=%s\npassword=%s\n' "$` + gitAuthUsernameEnv + `" "$` + gitAuthPasswordEnv + `"; fi; }; f`
+)
+
 // AuthEnvForURL returns git auth injection env for HTTPS clone/pull URLs.
 // Returns nil when no token is available or URL is not HTTPS.
-func AuthEnvForURL(cloneURL string) []string {
-	return authEnv(cloneURL)
+func AuthEnvForURL(cloneURL string, opts ParseOptions) []string {
+	return authEnvWithOptions(cloneURL, opts.CNBHosts, opts.GiteaHosts)
 }
 
 // ResolveTokenForURL returns token credentials resolved from env vars for the
 // provided HTTPS URL. Returns empty strings when no token is available.
-func ResolveTokenForURL(cloneURL string) (token, username string) {
-	return resolveToken(cloneURL)
+func ResolveTokenForURL(cloneURL string, opts ParseOptions) (token, username string) {
+	return resolveTokenWithOptions(cloneURL, opts.CNBHosts, opts.GiteaHosts)
 }
 
 // DetectPlatformForURL identifies the git hosting platform for a URL.
 func DetectPlatformForURL(cloneURL string) Platform {
 	return detectPlatform(cloneURL)
+}
+
+func detectPlatformWithOptions(cloneURL string, cnbHosts, giteaHosts []string) Platform {
+	host := strings.ToLower(extractHost(cloneURL))
+	if host == "" {
+		return PlatformUnknown
+	}
+	return detectPlatformFromHost(host, cnbHosts, giteaHosts)
+}
+
+func (s *Source) authEnv() []string {
+	if s == nil {
+		return nil
+	}
+	return authEnvWithOptions(s.CloneURL, s.CNBHosts, s.GiteaHosts)
+}
+
+func (s *Source) platform() Platform {
+	if s == nil {
+		return PlatformUnknown
+	}
+	return detectPlatformWithOptions(s.CloneURL, s.CNBHosts, s.GiteaHosts)
 }
 
 // existingConfigCount returns the current GIT_CONFIG_COUNT from the
@@ -177,17 +271,6 @@ func existingConfigCount() int {
 	return n
 }
 
-// originalPrefix returns the URL prefix that git's insteadOf should match.
-// If the URL already contains a username (e.g. https://user@host/...),
-// the prefix includes it so the rewrite rule matches the actual URL.
-func originalPrefix(cloneURL, host string) string {
-	u, err := url.Parse(strings.TrimSpace(cloneURL))
-	if err == nil && u.User != nil && u.User.Username() != "" {
-		return fmt.Sprintf("https://%s@%s/", u.User.Username(), host)
-	}
-	return fmt.Sprintf("https://%s/", host)
-}
-
 // sanitizeTokens replaces any known credential values found in text with
 // [REDACTED]. This prevents tokens and associated usernames from leaking
 // in error messages.
@@ -195,6 +278,7 @@ func sanitizeTokens(text string) string {
 	vars := []string{
 		"GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "BITBUCKET_TOKEN",
 		"AZURE_DEVOPS_TOKEN", "SKILLSHARE_GIT_TOKEN", "BITBUCKET_USERNAME",
+		"CNB_TOKEN", "GITEA_TOKEN",
 	}
 	for _, v := range vars {
 		if t := os.Getenv(v); t != "" {

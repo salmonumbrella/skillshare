@@ -1,0 +1,927 @@
+package plugin
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"path/filepath"
+	"slices"
+	"strings"
+)
+
+func hash(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
+
+func (s *Service) managedRoot() string {
+	p, _ := filepath.Abs(s.ConfigPath)
+	return filepath.Join(s.StateDir, "plugins", hash([]byte(p))[:16])
+}
+
+// discover shares a reviewed source within one preview (including recursive adds)
+// or the existing update batch, without caching it across standalone previews.
+func (s *Service) discover(ctx context.Context, source, ref, entry string) (*Discovery, error) {
+	return s.reads.sources.get(source+"\x00"+ref+"\x00"+entry, func() (*Discovery, error) {
+		return DiscoverOptions(ctx, source, ref, entry)
+	})
+}
+
+// updateCandidate preserves the selected update's missing/unsupported distinction.
+func updateCandidate(d *Discovery, name, agent string) (*Candidate, error) {
+	for _, candidate := range d.Candidates {
+		if candidate.Name != name {
+			continue
+		}
+		if candidate.Problem != "" || !slices.Contains(candidate.Targets, agent) {
+			return &candidate, fmt.Errorf("Updated source no longer provides a compatible native plugin")
+		}
+		return &candidate, nil
+	}
+	return nil, fmt.Errorf("plugin %s no longer exists in source", name)
+}
+
+func (s *Service) validate(r Request) error {
+	switch r.Action {
+	case "add", "import", "unimport", "sync", "remove", "update", "check", "enable", "disable":
+	default:
+		return fmt.Errorf("unknown plugin action %q", r.Action)
+	}
+	if r.Name != "" && !namePattern.MatchString(r.Name) {
+		return fmt.Errorf("invalid package name")
+	}
+	if r.Source != "" && r.Action != "add" {
+		return fmt.Errorf("source is only valid for add")
+	}
+	if r.SourceRef != "" && r.Action != "add" && r.Action != "update" {
+		return fmt.Errorf("source ref is only valid for add or update")
+	}
+	if r.Entry != "" && r.Action != "add" {
+		return fmt.Errorf("entry is only valid for add")
+	}
+	if r.From != "" && r.Action != "import" {
+		return fmt.Errorf("from is only valid for import")
+	}
+	if r.Plugin != "" && r.Action != "add" && r.Action != "import" {
+		return fmt.Errorf("plugin selector is only valid for add or import")
+	}
+	seen := map[string]bool{}
+	targets := s.targets()
+	for _, t := range r.Targets {
+		if !slices.Contains(targets, t) {
+			return fmt.Errorf("unsupported plugin target %q", t)
+		}
+		if seen[t] {
+			return fmt.Errorf("duplicate plugin target %q", t)
+		}
+		seen[t] = true
+	}
+	if r.Action == "add" && r.Source == "" {
+		return fmt.Errorf("add requires a source")
+	}
+	if r.Action == "add" && isNpmSource(r.Source) {
+		if !validNpmSource(r.Source) {
+			return fmt.Errorf("invalid npm source; use npm:<package> or npm:<package>@<version>")
+		}
+		if r.SourceRef != "" || r.Entry != "" || r.Plugin != "" {
+			return fmt.Errorf("an npm source takes no source ref, entry or plugin selector")
+		}
+		if len(r.Targets) == 0 {
+			return fmt.Errorf("npm packages are installed by Pi; choose a Pi target")
+		}
+	}
+	if r.Action == "import" && s.agentOf(r.From) == "omp" && !validID(r.Plugin) && ompPackageName.MatchString(r.Plugin) {
+		return agentError{key: "plugins.error.ompPackageImport", message: "This OMP plugin was installed by bun from npm, Git or a local link, which runs its install scripts; Skillshare manages OMP marketplace plugins only. Keep managing it in omp."}
+	}
+	if r.Action == "import" && (!slices.Contains(targets, r.From) || !validTargetID(s.agentOf(r.From), r.Plugin)) {
+		return fmt.Errorf("import requires --from <target> and a native plugin identifier")
+	}
+	if r.All {
+		if r.Action != "update" {
+			return fmt.Errorf("--all is only supported for update")
+		}
+		if r.Name != "" {
+			return fmt.Errorf("--all cannot be combined with a package name")
+		}
+		if r.SourceRef != "" {
+			return fmt.Errorf("--source-ref cannot be combined with --all")
+		}
+	}
+	if r.Action == "update" && r.Name == "" && !r.All {
+		return fmt.Errorf("update requires a package name or --all")
+	}
+	if (r.Action == "unimport" || r.Action == "remove" || r.Action == "enable" || r.Action == "disable") && r.Name == "" {
+		return fmt.Errorf("%s requires a package name", r.Action)
+	}
+	if r.Action == "unimport" && len(r.Targets) == 0 {
+		return agentError{key: "plugins.error.unimportTargetRequired", message: "unimport requires --target to select a local import receipt"}
+	}
+	return nil
+}
+
+func (s *Service) Preview(ctx context.Context, r Request) (*Plan, error) {
+	if r.Action == "check" && r.Name == "" {
+		return s.checkAll(ctx, r)
+	}
+	return s.preview(ctx, r, nil)
+}
+
+// cleanup is confined to the source replacement being resolved. Ordinary
+// previews cannot borrow a removal from another package or operation.
+func (s *Service) preview(ctx context.Context, r Request, cleanup *ompRemoval) (*Plan, error) {
+	r.Targets = slices.Clone(r.Targets)
+	for i, target := range r.Targets {
+		r.Targets[i] = NormalizeTarget(target)
+	}
+	r.From = NormalizeTarget(r.From)
+	if err := s.validate(r); err != nil {
+		return nil, err
+	}
+	// Recursive source previews share this operation's discoveries, not receiver lifetime.
+	if s.reads == nil {
+		preview := *s
+		preview.reads = &reads{}
+		s = &preview
+	}
+	d, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	p := &Plan{Changes: []Change{}}
+	hosts := map[string]Host{}
+	host := func(target string) Host {
+		if h, ok := hosts[target]; ok {
+			return h
+		}
+		h := s.sharedHost(ctx, target)
+		hosts[target] = h
+		return h
+	}
+	// A check of one plugin proves only its own leftover installs, so an Agent another plugin
+	// left something on cannot hold it up.
+	var own []string
+	if r.Action == "check" && r.Name != "" {
+		own = append(own, r.Name)
+	}
+	s.adoptLegacy(d, host, own...)
+	// ownMarket reports whether the marketplace Skillshare registered for b is still in place.
+	ownMarket := func(target string, b Binding) bool {
+		_, market, _ := strings.Cut(b.ID, "@")
+		return marketplaceAgent(s.agentOf(target)) && b.Source != "" && slices.Contains(host(target).ManagedMarketplaces, market)
+	}
+	// mayOwnMarket also covers an Agent whose marketplace list could not be read, so a removal
+	// stays pending instead of dropping the binding before its cleanup.
+	mayOwnMarket := func(target string, b Binding) bool {
+		return ownMarket(target, b) || marketplaceAgent(s.agentOf(target)) && b.Source != "" && host(target).Marketplaces == nil
+	}
+	appendPrepared := func(c Change) {
+		if c.Action == "blocked" {
+			p.Blocked = true
+		}
+		p.Changes = append(p.Changes, c)
+	}
+	appendChange := func(c Change) {
+		if c.Action == "noop" && c.Binding.ImportRetained {
+			c.Guidance = true
+			c.Message = fmt.Sprintf("Shared recipe changed; keeping this local import. To switch to source, run plugin unimport %s --target %s, then plugin sync.", c.Name, c.Target)
+			c.MessageKey = "plugins.note.importRecipeChanged"
+			c.MessageArgs = map[string]string{"name": c.Name, "target": c.Target}
+		}
+		appendPrepared(s.prepareChange(ctx, r, d, host, c, cleanup))
+	}
+	find := func(target, id string) (Installed, bool) {
+		for _, i := range host(target).Installed {
+			if i.ID == id {
+				return i, true
+			}
+		}
+		return Installed{}, false
+	}
+	if r.Action == "add" && isNpmSource(r.Source) {
+		name := r.Name
+		if name == "" {
+			if name = logicalName(r.Source); name == "" {
+				return nil, fmt.Errorf("use --name to choose a package name for this npm source")
+			}
+		}
+		others := []string{}
+		for other := range d.packages {
+			if other != name {
+				others = append(others, other)
+			}
+		}
+		slices.Sort(others)
+		for _, target := range slices.Compact(slices.Sorted(slices.Values(r.Targets))) {
+			owner := ""
+			for _, other := range others {
+				if b, ok := d.packages[other].Bindings[target]; ok && sameNpmPackage(b.ID, r.Source) {
+					owner = other
+					break
+				}
+			}
+			old, bound := d.packages[name].Bindings[target]
+			c := s.npmChange(name, target, r.Source, owner, old, bound && old.ID != "" && !old.Cleanup, host(target).Installed)
+			if old.ContextChanged {
+				appendChange(c)
+				continue
+			}
+			// An adopted entry with resource filters keeps them, as an import does. Installing
+			// another version over one keeps them too, so its new entry is recorded after the install.
+			filtered := func(id string) bool {
+				return slices.ContainsFunc(host(target).Installed, func(i Installed) bool { return i.Filtered && (i.ID == id || sameNpmPackage(i.ID, id)) })
+			}
+
+			if c.Action == "import" && filtered(c.ID) {
+				if err := s.preparePiRegistration(ctx, &c); err != nil {
+					c.Action, c.Message = "blocked", err.Error()
+				}
+			}
+			c.piRecordAfter = c.Action == "install" && filtered(c.ID)
+			appendChange(c)
+		}
+	} else if r.Action == "add" {
+		discovered, err := s.discover(ctx, r.Source, r.SourceRef, r.Entry)
+		if err != nil {
+			return nil, err
+		}
+		var candidate *Candidate
+		for _, c := range discovered.Candidates {
+			if c.Name == r.Plugin || (r.Plugin == "" && len(discovered.Candidates) == 1) {
+				cc := c
+				candidate = &cc
+				break
+			}
+		}
+		if candidate == nil {
+			return nil, fmt.Errorf("choose a plugin from this source using --plugin")
+		}
+		c := *candidate
+		name := r.Name
+		if name == "" {
+			name = c.Name
+		}
+		pack, exists := d.packages[name]
+		// The recorded source is where Agents are bound from later. It does not stop one Agent
+		// from using another distribution under the same name.
+		otherSource := pack.Source != "" && (pack.Source != discovered.Source || pack.Plugin != c.Name || pack.SourceRef != discovered.SourceRef)
+		if len(r.Targets) == 0 {
+			// Only record the package; Agents are bound later from the same source.
+			change := Change{Name: name, Action: "record", Components: c.Components, Message: "Add to Skillshare only; choose Agents later.", Binding: Binding{Source: discovered.Source, SourceRef: discovered.SourceRef, Plugin: c.Name, Entry: r.Entry, Version: c.Version}}
+			if slices.Contains(c.Targets, "codex") {
+				change.Logo = c.TargetInfo["codex"].Logo
+			}
+			if c.Problem != "" || len(c.Targets) == 0 {
+				change.Action = "blocked"
+				change.Message = c.Problem
+				if change.Message == "" {
+					change.Message = "No Agent can use this plugin."
+				}
+			} else if otherSource {
+				change.Action = "blocked"
+				change.Message = "Package already uses a different source; choose another name or remove it first."
+			} else if exists {
+				change.Action = "noop"
+			}
+			p.Blocked = change.Action == "blocked"
+			p.Changes = append(p.Changes, change)
+		}
+		for _, target := range slices.Compact(slices.Sorted(slices.Values(r.Targets))) {
+			agent := s.agentOf(target)
+			// Name the plugin so native marketplace lists show what Skillshare added.
+			digest := hash([]byte(s.ConfigPath + "\x00" + discovered.Source + "\x00" + c.Name + "\x00" + target))[:16]
+			market := "skillshare-" + marketUnsafe.ReplaceAllString(c.Name, "-") + "-" + digest
+			b := Binding{ID: c.Name + "@" + market, Source: discovered.Source, SourceRef: discovered.SourceRef, Commit: discovered.Commit, Plugin: c.Name, Digest: discovered.Digest, Version: c.TargetInfo[agent].Version, Components: c.TargetInfo[agent].Components}
+			switch agent {
+			case "cursor", "antigravity", "antigravity-cli", "copilot", "grok", "kimi", "hermes", "devin":
+				b.ID = c.Name
+			case "omp":
+				// omp caps marketplace names at 64 characters, so the plugin name is left out.
+				b.ID = c.Name + "@skillshare-" + digest
+			case "pi":
+				b.ID = filepath.Join(s.snapshotPath(b, target), "content", filepath.FromSlash(c.pathFor(agent)))
+			case "opencode":
+				b.Entry = c.Entry
+				b.ID = fileURL(filepath.Join(s.snapshotPath(b, target), "content", filepath.FromSlash(c.pathFor(agent)), c.Entry))
+			}
+			recipe := declareBinding(b)
+			change := Change{Name: name, Target: target, ID: b.ID, Binding: b, Action: "install", Components: b.Components, recipe: &recipe, sourceVersion: &c.Version}
+			if c.Problem != "" || !slices.Contains(c.Targets, agent) {
+				change.Action = "blocked"
+				change.Message = c.Problem
+				if info, ok := c.TargetInfo[agent]; ok && info.Problem != "" {
+					change.Message = info.Problem
+				}
+				if change.Message == "" {
+					change.Message = "No native manifest for this target; plugin components will not be silently converted or omitted."
+				}
+			}
+			if old, ok := d.packages[name].Bindings[target]; ok && old.ID != "" && !old.Cleanup {
+				if old.Source == b.Source && old.Plugin == b.Plugin && old.SourceRef == b.SourceRef || d.intent[name].Bindings[target].Source == b.Source && d.intent[name].Bindings[target].Plugin == b.Plugin && d.intent[name].Bindings[target].SourceRef == b.SourceRef {
+					change.Binding = old
+					change.ID = old.ID
+					if _, ok := find(target, old.ID); ok {
+						change.Action = "noop"
+					}
+				} else {
+					change.Action = "blocked"
+					change.Message = "Package already has a different binding for this target; choose another name or remove it first."
+				}
+			}
+			if change.Action == "install" {
+				change = existingNativeSourceChange(change, host(target).Installed, agent, c.TargetInfo[agent].Marketplace, d.intent[name].Bindings[target].Source, d.packages[name].Bindings[target])
+			}
+			if _, ok := find(target, change.ID); ok && change.Action == "install" && !(d.packages[name].Bindings[target].Cleanup && d.packages[name].Bindings[target].ID == change.ID) {
+				change.Action = "blocked"
+				change.Message = "A native installation already uses this identity; import it explicitly instead of replacing it."
+				change.MessageKey = "plugins.note.identityInUse"
+			}
+			appendChange(change)
+		}
+	} else if r.Action == "import" {
+		installed, ok := find(r.From, r.Plugin)
+		if !ok {
+			return nil, fmt.Errorf("plugin is not installed in this scope, or native inventory is unavailable")
+		}
+		name := r.Name
+		if name == "" {
+			name = installed.Name
+			if name == "" {
+				name, _, _ = strings.Cut(installed.ID, "@")
+			}
+			if !namePattern.MatchString(name) {
+				return nil, fmt.Errorf("use --name to choose a logical package name for this native identifier")
+			}
+		}
+		if agent := s.agentOf(r.From); agent == "cursor" || agent == "antigravity" {
+			return nil, fmt.Errorf("Local directory plugins can be added from source; importing existing or marketplace installations is not supported")
+		}
+		if installed.Filtered && s.agentOf(r.From) != "pi" {
+			return nil, fmt.Errorf("this native entry has resource filters or options; manage it in the native client to preserve those settings")
+		}
+		b := Binding{ID: installed.ID, Version: installed.Version, Imported: true}
+		if old, ok := d.packages[name].Bindings[r.From]; ok {
+			if old.ID != "" && old.ID != b.ID {
+				return nil, fmt.Errorf("package already manages a different plugin")
+			}
+			// An import follows what is installed; a source binding keeps the version Skillshare reviewed.
+			if old.Source == "" {
+				old.Version = installed.Version
+			}
+			decl, declared := d.intent[name].Bindings[r.From]
+			if declared && !decl.Imported && old.ID == "" {
+				matches, err := s.importMatchesRecipe(ctx, r.From, installed, decl)
+				if err != nil {
+					return nil, err
+				}
+				if !matches {
+					return nil, agentError{key: "plugins.error.importRecipeMismatch", message: "Native plugin does not match the declaration's recipe"}
+				}
+			}
+
+			if old.ID != "" && declared && !decl.Imported {
+				b = old
+			}
+		}
+		change := Change{Name: name, Target: r.From, ID: b.ID, Binding: b, Action: "import", Message: "Record the existing native installation locally; shared recipes, content and enabled state stay unchanged.", MessageKey: "plugins.note.localImportRecorded"}
+		if installed.Filtered && !d.packages[name].Bindings[r.From].ContextChanged {
+			if err := s.preparePiRegistration(ctx, &change); err != nil {
+				return nil, err
+			}
+		}
+
+		appendChange(change)
+	} else {
+		if r.Name != "" {
+			if _, ok := d.packages[r.Name]; !ok {
+				return nil, fmt.Errorf("plugin package %q not found", r.Name)
+			}
+		}
+		names := make([]string, 0, len(d.packages))
+		for name := range d.packages {
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		for _, name := range names {
+			if r.Name != "" && r.Name != name {
+				continue
+			}
+			if r.Action == "unimport" {
+				for _, target := range r.Targets {
+					if _, ok := d.packages[name].Bindings[target]; !ok {
+						return nil, agentError{key: "plugins.error.unimportTargetMissing", message: fmt.Sprintf("%s has no binding for target %s", name, target), args: map[string]string{"name": name, "target": target}}
+					}
+				}
+			}
+			for _, target := range slices.Sorted(maps.Keys(d.packages[name].Bindings)) {
+				b, ok := d.packages[name].Bindings[target]
+				if !ok || (len(r.Targets) > 0 && !slices.Contains(r.Targets, target)) {
+					continue
+				}
+				agent := s.agentOf(target)
+				decl, declared := d.intent[name].Bindings[target]
+
+				if r.Action == "update" && r.SourceRef != "" {
+					if decl.Source == "" || decl.Imported || isNpmSource(decl.Source) {
+						return nil, fmt.Errorf("source ref requires a reviewed Git source for %s/%s", name, target)
+					}
+					decl.SourceRef = r.SourceRef
+					disc, err := s.discover(ctx, decl.Source, decl.SourceRef, decl.Entry)
+					if err != nil {
+						return nil, err
+					}
+					if _, err := updateCandidate(disc, decl.Plugin, agent); err != nil {
+						return nil, err
+					}
+				}
+				if r.Action == "enable" || r.Action == "disable" {
+					if !declared {
+						p.Changes = append(p.Changes, Change{Name: name, Target: target, ID: b.ID, Binding: b, Action: "skip", Message: "This target was removed from shared intent; sync to finish local cleanup.", MessageKey: "plugins.note.removedIntent"})
+						continue
+					}
+					selected := r.Action == "enable"
+					b.Sync = &selected
+					p.Changes = append(p.Changes, Change{Name: name, Target: target, ID: b.ID, Binding: b, Action: "selection", Message: "Save sync selection only. Run sync to install or remove this managed target.", MessageKey: "plugins.note.selection"})
+					continue
+				}
+				if r.Action == "unimport" && !d.canUnimport(name, target) {
+					return nil, agentError{key: "plugins.error.unimportReceiptRequired", message: fmt.Sprintf("%s/%s has no local import backed by a shared source recipe", name, target), args: map[string]string{"name": name, "target": target}}
+				}
+				if b.ContextChanged {
+					appendChange(Change{Name: name, Target: target, ID: b.ID, Binding: b, Action: "blocked", Message: "Native account or scope changed; restore the previous account settings to resolve its local receipt before rebinding.", MessageKey: "plugins.note.accountChanged"})
+					continue
+				}
+				if b.ID == "" && (decl.Imported || r.Action == "remove" || !b.Selected()) {
+					action, message, key := "skip", localImportMessage(), "plugins.note.localImportRequired"
+					if r.Action == "remove" {
+						action, message, key = "forget", "Remove declaration; no local native installation is bound.", "plugins.note.noLocalBinding"
+					}
+					if !b.Selected() && r.Action != "remove" {
+						action, message, key = "noop", "", ""
+					}
+					p.Changes = append(p.Changes, Change{Name: name, Target: target, Binding: b, Action: action, Message: message, MessageKey: key})
+					continue
+				}
+				if b.Cleanup && (r.Action == "sync" || r.Action == "update" || r.Action == "remove") {
+					action := "remove"
+					if _, exists := find(target, b.ID); !exists && host(target).Error == "" && !mayOwnMarket(target, b) {
+						action = "forget"
+					}
+					old := b
+					old.Cleanup = false
+					removal := s.prepareChange(ctx, r, d, host, Change{Name: name, Target: target, ID: old.ID, Binding: old, Action: action, Message: "Remove the previous local installation before reconciling current intent.", MessageKey: "plugins.note.replaceLocal"}, nil)
+					changes, err := s.sourceReplacementChanges(ctx, r, name, target, decl, declared, removal)
+					if err != nil {
+						return nil, err
+					}
+					if len(changes) == 2 {
+						replacement := s.prepareChange(ctx, r, d, host, changes[1], removal.ompRemoval)
+						if replacement.Action != "blocked" && replacement.Action != "skip" {
+							appendPrepared(changes[0])
+						}
+						appendPrepared(replacement)
+					} else {
+						appendPrepared(changes[0])
+					}
+					continue
+				}
+				if b.ID == "" && !decl.Imported {
+					if r.Action == "check" {
+						p.Changes = append(p.Changes, Change{Name: name, Target: target, Binding: b, Action: "native-check", Message: "Installation required on this machine; sync to review and install the source.", MessageKey: "plugins.note.installRequired"})
+						continue
+					}
+					c, err := s.sourceChange(ctx, name, target, decl, r.isolatesTargets(), nil)
+					if err != nil {
+						return nil, err
+					}
+					appendChange(c)
+					continue
+				}
+				if r.Action == "unimport" {
+					c := Change{Name: name, Target: target, ID: b.ID, Binding: b, Action: "remove", Message: "Remove this machine's imported installation and its receipt; shared intent stays unchanged. The next sync installs the shared source recipe.", MessageKey: "plugins.note.localImportForgotten"}
+					if _, exists := find(target, b.ID); !exists && host(target).Error == "" && !mayOwnMarket(target, b) {
+						c.Action = "forget"
+					}
+					appendChange(c)
+					continue
+				}
+				c := Change{Name: name, Target: target, ID: b.ID, Binding: b, Action: r.Action}
+				_, exists := find(target, b.ID)
+				action := r.Action
+				if r.Action == "sync" && b.Selected() && declared && sameDistribution(b, decl) && (b.SourceRef != decl.SourceRef || b.Pending == "update") {
+					action = "update"
+				}
+				switch action {
+				case "sync":
+					if !b.Selected() {
+						c.Action = "uninstall"
+						if !exists && !ownMarket(target, b) && agent != "omp" {
+							c.Action = "noop"
+						}
+						break
+					}
+					c.Action = b.Pending
+					if c.Action == "" {
+						c.Action = "install"
+						if exists {
+							c.Action = "noop"
+						}
+					}
+					if c.Action == "install" && exists && b.PiRegistration == "" {
+						c.Action = "noop"
+					}
+					if c.Action == "remove" && !exists && host(target).Error == "" && !mayOwnMarket(target, b) {
+						c.Action = "forget"
+					}
+					if c.Action == "install" && b.Source == "" {
+						c.Message = "Reinstall using its existing native marketplace."
+					}
+				case "remove":
+					if !exists && host(target).Error == "" && !mayOwnMarket(target, b) {
+						c.Action = "forget"
+					}
+				case "enable", "disable":
+					selected := r.Action == "enable"
+					c.Binding.Sync = &selected
+					c.Binding.Pending = ""
+					c.Action = "selection"
+					c.Message = "Save sync selection only. Run sync to install or remove this managed target."
+					c.MessageKey = "plugins.note.selection"
+				case "check", "update":
+					c, err = s.checkOrUpdate(ctx, r, c, action, decl, declared, exists, host(target))
+					if err != nil {
+						return nil, err
+					}
+				}
+				if (c.Action == "uninstall" || c.Action == "remove") && !exists && ownMarket(target, b) {
+					c.Message, c.MessageKey = "The plugin is already gone; remove the marketplace Skillshare registered for it.", "plugins.note.marketplaceCleanup"
+				}
+				if c.Action == "install" && b.Source == "" && (agent == "antigravity" || agent == "cursor") {
+					c.Action = "blocked"
+					c.Message = "Imported installation has no reinstall source; install it in the native client, then sync again."
+					c.MessageKey = "plugins.note.importInstallRequired"
+				}
+				local := d.state.Bindings[name][target]
+				pendingRemoval := local.Pending != nil && (local.Pending.Action == "remove" || local.Pending.Action == "forget" || local.Pending.Action == "uninstall") && local.Pending.Store == s.storeIdentity(target) && local.Pending.Binding.ID == b.ID
+				switch {
+				case c.Action == "forget" && agent != "omp" || c.Action == "selection":
+					p.Changes = append(p.Changes, c)
+				case agent == "omp" && b.Source != "" && (c.Action == "update" && exists || r.Action == "update" && c.Action == "install" && pendingRemoval):
+					// OMP's native upgrade replaces cache another project may still use.
+					// Refresh the way a source change does: remove only this scope's
+					// registration, keep the cache, and install the new commit under a
+					// cache identity no project uses.
+					removal := s.prepareChange(ctx, r, d, host, Change{Name: name, Target: target, ID: b.ID, Binding: b, Action: "remove", Message: "Remove the previous local installation before reconciling current intent.", MessageKey: "plugins.note.replaceLocal", ompRefresh: true}, nil)
+					if removal.Action != "remove" {
+						// Installing over a registration that stays would be the destructive upgrade.
+						appendPrepared(removal)
+						break
+					}
+					c.Action, c.ompRefresh = "install", true
+					replacement := s.prepareChange(ctx, r, d, host, c, removal.ompRemoval)
+					if replacement.Action != "blocked" && replacement.Action != "skip" {
+						appendPrepared(removal)
+					}
+					appendPrepared(replacement)
+				default:
+					appendChange(c)
+				}
+			}
+			if r.Action == "remove" && len(r.Targets) == 0 && len(d.packages[name].Bindings) == 0 {
+				p.Changes = append(p.Changes, Change{Name: name, Action: "forget", Message: "Remove from Skillshare; no Agent has it."})
+			}
+		}
+	}
+
+	// A native installation can have only one owner in this configuration.
+	for i := range p.Changes {
+		c := &p.Changes[i]
+		if c.Target == "" {
+			continue
+		}
+		for name, pack := range d.packages {
+			if c.ID != "" && name != c.Name && pack.Bindings[c.Target].ID == c.ID {
+				c.Action = "blocked"
+				c.Message = "This native plugin is already managed by package " + name
+				p.Blocked = true
+			}
+		}
+	}
+	// Isolating a failed Agent only lets the others update. When none of them has
+	// anything to do, the update is blocked as it was before isolation.
+	if !r.All && r.isolatesTargets() && !slices.ContainsFunc(p.Changes, func(c Change) bool { return c.Action != "noop" && c.Action != "skip" }) {
+		for i, c := range p.Changes {
+			if c.Failed {
+				p.Changes[i].Action, p.Changes[i].Failed = "blocked", false
+				p.Blocked = true
+			}
+		}
+	}
+	// Bind previews to source bytes, selected operations, native versions/inventory,
+	// and config bytes. A changed selection or external edit invalidates approval.
+	ompRoots := map[string]string{}
+	for target, host := range hosts {
+		if host.ompCacheRoot != "" {
+			ompRoots[target] = host.ompCacheRoot
+		}
+	}
+	ompRemovals := map[string]string{}
+	ompRuntimePaths := map[string]string{}
+	for _, c := range p.Changes {
+		if c.ompRuntimePath != "" {
+			ompRuntimePaths[c.Target+"\x00"+c.ID] = c.ompRuntimePath
+		}
+		if c.ompRemoval != nil {
+			ompRemovals[c.Target+"\x00"+c.ID] = c.ompRemoval.revision
+		}
+	}
+	stores := map[string]string{}
+	for _, target := range s.targets() {
+		stores[target] = s.storeIdentity(target)
+	}
+	fingerprint, _ := json.Marshal(struct {
+		Request         Request
+		Raw             string
+		State           string
+		Stores          map[string]string
+		Changes         any
+		Hosts           map[string]Host
+		OMPCacheRoots   map[string]string
+		OMPRemovals     map[string]string
+		OMPRuntimePaths map[string]string
+	}{r, string(d.raw), string(d.stateRaw), stores, reviewedChanges(p.Changes), hosts, ompRoots, ompRemovals, ompRuntimePaths})
+	p.hosts = hosts
+	p.Revision = hash(fingerprint)
+	return p, nil
+}
+
+// existingNativeSourceChange preserves explicit add adoption while protecting a
+// shared source from a same-name native installation that can shadow its hooks.
+func existingNativeSourceChange(c Change, installed []Installed, agent, market, declaredSource string, old Binding) Change {
+	for _, native := range installed {
+		if old.Cleanup && native.ID == old.ID {
+			continue
+		}
+		if declaredSource != "" && agent == "claude" {
+			name := native.Name
+			if name == "" {
+				name, _, _ = strings.Cut(native.ID, "@")
+			}
+			if name == c.Binding.Plugin {
+				c.Action = "blocked"
+				c.Message = "An independent native plugin has the same name and may shadow the reviewed source. Remove it in the native client before syncing, or use plugin import explicitly to keep the native installation."
+				c.MessageKey = "plugins.note.independentNative"
+				return c
+			}
+		}
+		if declaredSource == "" && market != "" && native.ID == c.Binding.Plugin+"@"+market {
+			c.Action = "import"
+			c.ID = native.ID
+			c.Binding = Binding{ID: native.ID, Version: native.Version}
+			c.Message = "Already installed natively; adopt without reinstalling."
+			c.MessageKey = "plugins.note.nativeAdopt"
+			return c
+		}
+	}
+	return c
+}
+
+func (s *Service) prepareChange(ctx context.Context, r Request, d *document, host func(string) Host, c Change, cleanup *ompRemoval) Change {
+	if (r.Action == "add" || r.Action == "import") && d.packages[c.Name].Bindings[c.Target].ContextChanged {
+		c.Action, c.Message = "blocked", "Native account or scope changed; restore the previous account settings to resolve its local receipt before rebinding."
+		c.MessageKey = "plugins.note.accountChanged"
+		return c
+	}
+	h := host(c.Target)
+	agent := s.agentOf(c.Target)
+	failChange := func(message, key string, args map[string]string) {
+		if r.isolatesTargets() {
+			c.Action, c.Failed = "skip", true
+		} else {
+			c.Action = "blocked"
+		}
+		c.Message, c.MessageKey, c.MessageArgs = message, key, args
+	}
+	if agent == "pi" && c.Binding.PiRegistration != "" && len(c.piRecord) == 0 && (c.Action == "install" || c.Action == "uninstall" || c.Action == "remove" || c.Action == "update") {
+		if err := s.preparePiRegistration(ctx, &c); err != nil {
+			failChange(err.Error(), "", nil)
+		}
+	}
+	// A change already blocked or skipped keeps its own reason; the key always matches the message.
+	if h.Error != "" && c.Action != "blocked" && c.Action != "skip" {
+		failChange(h.Error, h.ErrorKey, h.ErrorArgs)
+	}
+	// An update that cannot reach a target skips it, so the plugin's other Agents still update.
+	skip := func(key, message string, args map[string]string) {
+		c.Action = "skip"
+		c.Message, c.MessageKey, c.MessageArgs = message, key, args
+	}
+	// An import receipt is not a reviewed reinstall source. Report a missing
+	// marketplace before directing the user to repair it in the native client.
+	if c.Binding.Source == "" && marketplaceAgent(agent) && (c.Action == "install" || c.Action == "update") && h.Marketplaces != nil {
+		_, market, _ := strings.Cut(c.ID, "@")
+		if _, ok := h.Marketplaces[market]; !ok {
+			skip("plugins.skip.marketplaceGone", fmt.Sprintf("The native marketplace %s is gone. Restore it in the native client, or remove this Agent and add the plugin again from its source.", market), map[string]string{"market": market})
+		}
+	}
+	// Claude reads a skill folder that has a plugin manifest as <name>@skills-dir, and loads
+	// only one plugin per name.
+	if c.Action == "install" && agent == "claude" && c.Message == "" {
+		name, _, _ := strings.Cut(c.ID, "@")
+		for _, item := range h.Installed {
+			if item.ID == name+"@skills-dir" {
+				c.Message = fmt.Sprintf("Claude's skills folder also has a %s plugin; Claude will load this plugin and skip that copy until one of them is renamed or removed.", name)
+				c.MessageKey, c.MessageArgs = "plugins.note.skillsDirClash", map[string]string{"name": name}
+			}
+		}
+	}
+	// omp copies a marketplace plugin without running it, but imports its extension modules
+	// and tools in-process at its next start; there is no native trust prompt to lean on.
+	if agent == "omp" && (c.Action == "install" || c.Action == "update") && c.Message == "" {
+		c.Message, c.MessageKey = "Installs the reviewed snapshot. If the plugin provides extensions or tools, OMP loads them at its next startup.", "plugins.note.ompRuntime"
+	}
+	// pi update keeps an npm package pinned to an exact version.
+	if version := pinnedNpm(c.ID); c.Action == "update" && agent == "pi" && version != "" {
+		skip("plugins.skip.npmPinned", fmt.Sprintf("Pinned to %s; to use another version, add the package again with that version.", version), map[string]string{"version": version})
+	}
+	// pi update has no project scope, and OpenCode v1 has no update command. omp's upgrade
+	// would reinstall whatever the native marketplace holds, which Skillshare never reviewed.
+	if c.Action == "update" && c.Binding.Source == "" && (s.ProjectRoot != "" && agent == "pi" || agent == "omp") || c.Action == "update" && c.Binding.Source == "" && agent == "opencode" && (s.ProjectRoot != "" || !openCode2(h.Version)) {
+		skip("plugins.skip.imported", "Update imported packages in the native client; Skillshare updates reviewed source snapshots only.", nil)
+	}
+	if c.Action == "update" && agent == "opencode" && c.Binding.Source == "" {
+		help, err := s.run(ctx, c.Target, "plugin", "update", "--help")
+		if err != nil || !strings.Contains(string(help), "update") {
+			skip("plugins.skip.opencodeNoUpdate", "Installed OpenCode does not expose a verified plugin update command.", nil)
+		}
+	}
+	if c.Binding.Source == "" && commandTarget(agent) && c.Action == "install" {
+		c.Action = "blocked"
+		c.Message = "This imported plugin has no reviewed reinstall source; install or update in the native client."
+		c.MessageKey = "plugins.note.importInstallRequired"
+	}
+	if c.Binding.Source == "" && commandTarget(agent) && c.Action == "update" {
+		skip("plugins.skip.imported", "This imported plugin has no reviewed reinstall source; update it in the native client.", nil)
+	}
+	if (c.Action == "update" || r.Action == "update" && c.Action == "install") && (agent == "copilot" || agent == "antigravity-cli") {
+		label := "GitHub Copilot CLI"
+		msg := "Update in Copilot to preserve native enablement."
+		if agent == "antigravity-cli" {
+			label = "Antigravity CLI"
+			msg = "Update in Antigravity CLI to preserve native enablement."
+		}
+		enabled := false
+		for _, item := range h.Installed {
+			if item.ID == c.ID && item.EnabledKnown && item.Enabled {
+				enabled = true
+				break
+			}
+		}
+		if !enabled {
+			skip("plugins.skip.keepEnablement", msg, map[string]string{"agent": label})
+		}
+	}
+	if c.Action == "update" && agent == "codex" && c.Binding.Source == "" {
+		// An imported plugin comes from a Codex marketplace, which Codex upgrades together
+		// with every plugin installed from it, as it also does when it starts.
+		_, market, _ := strings.Cut(c.ID, "@")
+		help, err := s.run(ctx, c.Target, "plugin", "marketplace", "--help")
+		if err != nil || !strings.Contains(string(help), "upgrade") {
+			skip("plugins.skip.codexNoUpgrade", "Installed Codex cannot upgrade marketplaces; update the plugin in Codex.", nil)
+		} else {
+			c.Message = fmt.Sprintf("Upgrades the Codex marketplace %s, which reinstalls every plugin installed from it.", market)
+			c.MessageKey, c.MessageArgs = "plugins.note.codexUpgrade", map[string]string{"market": market}
+		}
+	}
+	if c.Action == "update" && agent == "codex" && c.Binding.Source != "" {
+		for _, item := range h.Installed {
+			// Codex's add, which updates the plugin, always enables it.
+			if item.ID == c.ID && !item.Enabled {
+				skip("plugins.skip.codexDisabled", "Enable the plugin in Codex before updating it; updating would turn it back on.", nil)
+			}
+		}
+	}
+	// Only changes that will run a native command need native support; an intentional skip above
+	// is not a failed target.
+	if c.Action != "blocked" && c.Action != "noop" && c.Action != "forget" && c.Action != "skip" && c.Action != "import" && c.Action != "update-available" && c.Action != "native-check" {
+		if err := s.verifyCommand(ctx, c.Target, c.Action, c.ID); err != nil {
+			failChange(err.Error(), "", nil)
+		}
+	}
+	// Skips above are not native commands; what is left for omp must not destroy a shared cache.
+	if agent == "omp" && h.Error == "" {
+		ompGuard(h, &c)
+		if c.Action == "install" {
+			s.prepareOMPInstall(ctx, h, &c, cleanup)
+		}
+		if c.Action == "remove" || c.Action == "uninstall" || c.Action == "forget" {
+			local := d.state.Bindings[c.Name][c.Target]
+			reviewedVersion := c.Binding.Version
+			if local.Pending != nil && (local.Pending.Action == "remove" || local.Pending.Action == "forget" || local.Pending.Action == "uninstall") && local.Pending.Store == s.storeIdentity(c.Target) && local.Pending.Binding.ID == c.Binding.ID && local.Pending.OMPRemovalVersion != "" {
+				c.Binding.Version = local.Pending.OMPRemovalVersion
+			}
+			s.prepareOMPRemoval(h, &c)
+			c.Binding.Version = reviewedVersion
+		}
+	}
+	if r.isolatesTargets() && c.Action == "blocked" {
+		c.Action, c.Failed = "skip", true
+	}
+	return c
+}
+
+func (s *Service) checkOrUpdate(ctx context.Context, r Request, c Change, action string, decl declaration, declared, exists bool, host Host) (Change, error) {
+	b, target := c.Binding, c.Target
+	agent := s.agentOf(target)
+	if !b.Selected() {
+		c.Action = "noop"
+		return c, nil
+	}
+	if r.Action == "check" && b.Cleanup && (!declared || decl.Imported || isNpmSource(decl.Source)) {
+		c.Action, c.Message = "native-check", "Previous installation requires cleanup; sync to reconcile current intent."
+		c.MessageKey = "plugins.note.cleanupRequired"
+		return c, nil
+	}
+	if b.Source == "" && (r.Action != "check" || !declared || b.Imported || decl.Imported || isNpmSource(decl.Source)) {
+		// An npm package has no source snapshot to compare; npm names its latest version instead.
+		installed, latest := s.npmVersions(ctx, target, b.ID, host)
+		known := installed != nil && latest != nil
+		if known && slices.Compare(latest, installed) <= 0 {
+			c.Action = "noop"
+			return c, nil
+		}
+		if r.Action != "check" {
+			// No version is recorded: what Pi installed is read back from the package each time.
+			return c, nil
+		}
+		if known {
+			c.Action = "update-available"
+			c.Binding.Version = fmt.Sprintf("%d.%d.%d", latest[0], latest[1], latest[2])
+			return c, nil
+		}
+		c.Action = "native-check"
+		c.Message, c.MessageKey = "Imported installation: use the native marketplace to check releases.", "plugins.note.nativeCheck"
+		return c, nil
+	}
+	source, ref, plugin, entry := b.Source, b.SourceRef, b.Plugin, b.Entry
+	if r.Action == "check" && declared && !decl.Imported {
+		source, ref, plugin, entry = decl.Source, decl.SourceRef, decl.Plugin, decl.Entry
+	}
+	if declared && action == "update" {
+		ref = decl.SourceRef
+		c.Action = "update"
+	}
+	if r.SourceRef != "" {
+		ref = r.SourceRef
+	}
+	if r.Action == "check" && s.sourceUnmoved(ctx, b, source, ref, plugin, entry) {
+		c.Action, c.Components = "noop", b.Components
+		return c, nil
+	}
+	disc, err := s.discover(ctx, source, ref, entry)
+	if err != nil {
+		if !r.isolatesTargets() {
+			return c, err
+		}
+		key, args := ErrorKey(err)
+		c.Action, c.Failed = "skip", true
+		c.Message, c.MessageKey, c.MessageArgs = err.Error(), key, args
+		return c, nil
+	}
+
+	candidate, candidateErr := updateCandidate(disc, plugin, agent)
+	if candidateErr != nil {
+		if candidate == nil && !r.isolatesTargets() {
+			return c, candidateErr
+		}
+		c.Action = "blocked"
+		if r.isolatesTargets() {
+			c.Action, c.Failed = "skip", true
+		}
+		c.Message = candidateErr.Error()
+		return c, nil
+	}
+
+	c.Components, c.sourceVersion = candidate.TargetInfo[agent].Components, &candidate.Version
+	if disc.Digest == b.Digest && b.Pending == "" && source == b.Source && ref == b.SourceRef && plugin == b.Plugin && entry == b.Entry {
+		c.Action = "noop"
+	} else if r.Action == "check" {
+		c.Action = "update-available"
+		c.Message, c.MessageKey = "Source content changed; review an update before applying.", "plugins.note.sourceChanged"
+		// Check is read-only; the binding carries the source's version, commit and digest so the change can show
+		// old → new and a later update can tell whether the source moved again since.
+		c.Binding.Source, c.Binding.SourceRef, c.Binding.Plugin, c.Binding.Entry = source, ref, plugin, entry
+		c.Binding.Version = candidate.TargetInfo[agent].Version
+		c.Binding.Commit = disc.Commit
+		c.Binding.Digest = disc.Digest
+	} else {
+		c.Binding.Digest = disc.Digest
+		c.Binding.Commit = disc.Commit
+		c.Binding.SourceRef = disc.SourceRef
+		c.Binding.Version = candidate.TargetInfo[agent].Version
+		c.Binding.Components = candidate.TargetInfo[agent].Components
+		if !exists {
+			c.Action = "install"
+		}
+	}
+	return c, nil
+}

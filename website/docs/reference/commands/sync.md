@@ -6,9 +6,22 @@ sidebar_position: 2
 
 Push skills from source to all targets.
 
+Use `skillshare sync hooks` for native hooks (see [hooks](./hooks.md)).
+Use `skillshare sync mcp` for MCP connection settings, or `skillshare sync --all`
+to include skills, agents, extras, MCP and hooks. MCP synchronization uses entry
+ownership and conflict checks rather than skill symlinks. See [mcp](/docs/reference/commands/mcp).
+
 :::info Why is sync a separate command?
 Operations like `install` and `uninstall` only modify source — sync propagates to targets. This lets you batch changes, preview with `--dry-run`, and control when targets update. See [Why Sync is a Separate Step](/docs/understand/source-and-targets#why-sync-is-a-separate-step).
 :::
+
+## Agent-specific skill variants
+
+In a tracked repository, `skills/<known-agent>/<skill-path>/SKILL.md` is recognized as an agent-specific variant only when the same complete skill path exists under at least two distinct canonical agents beneath the same `skills/` parent. Aliases of one agent alone do not qualify. A lone category such as `skills/agents/planner` remains an ordinary skill.
+
+In merge/copy mode, variants route to the matching agent, including aliases and account targets. Compatible targets sharing one skills folder select the union of their agent identities: Codex and `universal` sharing `~/.agents/skills` keep the Codex variants. Each reader sees that shared union; incompatible settings still produce overlap/conflict diagnostics. Explicit source-local target overrides and frontmatter routing retain precedence, and ignores and include/exclude filters still apply.
+
+Source and repository summaries count logical skills once and show physical variants separately, for example `2 skills, 4 variants`. Per-target sync operations remain physical counts. Whole-directory symlink mode exposes every variant; `status` and `doctor` explain this limitation and recommend merge or copy for automatic routing.
 
 ## When to Use
 
@@ -71,12 +84,36 @@ skillshare sync -p       # Explicit project mode
 
 **Project sync** defaults to merge mode (per-skill symlinks), but each target can be set to copy or symlink mode via `skillshare target <name> --mode copy -p`. Backup is not created (project targets are reproducible from source).
 
+When sync adopts a hand-moved declared skill, only that skill's project entry,
+ignore rule and existing lock pin follow the move. A stale install record alone
+does not change `config.yaml`, `.gitignore` or `skills.lock.json`, and other
+remote installs in the source are not added to the project's `skills:` list.
+
 ```
 .skillshare/skills/                 .claude/skills/
 ├── my-skill/          ────────►    ├── my-skill/ → (symlink)
 ├── pdf/               ────────►    ├── pdf/      → (symlink)
 └── ...                             └── local/    (preserved)
 ```
+
+### Cleanup after a default path moves {#project-path-cleanup}
+
+A project config stores target names, not paths, so a target follows its built-in
+default. When a tool changes that default — as goose and openhands did when they
+adopted `.agents/skills` — the skills skillshare wrote to the old directory stay
+behind, and the tool reads both locations and lists every skill twice.
+
+Project sync removes them. For each target without an explicit `path:`, it looks
+at the directories that target's runtime also scans, and in any of them that no
+configured target writes to, it removes the entries skillshare created. Folders
+you made yourself and symlinks pointing outside the project are never touched.
+
+```
+  Cleaned 1 leftover skill from .goose/skills: the default path for 'goose' moved to .agents/skills
+```
+
+Setting an explicit `path:` for a target opts it out of the cleanup, and
+`--dry-run` previews what would be removed without changing anything.
 
 ---
 
@@ -86,7 +123,8 @@ Push skills from source to all targets.
 
 ```bash
 skillshare sync              # Sync skills to all targets
-skillshare sync --all        # Sync skills + extras
+skillshare sync agents       # Sync agents only
+skillshare sync --all        # Sync skills + agents + extras + MCP + hooks
 skillshare sync --dry-run    # Preview changes
 skillshare sync -n           # Short form
 skillshare sync --force      # Overwrite all managed skills
@@ -95,10 +133,11 @@ skillshare sync -f           # Short form
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--all` | | Also sync extras after skills (see [sync extras](#sync-extras) below) |
+| `--all` | | Also sync agents, extras, MCP and hooks after skills (excludes plugins) |
 | `--dry-run` | `-n` | Preview changes without writing |
 | `--force` | `-f` | Overwrite all managed entries regardless of checksum (copy mode) or replace existing directories with symlinks (merge mode) |
 | `--json` | | Output as JSON |
+| `--quiet` | `-q` | Suppress token summary and budget warnings |
 
 ### JSON Output
 
@@ -113,8 +152,11 @@ skillshare sync --json
   "local": 2,
   "updated": 0,
   "pruned": 1,
+  "ignored_count": 2,
+  "ignored_skills": ["_team/vendor/lib", "test-draft"],
   "dry_run": false,
   "duration": "0.234s",
+  "warnings": ["source link _dev-skills not followed: target is missing; kept existing target entries, nothing pruned this run"],
   "details": [
     {
       "name": "claude",
@@ -132,9 +174,22 @@ skillshare sync --json
       "updated": 0,
       "pruned": 0
     }
-  ]
+  ],
+  "context_cost": {
+    "groups": [
+      {
+        "targets": ["claude", "cursor"],
+        "always_loaded_tokens": 12400,
+        "on_demand_tokens": 58200
+      }
+    ]
+  }
 }
 ```
+
+The `ignored_count` and `ignored_skills` fields show skills excluded by `.skillignore` (and `.skillignore.local` if present). These are filtered at discovery time and never reach any target. When `.skillignore.local` is active, the text output includes a `.local` source hint. See [.skillignore](/docs/reference/appendix/file-structure#skillignore-optional) for pattern syntax.
+
+`warnings` appears only when a first-level source link was not followed (see [`follow_source_links`](../targets/configuration.md#follow_source_links)). A run that kept target entries because the link's target was unavailable says so there; `pruned` is `0` in that case by design.
 
 ### What Happens
 
@@ -153,11 +208,29 @@ flowchart TD
     S2 --> SYMLINK --> S3
 ```
 
+### When a target fails {#when-a-target-fails}
+
+Sync runs every target; one failed target does not stop the others. A target fails when syncing it hits an error, or when its own settings in the config are invalid, for example its skills path is a file instead of a folder or its `mode` is unknown. A target with invalid settings is skipped for skills and agents in that run. Each failed target is reported (`✗ <target>  invalid config: …` in text output, `error` in its `--json` `details` entry), and the command exits non-zero after the other targets have synced.
+
+Problems with the config as a whole still stop sync before any target runs: a missing or invalid source folder, an invalid global `mode` or `target_naming`, an invalid `git_root`, or invalid extras.
+
 ### Example Output
 
-<p>
-  <img src="/img/sync-demo.png" alt="sync demo" width="720" />
-</p>
+```text
+$ skillshare sync
+✓ Backup       claude, claude-work, cursor, gemini, opencode, universal → ~/.local/share/skillshare/backups/2026-09-28_12-52-50
+✓ claude       43 linked · 1 pruned
+✓ claude-work  43 linked · 1 pruned
+✓ cursor       43 linked · 1 local · 1 pruned
+✓ gemini       43 linked · 1 pruned
+✓ opencode     43 linked · 1 pruned
+✓ universal    43 linked · 1 pruned
+
+✓ Synced 43 skills to 6 targets · 0.0s
+  Context  ~1.2K tokens always loaded · ~18.5K on demand
+```
+
+When a folder you made already sits on the name a skill syncs to, sync keeps your folder and does not install the skill. Each target with such folders gets one line naming the first few (`kept local: a, b (sync --force replaces them)`), and they count as `local` instead of `up to date`. `skillshare diff` lists them as `Local override`.
 
 ---
 
@@ -233,7 +306,7 @@ git add → commit → push`"]
 
 ---
 
-## Dotfiles Manager Compatibility
+## Dotfiles Manager Compatibility {#dotfiles-manager-compatibility}
 
 If you use a dotfiles manager (GNU Stow, chezmoi, yadm, bare-git) that symlinks your source or target directories, skillshare handles it transparently:
 
@@ -268,13 +341,13 @@ skillshare target <name> --mode copy
 skillshare sync
 ```
 
-When `sync` prints a compatibility hint, the example target is chosen in this priority:
+The compatibility hint is printed by [`doctor`](./doctor.md), not by `sync`. Its example target is chosen in this priority:
 `cursor` → `antigravity` → `copilot` → `opencode`.
 If none of these targets exist (or they already run `copy`), no compatibility hint is shown.
 
 See [Sync Modes](/docs/understand/sync-modes) for a neutral decision matrix.
 
-### Per-target include/exclude filters
+### Per-target include/exclude filters {#per-target-includeexclude-filters}
 
 In merge and copy modes, each target can define `include` / `exclude` patterns in config:
 
@@ -289,15 +362,21 @@ targets:
 ```
 
 - Matching is against flat target names (for example `team__frontend__ui`)
+- An `include` pattern that matches no skill is reported, because such a target syncs nothing and drops what a previous pattern linked. Filters keep using flat names even when `target_naming: standard` or `prefixed` names the target entry after `SKILL.md`
 - `include` is applied first, then `exclude`
 - `diff`, `status`, `doctor`, and UI drift all use the filtered expected set
 - In symlink mode, filters are ignored
 - In copy mode, filters work the same way as merge mode
 - `sync` removes existing source-linked or managed entries that are now excluded
+- Targets that share one folder need the same filters, mode and target naming (filters and naming don't matter when both use `symlink` mode); otherwise each sync undoes the other and `sync` warns (see [`sync` keeps showing the same changes](/docs/troubleshooting/common-errors#sync-keeps-showing-the-same-changes))
 
 See [Configuration](/docs/reference/targets/configuration#include--exclude-target-filters) for full details.
 
-### Filter behavior examples
+:::tip
+These are just one of three filtering layers. See [Filtering Skills](/docs/how-to/daily-tasks/filtering-skills) for a complete guide covering `.skillignore`, SKILL.md `targets`, and target filters.
+:::
+
+### Filter behavior examples {#filter-behavior-examples}
 
 Assume source contains:
 - `core-auth`
@@ -359,7 +438,8 @@ After `sync`, cursor receives:
 #### What gets removed when filters change
 
 When a filter is updated and `sync` runs:
-- Source-linked entries (symlink/junction) that are now filtered out are pruned
+- Links skillshare created for source skills that are now filtered out are pruned
+- A live symlink/junction into the source that skillshare never tracked is preserved and counted as local
 - Local non-symlink folders already in target are preserved
 
 ### Merge Mode (Default)
@@ -424,13 +504,15 @@ Backups are created **automatically** before `sync` and `target remove`.
 
 Location: `~/.local/share/skillshare/backups/<timestamp>/`
 
+A snapshot captures only **local** target content. Merge-mode symlinks are skipped — they point into your source and `sync` recreates them — so snapshots stay small no matter how large your skills are. Retention is applied automatically after each sync. See [What Gets Backed Up](/docs/reference/commands/backup#what-gets-backed-up) and [Backups & Disk Space](/docs/reference/commands/backup#backups--disk-space).
+
 ### Manual Backup
 
 ```bash
 skillshare backup              # Backup all targets
 skillshare backup claude       # Backup specific target
 skillshare backup --list       # List all backups
-skillshare backup --cleanup    # Remove old backups
+skillshare backup --cleanup    # Remove old snapshots and abandoned incomplete directories
 skillshare backup --dry-run    # Preview
 ```
 
@@ -471,6 +553,40 @@ flowchart TD
 
 ---
 
+## Agent Sync {#agent-sync}
+
+Agents are synced separately from skills. Use `sync agents` for agent-only sync, or `sync --all` to include skills, agents, extras, MCP, and hooks:
+
+```bash
+skillshare sync              # Sync skills only (default)
+skillshare sync agents       # Sync agents only
+skillshare sync --all        # Sync skills + agents + extras + MCP + hooks
+```
+
+Agent sync supports all three modes (merge, copy, symlink), matching the target's configured mode. On Windows without Developer Mode, merge mode copies agent files instead of linking them and prints `! <target>: agents file links need Windows Developer Mode; copying instead`; see [Windows troubleshooting](/docs/troubleshooting/windows#file-links-need-windows-developer-mode-copying-instead). Only targets with an `agents` path definition receive agent syncs — currently Claude, Cursor, OpenCode, and Augment. See [Agents — Supported Targets](/docs/understand/agents#supported-targets) for the full list.
+
+Orphan cleanup, `.agentignore` filtering, and per-target include/exclude filters all work the same way as for skills. In merge mode, orphan cleanup removes only broken links and links that point into the agents source; live links to agent files elsewhere and local files are preserved.
+
+---
+
+## Sync Plugins
+
+`sync plugins [name]` is an alias for [`plugin sync`](./plugin.md). Plugins are
+**excluded from `sync --all`** and use native installation operations instead of
+skill sync modes.
+
+```bash
+skillshare sync plugins --dry-run --json
+skillshare sync plugins demo --target claude --no-tui
+```
+
+`plugin enable` and `plugin disable` save target selection only. The next plugin
+sync installs selected bindings and uninstalls deselected ones while keeping their
+definitions. Unmanaged plugins are unaffected. Plugin sync accepts `--target`,
+`--dry-run`, `--json`, `--no-tui`, `--revision`, and mode flags; ordinary sync options
+such as `--force`, `--quiet`, and `--all` do not apply. See [plugin](./plugin.md) for
+native client requirements, project scope, and partial-failure recovery.
+
 ## Sync Extras {#sync-extras}
 
 Sync non-skill resources (rules, commands, prompts, etc.) to arbitrary directories. Extras are configured separately from skills and have their own source directories.
@@ -479,7 +595,7 @@ Sync non-skill resources (rules, commands, prompts, etc.) to arbitrary directori
 skillshare sync extras            # Sync all configured extras
 skillshare sync extras --dry-run  # Preview changes
 skillshare sync extras --force    # Overwrite conflicting files
-skillshare sync --all             # Sync skills + extras in one command
+skillshare sync --all             # Sync skills + agents + extras + MCP + hooks
 ```
 
 | Flag | Short | Description |
@@ -487,13 +603,18 @@ skillshare sync --all             # Sync skills + extras in one command
 | `--dry-run` | `-n` | Preview changes without writing |
 | `--force` | `-f` | Overwrite conflicting files at target |
 
-:::info Global only
-`sync extras` is global-only. The `--all` flag is ignored in project mode.
+`--json` returns a non-zero exit status when extras sync has errors. `sync --all` also exits
+non-zero when an extras target fails, with or without `--json`. An extra whose source
+directory does not exist is skipped with a hint, not created. For single-file extras,
+`--dry-run` also reports edits that would be backed up before replacement.
+
+:::info Both modes supported
+`sync extras` works in both global and project mode. Use `sync --all` to sync skills, agents, extras, MCP, and hooks together, or `sync extras` to sync extras only. In project mode, extras source is `.skillshare/extras/<name>/`.
 :::
 
 ### Configuration
 
-Add an `extras` section to your global config (`~/.config/skillshare/config.yaml`):
+Add an `extras` section to your config (`~/.config/skillshare/config.yaml` for global, `.skillshare/config.yaml` for project):
 
 ```yaml
 extras:
@@ -508,20 +629,21 @@ extras:
 ```
 
 Each extra has:
-- **`name`** — directory name under `~/.config/skillshare/` (the source)
+- **`name`** — directory name under `extras/` in your config directory
 - **`targets`** — list of target paths with optional `mode`
 
-Source files live alongside your skills directory:
+Source files live under the `extras/` subdirectory:
 
 ```
 ~/.config/skillshare/
 ├── config.yaml
-├── skills/          ← skill source
-├── rules/           ← extras source (name: rules)
-│   ├── coding.md
-│   └── testing.md
-└── commands/        ← extras source (name: commands)
-    └── deploy.md
+├── skills/              ← skill source
+└── extras/              ← extras source root
+    ├── rules/           ← extras: rules
+    │   ├── coding.md
+    │   └── testing.md
+    └── commands/        ← extras: commands
+        └── deploy.md
 ```
 
 ### Sync modes
@@ -532,7 +654,11 @@ Source files live alongside your skills directory:
 | `copy` | Per-file copy |
 | `symlink` | Entire source directory symlinked to target path |
 
-In merge mode, only symlinks are pruned — user-created local files at the target are preserved.
+In merge mode, only broken symlinks and symlinks into the extra's source are pruned — user-created local files and live links to other locations are preserved.
+
+On Windows without Developer Mode, merge mode (and a [single-file extra](./extras.md#single-file-extras) in symlink mode) copies files instead, reports the target as `(copy)`, and prints `file links need Windows Developer Mode; copying instead` under it. These copies are updated and pruned like links, and replaced with links once file links work.
+
+Identical local files are reported as `local preserved`; `sync extras` does not suggest `--force` for them. They remain local files, not managed links.
 
 ### What happens
 
@@ -546,7 +672,7 @@ flowchart TD
     CMD --> WALK --> EACH --> SYNC --> PRUNE
 ```
 
-1. Walks the source directory (`~/.config/skillshare/<name>/`)
+1. Walks the source directory (`~/.config/skillshare/extras/<name>/`)
 2. For each target, creates symlinks or copies per configured mode
 3. Removes orphan files in the target that no longer exist in source
 
@@ -555,13 +681,60 @@ flowchart TD
 ```
 $ skillshare sync extras
 
-Rules
-  ✔ ~/.claude/rules  2 files linked (merge)
-  ✔ ~/.cursor/rules  2 files copied (copy)
+Extras
+✓ rules     ~/.claude/rules  2 files linked
+✓ rules     ~/.cursor/rules  2 files copied
+✓ commands  ~/.claude/commands  1 files linked
 
-Commands
-  ✔ ~/.claude/commands  1 files linked (merge)
+✓ Synced 2 extras to 3 folders · 0.0s
 ```
+
+---
+
+## Context Cost {#context-cost}
+
+After syncing, skillshare displays a token cost summary:
+
+```
+✓ Synced 47 skills to 4 targets · 0.3s
+  Context  ~12.4K tokens always loaded · ~58.2K on demand
+```
+
+- **Always-loaded**: frontmatter name + description (loaded every request)
+- **On-demand**: skill body (loaded when triggered)
+
+Targets with identical token counts are grouped on one line.
+
+### Budget Warnings
+
+Configure warning thresholds in your config:
+
+```yaml
+context_budget:
+  warn_always_loaded_tokens: 10000   # default; 0 = disabled
+  warn_on_demand_tokens: 100000      # default; 0 = disabled
+```
+
+When a threshold is exceeded, a warning appears with the top 3 offenders:
+
+```
+! Always-loaded context is ~50,123 tokens (budget: 10,000)
+   Top 3:
+     • my-big-skill                    ~8,200 tokens
+     • another-verbose-skill           ~6,400 tokens
+     • chatgpt-system-prompt           ~5,100 tokens
+   Run `skillshare analyze` for details.
+```
+
+### Quiet Mode
+
+Use `--quiet` or `-q` to suppress token summary and budget warnings:
+
+```bash
+skillshare sync --quiet
+```
+
+JSON output (`--json`) always includes `context_cost` regardless of `--quiet`.
 
 ---
 

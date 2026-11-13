@@ -29,6 +29,7 @@ export async function makeFixture(root, app, binary, names) {
     PI_CODING_AGENT_DIR: path.join(home, 'native/pi'),
     SKILLSHARE_CONFIG: path.join(home, '.config/skillshare/config.yaml'),
     SKILLSHARE_AUTO_UPDATE_CHECK: 'false',
+    ...(process.env.RUNNER_TRACKING_ID ? { RUNNER_TRACKING_ID: process.env.RUNNER_TRACKING_ID } : {}),
     GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: path.join(home, 'gitconfig'),
     GIT_TERMINAL_PROMPT: '0', GIT_AUTHOR_NAME: 'Fixture', GIT_COMMITTER_NAME: 'Fixture',
     GIT_AUTHOR_EMAIL: 'fixture@example.com', GIT_COMMITTER_EMAIL: 'fixture@example.com',
@@ -86,12 +87,15 @@ export async function makeFixture(root, app, binary, names) {
   let spawnError;
   const log = [];
   async function start(port) {
+    // Persist ownership before spawn: always() can recover even without server.json.
+    await writeFile(path.join(root, 'launch.json'), JSON.stringify({ binary, cwd: home }));
     server = spawn(binary, ['ui', '-g', '--no-open', '--host', '127.0.0.1', '--port', String(port)], {
       env, cwd: home, stdio: ['ignore', 'pipe', 'pipe'],
     });
     serverDone = new Promise(resolve => server.once('exit', resolve));
     server.on('error', error => { spawnError = error; });
-    await writeFile(path.join(root, 'server.json'), JSON.stringify({ pid: server.pid, binary, cwd: home }));
+    const startTime = (await readFile(`/proc/${server.pid}/stat`, 'utf8')).split(') ').pop().split(' ')[19];
+    await writeFile(path.join(root, 'server.json'), JSON.stringify({ pid: server.pid, binary, cwd: home, startTime }));
     server.stdout.on('data', data => log.push(data.toString()));
     server.stderr.on('data', data => log.push(data.toString()));
     const url = `http://127.0.0.1:${port}`;

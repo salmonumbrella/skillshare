@@ -71,6 +71,14 @@ func loadCopyTracker(dir string) *copyTracker {
 	return &copyTracker{dir: dir, m: m}
 }
 
+func loadSharedCopyTracker(dir string) (*copyTracker, error) {
+	m, err := readManifest(dir, true)
+	if err != nil {
+		return nil, err
+	}
+	return &copyTracker{dir: dir, m: m}, nil
+}
+
 // owns reports whether rel is a tracked copy the user has not edited.
 func (t *copyTracker) owns(rel string) bool {
 	sum, ok := t.m.Managed[filepath.ToSlash(rel)]

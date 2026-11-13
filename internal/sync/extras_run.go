@@ -11,6 +11,7 @@ import (
 
 // ExtraRunOptions holds what differs between the callers of RunExtraTargets.
 type ExtraRunOptions struct {
+	Shared    *SharedExtrasRun
 	Protected map[string]bool
 	DryRun    bool
 	Force     bool
@@ -90,6 +91,10 @@ func RunExtraTargets(extra config.ExtraConfig, sourceDir string, opts ExtraRunOp
 func runExtraTarget(extra config.ExtraConfig, t config.ExtraTargetConfig, sourceDir string, opts ExtraRunOptions) ExtraTargetRun {
 	tr := ExtraTargetRun{Target: t, Path: opts.ResolvePath(t.Path), Mode: EffectiveMode(t.Mode)}
 
+	if opts.Shared != nil && opts.Shared.failed != nil {
+		tr.Err = opts.Shared.failed
+		return tr
+	}
 	if extra.Name == config.AgentsExtraName && opts.AgentTargetPaths[filepath.Clean(tr.Path)] {
 		tr.SkippedBy = config.AgentsExtraName
 		return tr
@@ -108,7 +113,12 @@ func runExtraTarget(extra config.ExtraConfig, t config.ExtraTargetConfig, source
 		}
 	}
 
-	tr.Result, tr.Err = SyncExtraTarget(extra, t, sourceDir, tr.Path, tr.Mode, spec, ExtraSyncOptions{DryRun: opts.DryRun, Force: opts.Force, ProjectRoot: opts.ProjectRoot, Protected: opts.Protected})
+	mode := ExtraTargetMode(tr.Mode, extra.File != "")
+	place := opts.Shared.writer(extra, sourceDir, config.SharedPlacedTarget{Path: tr.Path, Mode: mode, As: t.As})
+	tr.Result, tr.Err = SyncExtraTarget(extra, t, sourceDir, tr.Path, tr.Mode, spec, ExtraSyncOptions{DryRun: opts.DryRun, Force: opts.Force, ProjectRoot: opts.ProjectRoot, Protected: opts.Protected, place: place, shared: opts.Shared})
+	if tr.Err != nil && place != nil {
+		tr.Err = opts.Shared.latch(tr.Err)
+	}
 	tr.Mode = ExtraTargetMode(tr.Mode, extra.File != "")
 	return tr
 }
@@ -129,5 +139,7 @@ func SyncExtraTarget(extra config.ExtraConfig, target config.ExtraTargetConfig, 
 	if spec != nil {
 		return nil, fmt.Errorf("extensions are not supported for single-file extras")
 	}
-	return SyncExtraFile(NewExtraFile(sourceDir, extra.File, targetPath, target.As, mode), opts.DryRun, opts.ProjectRoot)
+	f := NewExtraFile(sourceDir, extra.File, targetPath, target.As, mode)
+	f.place = opts.place
+	return SyncExtraFile(f, opts.DryRun, opts.ProjectRoot)
 }

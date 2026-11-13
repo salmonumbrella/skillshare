@@ -368,3 +368,150 @@ func extraCreated(path string) bool {
 	_, err := os.Stat(filepath.Join(extraBackupDir(path), "created"))
 	return err == nil
 }
+
+func extraContentFingerprint(data []byte) string { return fmt.Sprintf("file:%x", sha256.Sum256(data)) }
+
+func sharedNativeFacts(p *config.SharedExtraIntent) (map[string]string, error) {
+	facts := map[string]string{}
+	for name := range p.MetadataAfter {
+		if name == "fallback" {
+			target := p.Placement.Receipt.Targets[0].Path
+			tracker, err := loadSharedCopyTracker(target)
+			if err != nil {
+				return nil, err
+			}
+			facts[name] = "absent"
+			if hash := tracker.m.Managed[p.Relative]; hash != "" {
+				facts[name] = "file:" + hash
+			}
+			continue
+		}
+		fingerprint, err := placementFingerprint(filepath.Join(extraBackupDir(p.Effects[0].Path), name))
+		if err != nil {
+			return nil, err
+		}
+		if fingerprint != "absent" && !strings.HasPrefix(fingerprint, "file:") {
+			return nil, fmt.Errorf("unsafe native attach metadata")
+		}
+		facts[name] = fingerprint
+	}
+	return facts, nil
+}
+
+func reconcileSharedNative(p *config.SharedExtraIntent, after bool) error {
+	got, err := sharedNativeFacts(p)
+	if err != nil {
+		return err
+	}
+	want, other := p.MetadataBefore, p.MetadataAfter
+	if after {
+		want, other = other, want
+	}
+	// Verify irreplaceable restore facts before repairing derived markers.
+	for name, expected := range want {
+		if got[name] == expected {
+			continue
+		}
+		repair := expected == "absent" && got[name] == other[name] || after && (name == "created" || name == "written" || name == "fallback") && (got[name] == "absent" || got[name] == other[name])
+		if !repair {
+			return fmt.Errorf("native %s metadata changed; shared placement kept for recovery", name)
+		}
+	}
+	for _, name := range []string{"created", "restore", "restore-link", "restore-junction", "import-base", "written", "fallback"} {
+		expected, ok := want[name]
+		if !ok || got[name] == expected {
+			continue
+		}
+		path := p.Effects[0].Path
+		if name == "fallback" {
+			tracker, err := loadSharedCopyTracker(p.Placement.Receipt.Targets[0].Path)
+			if err != nil {
+				return err
+			}
+			if expected == "absent" {
+				tracker.forget(p.Relative)
+			} else {
+				tracker.record(p.Relative)
+			}
+			if err := tracker.save(); err != nil {
+				return err
+			}
+		} else if expected == "absent" {
+			if err := os.Remove(filepath.Join(extraBackupDir(path), name)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		} else if name == "created" {
+			if err := markExtraCreated(path); err != nil {
+				return err
+			}
+			got, err = sharedNativeFacts(p)
+			if err != nil {
+				return err
+			}
+		} else if name == "written" {
+			if err := recordExtraWritten(path); err != nil {
+				return err
+			}
+		}
+	}
+	verified, err := sharedNativeFacts(p)
+	if err != nil {
+		return err
+	}
+	for name, expected := range want {
+		if verified[name] != expected {
+			return fmt.Errorf("native %s metadata repair failed", name)
+		}
+	}
+	return nil
+}
+
+// sharedChange observes the same native destinations the file writer uses.
+// A write through a user's link records both the link and its referent.
+func (f ExtraFile) sharedChange(after string, follow bool) (placementChange, error) {
+	change := placementChange{path: f.Target, before: f.before, after: after, metadata: map[string]string{}}
+	for _, name := range []string{attachCreated, attachRestore, attachRestoreLink, attachRestoreJunction, extraWritten, extraImportBase} {
+		fingerprint, err := placementFingerprint(filepath.Join(extraBackupDir(f.Target), name))
+		if err != nil {
+			return change, err
+		}
+		if fingerprint != "absent" && !strings.HasPrefix(fingerprint, "file:") {
+			return change, fmt.Errorf("unsafe native attach metadata")
+		}
+		change.metadata[name] = fingerprint
+	}
+	if follow && utils.IsSymlinkOrJunction(f.Target) {
+		destination, err := utils.ConfigWritePath(f.Target, false)
+		if err != nil {
+			return change, err
+		}
+		before := f.referentBefore
+		change.after, err = placementFingerprint(f.Target)
+		if err != nil {
+			return change, err
+		}
+		change.effects = []config.SharedExtraEffect{{Path: destination, Before: before, After: after}}
+	}
+	return change, nil
+}
+
+func (f ExtraFile) sharedRestoreFingerprint(kind string) (string, error) {
+	if kind == attachRestoreLink || kind == attachRestoreJunction {
+		link, err := os.Readlink(f.Target)
+		return extraContentFingerprint([]byte(link)), err
+	}
+	data, err := os.ReadFile(f.Target)
+	if err != nil {
+		return "", err
+	}
+	if stripped, changed := f.removeImport(string(data)); changed {
+		data = []byte(stripped)
+	}
+	if _, err := f.findContentBlock(strings.Split(string(data), "\n")); err != nil {
+		return "", err
+	}
+	if stripped, changed := f.removeContentBlock(string(data)); changed {
+		data = []byte(stripped)
+	}
+	return extraContentFingerprint(data), nil
+}

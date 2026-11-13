@@ -22,10 +22,11 @@ import (
 
 // Declarations remain portable; receipts describe only what this machine placed.
 type SharedPlacedTarget struct {
-	Path  string            `yaml:"path"`
-	Mode  string            `yaml:"mode,omitempty"`
-	As    string            `yaml:"as,omitempty"`
-	Files map[string]string `yaml:"files,omitempty"` // written relative outputs: content hashes or link identities
+	Path   string            `yaml:"path"`
+	Mode   string            `yaml:"mode,omitempty"`
+	As     string            `yaml:"as,omitempty"`
+	Native map[string]string `yaml:"native,omitempty"`
+	Files  map[string]string `yaml:"files,omitempty"` // written relative outputs: content hashes or link identities
 }
 type SharedReceipt struct {
 	Source  string               `yaml:"source"`
@@ -49,6 +50,7 @@ type SharedExtraIntent struct {
 	MetadataBefore map[string]string   `yaml:"metadata_before,omitempty"`
 	MetadataAfter  map[string]string   `yaml:"metadata_after,omitempty"`
 	Fallback       bool                `yaml:"fallback,omitempty"`
+	RetainOnly     bool                `yaml:"retain_only,omitempty"`
 }
 type SharedExtraEffect struct {
 	Path   string `yaml:"path"`
@@ -262,6 +264,12 @@ func decodeSharedState(raw []byte) (SharedState, error) {
 			return state, fmt.Errorf("invalid shared placement intent")
 		}
 		target := p.Placement.Receipt.Targets[0]
+		if ValidateExtraConfig(ExtraConfig{Name: p.Placement.Name, File: p.Placement.Receipt.File, Targets: []ExtraTargetConfig{{Path: target.Path, Mode: target.Mode, As: target.As}}}) != nil {
+			return state, fmt.Errorf("invalid shared intent target")
+		}
+		if len(p.Effects) == 2 && !strings.HasPrefix(p.Effects[0].Before, "link:") {
+			return state, fmt.Errorf("invalid shared intent referent")
+		}
 		rel := filepath.FromSlash(p.Relative)
 		if !filepath.IsAbs(target.Path) || p.Relative != "" && (filepath.IsAbs(rel) || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
 			return state, fmt.Errorf("invalid shared intent output")
@@ -285,17 +293,19 @@ func decodeSharedState(raw []byte) (SharedState, error) {
 			}
 		}
 		for path, fingerprint := range p.Parents {
-			if !filepath.IsAbs(path) || !sharedFingerprintValid(fingerprint) {
+			if !filepath.IsAbs(path) || !(fingerprint == "absent" || fingerprint == "directory" || strings.HasPrefix(fingerprint, "link:")) || !sharedFingerprintValid(fingerprint) {
 				return state, fmt.Errorf("invalid shared intent parent")
 			}
 		}
-		for _, metadata := range []map[string]string{p.MetadataBefore, p.MetadataAfter} {
-			for name, fingerprint := range metadata {
-				if !slices.Contains([]string{"created", "restore", "restore-link", "restore-junction", "written", "import-base"}, name) || !sharedFingerprintValid(fingerprint) {
-					return state, fmt.Errorf("invalid shared intent metadata")
-				}
+		if len(p.MetadataBefore) != len(p.MetadataAfter) || !sharedMetadataValid(p.MetadataBefore) || !sharedMetadataValid(p.MetadataAfter) {
+			return state, fmt.Errorf("invalid shared intent metadata")
+		}
+		for name := range p.MetadataBefore {
+			if _, ok := p.MetadataAfter[name]; !ok {
+				return state, fmt.Errorf("invalid shared intent metadata")
 			}
 		}
+
 	}
 	for _, placement := range placements {
 		if ValidateExtraName(placement.Name) != nil {
@@ -303,6 +313,11 @@ func decodeSharedState(raw []byte) (SharedState, error) {
 		}
 		if placement.DeclarationDir != "" && !filepath.IsAbs(placement.DeclarationDir) {
 			return state, fmt.Errorf("invalid shared declaration directory")
+		}
+		for _, target := range placement.Receipt.Targets {
+			if !sharedMetadataValid(target.Native) {
+				return state, fmt.Errorf("invalid shared native receipt")
+			}
 		}
 		// Reuse the portable validator so raw declaration nodes cannot hide unknown
 		// fields, aliases or invalid extras shapes inside a machine-local snapshot.
@@ -326,9 +341,21 @@ func decodeSharedState(raw []byte) (SharedState, error) {
 	return state, nil
 }
 
+func sharedMetadataValid(metadata map[string]string) bool {
+	for name, fingerprint := range metadata {
+		if !slices.Contains([]string{"created", "restore", "restore-link", "restore-junction", "written", "import-base", "fallback"}, name) || !(fingerprint == "absent" || strings.HasPrefix(fingerprint, "file:")) || !sharedFingerprintValid(fingerprint) {
+			return false
+		}
+	}
+	return true
+}
+
 func sharedFingerprintValid(value string) bool {
 	if value == "absent" || value == "directory" {
 		return true
+	}
+	if strings.HasPrefix(value, "link-to:") {
+		return filepath.IsAbs(strings.TrimPrefix(value, "link-to:"))
 	}
 	if strings.HasPrefix(value, "link:") {
 		return len(value) > 5 && !strings.ContainsRune(value, 0)

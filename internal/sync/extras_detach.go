@@ -1,6 +1,8 @@
 package sync
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,29 +24,85 @@ type SharedExtrasRun struct {
 	cfg       *config.Config
 	state     *config.SharedStateFile
 	dryRun    bool
+	release   func()
+	failed    error
 	protected map[string]bool
+	recovered map[string]bool
 	// The recorded declaration's relative paths precede this run's pointer update.
 	declarationDir string
 }
 
-func BeginSharedExtras(cfg *config.Config, dryRun bool) (*SharedExtrasRun, error) {
+type SharedExtrasScope struct{ Name, Target string }
+
+func BeginSharedExtras(cfg *config.Config, dryRun bool, scopes ...SharedExtrasScope) (*SharedExtrasRun, error) {
 	if !cfg.SharedEnabled() {
 		return nil, nil
 	}
-	if err := cfg.CheckSharedApply(); err != nil {
-		return nil, err
-	}
 	path := cfg.SharedStatus().Path
-	state, err := config.LoadSharedState(config.ConfigPath(), cfg.EffectiveGitRoot(), filepath.Dir(path))
+	var state *config.SharedStateFile
+	var release func()
+	var err error
+	if dryRun {
+		state, err = config.LoadSharedState(config.ConfigPath(), cfg.EffectiveGitRoot(), filepath.Dir(path))
+	} else {
+		state, release, err = config.BeginSharedStateWrite(context.Background(), config.ConfigPath(), cfg.EffectiveGitRoot(), filepath.Dir(path))
+		if err == nil {
+			fresh, loadErr := config.LoadReadOnlyPath(config.ConfigPath())
+			if loadErr != nil {
+				err = loadErr
+			} else if !fresh.SharedEnabled() || !utils.PathsEqual(fresh.SharedStatus().Path, path) || !utils.PathsEqual(fresh.EffectiveGitRoot(), cfg.EffectiveGitRoot()) {
+				err = fmt.Errorf("shared settings identity changed; retry the sync")
+			} else {
+				cfg = fresh
+			}
+		}
+	}
+	if err == nil {
+		err = cfg.CheckSharedApply()
+	}
 	if err != nil {
+		if release != nil {
+			release()
+		}
 		return nil, &config.SharedError{Code: config.SharedUnavailable, Path: path, Cause: err}
 	}
 	previousPath := state.State.Pointer
 	if previousPath == "" {
 		previousPath = path
 	}
+	r := &SharedExtrasRun{cfg: cfg, state: state, release: release, dryRun: dryRun, protected: map[string]bool{}, recovered: map[string]bool{}, declarationDir: filepath.Dir(previousPath)}
+	if !dryRun && state.State.Pending != nil {
+		p := state.State.Pending
+		if len(scopes) > 0 && (scopes[0].Name != "" && scopes[0].Name != p.Placement.Name || scopes[0].Target != "" && !utils.PathsEqual(scopes[0].Target, p.Placement.Receipt.Targets[0].Path)) {
+			err = fmt.Errorf("pending shared placement for %s at %s is outside the selected scope", p.Placement.Name, p.Placement.Receipt.Targets[0].Path)
+		} else {
+			err = r.recoverPending()
+		}
+		if err != nil {
+			r.Close()
+			return nil, &config.SharedError{Code: config.SharedUnavailable, Path: path, Cause: err}
+		}
+	}
 	state.RecordPointer(path)
-	return &SharedExtrasRun{cfg: cfg, state: state, dryRun: dryRun, protected: map[string]bool{}, declarationDir: filepath.Dir(previousPath)}, nil
+	return r, nil
+}
+
+func (r *SharedExtrasRun) Close() {
+	if r != nil && r.release != nil {
+		r.release()
+	}
+}
+func (r *SharedExtrasRun) Config() *config.Config {
+	if r == nil {
+		return nil
+	}
+	return r.cfg
+}
+func (r *SharedExtrasRun) latch(err error) error {
+	if err != nil && r.failed == nil {
+		r.failed = &config.SharedError{Code: config.SharedUnavailable, Path: r.cfg.SharedStatus().Path, Cause: err}
+	}
+	return r.failed
 }
 
 func (r *SharedExtrasRun) Protected() map[string]bool {
@@ -57,10 +115,10 @@ func (r *SharedExtrasRun) Save() error {
 	if r == nil || r.dryRun {
 		return nil
 	}
-	if err := r.state.Save(); err != nil {
-		return &config.SharedError{Code: config.SharedUnavailable, Path: r.cfg.SharedStatus().Path, Cause: err}
+	if r.failed != nil {
+		return r.failed
 	}
-	return nil
+	return r.latch(r.state.Save())
 }
 
 func placedOutput(file string, target config.SharedPlacedTarget) string {
@@ -101,7 +159,7 @@ func (r *SharedExtrasRun) currentTarget(old config.SharedPlacement, t config.Sha
 	var previous *config.ExtraTargetConfig
 	for i := range declaration.Targets {
 		candidate := &declaration.Targets[i]
-		if utils.PathsEqual(sharedfile.ResolvePath(r.declarationDir, candidate.Path), t.Path) && candidate.As == t.As {
+		if utils.PathsEqual(sharedfile.ResolvePath(declarationDir(old, r.declarationDir), candidate.Path), t.Path) && candidate.As == t.As {
 			previous = candidate
 			break
 		}
@@ -111,7 +169,7 @@ func (r *SharedExtrasRun) currentTarget(old config.SharedPlacement, t config.Sha
 	}
 	extension := previous.Extension
 	if strings.ContainsAny(extension, `/\`) || strings.HasPrefix(extension, ".") {
-		extension = sharedfile.ResolvePath(r.declarationDir, extension)
+		extension = sharedfile.ResolvePath(declarationDir(old, r.declarationDir), extension)
 	}
 	for _, extra := range r.cfg.Extras {
 		if extra.Name != old.Name {
@@ -152,6 +210,9 @@ func (r *SharedExtrasRun) detach(resolve func(string) string, selected func(stri
 	if r == nil {
 		return nil
 	}
+	if r.failed != nil {
+		return []DetachResult{{Errors: []string{r.failed.Error()}}}
+	}
 	var results []DetachResult
 	var remaining []config.SharedPlacement
 	for _, old := range r.state.State.Extras {
@@ -189,6 +250,9 @@ func (r *SharedExtrasRun) detach(resolve func(string) string, selected func(stri
 		}
 	}
 	r.state.State.Extras = remaining
+	if err := r.Save(); err != nil {
+		results = append(results, DetachResult{Errors: []string{err.Error()}})
+	}
 	return results
 }
 
@@ -203,6 +267,20 @@ func (r *SharedExtrasRun) detachTarget(old config.SharedPlacement, target config
 			ForgetExtraTarget(f)
 			result.Kept = append(result.Kept, parent)
 			return result
+		}
+		if target.Native != nil {
+			p := &config.SharedExtraIntent{Effects: []config.SharedExtraEffect{{Path: f.Target}}, MetadataAfter: target.Native}
+			facts, err := sharedNativeFacts(p)
+			if err != nil {
+				result.Errors = append(result.Errors, err.Error())
+				return result
+			}
+			for name, expected := range target.Native {
+				if facts[name] != expected {
+					result.Errors = append(result.Errors, "native restore metadata changed; kept for recovery")
+					return result
+				}
+			}
 		}
 		changed, kept, err := DetachExtraFileTarget(f)
 		if err != nil {
@@ -222,7 +300,11 @@ func (r *SharedExtrasRun) detachTarget(old config.SharedPlacement, target config
 			result.Kept = append(result.Kept, target.Path)
 			return result
 		}
-		copies := loadCopyTracker(target.Path)
+		copies, err := loadSharedCopyTracker(target.Path)
+		if err != nil {
+			result.Errors = append(result.Errors, err.Error())
+			return result
+		}
 		for rel, expected := range target.Files {
 			path := filepath.Join(target.Path, filepath.FromSlash(rel))
 			// Receipts are private but still never authorize traversing outside a target.
@@ -320,73 +402,31 @@ func sharedOutputIdentity(path string) (string, error) {
 	return utils.FileHash(path)
 }
 
-func (r *SharedExtrasRun) Record(extra config.ExtraConfig, sourceDir string, run ExtraRun, outputExt func(config.ExtraTargetConfig) string) {
-	if r == nil || r.dryRun || run.SourceMissing || r.cfg.ExtraOrigin(extra.Name) != sharedfile.Shared {
-		return
+func declarationDir(p config.SharedPlacement, fallback string) string {
+	if p.DeclarationDir != "" {
+		return p.DeclarationDir
 	}
-	declaration, ok := r.cfg.SharedExtraDeclaration(extra.Name)
-	if !ok {
-		return
-	}
-	next := config.SharedPlacement{Name: extra.Name, Declaration: declaration, Receipt: config.SharedReceipt{Source: sourceDir, File: extra.File}}
-	for _, tr := range run.Targets {
-		if tr.Err != nil || tr.ExtensionErr != nil || tr.ModeErr != nil || tr.SkippedBy != "" || tr.Result == nil || len(tr.Result.Errors) > 0 || tr.Result.Skipped > 0 {
-			continue
-		}
-		target := config.SharedPlacedTarget{Path: tr.Path, Mode: tr.Mode, As: tr.Target.As}
-		if protectedOutput(placedOutput(extra.File, target), r.protected) {
-			continue
-		}
-		var previous *config.SharedPlacedTarget
-		for _, old := range r.state.State.Extras {
-			if old.Name != extra.Name || old.Receipt.Source != sourceDir || old.Receipt.File != extra.File {
-				continue
-			}
-			for i := range old.Receipt.Targets {
-				candidate := &old.Receipt.Targets[i]
-				if candidate.Path == target.Path && candidate.As == target.As {
-					previous = candidate
-					break
-				}
-			}
-		}
-		if extra.File == "" && (target.Mode == "copy" || target.Mode == "merge") {
-			target.Files = map[string]string{}
-			if previous != nil {
-				for rel, hash := range previous.Files {
-					target.Files[rel] = hash
-				}
-			}
-			valid := true
-			for _, rel := range tr.Result.written {
-				hash, err := sharedOutputIdentity(filepath.Join(tr.Path, rel))
-				if err != nil {
-					valid = false
-					break
-				}
-				target.Files[filepath.ToSlash(rel)] = hash
-			}
-			if !valid || len(target.Files) == 0 {
-				continue
-			}
-		} else if extra.File != "" && !extraAttached(placedOutput(extra.File, target)) && !NewExtraFile(sourceDir, extra.File, tr.Path, tr.Target.As, tr.Mode).isOurLink() {
-			// An identical file that SyncExtraFile did not attach remains the user's.
-			continue
-		}
-		next.Receipt.Targets = append(next.Receipt.Targets, target)
-	}
-	if len(next.Receipt.Targets) == 0 {
-		return
-	}
-	// A target-only run replaces only its own receipts. Other targets retain
-	// their old declaration until they too have detached and applied its change.
+	return fallback
+}
+
+// mergePlacement changes only the output whose native write was verified.
+func (r *SharedExtrasRun) mergePlacement(next config.SharedPlacement) {
+	target := &next.Receipt.Targets[0]
 	var remaining []config.SharedPlacement
 	for _, old := range r.state.State.Extras {
-		if old.Name == extra.Name && old.Receipt.Source == sourceDir && old.Receipt.File == extra.File {
-			old.Receipt.Targets = slices.DeleteFunc(slices.Clone(old.Receipt.Targets), func(target config.SharedPlacedTarget) bool {
-				return slices.ContainsFunc(next.Receipt.Targets, func(recorded config.SharedPlacedTarget) bool {
-					return recorded.Path == target.Path && recorded.As == target.As
-				})
+		if old.Name == next.Name && old.Receipt.Source == next.Receipt.Source && old.Receipt.File == next.Receipt.File {
+			old.Receipt.Targets = slices.DeleteFunc(slices.Clone(old.Receipt.Targets), func(previous config.SharedPlacedTarget) bool {
+				if previous.Path != target.Path || previous.As != target.As {
+					return false
+				}
+				if target.Files != nil {
+					for rel, hash := range previous.Files {
+						if _, ok := target.Files[rel]; !ok {
+							target.Files[rel] = hash
+						}
+					}
+				}
+				return true
 			})
 		}
 		if len(old.Receipt.Targets) > 0 {
@@ -394,6 +434,206 @@ func (r *SharedExtrasRun) Record(extra config.ExtraConfig, sourceDir string, run
 		}
 	}
 	r.state.State.Extras = append(remaining, next)
+}
+
+type placementChange struct {
+	path, before, after  string
+	effects              []config.SharedExtraEffect
+	metadata             map[string]string
+	fallback, retainOnly bool
+}
+type placementWriter func(placementChange, func() error) error
+
+func placementLinkAfter(place placementWriter, source string) string {
+	if place == nil {
+		return ""
+	}
+	return "link-to:" + evalOrClean(source)
+}
+
+func placeExtra(place placementWriter, change placementChange, mutate func() error) error {
+	if place == nil {
+		return mutate()
+	}
+	return place(change, mutate)
+}
+
+func (r *SharedExtrasRun) writer(extra config.ExtraConfig, source string, target config.SharedPlacedTarget) placementWriter {
+	if r == nil || r.dryRun || r.cfg.ExtraOrigin(extra.Name) != sharedfile.Shared {
+		return nil
+	}
+	return func(change placementChange, mutate func() error) error {
+		if r.failed != nil {
+			return r.failed
+		}
+		declaration, ok := r.cfg.SharedExtraDeclaration(extra.Name)
+		if !ok {
+			return r.latch(fmt.Errorf("shared declaration disappeared"))
+		}
+		rel, err := filepath.Rel(target.Path, change.path)
+		if err != nil {
+			return r.latch(err)
+		}
+		if extra.File != "" || target.Mode == "symlink" {
+			rel = ""
+		}
+		before, err := placementFingerprint(change.path)
+		if err != nil {
+			return r.latch(err)
+		}
+		if change.before != "" && before != change.before {
+			return r.latch(fmt.Errorf("shared destination changed before placement: %s", change.path))
+		}
+		p := &config.SharedExtraIntent{Placement: config.SharedPlacement{Name: extra.Name, Declaration: declaration, DeclarationDir: filepath.Dir(r.cfg.SharedStatus().Path), Receipt: config.SharedReceipt{Source: source, File: extra.File, Targets: []config.SharedPlacedTarget{target}}}, Relative: filepath.ToSlash(rel), Effects: append([]config.SharedExtraEffect{{Path: change.path, Before: before, After: change.after}}, change.effects...), MetadataAfter: change.metadata, Fallback: change.fallback, RetainOnly: change.retainOnly}
+		p.Parents = map[string]string{}
+		for _, effect := range p.Effects {
+			for parent := filepath.Dir(effect.Path); ; parent = filepath.Dir(parent) {
+				fingerprint, err := placementFingerprint(parent)
+				if err != nil {
+					return r.latch(err)
+				}
+				p.Parents[parent] = fingerprint
+				if filepath.Dir(parent) == parent {
+					break
+				}
+			}
+		}
+		if p.MetadataAfter != nil {
+			p.MetadataBefore, err = sharedNativeFacts(p)
+			if err != nil {
+				return r.latch(err)
+			}
+		}
+		if r.state.State.Pending != nil {
+			return r.latch(fmt.Errorf("shared placement recovery is unresolved"))
+		}
+		r.state.State.Pending = p
+		if err := r.Save(); err != nil {
+			return err
+		}
+		if err := checkPlacementParents(p, false); err != nil {
+			return r.latch(err)
+		}
+		for _, effect := range p.Effects {
+			if got, err := placementFingerprint(effect.Path); err != nil || got != effect.Before {
+				return r.latch(fmt.Errorf("shared destination changed before placement: %s", effect.Path))
+			}
+		}
+		if current, err := sharedNativeFacts(p); err != nil {
+			return r.latch(err)
+		} else {
+			for name, fingerprint := range p.MetadataBefore {
+				if current[name] != fingerprint {
+					return r.latch(fmt.Errorf("native %s metadata changed before placement", name))
+				}
+			}
+		}
+		nativeErr := mutate()
+		err = r.recoverPending()
+		if err != nil {
+			return r.latch(errors.Join(nativeErr, err))
+		}
+		return nativeErr
+	}
+}
+
+func placementFingerprint(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return "absent", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if utils.IsLinkMode(path, info.Mode()) {
+		raw, err := os.Readlink(path)
+		return "link:" + raw, err
+	}
+	if info.IsDir() {
+		return "directory", nil
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("unsupported shared destination: %s", path)
+	}
+	hash, err := utils.FileHash(path)
+	return "file:" + hash, err
+}
+
+func matchesPlacementFingerprint(path, got, want string) bool {
+	if strings.HasPrefix(want, "link-to:") && strings.HasPrefix(got, "link:") {
+		return utils.PathsEqual(evalOrClean(resolveReadlink(strings.TrimPrefix(got, "link:"), path)), strings.TrimPrefix(want, "link-to:"))
+	}
+	return got == want
+}
+
+func checkPlacementParents(p *config.SharedExtraIntent, recovery bool) error {
+	if len(p.Effects) == 2 {
+		link := resolveReadlink(strings.TrimPrefix(p.Effects[0].Before, "link:"), p.Effects[0].Path)
+		destination, err := utils.ConfigWritePath(link, false)
+		if err != nil {
+			return err
+		}
+		if !utils.PathsEqual(destination, p.Effects[1].Path) {
+			return fmt.Errorf("shared write referent changed")
+		}
+	}
+	for path, before := range p.Parents {
+		got, err := placementFingerprint(path)
+		if err != nil {
+			return err
+		}
+		if got != before && !(recovery && before == "absent" && got == "directory") {
+			return fmt.Errorf("shared destination parent changed: %s", path)
+		}
+	}
+	return nil
+}
+
+func (r *SharedExtrasRun) recoverPending() error {
+	p := r.state.State.Pending
+	if p == nil {
+		return nil
+	}
+	if err := checkPlacementParents(p, true); err != nil {
+		return err
+	}
+	before, after := true, true
+	for _, effect := range p.Effects {
+		got, err := placementFingerprint(effect.Path)
+		if err != nil {
+			return err
+		}
+		before = before && got == effect.Before && got != "directory"
+		after = after && matchesPlacementFingerprint(effect.Path, got, effect.After)
+	}
+	if !before && !after {
+		return fmt.Errorf("shared placement for %s at %s is ambiguous; kept for recovery", p.Placement.Name, p.Effects[0].Path)
+	}
+	if err := reconcileSharedNative(p, after); err != nil {
+		return err
+	}
+	if after && !p.RetainOnly {
+		if p.Placement.Receipt.File != "" {
+			p.Placement.Receipt.Targets[0].Native = p.MetadataAfter
+		}
+		if p.Placement.Receipt.File == "" && p.Placement.Receipt.Targets[0].Mode != "symlink" {
+			hash, err := sharedOutputIdentity(p.Effects[0].Path)
+			if err != nil {
+				return err
+			}
+			p.Placement.Receipt.Targets[0].Files = map[string]string{p.Relative: hash}
+		}
+		r.mergePlacement(p.Placement)
+		if same, shared := r.currentTarget(p.Placement, p.Placement.Receipt.Targets[0], config.ExpandPath); same && shared {
+			r.recovered[p.Effects[0].Path] = true
+		}
+	}
+	r.state.State.Pending = nil
+	if err := r.state.Save(); err != nil {
+		r.state.State.Pending = p
+		return err
+	}
+	return nil
 }
 
 // DetachExtraFileTarget uses restore's ownership tests but leaves edited

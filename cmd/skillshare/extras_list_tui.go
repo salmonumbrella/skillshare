@@ -1046,11 +1046,19 @@ func (m extrasListTUIModel) doSync(name, targetPath string) (string, error) {
 			return "", err
 		}
 		m.cfg = cfg
-		session, err = sync.BeginSharedExtras(cfg, false)
+		scope := sync.SharedExtrasScope{Name: name}
+		if targetPath != "" {
+			scope.Target = config.ExpandPath(targetPath)
+		}
+		session, err = sync.BeginSharedExtras(cfg, false, scope)
 		if err != nil {
 			return "", err
 		}
+		if session != nil {
+			m.cfg = session.Config()
+		}
 	}
+	defer session.Close()
 	extra, targets, err := m.resolveExtraWithTargets(name, targetPath)
 	if err != nil {
 		return "", err
@@ -1089,7 +1097,7 @@ func (m extrasListTUIModel) doSync(name, targetPath string) (string, error) {
 	}
 	run := sync.RunExtraTargets(selected, sourceDir, sync.ExtraRunOptions{ResolvePath: func(path string) string {
 		return canonicalExtraTargetPath(mode, projectRoot, path)
-	}, ProjectRoot: projectRoot, Protected: session.Protected(), ResolveExtension: func(ext string) (*sync.ExtensionSpec, error) { return resolveExtension(ext, extDir) }})
+	}, ProjectRoot: projectRoot, Protected: session.Protected(), Shared: session, ResolveExtension: func(ext string) (*sync.ExtensionSpec, error) { return resolveExtension(ext, extDir) }})
 	if run.SourceMissing {
 		runErr = errors.Join(runErr, fmt.Errorf("extras source directory does not exist: %s", sourceDir))
 	}
@@ -1099,7 +1107,7 @@ func (m extrasListTUIModel) doSync(name, targetPath string) (string, error) {
 			runErr = errors.Join(runErr, fmt.Errorf("%s", strings.Join(tr.Result.Errors, "; ")))
 		}
 	}
-	session.Record(selected, sourceDir, run, nil)
+
 	if err := errors.Join(runErr, session.Save()); err != nil {
 		return "", err
 	}

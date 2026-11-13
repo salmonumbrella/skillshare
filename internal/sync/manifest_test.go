@@ -148,3 +148,36 @@ func TestRemoveManifest(t *testing.T) {
 		t.Errorf("removing non-existent manifest should not error: %v", err)
 	}
 }
+
+func TestReadManifestStrictRetainsOrdinaryRecoveryPolicy(t *testing.T) {
+	for _, unreadable := range []bool{false, true} {
+		t.Run(map[bool]string{false: "malformed", true: "unreadable"}[unreadable], func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, ManifestFile)
+			if unreadable {
+				if err := os.Mkdir(path, 0755); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(path, []byte("{malformed"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readManifest(dir, true); err == nil {
+				t.Fatal("strict observation accepted ambiguous metadata")
+			}
+			ordinary, err := ReadManifest(dir)
+			if unreadable && err == nil || !unreadable && (err != nil || len(ordinary.Managed) != 0) {
+				t.Fatalf("public policy changed: %+v %v", ordinary, err)
+			}
+			if tracker := loadCopyTracker(dir); tracker == nil || len(tracker.m.Managed) != 0 {
+				t.Fatal("ordinary tracker no longer suppresses errors")
+			}
+			if _, err := loadSharedCopyTracker(dir); err == nil {
+				t.Fatal("shared tracker suppressed metadata error")
+			}
+		})
+	}
+	strict, err := readManifest(t.TempDir(), true)
+	if err != nil || strict.Managed == nil || strict.Mtimes == nil || strict.Naming == nil {
+		t.Fatalf("missing manifest: %+v %v", strict, err)
+	}
+}

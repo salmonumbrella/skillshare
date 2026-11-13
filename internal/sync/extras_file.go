@@ -36,8 +36,10 @@ type ExtraFile struct {
 	Target string // <target path>/<as or file>
 	Mode   string // merge (default), symlink, copy, import, prepend, or append
 
-	projectRoot  string
-	linkFallback bool // Mode is copy because file links are unavailable
+	place                  placementWriter
+	before, referentBefore string
+	projectRoot            string
+	linkFallback           bool // Mode is copy because file links are unavailable
 }
 
 // NewExtraFile resolves the source and target files of a single-file extra.
@@ -97,6 +99,24 @@ func SyncExtraFile(f ExtraFile, dryRun bool, projectRoot string) (*ExtraResult, 
 	if !f.sourceExists() {
 		return nil, fmt.Errorf("extras source file does not exist: %s", f.Source)
 	}
+	if f.place != nil {
+		var err error
+		f.before, err = placementFingerprint(f.Target)
+		if err != nil {
+			return nil, err
+		}
+		if strings.HasPrefix(f.before, "link:") {
+			dest, err := utils.ConfigWritePath(f.Target, false)
+			if err != nil {
+				return nil, err
+			}
+			f.referentBefore, err = placementFingerprint(dest)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	switch f.Mode {
 	case "import":
 		return syncExtraImport(f, dryRun)
@@ -119,6 +139,10 @@ func syncExtraFileReplace(f ExtraFile, dryRun bool, projectRoot string) (*ExtraR
 	copyMode := f.Mode == "copy"
 	attached := extraAttached(f.Target)
 
+	var prepare func() error
+	var importBase *string
+	restoreKind := ""
+
 	info, err := os.Lstat(f.Target)
 	switch {
 	case os.IsNotExist(err):
@@ -128,7 +152,7 @@ func syncExtraFileReplace(f ExtraFile, dryRun bool, projectRoot string) (*ExtraR
 		if !copyMode && f.isOurLink() && fileLinkUsable(f.Target) {
 			dest, _ := os.Readlink(f.Target)
 			if linkNeedsReformat(dest, relative) && !dryRun {
-				if err := reformatLink(f.Target, f.Source, relative); err != nil {
+				if err := placeExtra(f.place, placementChange{path: f.Target, before: f.before, after: placementLinkAfter(f.place, f.Source), retainOnly: true}, func() error { return reformatLink(f.Target, f.Source, relative) }); err != nil {
 					return nil, fmt.Errorf("failed to reformat symlink: %w", err)
 				}
 			}
@@ -144,42 +168,56 @@ func syncExtraFileReplace(f ExtraFile, dryRun bool, projectRoot string) (*ExtraR
 			warning := replacementWarning(f.Target, dryRun)
 			result.addFileWarning(warning.Code, warning.Message, warning.Params)
 		}
-		if !dryRun && leavingImport {
-			if !attached {
-				if err := recordExtraRestoreLink(f.Target); err != nil {
-					return nil, err
+		if !attached && !f.isOurLink() {
+			restoreKind = attachRestoreLink
+			if info.Mode()&os.ModeSymlink == 0 {
+				restoreKind = attachRestoreJunction
+			}
+		}
+		if leavingImport {
+			importBase = &base
+		}
+		prepare = func() error {
+
+			if leavingImport {
+				if !attached {
+					if err := recordExtraRestoreLink(f.Target); err != nil {
+						return err
+					}
+					attached = true
 				}
-				attached = true
-			}
-			if err := recordExtraImportBase(f.Target, base); err != nil {
-				return nil, err
-			}
-			info, err := os.Stat(f.Target)
-			if err != nil {
-				return nil, err
-			}
-			if err := os.WriteFile(f.Target, []byte(base), info.Mode().Perm()); err != nil {
-				return nil, err
-			}
-		}
-		if !dryRun && drift {
-			if err := backupExtraDrift(f.Target, ""); err != nil {
-				return nil, err
-			}
-		}
-		// Any other symlink is left over from a mode change, or, on first
-		// attach, the user's own link: record it so restore can put it back.
-		if !dryRun {
-			if !attached && !f.isOurLink() {
-				if err := recordExtraRestoreLink(f.Target); err != nil {
-					return nil, err
+				if err := recordExtraImportBase(f.Target, base); err != nil {
+					return err
 				}
-				attached = true
+				info, err := os.Stat(f.Target)
+				if err != nil {
+					return err
+				}
+				if err := os.WriteFile(f.Target, []byte(base), info.Mode().Perm()); err != nil {
+					return err
+				}
 			}
-			if err := os.Remove(f.Target); err != nil {
-				return nil, fmt.Errorf("failed to remove conflicting symlink: %w", err)
+			if drift {
+				if err := backupExtraDrift(f.Target, ""); err != nil {
+					return err
+				}
 			}
+			// Any other symlink is left over from a mode change, or, on first
+			// attach, the user's own link: record it so restore can put it back.
+			{
+				if !attached && !f.isOurLink() {
+					if err := recordExtraRestoreLink(f.Target); err != nil {
+						return err
+					}
+					attached = true
+				}
+				if err := os.Remove(f.Target); err != nil {
+					return fmt.Errorf("failed to remove conflicting symlink: %w", err)
+				}
+			}
+			return nil
 		}
+
 	case info.IsDir():
 		result.Skipped = 1
 		result.addFileWarning("target_directory", fmt.Sprintf("%s is a directory; not replaced", f.Target), map[string]string{"path": f.Target})
@@ -193,7 +231,7 @@ func syncExtraFileReplace(f ExtraFile, dryRun bool, projectRoot string) (*ExtraR
 		}
 		same := contentEqual(f.Source, f.Target)
 		if copyMode && same {
-			if !dryRun && attached && !isOurExtraCopy(f.Target) {
+			if !dryRun && f.place == nil && attached && !isOurExtraCopy(f.Target) {
 				_ = recordExtraWritten(f.Target) // best effort: only saves a later drift backup
 			}
 			result.Synced = 1
@@ -205,23 +243,30 @@ func syncExtraFileReplace(f ExtraFile, dryRun bool, projectRoot string) (*ExtraR
 			warning := replacementWarning(f.Target, dryRun)
 			result.addFileWarning(warning.Code, warning.Message, warning.Params)
 		}
-		if !dryRun {
+		if attached && extraCreated(f.Target) {
+			if data, err := os.ReadFile(f.Target); err == nil {
+				if rest, ok := f.removeContentBlock(string(data)); ok && strings.TrimSpace(rest) != "" {
+					attached = false
+				}
+			}
+		}
+		if !attached {
+			restoreKind = attachRestore
+		}
+		if hadImport {
+			importBase = &leavingImport
+		}
+
+		prepare = func() error {
 			// On first attach, back up even an identical file: restoring the
 			// target later has nothing else to put back once the link is
 			// removed. Once attached, a differing file is an edit; keep it as
 			// a drift backup so the restore point stays the pre-attach state.
 			// A file a block created is the user's once they wrote lines
 			// outside the block: record those lines, not "no file".
-			if attached && extraCreated(f.Target) {
-				if data, err := os.ReadFile(f.Target); err == nil {
-					if rest, ok := f.removeContentBlock(string(data)); ok && strings.TrimSpace(rest) != "" {
-						attached = false
-					}
-				}
-			}
 			if !attached {
 				if err := recordExtraRestorePoint(f); err != nil {
-					return nil, err
+					return err
 				}
 				attached = true
 			} else if edited {
@@ -231,17 +276,18 @@ func syncExtraFileReplace(f ExtraFile, dryRun bool, projectRoot string) (*ExtraR
 					reason = DriftReasonMode
 				}
 				if err := backupExtraDrift(f.Target, reason); err != nil {
-					return nil, err
+					return err
 				}
 			}
 			if hadImport {
 				if err := recordExtraImportBase(f.Target, leavingImport); err != nil {
-					return nil, fmt.Errorf("back up %s: %w", f.Target, err)
+					return fmt.Errorf("back up %s: %w", f.Target, err)
 				}
 			}
 			if err := os.Remove(f.Target); err != nil {
-				return nil, fmt.Errorf("failed to remove existing file: %w", err)
+				return fmt.Errorf("failed to remove existing file: %w", err)
 			}
+			return nil
 		}
 	}
 
@@ -249,28 +295,88 @@ func syncExtraFileReplace(f ExtraFile, dryRun bool, projectRoot string) (*ExtraR
 		result.Synced = 1
 		return result, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(f.Target), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create parent dir: %w", err)
-	}
-	if copyMode {
-		if err := copyFile(f.Source, f.Target); err != nil {
-			return nil, fmt.Errorf("failed to copy file: %w", err)
+	after := placementLinkAfter(f.place, f.Source)
+	writeCopy := func() error { return copyFile(f.Source, f.Target) }
+	if copyMode && f.place != nil {
+		data, err := os.ReadFile(f.Source)
+		if err != nil {
+			return nil, err
 		}
-	} else if err := createLink(f.Target, f.Source, relative); err != nil {
-		return nil, fmt.Errorf("failed to create symlink: %w", err)
+		info, err := os.Stat(f.Source)
+		if err != nil {
+			return nil, err
+		}
+		after = extraContentFingerprint(data)
+		writeCopy = func() error { return os.WriteFile(f.Target, data, info.Mode().Perm()) }
 	}
-	if !attached {
-		if err := markExtraCreated(f.Target); err != nil {
-			return nil, fmt.Errorf("failed to record created file: %w", err)
+	change := placementChange{path: f.Target, after: after}
+	if f.place != nil {
+		change, err = f.sharedChange(after, false)
+		if err != nil {
+			return nil, err
+		}
+		if restoreKind != "" {
+			fingerprint, err := f.sharedRestoreFingerprint(restoreKind)
+			if err != nil {
+				return nil, err
+			}
+			for _, name := range []string{attachCreated, attachRestore, attachRestoreLink, attachRestoreJunction, extraWritten, extraImportBase} {
+				change.metadata[name] = "absent"
+			}
+			change.metadata[restoreKind] = fingerprint
+		} else if !attached {
+			change.metadata[attachCreated] = extraContentFingerprint(nil)
+		}
+		if importBase != nil {
+			change.metadata[extraImportBase] = extraContentFingerprint([]byte(*importBase))
+			if utils.IsSymlinkOrJunction(f.Target) {
+				dest, err := utils.ConfigWritePath(f.Target, false)
+				if err != nil {
+					return nil, err
+				}
+				before := f.referentBefore
+				change.effects = []config.SharedExtraEffect{{Path: dest, Before: before, After: extraContentFingerprint([]byte(*importBase))}}
+			}
+		}
+		change.metadata[extraWritten] = "absent"
+		if copyMode {
+			change.metadata[extraWritten] = after
 		}
 	}
-	if copyMode {
-		if err := recordExtraWritten(f.Target); err != nil {
-			return nil, fmt.Errorf("failed to record copied file: %w", err)
+	if err := placeExtra(f.place, change, func() error {
+		if prepare != nil {
+			if err := prepare(); err != nil {
+				return err
+			}
 		}
-	} else {
-		clearExtraWritten(f.Target)
+
+		if err := os.MkdirAll(filepath.Dir(f.Target), 0755); err != nil {
+			return fmt.Errorf("failed to create parent dir: %w", err)
+		}
+		if copyMode {
+			if err := writeCopy(); err != nil {
+				return fmt.Errorf("failed to copy file: %w", err)
+			}
+		} else if err := createLink(f.Target, f.Source, relative); err != nil {
+			return fmt.Errorf("failed to create symlink: %w", err)
+		}
+		if !attached {
+			if err := markExtraCreated(f.Target); err != nil {
+				return fmt.Errorf("failed to record created file: %w", err)
+			}
+		}
+		if copyMode {
+			if err := recordExtraWritten(f.Target); err != nil {
+				return fmt.Errorf("failed to record copied file: %w", err)
+			}
+		} else {
+			clearExtraWritten(f.Target)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
+
 	result.Synced = 1
 	return result, nil
 }
@@ -382,11 +488,7 @@ func syncExtraImport(f ExtraFile, dryRun bool) (*ExtraResult, error) {
 		return nil, err // a damaged block must be repaired first, or the import line would double it
 	}
 	if block != nil {
-		if contentBlockHash(block.body) != block.hash && !dryRun {
-			if err := backupExtraDrift(f.Target, DriftReasonMode); err != nil {
-				return nil, err
-			}
-		}
+
 		stripped, _ := f.removeContentBlock(string(data))
 		data = []byte(stripped)
 	}
@@ -427,38 +529,64 @@ func syncExtraImport(f ExtraFile, dryRun bool) (*ExtraResult, error) {
 		return result, nil
 	}
 	if !changed {
+		if f.place != nil {
+			return result, nil
+		}
 		clearExtraImportBase(f.Target)
 		return result, nil
 	}
 
-	if editedCopy {
-		if err := backupExtraDrift(f.Target, DriftReasonMode); err != nil {
+	change := placementChange{path: f.Target}
+	if f.place != nil {
+		change, err = f.sharedChange(extraContentFingerprint([]byte(updated)), !ourLink)
+		if err != nil {
 			return nil, err
 		}
-	}
-	if ourLink {
-		if err := os.Remove(f.Target); err != nil {
-			return nil, fmt.Errorf("failed to remove leftover symlink: %w", err)
+		change.metadata[extraWritten], change.metadata[extraImportBase] = "absent", "absent"
+		if (!exists || ourLink) && !attached {
+			change.metadata[attachCreated] = extraContentFingerprint(nil)
 		}
 	}
-	perm := os.FileMode(0644)
-	if info, statErr := os.Stat(f.Target); statErr == nil {
-		perm = info.Mode().Perm()
-	}
-	if err := os.MkdirAll(filepath.Dir(f.Target), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create parent dir: %w", err)
-	}
-	if err := os.WriteFile(f.Target, []byte(updated), perm); err != nil {
-		return nil, fmt.Errorf("failed to write target: %w", err)
-	}
-	clearExtraWritten(f.Target)
-	clearExtraImportBase(f.Target)
-	// A switch from another mode keeps the restore point recorded then.
-	if (!exists || ourLink) && !attached {
-		if err := markExtraCreated(f.Target); err != nil {
-			return nil, fmt.Errorf("failed to record created file: %w", err)
+	if err := placeExtra(f.place, change, func() error {
+		if block != nil && contentBlockHash(block.body) != block.hash {
+			if err := backupExtraDrift(f.Target, DriftReasonMode); err != nil {
+				return err
+			}
 		}
+
+		if editedCopy {
+			if err := backupExtraDrift(f.Target, DriftReasonMode); err != nil {
+				return err
+			}
+		}
+		if ourLink {
+			if err := os.Remove(f.Target); err != nil {
+				return fmt.Errorf("failed to remove leftover symlink: %w", err)
+			}
+		}
+		perm := os.FileMode(0644)
+		if info, statErr := os.Stat(f.Target); statErr == nil {
+			perm = info.Mode().Perm()
+		}
+		if err := os.MkdirAll(filepath.Dir(f.Target), 0755); err != nil {
+			return fmt.Errorf("failed to create parent dir: %w", err)
+		}
+		if err := os.WriteFile(f.Target, []byte(updated), perm); err != nil {
+			return fmt.Errorf("failed to write target: %w", err)
+		}
+		clearExtraWritten(f.Target)
+		clearExtraImportBase(f.Target)
+		// A switch from another mode keeps the restore point recorded then.
+		if (!exists || ourLink) && !attached {
+			if err := markExtraCreated(f.Target); err != nil {
+				return fmt.Errorf("failed to record created file: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
+
 	return result, nil
 }
 

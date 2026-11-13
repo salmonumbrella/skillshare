@@ -78,6 +78,8 @@ func DiscoverExtraFiles(sourcePath string) ([]string, error) {
 
 // ExtraSyncOptions holds the run flags of one extras sync or collect.
 type ExtraSyncOptions struct {
+	place     placementWriter
+	shared    *SharedExtrasRun
 	Protected map[string]bool
 	DryRun    bool
 	Force     bool
@@ -121,7 +123,7 @@ func syncExtraDir(sourcePath, targetPath, mode string, target config.ExtraTarget
 
 	switch mode {
 	case "symlink":
-		return syncExtraSymlinkMode(sourcePath, targetPath, opts.DryRun, opts.Force, opts.ProjectRoot)
+		return syncExtraSymlinkMode(sourcePath, targetPath, opts.DryRun, opts.Force, opts.ProjectRoot, opts.place)
 	case "merge", "copy":
 		return syncExtraPerFile(sourcePath, targetPath, mode, target, opts)
 	default:
@@ -149,6 +151,9 @@ func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTarget
 
 	seen := make(map[string]string) // flatten: basename → original rel
 	for _, rel := range files {
+		if opts.shared != nil && opts.shared.failed != nil {
+			break
+		}
 		srcFile := filepath.Join(absSrc, rel)
 		tgtRel := rel
 		if target.Flatten {
@@ -170,6 +175,11 @@ func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTarget
 			continue
 		}
 
+		if opts.shared != nil && opts.shared.recovered[tgtFile] {
+			result.Synced++
+			continue
+		}
+
 		// Dry-run reports the outcome without spawning the extension and without
 		// touching the filesystem. The transformed output can only be produced by
 		// a subprocess, and a preview must never execute arbitrary extension code,
@@ -187,6 +197,16 @@ func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTarget
 			continue
 		}
 
+		observed := ""
+		if opts.place != nil {
+			var err error
+			observed, err = placementFingerprint(tgtFile)
+			if err != nil {
+				result.Errors = append(result.Errors, err.Error())
+				continue
+			}
+		}
+
 		env := map[string]string{
 			"SS_SRC_PATH":   srcFile,
 			"SS_REL_PATH":   rel,
@@ -200,6 +220,7 @@ func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTarget
 			continue
 		}
 
+		remove := false
 		// Conflict/force contract, mirroring syncOneExtraFile copy semantics:
 		// only leftover symlinks auto-replace; real files and directories are
 		// never destroyed without --force.
@@ -208,10 +229,7 @@ func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTarget
 			case utils.IsLinkMode(tgtFile, info.Mode()):
 				// Leftover symlink from a different mode: safe to replace.
 				// os.Remove drops the link itself without following it.
-				if rmErr := os.Remove(tgtFile); rmErr != nil {
-					result.Errors = append(result.Errors, fmt.Sprintf("%s: failed to remove conflicting symlink: %v", rel, rmErr))
-					continue
-				}
+				remove = true
 			case info.IsDir():
 				// A real directory is never silently destroyed; require --force,
 				// then replace it wholesale with the generated file.
@@ -219,10 +237,7 @@ func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTarget
 					result.Skipped++
 					continue
 				}
-				if rmErr := os.RemoveAll(tgtFile); rmErr != nil {
-					result.Errors = append(result.Errors, fmt.Sprintf("%s: failed to remove conflicting directory: %v", rel, rmErr))
-					continue
-				}
+				remove = true
 			default:
 				// Regular file: idempotent if identical, otherwise needs --force.
 				if existing, readErr := os.ReadFile(tgtFile); readErr == nil && bytes.Equal(existing, out) {
@@ -237,14 +252,21 @@ func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTarget
 			}
 		}
 
-		if mkErr := os.MkdirAll(filepath.Dir(tgtFile), 0755); mkErr != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("%s: create target dir: %v", rel, mkErr))
-			continue
-		}
-		if wErr := os.WriteFile(tgtFile, out, 0644); wErr != nil {
+		if wErr := placeExtra(opts.place, placementChange{path: tgtFile, before: observed, after: extraContentFingerprint(out)}, func() error {
+			if remove {
+				if err := os.RemoveAll(tgtFile); err != nil {
+					return err
+				}
+			}
+			if err := os.MkdirAll(filepath.Dir(tgtFile), 0755); err != nil {
+				return err
+			}
+			return os.WriteFile(tgtFile, out, 0644)
+		}); wErr != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: write target: %v", rel, wErr))
 			continue
 		}
+
 		result.Synced++
 		result.written = append(result.written, tgtRel)
 	}
@@ -253,7 +275,11 @@ func syncExtraTransform(sourcePath, targetPath string, target config.ExtraTarget
 }
 
 // syncExtraSymlinkMode symlinks the entire source directory to the target path.
-func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool, projectRoot string) (*ExtraResult, error) {
+func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool, projectRoot string, places ...placementWriter) (*ExtraResult, error) {
+	var place placementWriter
+	if len(places) > 0 {
+		place = places[0]
+	}
 	result := &ExtraResult{}
 
 	absSrc, err := filepath.Abs(sourcePath)
@@ -281,7 +307,7 @@ func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool, pro
 						result.Synced = 1
 						return result, nil
 					}
-					if err := reformatLink(targetPath, absSrc, relative); err != nil {
+					if err := placeExtra(place, placementChange{path: targetPath, after: placementLinkAfter(place, absSrc), retainOnly: true}, func() error { return reformatLink(targetPath, absSrc, relative) }); err != nil {
 						return nil, fmt.Errorf("failed to reformat directory symlink: %w", err)
 					}
 					result.Synced = 1
@@ -293,19 +319,11 @@ func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool, pro
 				result.Skipped = 1
 				return result, nil
 			}
-			if !dryRun {
-				if err := os.Remove(targetPath); err != nil {
-					return nil, fmt.Errorf("failed to remove wrong symlink: %w", err)
-				}
-			}
 		} else {
 			// Real file/dir
 			if !force {
 				result.Skipped = 1
 				return result, nil
-			}
-			if !dryRun {
-				os.RemoveAll(targetPath)
 			}
 		}
 	}
@@ -315,13 +333,25 @@ func syncExtraSymlinkMode(sourcePath, targetPath string, dryRun, force bool, pro
 		return result, nil
 	}
 
-	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create parent directory: %w", err)
+	if err := placeExtra(place, placementChange{path: targetPath, after: placementLinkAfter(place, absSrc)}, func() error {
+		if lstatErr == nil {
+			if err := os.RemoveAll(targetPath); err != nil {
+				return err
+			}
+		}
+
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+			return fmt.Errorf("failed to create parent directory: %w", err)
+		}
+		relative := shouldUseRelative(projectRoot, absSrc, targetPath)
+		if err := createLink(targetPath, absSrc, relative); err != nil {
+			return fmt.Errorf("failed to create directory symlink: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	relative := shouldUseRelative(projectRoot, absSrc, targetPath)
-	if err := createLink(targetPath, absSrc, relative); err != nil {
-		return nil, fmt.Errorf("failed to create directory symlink: %w", err)
-	}
+
 	result.Synced = 1
 	return result, nil
 }
@@ -336,6 +366,13 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 	var copies *copyTracker
 	if mode == "merge" {
 		copies = loadCopyTracker(targetPath)
+		if opts.place != nil {
+			var err error
+			copies, err = loadSharedCopyTracker(targetPath)
+			if err != nil {
+				return nil, opts.shared.latch(err)
+			}
+		}
 		if !canCreateFileLink() {
 			mode = "copy"
 			result.Warnings = append(result.Warnings, FileLinkFallbackWarning)
@@ -359,6 +396,9 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 	relative := shouldUseRelative(projectRoot, sourcePath, targetPath)
 
 	for _, rel := range files {
+		if opts.shared != nil && opts.shared.failed != nil {
+			break
+		}
 		srcFile := filepath.Join(absSrc, rel)
 		tgtRel := rel
 		if target.Flatten {
@@ -374,7 +414,7 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 		}
 		tgtFile := filepath.Join(targetPath, tgtRel)
 
-		synced, skipped, syncErr := syncOneExtraFile(srcFile, tgtFile, mode, dryRun, force, relative, copies, tgtRel, opts.Protected, &result.written)
+		synced, skipped, syncErr := syncOneExtraFile(srcFile, tgtFile, mode, dryRun, force, relative, copies, tgtRel, opts.Protected, &result.written, opts.place)
 		if syncErr != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", rel, syncErr))
 			continue
@@ -389,6 +429,10 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 				result.Preserved += skipped
 			}
 		}
+	}
+
+	if opts.shared != nil && opts.shared.failed != nil {
+		return result, nil
 	}
 
 	// Prune merge-mode symlink orphans (only when not dry-run). Copy targets do
@@ -441,14 +485,21 @@ func syncExtraPerFile(sourcePath, targetPath, mode string, target config.ExtraTa
 // syncOneExtraFile syncs a single file. Returns (synced, skipped, error).
 // copies, when set, tracks copies made in place of merge-mode links under
 // the target-relative name tgtRel.
-func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force, relative bool, copies *copyTracker, tgtRel string, protected map[string]bool, written *[]string) (int, int, error) {
+func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force, relative bool, copies *copyTracker, tgtRel string, protected map[string]bool, written *[]string, places ...placementWriter) (int, int, error) {
 	if protectedOutput(tgtFile, protected) {
 		return 0, 1, nil
 	}
-	// Ensure parent directory exists
-	if !dryRun {
-		if err := os.MkdirAll(filepath.Dir(tgtFile), 0755); err != nil {
-			return 0, 0, fmt.Errorf("failed to create parent dir: %w", err)
+	var place placementWriter
+	if len(places) > 0 {
+		place = places[0]
+	}
+
+	observed := ""
+	if place != nil {
+		var err error
+		observed, err = placementFingerprint(tgtFile)
+		if err != nil {
+			return 0, 0, err
 		}
 	}
 
@@ -468,7 +519,7 @@ func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force, relative boo
 					}
 					// Correct target but wrong format — recreate
 					if !dryRun {
-						if err := reformatLink(tgtFile, srcFile, relative); err != nil {
+						if err := placeExtra(place, placementChange{path: tgtFile, before: observed, after: placementLinkAfter(place, srcFile), retainOnly: true}, func() error { return reformatLink(tgtFile, srcFile, relative) }); err != nil {
 							return 0, 0, fmt.Errorf("failed to reformat symlink: %w", err)
 						}
 					}
@@ -493,33 +544,68 @@ func syncOneExtraFile(srcFile, tgtFile, mode string, dryRun, force, relative boo
 			return 0, 1, nil
 		}
 
-		if !dryRun {
-			if err := os.Remove(tgtFile); err != nil {
-				return 0, 0, fmt.Errorf("failed to remove conflicting file: %w", err)
-			}
-		}
 	}
 
 	if dryRun {
 		return 1, 0, nil
 	}
 
-	switch mode {
-	case "merge":
-		if err := createLink(tgtFile, srcFile, relative); err != nil {
-			return 0, 0, fmt.Errorf("failed to create symlink: %w", err)
+	after := placementLinkAfter(place, srcFile)
+	writeCopy := func() error { return copyFile(srcFile, tgtFile) }
+	if mode == "copy" && place != nil {
+		data, err := os.ReadFile(srcFile)
+		if err != nil {
+			return 0, 0, err
 		}
-		if copies != nil {
-			copies.forget(tgtRel)
+		info, err := os.Stat(srcFile)
+		if err != nil {
+			return 0, 0, err
 		}
-	case "copy":
-		if err := copyFile(srcFile, tgtFile); err != nil {
-			return 0, 0, fmt.Errorf("failed to copy file: %w", err)
-		}
-		if copies != nil {
-			copies.record(tgtRel)
-		}
+		after = extraContentFingerprint(data)
+		writeCopy = func() error { return os.WriteFile(tgtFile, data, info.Mode().Perm()) }
 	}
+	change := placementChange{path: tgtFile, before: observed, after: after}
+	if copies != nil && place != nil {
+		change.metadata = map[string]string{"fallback": "absent"}
+		if mode == "copy" {
+			change.metadata["fallback"] = after
+		}
+		change.fallback = mode == "copy"
+	}
+	if err := placeExtra(place, change, func() error {
+		if err := os.MkdirAll(filepath.Dir(tgtFile), 0755); err != nil {
+			return err
+		}
+		if lstatErr == nil {
+			if err := os.Remove(tgtFile); err != nil {
+				return err
+			}
+		}
+
+		switch mode {
+		case "merge":
+			if err := createLink(tgtFile, srcFile, relative); err != nil {
+				return fmt.Errorf("failed to create symlink: %w", err)
+			}
+			if copies != nil {
+				copies.forget(tgtRel)
+			}
+		case "copy":
+			if err := writeCopy(); err != nil {
+				return fmt.Errorf("failed to copy file: %w", err)
+			}
+			if copies != nil {
+				copies.record(tgtRel)
+			}
+		}
+		if copies != nil && place != nil {
+			return copies.save()
+		}
+		return nil
+	}); err != nil {
+		return 0, 0, err
+	}
+
 	if written != nil {
 		*written = append(*written, tgtRel)
 	}

@@ -2,6 +2,7 @@ package sync
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -27,7 +28,11 @@ type Manifest struct {
 
 // ReadManifest reads the manifest from a target directory.
 // Returns an empty manifest if the file does not exist.
-func ReadManifest(targetPath string) (*Manifest, error) {
+func ReadManifest(targetPath string) (*Manifest, error) { return readManifest(targetPath, false) }
+
+// Strict observations are reserved for shared placement recovery. Ordinary
+// callers retain the historical rebuild-on-corruption behavior.
+func readManifest(targetPath string, strict bool) (*Manifest, error) {
 	p := filepath.Join(targetPath, ManifestFile)
 	data, err := os.ReadFile(p)
 	if err != nil {
@@ -39,6 +44,9 @@ func ReadManifest(targetPath string) (*Manifest, error) {
 
 	var m Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
+		if strict {
+			return nil, fmt.Errorf("invalid native copy manifest: %w", err)
+		}
 		// Corrupt manifest — treat as empty so next sync rebuilds it.
 		return &Manifest{Managed: make(map[string]string), Mtimes: make(map[string]int64), Naming: make(map[string]string)}, nil
 	}

@@ -305,32 +305,50 @@ func applyExtraBlock(f ExtraFile, dryRun, overwriteEdited bool) (*ExtraResult, e
 		return result, nil
 	}
 
-	if editedCopy {
-		if err := backupExtraDrift(f.Target, DriftReasonMode); err != nil {
+	change := placementChange{path: f.Target}
+	if f.place != nil {
+		change, err = f.sharedChange(extraContentFingerprint([]byte(updated)), !ourLink)
+		if err != nil {
 			return nil, err
 		}
-	}
-	if ourLink {
-		if err := os.Remove(f.Target); err != nil {
-			return nil, fmt.Errorf("failed to remove leftover symlink: %w", err)
+		change.metadata[extraWritten] = "absent"
+		if (!exists || ourLink) && !attached {
+			change.metadata[attachCreated] = extraContentFingerprint(nil)
 		}
 	}
-	perm := os.FileMode(0644)
-	if info, statErr := os.Stat(f.Target); statErr == nil {
-		perm = info.Mode().Perm()
-	}
-	if err := os.MkdirAll(filepath.Dir(f.Target), 0755); err != nil {
-		return nil, fmt.Errorf("failed to create parent dir: %w", err)
-	}
-	if err := os.WriteFile(f.Target, []byte(updated), perm); err != nil {
-		return nil, fmt.Errorf("failed to write target: %w", err)
-	}
-	clearExtraWritten(f.Target)
-	if (!exists || ourLink) && !attached {
-		if err := markExtraCreated(f.Target); err != nil {
-			return nil, fmt.Errorf("failed to record created file: %w", err)
+	if err := placeExtra(f.place, change, func() error {
+
+		if editedCopy {
+			if err := backupExtraDrift(f.Target, DriftReasonMode); err != nil {
+				return err
+			}
 		}
+		if ourLink {
+			if err := os.Remove(f.Target); err != nil {
+				return fmt.Errorf("failed to remove leftover symlink: %w", err)
+			}
+		}
+		perm := os.FileMode(0644)
+		if info, statErr := os.Stat(f.Target); statErr == nil {
+			perm = info.Mode().Perm()
+		}
+		if err := os.MkdirAll(filepath.Dir(f.Target), 0755); err != nil {
+			return fmt.Errorf("failed to create parent dir: %w", err)
+		}
+		if err := os.WriteFile(f.Target, []byte(updated), perm); err != nil {
+			return fmt.Errorf("failed to write target: %w", err)
+		}
+		clearExtraWritten(f.Target)
+		if (!exists || ourLink) && !attached {
+			if err := markExtraCreated(f.Target); err != nil {
+				return fmt.Errorf("failed to record created file: %w", err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
+
 	return result, nil
 }
 

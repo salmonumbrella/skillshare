@@ -686,17 +686,26 @@ func extrasSyncStatus(results []extraSyncResult) (string, int) {
 // Per-target failures are reported in the results. Callers must hold s.mu.
 func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult, error) {
 	var session *syncpkg.SharedExtrasRun
+	cfg := s.cfg
 	if !s.IsProjectMode() {
 		var err error
-		session, err = syncpkg.BeginSharedExtras(s.cfg, dryRun)
+		session, err = syncpkg.BeginSharedExtras(cfg, dryRun, syncpkg.SharedExtrasScope{Name: name})
 		if err != nil {
 			return nil, err
 		}
 	}
 
+	defer session.Close()
+	if session != nil {
+		cfg = session.Config()
+	}
+	extras := cfg.Extras
+	if s.IsProjectMode() {
+		extras = s.extrasConfig()
+	}
 	projectRoot := s.projectRoot
-	source := s.cfg.EffectiveSkillsSource()
-	extrasSource := s.cfg.EffectiveExtrasSource()
+	source := cfg.EffectiveSkillsSource()
+	extrasSource := cfg.EffectiveExtrasSource()
 	var projectExtrasParent string
 	if s.IsProjectMode() {
 		projectExtrasParent = s.projectCfg.EffectiveExtrasSource(s.projectRoot)
@@ -704,15 +713,16 @@ func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult,
 
 	opts := syncpkg.ExtraRunOptions{
 		Protected:        session.Protected(),
+		Shared:           session,
 		DryRun:           dryRun,
 		Force:            force,
 		ProjectRoot:      projectRoot,
 		ResolvePath:      func(path string) string { return resolveExtrasTargetPath(projectRoot, path) },
 		ResolveExtension: s.resolveExtensionSpec,
 	}
-	for _, extra := range s.extrasConfig() {
+	for _, extra := range extras {
 		if extra.Name == config.AgentsExtraName {
-			opts.AgentTargetPaths = s.extrasAgentTargetPaths()
+			opts.AgentTargetPaths = s.extrasAgentTargetPaths(cfg)
 			break
 		}
 	}
@@ -734,7 +744,7 @@ func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult,
 		results = append(results, extraSyncResult{Name: detached.Name, Targets: []extraTargetSyncResult{target}})
 	}
 
-	for _, extra := range s.extrasConfig() {
+	for _, extra := range extras {
 		if name != "" && extra.Name != name {
 			continue
 		}
@@ -746,7 +756,7 @@ func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult,
 		}
 
 		run := syncpkg.RunExtraTargets(extra, sourceDir, opts)
-		session.Record(extra, sourceDir, run, nil)
+
 		result := extraSyncResult{
 			Name:    extra.Name,
 			Targets: make([]extraTargetSyncResult, 0, len(extra.Targets)),
@@ -799,15 +809,23 @@ func (s *Server) syncExtras(name string, dryRun, force bool) ([]extraSyncResult,
 
 // extrasAgentTargetPaths returns the agents sync target paths for
 // syncpkg.ExtraRunOptions.AgentTargetPaths. Callers must hold s.mu.
-func (s *Server) extrasAgentTargetPaths() map[string]bool {
+func (s *Server) extrasAgentTargetPaths(configs ...*config.Config) map[string]bool {
+	cfg := s.cfg
+	if len(configs) > 0 {
+		cfg = configs[0]
+	}
 	builtinAgents := s.builtinAgentTargets()
 	var paths []string
-	for name, target := range s.cfg.Targets {
+	for name, target := range cfg.Targets {
 		if p := resolveAgentPath(target, builtinAgents, name, s.IsProjectMode()); p != "" {
 			paths = append(paths, resolveExtrasTargetPath(s.projectRoot, p))
 		}
 	}
-	return syncpkg.AgentTargetPaths(s.agentsSource(), paths)
+	source := s.agentsSource()
+	if !s.IsProjectMode() {
+		source = cfg.EffectiveAgentsSource()
+	}
+	return syncpkg.AgentTargetPaths(source, paths)
 }
 
 // handleExtrasMode — PATCH /api/extras/{name}/mode

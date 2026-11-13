@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,67 @@ import (
 	"skillshare/internal/config"
 	"skillshare/internal/testutil"
 )
+
+func TestSharedCopyReceiptSaveFailureRecoversBeforeDetach(t *testing.T) {
+	sb, cfg, source, target := sharedRunFixture(t, "copy", false)
+	sb.WriteFile(filepath.Join(source, "control.md"), "already here\n")
+	sb.WriteFile(filepath.Join(target, "control.md"), "already here\n")
+	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fault := errors.New("receipt replacement fault")
+	session.state.SetWriteFaultForTest(func() error {
+		if session.state.State.Pending == nil {
+			return fault
+		}
+		return nil
+	})
+	run := RunExtraTargets(cfg.Extras[0], source, ExtraRunOptions{ResolvePath: config.ExpandPath, Shared: session})
+	if len(run.Targets) != 1 || run.Targets[0].Result == nil || len(run.Targets[0].Result.Errors) == 0 {
+		t.Fatalf("receipt fault was not surfaced: %+v", run)
+	}
+	if got := sb.ReadFile(filepath.Join(target, "fixture.md")); got != "managed content\n" {
+		t.Fatalf("native copy did not complete: %q", got)
+	}
+	if !errors.Is(session.Save(), fault) {
+		t.Fatal("failed run did not retain its receipt-save error")
+	}
+	session.Close()
+	// A fresh run must recover ownership without treating the identical copy as
+	// a pre-existing user file. The sibling present before the intent stays local.
+	retry, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(retry.Close)
+	if err != nil {
+		t.Fatal(err)
+	}
+	RunExtraTargets(retry.Config().Extras[0], source, ExtraRunOptions{ResolvePath: config.ExpandPath, Shared: retry})
+	if err := retry.Save(); err != nil {
+		t.Fatal(err)
+	}
+	retry.Close()
+	sb.WriteFile(filepath.Join(filepath.Dir(sb.ConfigPath), "team.yaml"), "version: 1\nextras: []\n")
+	cfg, err = config.LoadReadOnlyPath(sb.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detach, err := BeginSharedExtras(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer detach.Close()
+	results := detach.Detach(config.ExpandPath)
+	if len(results) != 1 || len(results[0].Errors) != 0 {
+		t.Fatalf("detach=%+v", results)
+	}
+	if _, err := os.Lstat(filepath.Join(target, "fixture.md")); !os.IsNotExist(err) {
+		t.Fatalf("recovered copy remained after removal: %v", err)
+	}
+	if got := sb.ReadFile(filepath.Join(target, "control.md")); got != "already here\n" {
+		t.Fatalf("identical pre-existing control changed: %q", got)
+	}
+}
 
 func TestSharedOutputSettingsChangeDetachesPriorOutputs(t *testing.T) {
 	for _, change := range []string{"extension", "relative-extension", "flatten", "include", "exclude", "local-include"} {
@@ -47,18 +109,22 @@ func TestSharedOutputSettingsChangeDetachesPriorOutputs(t *testing.T) {
 					return &ExtensionSpec{Name: name, Run: []string{"cat"}, Dir: source, OutputExt: ext}, nil
 				}}
 				session, err := BeginSharedExtras(cfg, false)
+				t.Cleanup(session.Close)
 				if err != nil {
 					t.Fatal(err)
 				}
+				opts.Shared = session
 				run := RunExtraTargets(cfg.Extras[0], source, opts)
 				if len(run.Targets) != 1 || run.Targets[0].Err != nil || run.Targets[0].Result == nil || len(run.Targets[0].Result.Errors) > 0 {
 					t.Fatalf("initial apply=%+v", run)
 				}
-				session.Record(cfg.Extras[0], source, run, nil)
+
 				if err := session.Save(); err != nil {
 					t.Fatal(err)
 				}
+				session.Close()
 				session, err = BeginSharedExtras(cfg, false)
+				t.Cleanup(session.Close)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -88,7 +154,9 @@ func TestSharedOutputSettingsChangeDetachesPriorOutputs(t *testing.T) {
 					settings = "" // The local override changes output selection.
 				}
 				cfg = writeDeclaration(settings)
+				session.Close()
 				session, err = BeginSharedExtras(cfg, false)
+				t.Cleanup(session.Close)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -103,12 +171,12 @@ func TestSharedOutputSettingsChangeDetachesPriorOutputs(t *testing.T) {
 				} else if _, err := os.Lstat(oldOutput); !os.IsNotExist(err) {
 					t.Fatalf("stale output remains: %s: %v", oldOutput, err)
 				}
-				opts.Force, opts.Protected = true, session.Protected()
+				opts.Force, opts.Protected, opts.Shared = true, session.Protected(), session
 				run = RunExtraTargets(cfg.Extras[0], source, opts)
 				if run.Targets[0].Err != nil || run.Targets[0].Result == nil || len(run.Targets[0].Result.Errors) != 0 {
 					t.Fatalf("replacement apply=%+v", run)
 				}
-				session.Record(cfg.Extras[0], source, run, nil)
+
 				if err := session.Save(); err != nil {
 					t.Fatal(err)
 				}
@@ -150,6 +218,7 @@ func TestSharedOutputSettingsSelectedTargetKeepsOtherDeclaration(t *testing.T) {
 	applySharedFixture(t, cfg, source)
 	cfg = writeDeclaration(true)
 	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,15 +227,17 @@ func TestSharedOutputSettingsSelectedTargetKeepsOtherDeclaration(t *testing.T) {
 	}
 	extra := cfg.Extras[0]
 	extra.Targets = extra.Targets[:1]
-	run := RunExtraTargets(extra, source, ExtraRunOptions{ResolvePath: config.ExpandPath, Protected: session.Protected()})
-	session.Record(extra, source, run, nil)
+	RunExtraTargets(extra, source, ExtraRunOptions{ResolvePath: config.ExpandPath, Protected: session.Protected(), Shared: session})
+
 	if err := session.Save(); err != nil {
 		t.Fatal(err)
 	}
 	if sb.ReadFile(filepath.Join(other, "nested", "guide.md")) != "guide\n" {
 		t.Fatal("selected sync touched unselected target")
 	}
+	session.Close()
 	session, err = BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +261,7 @@ func TestSharedSameOutputSettingsLocalHandoffAndNoPointer(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +287,9 @@ func TestSharedSameOutputSettingsLocalHandoffAndNoPointer(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.Shared = nil
+	session.Close()
 	session, err = BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if session != nil || err != nil || len(session.Detach(config.ExpandPath)) != 0 || session.Save() != nil || before != sb.ReadFile(statePath) {
 		t.Fatal("no-pointer touched shared state")
 	}
@@ -243,22 +317,24 @@ func sharedRunFixture(t *testing.T, mode string, single bool) (*testutil.Sandbox
 func applySharedFixture(t *testing.T, cfg *config.Config, source string) *SharedExtrasRun {
 	t.Helper()
 	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
 	session.Detach(config.ExpandPath)
 	for _, extra := range cfg.Extras {
-		run := RunExtraTargets(extra, source, ExtraRunOptions{ResolvePath: config.ExpandPath, Protected: session.Protected()})
+		run := RunExtraTargets(extra, source, ExtraRunOptions{ResolvePath: config.ExpandPath, Protected: session.Protected(), Shared: session})
 		for _, target := range run.Targets {
 			if target.Err != nil || target.Result == nil || len(target.Result.Errors) > 0 {
 				t.Fatalf("apply=%+v", target)
 			}
 		}
-		session.Record(extra, source, run, nil)
+
 	}
 	if err := session.Save(); err != nil {
 		t.Fatal(err)
 	}
+	session.Close()
 	return session
 }
 
@@ -284,6 +360,7 @@ func TestSharedExtrasDetachMatrix(t *testing.T) {
 					t.Fatal(err)
 				}
 				session, err := BeginSharedExtras(cfg, false)
+				t.Cleanup(session.Close)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -328,6 +405,7 @@ func TestSharedCopyReceiptsExcludeIdenticalPreexisting(t *testing.T) {
 				t.Fatal(err)
 			}
 			session, err := BeginSharedExtras(cfg, false)
+			t.Cleanup(session.Close)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -364,6 +442,7 @@ func TestSharedDetachProtectsEditedReplacementAndLocalOverride(t *testing.T) {
 					t.Fatal(err)
 				}
 				session, err := BeginSharedExtras(cfg, false)
+				t.Cleanup(session.Close)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -371,8 +450,8 @@ func TestSharedDetachProtectsEditedReplacementAndLocalOverride(t *testing.T) {
 				if len(results) != 1 || len(results[0].Kept) != 1 {
 					t.Fatalf("detach=%+v", results)
 				}
-				run := RunExtraTargets(cfg.Extras[0], replacement, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Protected: session.Protected()})
-				session.Record(cfg.Extras[0], replacement, run, nil)
+				RunExtraTargets(cfg.Extras[0], replacement, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Protected: session.Protected(), Shared: session})
+
 				if sb.ReadFile(output) != "edited by user\n" {
 					t.Fatal("force overwrote protected output")
 				}
@@ -398,6 +477,7 @@ func TestSharedDetachDryRunAndNoPointer(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, err := BeginSharedExtras(cfg, true)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,6 +552,7 @@ func TestSharedMergeReplacedLinkVanishedSourceProtectsForce(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +560,7 @@ func TestSharedMergeReplacedLinkVanishedSourceProtectsForce(t *testing.T) {
 	if len(detached) != 1 || len(detached[0].Kept) != 1 {
 		t.Fatalf("detach=%+v", detached)
 	}
-	RunExtraTargets(cfg.Extras[0], replacement, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Protected: session.Protected()})
+	RunExtraTargets(cfg.Extras[0], replacement, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Protected: session.Protected(), Shared: session})
 	if sb.ReadFile(output) != "local replacement\n" {
 		t.Fatal("force erased replaced link")
 	}
@@ -504,6 +585,7 @@ func TestSharedFailedDetachRetainedAndRetried(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(target, 0755) })
 	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +599,9 @@ func TestSharedFailedDetachRetainedAndRetried(t *testing.T) {
 	if err := os.Chmod(target, 0755); err != nil {
 		t.Fatal(err)
 	}
+	session.Close()
 	retry, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(retry.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,6 +634,7 @@ func TestSharedSamePathModeAndFileIdentityDetach(t *testing.T) {
 				t.Fatal(err)
 			}
 			session, err := BeginSharedExtras(cfg, false)
+			t.Cleanup(session.Close)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -622,6 +707,7 @@ func TestSharedMergeReplacedForeignLinkIsProtected(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +715,7 @@ func TestSharedMergeReplacedForeignLinkIsProtected(t *testing.T) {
 	if len(results) != 1 || len(results[0].Kept) != 1 {
 		t.Fatalf("detach=%+v", results)
 	}
-	RunExtraTargets(cfg.Extras[0], replacement, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Protected: session.Protected()})
+	RunExtraTargets(cfg.Extras[0], replacement, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Protected: session.Protected(), Shared: session})
 	dest, err := os.Readlink(output)
 	if err != nil || dest != foreign {
 		t.Fatalf("link replaced: %q %v", dest, err)
@@ -655,6 +741,7 @@ func TestSharedMergeDoesNotAcquirePreexistingLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -711,6 +798,7 @@ func TestSharedDetachDoesNotFollowReplacedParent(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -721,7 +809,7 @@ func TestSharedDetachDoesNotFollowReplacedParent(t *testing.T) {
 	if sb.ReadFile(filepath.Join(native, "own.md")) != "same content\n" {
 		t.Fatal("native file removed")
 	}
-	RunExtraTargets(config.ExtraConfig{Targets: []config.ExtraTargetConfig{{Path: target, Mode: "copy"}}}, source, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Protected: session.Protected()})
+	RunExtraTargets(config.ExtraConfig{Targets: []config.ExtraTargetConfig{{Path: target, Mode: "copy"}}}, source, ExtraRunOptions{ResolvePath: config.ExpandPath, Force: true, Protected: session.Protected(), Shared: session})
 	if sb.ReadFile(filepath.Join(native, "own.md")) != "same content\n" {
 		t.Fatal("native file overwritten")
 	}
@@ -742,6 +830,7 @@ func TestSharedDetachSelectionPreservesOtherReceipts(t *testing.T) {
 		t.Fatal(err)
 	}
 	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -754,5 +843,35 @@ func TestSharedDetachSelectionPreservesOtherReceipts(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(other, "fixture.md")); err != nil {
 		t.Fatal("unselected target touched", err)
+	}
+}
+
+func TestSharedFallbackRecoveryRefusesMalformedNativeMetadata(t *testing.T) {
+	restore := SetFileLinksForTest(false)
+	defer restore()
+	sb, cfg, source, target := sharedRunFixture(t, "merge", false)
+	session, err := BeginSharedExtras(cfg, false)
+	t.Cleanup(session.Close)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.state.SetWriteFaultForTest(func() error {
+		if session.state.State.Pending == nil {
+			return errors.New("promotion failed")
+		}
+		return nil
+	})
+	RunExtraTargets(cfg.Extras[0], source, ExtraRunOptions{ResolvePath: config.ExpandPath, Shared: session})
+	session.Close()
+	statePath, _ := config.SharedStatePath(sb.ConfigPath)
+	before := sb.ReadFile(statePath)
+	output := sb.ReadFile(filepath.Join(target, "fixture.md"))
+	sb.WriteFile(filepath.Join(target, ManifestFile), "{malformed")
+	if retry, err := BeginSharedExtras(cfg, false); err == nil {
+		retry.Close()
+		t.Fatal("ambiguous tracker was rebuilt during recovery")
+	}
+	if sb.ReadFile(statePath) != before || sb.ReadFile(filepath.Join(target, "fixture.md")) != output || sb.ReadFile(filepath.Join(target, ManifestFile)) != "{malformed" {
+		t.Fatal("refusal changed evidence")
 	}
 }

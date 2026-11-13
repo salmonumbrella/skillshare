@@ -86,6 +86,10 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 		}
 		return err
 	}
+	defer sharedRun.Close()
+	if sharedRun != nil {
+		cfg = sharedRun.Config()
+	}
 	totals := extrasSyncTotals{width: extrasRowWidth(cfg.Extras)}
 	jsonEntries := sharedDetachEntries(sharedRun.Detach(config.ExpandPath), jsonOutput, &totals)
 	if len(cfg.Extras) == 0 && sharedRun == nil {
@@ -145,6 +149,7 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 		DryRun:      dryRun,
 		Force:       force,
 		Protected:   sharedRun.Protected(),
+		Shared:      sharedRun,
 		ResolvePath: config.ExpandPath,
 		ResolveExtension: func(ext string) (*sync.ExtensionSpec, error) {
 			return resolveExtension(ext, globalExtensionsDir())
@@ -156,7 +161,7 @@ func cmdSyncExtrasGlobal(dryRun, force, jsonOutput, partOfAll bool, start time.T
 		extraSource := config.ResolveExtrasSourceDir(extra, cfg.EffectiveExtrasSource(), cfg.EffectiveSkillsSource())
 
 		run := sync.RunExtraTargets(extra, extraSource, opts)
-		sharedRun.Record(extra, extraSource, run, nil)
+
 		if run.SourceMissing {
 			printMissingExtraSource(extra.Name, extraSource, jsonOutput)
 			if jsonOutput {
@@ -392,6 +397,7 @@ func runExtrasSyncEntries(extras []config.ExtraConfig, sourceFunc func(config.Ex
 	}
 	opts := sync.ExtraRunOptions{
 		Protected:   session.Protected(),
+		Shared:      session,
 		DryRun:      dryRun,
 		Force:       force,
 		ProjectRoot: projectRoot,
@@ -408,7 +414,7 @@ func runExtrasSyncEntries(extras []config.ExtraConfig, sourceFunc func(config.Ex
 		entry := syncExtrasJSONEntry{Name: extra.Name}
 		sourceDir := sourceFunc(extra)
 		run := sync.RunExtraTargets(extra, sourceDir, opts)
-		session.Record(extra, sourceDir, run, nil)
+
 		if run.SourceMissing {
 			entry.Targets = []syncExtrasJSONTarget{}
 		}

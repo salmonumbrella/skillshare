@@ -48,6 +48,10 @@ func runGlobalExtrasSyncEntries(cfg *config.Config, dryRun, force bool, agentPat
 	if err != nil {
 		return nil, err
 	}
+	defer session.Close()
+	if session != nil {
+		cfg = session.Config()
+	}
 	totals := extrasSyncTotals{}
 	entries := sharedDetachEntries(session.Detach(config.ExpandPath), true, &totals)
 	applied, applyErr := runExtrasSyncEntries(cfg.Extras, func(extra config.ExtraConfig) string {

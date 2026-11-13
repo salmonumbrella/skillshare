@@ -84,11 +84,31 @@ async function click(page, target) {
   await page.mouse.click(tip.x, tip.y);
 }
 
-async function shot(page, side, state, title, group = 'desktop') {
-  await caption(page, title);
-  await page.evaluate(() => window.scrollTo(0, 0));
-  assert.ok(await page.locator('html').evaluate(el => el.classList.contains('dark')));
-  const metrics = await page.evaluate(() => ({
+async function settleCapture(page, expectDialog) {
+  // Role visibility excludes exit ghosts and can precede the first opaque paint.
+  // Observe real animations; never finish/disable them (the recorder needs them).
+  await page.waitForFunction(expectDialog => {
+    if (document.querySelector('.ss-ghost, .ss-menu')) return false;
+    const dialogs = [...document.querySelectorAll('.ss-scrim[role="dialog"][aria-modal="true"]')];
+    if (dialogs.length !== Number(expectDialog)) return false;
+    if (document.querySelectorAll('.ss-dlg').length !== Number(expectDialog)) return false;
+    if (!expectDialog && document.querySelector('.ss-scrim')) return false;
+    const layers = [...document.querySelectorAll('.ss-scrim, .ss-dlg, .ss-toast')];
+    return layers.every(el => {
+      const style = getComputedStyle(el);
+      const r = el.getBoundingClientRect();
+      return !el.closest('[inert], [aria-hidden="true"]') && style.visibility === 'visible'
+        && Number(style.opacity) === 1 && r.width > 0 && r.height > 0
+        && r.bottom > 52 && r.top < innerHeight && r.right > 0 && r.left < innerWidth
+        // Own animations only: a toast's countdown and loading spinners keep running.
+        && el.getAnimations().every(animation => !animation.pending
+          && (animation.playState === 'finished' || animation.playState === 'idle'));
+    });
+  }, expectDialog, { timeout: 10000, polling: 'raf' });
+}
+
+function captureMetrics() {
+  return {
     viewport: { width: innerWidth, height: innerHeight }, devicePixelRatio,
     scroll: { x: scrollX, y: scrollY }, crop: { x: 0, y: 0, width: innerWidth, height: innerHeight },
     background: getComputedStyle(document.body).backgroundColor,
@@ -96,9 +116,31 @@ async function shot(page, side, state, title, group = 'desktop') {
       const r = el.getBoundingClientRect();
       return { text: el.textContent, x: r.x, y: r.y, width: r.width, height: r.height, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth };
     }),
-  }));
+    layers: [...document.querySelectorAll('.ss-scrim, .ss-dlg, .ss-menu, .ss-toast, .ss-ghost')].map(el => {
+      const r = el.getBoundingClientRect();
+      const style = getComputedStyle(el);
+      return {
+        classes: el.className, text: el.textContent, x: r.x, y: r.y, width: r.width, height: r.height,
+        opacity: style.opacity, visibility: style.visibility, transform: style.transform,
+        hidden: Boolean(el.closest('[inert], [aria-hidden="true"]')),
+        moving: el.getAnimations().some(animation => animation.pending
+          || (animation.playState !== 'finished' && animation.playState !== 'idle')),
+      };
+    }),
+  };
+}
+
+async function shot(page, side, state, title, { group = 'desktop', dialog = false } = {}) {
+  await caption(page, title);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  assert.ok(await page.locator('html').evaluate(el => el.classList.contains('dark')));
+  await settleCapture(page, dialog);
+  const metrics = await page.evaluate(captureMetrics);
+  assert.equal(await page.getByRole('dialog').count(), Number(dialog), `${state}: expected live dialog state`);
+  assert.equal(await page.locator('.ss-ghost, .ss-menu').count(), 0, `${state}: no closing overlay or menu`);
   const file = `${group}-${side}-${state}.png`;
   await page.screenshot({ path: path.join(output, file), fullPage: false });
+  assert.deepEqual(await page.evaluate(captureMetrics), metrics, `${state}: frame changed during PNG capture`);
   manifest.captures.push({ side, state, group, file, title, metrics });
 }
 
@@ -204,6 +246,7 @@ async function openConfirmation(s, name) {
   await click(s.page, row(s.page, name).getByRole('button', { name: s.t('dashboard.trackedRepos.actions'), exact: true }));
   await click(s.page, s.page.getByRole('menuitem', { name: s.t('dashboard.trackedRepos.uninstall'), exact: true }));
   await s.page.getByRole('dialog').waitFor();
+  await settleCapture(s.page, true);
 }
 async function deleteClick(s) {
   const response = s.page.waitForResponse(response => response.request().method() === 'DELETE' && response.url().includes('/api/repos/'));
@@ -258,7 +301,7 @@ async function desktop(side) {
       const text = await page.getByRole('dialog').innerText();
       assert.ok(text.includes(s.t('dashboard.trackedRepos.uninstallConfirm.record', { name })));
       assert.equal(/trash|force/i.test(text), false);
-      await shot(page, side, `${name.slice(1)}-confirm`, 'Record-only confirmation: files stay in place');
+      await shot(page, side, `${name.slice(1)}-confirm`, 'Record-only confirmation: files stay in place', { dialog: true });
       const response = await deleteClick(s);
       await success(s, name, response, false);
       await shot(page, side, `${name.slice(1)}-result`, 'Record removed: row gone and actual record-removal toast');
@@ -271,21 +314,21 @@ async function desktop(side) {
     await page.route('**/api/repos/_blocked*', route => route.request().method() === 'DELETE'
       ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Synthetic CI record-removal failure' }) }) : route.fallback());
     await openConfirmation(s, '_blocked');
-    await shot(page, side, 'blocked-confirm', 'Synthetic error fixture: initial record-only confirmation');
+    await shot(page, side, 'blocked-confirm', 'Synthetic error fixture: initial record-only confirmation', { dialog: true });
     const blocked = await deleteClick(s);
     assert.equal(blocked.status(), 500);
     await page.getByText('Synthetic CI record-removal failure', { exact: true }).waitFor();
     assert.equal(await page.getByRole('button', { name: s.t('resources.uninstall.retryForce'), exact: true }).count(), 0);
     assert.ok(await row(page, '_blocked').isVisible());
     assert.ok(JSON.parse(await readFile(fixture.metadata, 'utf8')).entries._blocked);
-    await shot(page, side, 'blocked-error', 'Synthetic nonforceable failure: record stays, no force action');
+    await shot(page, side, 'blocked-error', 'Synthetic nonforceable failure: record stays, no force action', { dialog: true });
     await page.waitForTimeout(2000);
     await click(page, page.getByRole('dialog').getByRole('button', { name: s.t('common.cancel'), exact: true }));
     check('after: labelled synthetic nonforceable error keeps record/row and offers no force');
 
     for (const [name, refusal] of [['_restored', null], ['_restored-dirty', 'repo_dirty'], ['_restored-status', 'repo_status_failed']]) {
       await openConfirmation(s, name);
-      await shot(page, side, `${name.slice(1)}-confirm`, 'Selected declaration: confirmation still describes the record');
+      await shot(page, side, `${name.slice(1)}-confirm`, 'Selected declaration: confirmation still describes the record', { dialog: true });
       // Synthetic filesystem restore AFTER selection, with a real local Git checkout.
       await fixture.restore(name, refusal === 'repo_dirty');
       if (refusal === 'repo_status_failed') {
@@ -308,7 +351,7 @@ async function desktop(side) {
         assert.ok((await row(page, name).innerText()).includes(s.t('dashboard.trackedRepos.noCheckout')), 'Selected row stays stale until a successful removal refreshes it');
         await shot(page, side, `${name.slice(1)}-refusal`, refusal === 'repo_dirty'
           ? 'Real dirty checkout refusal: explicit force confirmation required'
-          : 'Synthetic status failure on real restored checkout: explicit force confirmation');
+          : 'Synthetic status failure on real restored checkout: explicit force confirmation', { dialog: true });
         const retried = page.waitForResponse(r => r.request().method() === 'DELETE' && r.url().includes(`/api/repos/${name}`));
         await click(page, dialog.getByRole('button', { name: s.t('resources.uninstall.retryForce'), exact: true }));
         response = await retried;
@@ -322,14 +365,14 @@ async function desktop(side) {
   // Existing flows are exercised through the actual controls on BOTH product pins.
   for (const [name, dirty] of [['_clean', false], ['_dirty', true]]) {
     await openConfirmation(s, name);
-    await shot(page, side, `${name.slice(1)}-confirm`, `${dirty ? 'Dirty' : 'Clean'} checkout: existing uninstall confirmation`);
+    await shot(page, side, `${name.slice(1)}-confirm`, `${dirty ? 'Dirty' : 'Clean'} checkout: existing uninstall confirmation`, { dialog: true });
     let response = await deleteClick(s);
     if (dirty) {
       assert.equal(response.status(), 409);
       assert.equal((await response.json()).error_code, 'repo_dirty');
       const retry = page.getByRole('dialog').getByRole('button', { name: s.t('resources.uninstall.retryForce'), exact: true });
       await retry.waitFor();
-      await shot(page, side, 'dirty-refusal', 'Real dirty checkout: changes require explicit force confirmation');
+      await shot(page, side, 'dirty-refusal', 'Real dirty checkout: changes require explicit force confirmation', { dialog: true });
       const result = page.waitForResponse(r => r.request().method() === 'DELETE' && r.url().includes('/api/repos/_dirty'));
       await click(page, retry);
       response = await result;
@@ -350,10 +393,10 @@ async function desktop(side) {
 async function localized(side) {
   const long = '_dokumentation-und-automatisierung-fuer-das-entwicklungsteam';
   const s = await session(side, 'narrow-de', narrowViewport, 'de', [...names, long]);
-  await shot(s.page, side, 'long-row', 'Deutsch · 1024 CSS px · synthetic long repository name', 'narrow-de');
+  await shot(s.page, side, 'long-row', 'Deutsch · 1024 CSS px · synthetic long repository name', { group: 'narrow-de' });
   if (side === 'after') {
     await openConfirmation(s, long);
-    await shot(s.page, side, 'long-confirm', 'Deutsch · record-only confirmation with long repository name', 'narrow-de');
+    await shot(s.page, side, 'long-confirm', 'Deutsch · record-only confirmation with long repository name', { group: 'narrow-de', dialog: true });
     const layout = await s.page.locator('.ss-dlg').evaluate(dialog => {
       const r = dialog.getBoundingClientRect();
       const body = dialog.querySelector('.db');
@@ -364,7 +407,7 @@ async function localized(side) {
     check('after: German long-name record confirmation fits measured 1024px viewport');
   } else {
     assert.equal((await s.overview()).trackedRepos.some(repo => repo.name === long), false);
-    await shot(s.page, side, 'long-confirm', 'Deutsch · before has no declaration control (same long-name fixture)', 'narrow-de');
+    await shot(s.page, side, 'long-confirm', 'Deutsch · before has no declaration control (same long-name fixture)', { group: 'narrow-de' });
   }
   await s.close();
 }

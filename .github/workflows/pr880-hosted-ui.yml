@@ -114,10 +114,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
       - name: Capture real dashboard controls and removal sequence
+        shell: bash
         env:
           CAPTURE_PLAYWRIGHT: ${{ runner.temp }}/pr880-tools/node_modules/playwright/index.mjs
           CAPTURE_STATE_ROOT: ${{ runner.temp }}/pr880-fixtures
-        run: node harness/scripts/ci-ui/capture.mjs 2>&1 | tee evidence/capture.log
+        run: |
+          set -euo pipefail
+          node harness/scripts/ci-ui/capture.mjs 2>&1 | tee evidence/capture.log
       - name: Stop owned backends and remove synthetic homes even after interruption
         if: always()
         run: |

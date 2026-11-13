@@ -177,7 +177,9 @@ async function session(side, group, size, locale, fixtureNames = names) {
   const t = (key, params) => translate(messages, key, params);
   await page.goto(`${url}/?theme=dark`, { waitUntil: 'networkidle' });
   await page.getByRole('heading', { name: t('dashboard.title'), exact: true }).waitFor();
-  await page.getByText('clean', { exact: true }).waitFor();
+  const cleanStatus = row(page, '_clean').locator('.ss-st');
+  await cleanStatus.waitFor();
+  assert.equal(await cleanStatus.innerText(), t('dashboard.trackedRepos.clean'));
   await page.evaluate(() => document.fonts.ready);
   await overlays(page);
   // Use one fixed scroll/crop in both sides, retaining navigation and section chrome.

@@ -3,6 +3,8 @@ name: Verify issue 913 exact source
 on:
   push:
     branches: [ci/issue-913-exact-source]
+  pull_request:
+    branches: [fix/opencode-v2-packages]
 
 permissions:
   contents: read

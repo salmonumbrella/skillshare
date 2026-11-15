@@ -1,0 +1,92 @@
+name: Verify issue 913 exact source
+
+on:
+  push:
+    branches: [ci/issue-913-exact-source]
+  pull_request:
+    branches: [fix/opencode-v2-packages]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: issue-913-exact-source
+  cancel-in-progress: false
+
+env:
+  REVIEWED_SHA: dfc490c56ad3799c0760627c93c0bccf09411be1
+  REVIEWED_TREE: 45ebabfe2bc63afd3cf49cba1e9d16ea5a3b6721
+
+jobs:
+  focused-go:
+    if: github.repository == 'salmonumbrella/skillshare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out reviewed source, not the harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: dfc490c56ad3799c0760627c93c0bccf09411be1
+          persist-credentials: false
+      - name: Verify exact source identity
+        run: |
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$REVIEWED_TREE"
+          git show -s --format='source commit=%H tree=%T'
+          test -z "$(git status --porcelain)"
+      - name: Set up declared Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Check context routes
+        run: python3 scripts/ai-context.py check
+      - name: Package loader regression
+        run: go test -v ./internal/opencode -run '^TestPackageLoaderInputs$' -count=1
+      - name: Synthetic hook and account lifecycle regressions
+        run: go test -v ./internal/hooks -run '^(TestOpenCode|TestAccountHomeNamedLikeOpenCodePackage)' -count=1
+      - name: Synthetic plugin directory regressions
+        run: go test -v ./internal/plugin -run '^(TestOpenCodeDirectoryPackageLifecycle|TestOpenCodeDirectoryImportAndFlatRefusal|TestOpenCodeVersionChangesInvalidatePreview|TestOpenCodeDirectoryRejectsEscapingEntry)$' -count=1
+      - name: Build CLI for the synthetic integration test
+        run: make build
+      - name: Synthetic version-probe CLI regression
+        env:
+          SKILLSHARE_TEST_BINARY: ${{ github.workspace }}/bin/skillshare
+        run: go test -v ./tests/integration -run '^TestHooksOpenCodeV2FileInput$' -count=1
+      - name: Formatting check
+        run: make fmt-check
+
+  focused-dashboard:
+    if: github.repository == 'salmonumbrella/skillshare'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out reviewed source, not the harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: dfc490c56ad3799c0760627c93c0bccf09411be1
+          persist-credentials: false
+      - name: Verify exact source identity
+        run: |
+          test "$(git rev-parse HEAD)" = "$REVIEWED_SHA"
+          test "$(git rev-parse HEAD^{tree})" = "$REVIEWED_TREE"
+          git show -s --format='source commit=%H tree=%T'
+          test -z "$(git status --porcelain)"
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+      - name: Set up pinned pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 12.6.0
+          run_install: false
+      - name: Install frozen dashboard development dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+      - name: Focused hook and localization tests
+        working-directory: ui
+        run: pnpm exec vitest run src/components/hooks/hooksView.test.ts src/components/hooks/hookCatalog.test.ts src/i18n/i18n.test.ts src/i18n/keys.test.ts
+      - name: Dashboard typecheck and build
+        working-directory: ui
+        run: pnpm run build

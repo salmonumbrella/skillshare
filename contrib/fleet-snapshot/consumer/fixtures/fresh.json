@@ -1,0 +1,1 @@
+{"schemaVersion":1,"machineId":"spoke-a","generatedAt":"2026-11-16T10:00:00Z","entries":[{"skillId":"skill-alpha","projectLabel":"project-demo","harnesses":["harness-a","harness-b"],"state":"configured"},{"skillId":"skill-beta","harnesses":["harness-a"],"state":"applied"}]}

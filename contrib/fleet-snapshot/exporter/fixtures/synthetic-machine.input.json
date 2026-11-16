@@ -1,0 +1,43 @@
+{
+  "inputVersion": 1,
+  "exportEnabled": true,
+  "machineId": "m-0a1b2c3d",
+  "generatedAt": "2026-11-16T12:00:00Z",
+  "projects": {
+    "/synthetic/home/u1/work/project-one": "alpha"
+  },
+  "targets": [
+    {"harness": "claude", "dir": "/synthetic/home/u1/.agents/skills", "mode": "merge",
+     "desired": ["skill-a", "skill-b", "skill-c"]},
+    {"harness": "agents", "dir": "/synthetic/home/u1/.agents/skills/", "mode": "merge",
+     "desired": ["skill-a"]},
+    {"harness": "cursor", "dir": "/synthetic/home/u1/.cursor/skills", "mode": "copy",
+     "desired": ["skill-a", "skill-c"]},
+    {"harness": "codex", "dir": "/synthetic/home/u1/.codex/skills", "mode": "symlink",
+     "desired": ["skill-a", "skill-b"]},
+    {"harness": "gemini", "dir": "/synthetic/home/u1/.gemini/skills", "mode": "merge",
+     "desired": ["skill-d"]},
+    {"harness": "claude", "dir": "/synthetic/home/u1/work/project-one/.claude/skills",
+     "project": "/synthetic/home/u1/work/project-one", "mode": "merge",
+     "desired": ["skill-a"]},
+    {"harness": "claude", "dir": "/synthetic/home/u1/work/project-two/.claude/skills",
+     "project": "/synthetic/home/u1/work/project-two", "mode": "merge",
+     "desired": ["skill-secret-project"]}
+  ],
+  "evidence": [
+    {"dir": "/synthetic/home/u1/.agents/skills",
+     "manifest": {"status": "present", "content": {
+       "managed": {"skill-a": "symlink", "skill-b": "symlink"},
+       "updated_at": "2026-11-16T11:00:00Z"}},
+     "verifiedLinks": ["skill-a"]},
+    {"dir": "/synthetic/home/u1/.cursor/skills",
+     "manifest": {"status": "present", "content": {
+       "managed": {"skill-a": "1111111111111111111111111111111111111111111111111111111111111111",
+                   "skill-orphan": "2222222222222222222222222222222222222222222222222222222222222222"},
+       "mtimes": {"skill-a": 1763290000000000000}}}},
+    {"dir": "/synthetic/home/u1/.codex/skills",
+     "manifest": {"status": "absent"}, "dirLinkVerified": true},
+    {"dir": "/synthetic/home/u1/work/project-one/.claude/skills",
+     "manifest": {"status": "absent"}}
+  ]
+}

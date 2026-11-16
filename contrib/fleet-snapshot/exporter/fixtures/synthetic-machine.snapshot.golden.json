@@ -1,0 +1,81 @@
+{
+  "entries": [
+    {
+      "harnesses": [
+        "agents",
+        "claude"
+      ],
+      "skillId": "skill-a",
+      "state": "applied"
+    },
+    {
+      "harnesses": [
+        "codex"
+      ],
+      "skillId": "skill-a",
+      "state": "applied"
+    },
+    {
+      "harnesses": [
+        "cursor"
+      ],
+      "skillId": "skill-a",
+      "state": "applied"
+    },
+    {
+      "harnesses": [
+        "claude"
+      ],
+      "projectLabel": "alpha",
+      "skillId": "skill-a",
+      "state": "configured"
+    },
+    {
+      "harnesses": [
+        "agents",
+        "claude"
+      ],
+      "skillId": "skill-b",
+      "state": "unknown"
+    },
+    {
+      "harnesses": [
+        "codex"
+      ],
+      "skillId": "skill-b",
+      "state": "applied"
+    },
+    {
+      "harnesses": [
+        "agents",
+        "claude"
+      ],
+      "skillId": "skill-c",
+      "state": "configured"
+    },
+    {
+      "harnesses": [
+        "cursor"
+      ],
+      "skillId": "skill-c",
+      "state": "configured"
+    },
+    {
+      "harnesses": [
+        "gemini"
+      ],
+      "skillId": "skill-d",
+      "state": "unknown"
+    },
+    {
+      "harnesses": [
+        "cursor"
+      ],
+      "skillId": "skill-orphan",
+      "state": "applied"
+    }
+  ],
+  "generatedAt": "2026-11-16T12:00:00Z",
+  "machineId": "m-0a1b2c3d",
+  "schemaVersion": 1
+}

@@ -160,6 +160,7 @@ func filterSkillEntries(skills []skillEntry, pattern, typeFilter string, status 
 	}
 
 	pat := strings.ToLower(pattern)
+	wantType := normalizeTypeValue(typeFilter)
 	var result []skillEntry
 	for _, s := range skills {
 		// Status filter
@@ -168,21 +169,8 @@ func filterSkillEntries(skills []skillEntry, pattern, typeFilter string, status 
 		}
 
 		// Type filter
-		if typeFilter != "" {
-			switch typeFilter {
-			case "tracked":
-				if s.RepoName == "" {
-					continue
-				}
-			case "local":
-				if s.Source != "" {
-					continue
-				}
-			case "github":
-				if s.Source == "" || s.RepoName != "" {
-					continue
-				}
-			}
+		if wantType != "" && skillTypeCategory(s) != wantType {
+			continue
 		}
 
 		// Pattern filter

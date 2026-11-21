@@ -70,6 +70,25 @@ func TestListProject_TrackedRepo_ShowsSkills(t *testing.T) {
 	result.AssertOutputContains(t, "tracked")
 }
 
+func TestListProject_LocalFilterExcludesTrackedMembers(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	root := sb.SetupProjectDir("claude")
+	sb.CreateProjectSkill(root, "local-only", map[string]string{"SKILL.md": "# Local"})
+	repo := setupBareRepoWithNestedAndRootSkill(t, sb, "team")
+	sb.RunCLIInDir(root, "install", "-p", repo, "--track", "--name", "team").AssertSuccess(t)
+
+	tracked := sb.RunCLIInDir(root, "list", "-p", "--type", "tracked", "--json")
+	tracked.AssertSuccess(t)
+	tracked.AssertOutputContains(t, "_team/foo")
+	tracked.AssertOutputNotContains(t, "local-only")
+
+	local := sb.RunCLIInDir(root, "list", "-p", "--type", "local", "--json")
+	local.AssertSuccess(t)
+	local.AssertOutputContains(t, "local-only")
+	local.AssertOutputNotContains(t, "_team")
+}
+
 func TestListProject_AutoDetectsMode(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()

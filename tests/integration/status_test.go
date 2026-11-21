@@ -29,6 +29,20 @@ targets: {}
 	result.AssertRowContains(t, "skills", "~/.config/skillshare/skills  2 skills")
 }
 
+func TestStatus_RejectsUnknownFlag(t *testing.T) {
+	sb := testutil.NewSandbox(t)
+	defer sb.Cleanup()
+	sb.WriteConfig("source: " + sb.SourcePath + "\ntargets: {}\n")
+
+	for _, mode := range []string{"-g", "-p"} {
+		t.Run(mode, func(t *testing.T) {
+			result := sb.RunCLI("status", mode, "--jsno")
+			result.AssertFailure(t)
+			result.AssertAnyOutputContains(t, "unexpected arguments: [--jsno]")
+		})
+	}
+}
+
 func TestStatus_ShowsTargetStatus(t *testing.T) {
 	sb := testutil.NewSandbox(t)
 	defer sb.Cleanup()

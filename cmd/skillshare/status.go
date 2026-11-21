@@ -101,14 +101,14 @@ func cmdStatus(args []string) error {
 	applyModeLabel(mode)
 
 	jsonOutput := hasFlag(rest, "--json")
+	for _, arg := range rest {
+		// Global status has historically accepted positional arguments (e.g. agents).
+		if arg != "--json" && (mode == modeProject || strings.HasPrefix(arg, "-")) {
+			return fmt.Errorf("unexpected arguments: %v", rest)
+		}
+	}
 
 	if mode == modeProject {
-		// Reject unexpected positional arguments in project mode
-		for _, arg := range rest {
-			if arg != "--json" {
-				return fmt.Errorf("unexpected arguments: %v", rest)
-			}
-		}
 		if jsonOutput {
 			return cmdStatusProjectJSON(cwd)
 		}

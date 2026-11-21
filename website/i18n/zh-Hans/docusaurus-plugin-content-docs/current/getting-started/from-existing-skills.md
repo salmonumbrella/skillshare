@@ -117,7 +117,7 @@ skillshare sync
 Tracked 依赖是 gitignored 的，不会随 clone 一起下来。init 之后重新安装它们：
 
 ```bash
-skillshare install https://github.com/your-company/skills --track --force
+skillshare install -g
 skillshare sync
 ```
 

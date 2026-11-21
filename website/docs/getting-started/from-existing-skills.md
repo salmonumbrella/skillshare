@@ -117,7 +117,7 @@ skillshare sync
 Tracked dependencies are gitignored and won't come down with the clone. Re-install them after init:
 
 ```bash
-skillshare install https://github.com/your-company/skills --track --force
+skillshare install -g
 skillshare sync
 ```
 

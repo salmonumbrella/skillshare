@@ -117,7 +117,7 @@ skillshare sync
 Tracked 相依項目已被 gitignore，不會跟著 clone 下來。init 之後重新安裝它們：
 
 ```bash
-skillshare install https://github.com/your-company/skills --track --force
+skillshare install -g
 skillshare sync
 ```
 

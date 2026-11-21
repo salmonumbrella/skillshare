@@ -117,7 +117,7 @@ skillshare sync
 tracked な依存は gitignore されているため、クローンには含まれません。init のあとに再インストールしてください:
 
 ```bash
-skillshare install https://github.com/your-company/skills --track --force
+skillshare install -g
 skillshare sync
 ```
 

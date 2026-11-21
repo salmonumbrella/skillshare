@@ -173,7 +173,7 @@ skillshare init \
 
 # 3. Tracked 의존성 재설치
 #    (_ 접두어 디렉터리는 gitignore되어 있으므로 클론한 리포지터리에 없습니다)
-skillshare install https://github.com/<your-company>/skills --track --force
+skillshare install -g
 
 # 4. Sync
 skillshare sync
@@ -196,7 +196,7 @@ skillshare init \
   --no-copy \
   --no-skill
 
-skillshare install https://github.com/<your-company>/skills --track --force
+skillshare install -g
 skillshare sync
 ```
 

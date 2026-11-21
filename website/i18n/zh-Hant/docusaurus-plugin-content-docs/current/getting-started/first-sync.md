@@ -173,7 +173,7 @@ skillshare init \
 
 # 3. 重新安裝 tracked 相依項目
 #    （_ 前綴的目錄已被 gitignore，所以不會在 clone 下來的 repo 裡）
-skillshare install https://github.com/<your-company>/skills --track --force
+skillshare install -g
 
 # 4. Sync
 skillshare sync
@@ -196,7 +196,7 @@ skillshare init \
   --no-copy \
   --no-skill
 
-skillshare install https://github.com/<your-company>/skills --track --force
+skillshare install -g
 skillshare sync
 ```
 

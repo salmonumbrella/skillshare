@@ -117,7 +117,7 @@ skillshare sync
 Tracked 의존성은 gitignore되어 있으므로 클론할 때 함께 내려오지 않습니다. init 이후에 다시 설치하세요.
 
 ```bash
-skillshare install https://github.com/your-company/skills --track --force
+skillshare install -g
 skillshare sync
 ```
 

@@ -173,7 +173,7 @@ skillshare init \
 
 # 3. tracked な依存を再インストール
 #    （_ 始まりのディレクトリは gitignore されているため、クローンには含まれません）
-skillshare install https://github.com/<your-company>/skills --track --force
+skillshare install -g
 
 # 4. Sync
 skillshare sync
@@ -196,7 +196,7 @@ skillshare init \
   --no-copy \
   --no-skill
 
-skillshare install https://github.com/<your-company>/skills --track --force
+skillshare install -g
 skillshare sync
 ```
 

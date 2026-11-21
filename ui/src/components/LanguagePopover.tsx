@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Check, Languages } from 'lucide-react';
-import { messagesByLocale, supportedLocales, useI18n, type Locale } from '../i18n';
+import { messagesByLocale, supportedLocales, useI18n } from '../i18n';
 import { useMenuPresence } from '../hooks/usePresence';
 
 export default function LanguagePopover() {
@@ -30,28 +30,30 @@ export default function LanguagePopover() {
   }, [open]);
 
   useEffect(() => {
-    if (!open) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false);
-    };
-    document.addEventListener('keydown', handler);
-    return () => document.removeEventListener('keydown', handler);
-  }, [open]);
-
-  useEffect(() => {
     if (!open || !panelRef.current) return;
     const selected = panelRef.current.querySelector('[aria-checked="true"]') as HTMLElement | null;
     selected?.focus();
   }, [open]);
 
-  const selectLocale = (nextLocale: Locale) => {
-    setLocale(nextLocale);
+  const closeToTrigger = () => {
     setOpen(false);
     triggerRef.current?.focus();
   };
 
   return (
-    <div ref={containerRef} className="relative">
+    <div
+      ref={containerRef}
+      className="relative"
+      onKeyDown={(e) => {
+        if (open && e.key === 'Escape') {
+          e.preventDefault();
+          closeToTrigger();
+        }
+      }}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget)) setOpen(false);
+      }}
+    >
       <button
         ref={triggerRef}
         type="button"
@@ -59,6 +61,7 @@ export default function LanguagePopover() {
         className={`ss-ib ${open ? 'bg-sel text-sel-ink' : ''}`}
         aria-label={t('language.settings')}
         title={t('language.settings')}
+        aria-haspopup="menu"
         aria-expanded={open}
       >
         <Languages size={16} />
@@ -67,7 +70,15 @@ export default function LanguagePopover() {
       {menu.shown && (
         <div
           ref={panelRef}
-          role="radiogroup"
+          role="menu"
+          onKeyDown={(e) => {
+            const step = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : 0;
+            if (!step) return;
+            e.preventDefault();
+            const items = Array.from(e.currentTarget.querySelectorAll('button'));
+            const index = items.findIndex((item) => item === document.activeElement);
+            items[(index + step + items.length) % items.length]?.focus();
+          }}
           aria-label={t('language.settings')}
           {...menu.exitProps}
           className={`ss-menu absolute left-0 bottom-full mb-3 z-50 origin-bottom-left !w-[300px] max-w-[calc(100vw-6rem)] max-h-[calc(100dvh-8rem)] overflow-y-auto ${menu.motion}`}
@@ -79,11 +90,14 @@ export default function LanguagePopover() {
               <button
                 key={entry.code}
                 type="button"
-                role="radio"
+                role="menuitemradio"
                 aria-checked={on}
-                onClick={() => selectLocale(entry.code)}
+                onClick={() => {
+                  setLocale(entry.code);
+                  closeToTrigger();
+                }}
                 className={on ? 'hv' : ''}
-                tabIndex={on ? 0 : -1}
+                tabIndex={-1}
               >
                 <span className="whitespace-nowrap">{entry.nativeName}</span>
                 <span className="ml-auto text-xs text-ink-3 whitespace-nowrap">

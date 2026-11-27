@@ -20,8 +20,11 @@ func TestRegionIndexMatchesRescans(t *testing.T) {
 	tokens := []string{"(", ")", "(", ")", "\\", "\\\\", " ", "\t", "\n", "\"", "'", "<", ">", "a", "é", " ",
 		"](", "<!--", "-->", "<?", "?>", "<!A", "<![CDATA[", "]]>", "<a b='c'>", "</a>", "x y"}
 	rng := rand.New(rand.NewSource(19))
-	asked := 0
-	for round := 0; round < 20000; round++ {
+	asked, rounds := 0, 20000
+	if raceBuild {
+		rounds = 4000
+	}
+	for round := 0; round < rounds; round++ {
 		var b strings.Builder
 		for n := rng.Intn(24); n > 0; n-- {
 			b.WriteString(tokens[rng.Intn(len(tokens))])
@@ -50,12 +53,12 @@ func TestRegionIndexMatchesRescans(t *testing.T) {
 			}
 		}
 	}
-	if asked < 5000 {
+	if asked < rounds/4 {
 		t.Fatalf("only %d destinations compared", asked)
 	}
 }
 
-// hostileBodies are a megabyte each of the shapes that made the scanner, or the
+// hostileBodies are n bytes each of the shapes that made the scanner, or the
 // reference it mirrors, quadratic: every link rescanning the rest of the page,
 // every list marker re-reading its line, every line walking deep nesting.
 func hostileBodies(n int) map[string]string {
@@ -80,17 +83,54 @@ func hostileBodies(n int) map[string]string {
 	}
 }
 
-func TestCompactStaysLinearOnHostileInput(t *testing.T) {
-	if testing.Short() {
-		t.Skip("scans a megabyte per shape")
+// Four times the input must cost about four times the time. Quadratic work
+// costs sixteen times, whatever the machine or the build: an absolute bound
+// would have to be tuned for the race detector and for a loaded CI runner.
+func TestCompactScalesLinearlyOnHostileInput(t *testing.T) {
+	small, large := 128<<10, 512<<10
+	if raceBuild {
+		small, large = 4<<10, 16<<10 // keeps the whole test to a couple of seconds there
 	}
-	const size = 1 << 20 // the largest file a report reads
+	timed := func(body string) time.Duration {
+		start := time.Now()
+		if _, ok := compactPathLinks(body, "wiki/guide.md", nil); !ok {
+			t.Fatal("stopped without a stopper")
+		}
+		return time.Since(start)
+	}
+	// The fastest of several interleaved runs stands for each size: other packages'
+	// tests share the machine, and a busy moment in one run must not read as growth.
+	ratio := func(name string, runs int) (base, grown time.Duration, r float64) {
+		smallBody, largeBody := hostileBodies(small)[name], hostileBodies(large)[name]
+		base, grown = time.Hour, time.Hour
+		for i := 0; i < runs; i++ {
+			base, grown = min(base, timed(smallBody)), min(grown, timed(largeBody))
+		}
+		return base, grown, float64(grown) / float64(max(base, time.Microsecond))
+	}
+	for name := range hostileBodies(16) {
+		base, grown, r := ratio(name, 2)
+		if r > 10 {
+			base, grown, r = ratio(name, 6) // look again before calling it growth
+		}
+		if r > 10 {
+			t.Errorf("%s: %v for %d bytes, %v for %d bytes: %.1f times the time for 4 times the input", name, base, small, grown, large, r)
+		}
+	}
+}
+
+// The largest file a report reads scans in a fraction of a second. Not under
+// the race detector, whose slowdown says nothing about the scanner.
+func TestCompactScansAMegabyteQuickly(t *testing.T) {
+	if raceBuild || testing.Short() {
+		t.Skip("an absolute time bound for an ordinary build")
+	}
+	const size = 1 << 20
 	for name, body := range hostileBodies(size) {
 		start := time.Now()
 		if _, ok := compactPathLinks(body, "wiki/guide.md", nil); !ok {
 			t.Errorf("%s: stopped without a stopper", name)
 		}
-		// Each takes a fraction of a second; quadratic work at this size takes minutes.
 		if elapsed := time.Since(start); elapsed > 5*time.Second {
 			t.Errorf("%s: %v for %d bytes", name, elapsed, size)
 		}

@@ -341,18 +341,19 @@ func TestMeasureHostile(t *testing.T) {
 		}
 	}
 
-	// A megabyte of unclosed links is the largest file a report reads; it is measured, and quickly.
+	// A page of nothing but unclosed links, as large as a report reads, is measured within its time.
+	// Under the race detector a smaller page stands in: the scan is some fifty times slower there.
+	links := 1 << 18
+	if raceBuild {
+		links = 1 << 13
+	}
 	hostile := writeTree(t, map[string]string{
-		"AGENTS.md": "`a`", "wiki/a.md": strings.Repeat("[a](", 1<<18),
+		"AGENTS.md": "`a`", "wiki/a.md": strings.Repeat("[a](", links),
 		ConfigRel: `{"compactPathLinks":true,"topics":{"a":{"description":"","maxBytes":2000000,"sources":[{"path":"wiki/a.md"}]}}}`,
 	})
-	start := time.Now()
 	report := measure(t, hostile, DefaultLimits)
-	if topic := report.Topics[0]; topic.Bytes == nil || *topic.Bytes != len("<!-- wiki/a.md -->\n")+1<<20 || report.Truncated {
-		t.Errorf("megabyte of unclosed links: %+v", topic)
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Errorf("megabyte of unclosed links took %v", elapsed)
+	if topic := report.Topics[0]; topic.Bytes == nil || *topic.Bytes != len("<!-- wiki/a.md -->\n")+4*links || report.Truncated {
+		t.Errorf("page of unclosed links: %+v", topic)
 	}
 
 	// A large, ordinary page in a router that compacts is measured like any other.

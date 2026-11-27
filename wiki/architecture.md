@@ -54,9 +54,10 @@ and is excluded from the reload middleware, so opening the tab writes nothing.
 The size rule and the Markdown link scanner (`mdscan.go`, `compact.go`) are a
 port of the router's script at the release named by `Reference` in
 `version.go`. `testdata/` holds what that script prints, written by
-`scripts/testing/context_router_goldens.py`. To follow a newer router, change
-the tag there and in `version.go`, regenerate, and make the port match again;
-do not edit the goldens or relax a comparison.
+`scripts/testing/context_router_goldens.py`. A router release means updating
+`Reference` and `firstUnseen` in `version.go` and the tag in that script,
+regenerating the goldens, and making the port match again; do not edit the
+goldens or relax a comparison.
 
 ## Shared Memory Notes
 

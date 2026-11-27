@@ -2,12 +2,14 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"skillshare/internal/config"
@@ -180,5 +182,69 @@ func TestContextRouter_ScriptVersion(t *testing.T) {
 	resp := getContextRouter(t, s, "", http.StatusOK)
 	if resp.Router.ScriptVersion != "0.2.1" || resp.Router.SemanticsVersion != "0.2.1" || resp.Router.VersionStatus != contextrouter.VersionLegacy {
 		t.Fatalf("0.2.1 script: %+v", resp.Router)
+	}
+}
+
+// Without a home folder there is nothing to stop the walk above a source, so
+// it is not made; a registered project is still found.
+func TestContextRouter_NoHomeFolder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the home folder comes from USERPROFILE on Windows")
+	}
+	s, source := newTestServer(t)
+	addRouter(t, filepath.Dir(source), "`page`")
+	project := addRouter(t, t.TempDir(), "`page`")
+	addProject(t, s, project)
+	if resp := getContextRouter(t, s, "", http.StatusOK); len(resp.Roots) != 2 {
+		t.Fatalf("with a home folder: %+v", resp.Roots)
+	}
+	t.Setenv("HOME", "")
+	if _, err := os.UserHomeDir(); err == nil {
+		t.Skip("a home folder is known without HOME")
+	}
+	resp := getContextRouter(t, s, "", http.StatusOK)
+	if len(resp.Roots) != 1 || resp.Roots[0].Path != project || resp.Roots[0].Origin != contextrouter.OriginProject {
+		t.Fatalf("without a home folder: %+v", resp.Roots)
+	}
+}
+
+// With several routers, only the selected folder is measured. The others are
+// listed from the presence of their config alone: here they cannot even be read.
+func TestContextRouter_MeasuresOnlyTheSelectedFolder(t *testing.T) {
+	s, _ := newTestServer(t)
+	var roots []string
+	for i := 0; i < 3; i++ {
+		root := addRouter(t, t.TempDir(), "`page`")
+		addProject(t, s, root)
+		roots = append(roots, root)
+	}
+	selected := roots[1]
+	for _, root := range roots {
+		if root == selected {
+			continue
+		}
+		// A directory where the config should be: present, so the folder is listed, and unreadable as a file.
+		config := filepath.Join(root, "wiki", "ai-context.json")
+		if err := os.Remove(config); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(config, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var measured []string
+	original := measureContextRouter
+	measureContextRouter = func(ctx context.Context, root string, lim contextrouter.Limits) (contextrouter.Report, error) {
+		measured = append(measured, root)
+		return original(ctx, root, lim)
+	}
+	t.Cleanup(func() { measureContextRouter = original })
+
+	resp := getContextRouter(t, s, selected, http.StatusOK)
+	if len(resp.Roots) != 3 || resp.Selected != selected || resp.Router == nil || resp.Router.Error != nil || resp.Router.Kernel == nil {
+		t.Fatalf("got roots %+v, router %+v", resp.Roots, resp.Router)
+	}
+	if len(measured) != 1 || measured[0] != selected {
+		t.Fatalf("measured %v, want only %s", measured, selected)
 	}
 }

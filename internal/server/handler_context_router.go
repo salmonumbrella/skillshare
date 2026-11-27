@@ -8,6 +8,9 @@ import (
 	"skillshare/internal/contextrouter"
 )
 
+// measureContextRouter is contextrouter.Measure, replaceable so a test can see which folders are measured.
+var measureContextRouter = contextrouter.Measure
+
 // handleContextRouter answers the Context page's Router tab: the folders that
 // have an agents-context-router config, and one of them measured against its
 // byte caps. It reads only. The router's script is never run, and the config
@@ -25,12 +28,16 @@ func (s *Server) handleContextRouter(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		in.SkillsSource = s.cfg.EffectiveSkillsSource()
-		in.AgentsSource = s.cfg.EffectiveAgentsSource()
+		// The walk above a source stops below the home folder. Without a home
+		// folder to stop at, it is not made; registered projects still count.
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			in.Home = home
+			in.SkillsSource = s.cfg.EffectiveSkillsSource()
+			in.AgentsSource = s.cfg.EffectiveAgentsSource()
+		}
 		for root, project := range s.cfg.Projects {
 			in.Projects = append(in.Projects, contextrouter.Project{Path: config.ExpandPath(root), Name: project.Name})
 		}
-		in.Home, _ = os.UserHomeDir()
 	}
 	// Release s.mu before reading the folders: every other API request waits on it.
 	s.mu.Unlock()
@@ -55,7 +62,7 @@ func (s *Server) handleContextRouter(w http.ResponseWriter, r *http.Request) {
 
 	var report *contextrouter.Report
 	if selected != "" {
-		measured, err := contextrouter.Measure(r.Context(), selected, contextrouter.DefaultLimits)
+		measured, err := measureContextRouter(r.Context(), selected, contextrouter.DefaultLimits)
 		if err != nil {
 			if r.Context().Err() != nil {
 				return // the client left

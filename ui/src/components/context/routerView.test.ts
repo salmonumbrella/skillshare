@@ -6,6 +6,7 @@ import {
   exactBytes,
   isStaleRoot,
   originKey,
+  pickerFolder,
   routerProblems,
   selectRoot,
   staleNotice,
@@ -235,5 +236,18 @@ describe('staleNotice', () => {
   it('is silent when nothing was lost', () => {
     expect(staleNotice('', '/a')).toBeNull();
     expect(staleNotice('', '')).toBeNull();
+  });
+});
+
+describe('pickerFolder', () => {
+  const roots = [{ path: '/a' }, { path: '/b' }];
+
+  it('shows the folder just picked while the one on screen is still the old one', () => {
+    expect(pickerFolder(roots, '/b', '/a')).toBe('/b');
+  });
+
+  it('shows the folder on screen when the URL names none, or one that is not listed', () => {
+    expect(pickerFolder(roots, '', '/a')).toBe('/a');
+    expect(pickerFolder(roots, '/gone', '/a')).toBe('/a');
   });
 });

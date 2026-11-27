@@ -1,4 +1,4 @@
-import type { RouterOrigin, RouterReport, RouterTopic } from '../../api/contextRouter';
+import type { RouterOrigin, RouterReport, RouterRoot, RouterTopic } from '../../api/contextRouter';
 import { ApiError } from '../../api/http';
 import { plural } from '../../i18n';
 
@@ -128,3 +128,10 @@ export const staleNotice = (gone: string, current: string): Sentence | null =>
     : current
       ? { key: 'context.router.stale', params: { path: gone, current } }
       : { key: 'context.router.staleNone', params: { path: gone } };
+
+/** What the folder picker shows: the folder the URL asks for as soon as it is picked, so the picker and the URL agree while the report for it is still loading; otherwise the folder on screen. */
+export const pickerFolder = (
+  roots: Pick<RouterRoot, 'path'>[],
+  wanted: string,
+  shown: string,
+): string => (wanted && roots.some((r) => r.path === wanted) ? wanted : shown);

@@ -16,6 +16,7 @@ import {
   exactBytes,
   isStaleRoot,
   originKey,
+  pickerFolder,
   routerProblems,
   selectRoot,
   staleNotice,
@@ -143,7 +144,7 @@ export default function RouterPanel({ actions }: { actions: HTMLElement | null }
         roots.length > 1 &&
         createPortal(
           <Select
-            value={current.path}
+            value={pickerFolder(roots, root, current.path)}
             onChange={setRoot}
             prefix={t('context.router.folder')}
             className="w-[320px]"
@@ -172,11 +173,14 @@ export default function RouterPanel({ actions }: { actions: HTMLElement | null }
         </div>
       )}
 
+      {/* Narrow screens: the kernel figure takes a row of its own so it never breaks mid-number. */}
       {!router.error && kernel && (
-        <div className="ss-counts !grid-cols-3">
-          <div>
+        <div className="ss-counts !grid-cols-3 max-md:!grid-cols-2">
+          <div className="max-md:col-span-2">
             <span className="flex flex-col gap-[3px]">
-              <b className={kernelOver || kernel.bytes === null ? 'text-warn' : ''}>
+              <b
+                className={`whitespace-nowrap ${kernelOver || kernel.bytes === null ? 'text-warn' : ''}`}
+              >
                 {kernel.bytes === null ? (
                   t('context.router.unavailable')
                 ) : (
@@ -194,7 +198,7 @@ export default function RouterPanel({ actions }: { actions: HTMLElement | null }
               </span>
             </span>
           </div>
-          <div>
+          <div className="max-md:![border-left:0] max-md:![border-top:var(--sep)]">
             <span className="flex flex-col gap-[3px]">
               <b>{topics.length}</b>
               <span className="text-[13px] text-ink-2">
@@ -202,7 +206,7 @@ export default function RouterPanel({ actions }: { actions: HTMLElement | null }
               </span>
             </span>
           </div>
-          <div>
+          <div className="max-md:![border-top:var(--sep)]">
             <span className="flex flex-col gap-[3px]">
               <b className={problems.length > 0 ? 'text-warn' : ''}>{problems.length}</b>
               <span className="text-[13px] text-ink-2">

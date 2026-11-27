@@ -2344,6 +2344,7 @@
   "context.router.origin.agents_source": "trouvé dans votre source d'agents ou au-dessus",
   "context.router.origin.project": "un projet enregistré",
   "context.router.stale": "{path} n'a plus de context router. {current} est affiché à la place.",
+  "context.router.staleNone": "{path} n'a plus de context router.",
   "context.router.stat.kernel": "kernel configuré ({file})",
   "context.router.stat.topics.one": "sujet local, chargé à la demande",
   "context.router.stat.topics.other": "sujets locaux, chargés à la demande",

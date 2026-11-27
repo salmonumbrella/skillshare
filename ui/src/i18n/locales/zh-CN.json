@@ -2344,6 +2344,7 @@
   "context.router.origin.agents_source": "在 agents source 或其上层找到",
   "context.router.origin.project": "已注册的项目",
   "context.router.stale": "{path} 已经没有 context router，改为显示 {current}。",
+  "context.router.staleNone": "{path} 已经没有 context router。",
   "context.router.stat.kernel": "设定的 kernel（{file}）",
   "context.router.stat.topics.one": "本地 topic，按需加载",
   "context.router.stat.topics.other": "本地 topic，按需加载",

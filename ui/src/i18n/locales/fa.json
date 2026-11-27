@@ -2344,6 +2344,7 @@
   "context.router.origin.agents_source": "در منبع عامل‌ها یا بالاتر از آن پیدا شد",
   "context.router.origin.project": "یک پروژهٔ ثبت‌شده",
   "context.router.stale": "{path} دیگر context router ندارد. به‌جای آن {current} نمایش داده می‌شود.",
+  "context.router.staleNone": "{path} دیگر context router ندارد.",
   "context.router.stat.kernel": "kernel پیکربندی‌شده ({file})",
   "context.router.stat.topics.one": "موضوع محلی، بارگذاری هنگام نیاز",
   "context.router.stat.topics.other": "موضوع محلی، بارگذاری هنگام نیاز",

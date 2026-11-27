@@ -2344,6 +2344,7 @@
   "context.router.origin.agents_source": "ditemukan di sumber agent atau di atasnya",
   "context.router.origin.project": "proyek terdaftar",
   "context.router.stale": "{path} tidak lagi punya context router. Menampilkan {current} sebagai gantinya.",
+  "context.router.staleNone": "{path} tidak lagi punya context router.",
   "context.router.stat.kernel": "kernel yang dikonfigurasi ({file})",
   "context.router.stat.topics.one": "topik lokal, dimuat saat dibutuhkan",
   "context.router.stat.topics.other": "topik lokal, dimuat saat dibutuhkan",

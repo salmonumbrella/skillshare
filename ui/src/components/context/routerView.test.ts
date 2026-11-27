@@ -8,6 +8,7 @@ import {
   originKey,
   routerProblems,
   selectRoot,
+  staleNotice,
   topicState,
   versionLine,
   versionNote,
@@ -213,5 +214,26 @@ describe('the folder in the URL', () => {
     expect(selectRoot(new URLSearchParams('tab=router&root=%2Fa'), '').toString()).toBe(
       'tab=router',
     );
+  });
+});
+
+describe('staleNotice', () => {
+  it('says what is shown instead of the lost folder', () => {
+    expect(staleNotice('/gone', '/a')).toEqual({
+      key: 'context.router.stale',
+      params: { path: '/gone', current: '/a' },
+    });
+  });
+
+  it('still names the lost folder when no router is left to show', () => {
+    expect(staleNotice('/gone', '')).toEqual({
+      key: 'context.router.staleNone',
+      params: { path: '/gone' },
+    });
+  });
+
+  it('is silent when nothing was lost', () => {
+    expect(staleNotice('', '/a')).toBeNull();
+    expect(staleNotice('', '')).toBeNull();
   });
 });

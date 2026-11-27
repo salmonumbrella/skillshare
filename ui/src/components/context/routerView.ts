@@ -120,3 +120,11 @@ export function selectRoot(params: URLSearchParams, root: string): URLSearchPara
   next.delete('gone');
   return next;
 }
+
+/** The note about a folder that lost its router: with what is shown instead, or alone when no router is left to show. Null when nothing was lost. */
+export const staleNotice = (gone: string, current: string): Sentence | null =>
+  !gone
+    ? null
+    : current
+      ? { key: 'context.router.stale', params: { path: gone, current } }
+      : { key: 'context.router.staleNone', params: { path: gone } };

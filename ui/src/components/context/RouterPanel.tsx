@@ -1,9 +1,8 @@
 import { useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { useSearchParams } from 'react-router-dom';
-import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { AlertCircle, AlertTriangle, ExternalLink, FileText, Signpost } from 'lucide-react';
-import { contextRouterApi } from '../../api/contextRouter';
 import type { RouterSource, RouterTopic } from '../../api/contextRouter';
 import EmptyState from '../EmptyState';
 import { Select } from '../Select';
@@ -11,7 +10,7 @@ import Spinner from '../Spinner';
 import { useAppContext } from '../../context/AppContext';
 import { plural, useT } from '../../i18n';
 import { shortenHome } from '../../lib/paths';
-import { queryKeys, staleTimes } from '../../lib/queryKeys';
+import { routerQueryOptions } from './routerQuery';
 import {
   dropStaleRoot,
   exactBytes,
@@ -19,6 +18,7 @@ import {
   originKey,
   routerProblems,
   selectRoot,
+  staleNotice,
   topicState,
   versionLine,
   versionNote,
@@ -35,14 +35,7 @@ export default function RouterPanel({ actions }: { actions: HTMLElement | null }
   const [params, setParams] = useSearchParams();
   const root = params.get('root') ?? '';
   const setRoot = (next: string) => setParams((p) => selectRoot(p, next), { replace: true });
-  const { data, isPending, isPlaceholderData, error } = useQuery({
-    queryKey: queryKeys.contextRouter.root(root),
-    queryFn: ({ signal }) => contextRouterApi.get(root, signal),
-    staleTime: staleTimes.contextRouter,
-    // Keep the folder on screen while the next one is measured, instead of a spinner.
-    placeholderData: keepPreviousData,
-    retry: false,
-  });
+  const { data, isPending, isPlaceholderData, error } = useQuery(routerQueryOptions(root));
   // A bookmarked folder that lost its router: fall back to the default folder and say so.
   // The lost folder moves to `gone`, so the note survives the reload of the default.
   const stale = params.get('gone') ?? '';
@@ -69,21 +62,31 @@ export default function RouterPanel({ actions }: { actions: HTMLElement | null }
   const roots = data?.roots ?? [];
   const router = data?.router;
   const current = roots.find((r) => r.path === data?.selected);
+  const lost = staleNotice(shortenHome(stale), router && current ? shortenHome(current.path) : '');
+  const lostNote = lost && (
+    <div className="ss-note inf">
+      <span className="flex-1 break-words">{t(lost.key, lost.params)}</span>
+    </div>
+  );
   if (!router || !current)
     return (
-      <EmptyState
-        icon={Signpost}
-        title={t('context.router.empty.title')}
-        description={t(
-          isProjectMode ? 'context.router.empty.project' : 'context.router.empty.global',
-        )}
-        action={
-          <a className="ss-btn" href={ROUTER_README} target="_blank" rel="noreferrer">
-            {t('context.router.learn')}
-            <ExternalLink size={13} />
-          </a>
-        }
-      />
+      <div className="flex flex-col gap-5">
+        {/* The bookmarked folder was the last one: say so, or the empty state reads as if nothing was ever there. */}
+        {lostNote}
+        <EmptyState
+          icon={Signpost}
+          title={t('context.router.empty.title')}
+          description={t(
+            isProjectMode ? 'context.router.empty.project' : 'context.router.empty.global',
+          )}
+          action={
+            <a className="ss-btn" href={ROUTER_README} target="_blank" rel="noreferrer">
+              {t('context.router.learn')}
+              <ExternalLink size={13} />
+            </a>
+          }
+        />
+      </div>
     );
 
   const say = (p: RouterProblem) =>
@@ -149,6 +152,8 @@ export default function RouterPanel({ actions }: { actions: HTMLElement | null }
           actions,
         )}
 
+      {lostNote}
+
       {/* Always shown: the server may have picked a folder above a source by itself. */}
       <p className="text-[13px] text-ink-2">
         {t('context.router.folder')}{' '}
@@ -157,17 +162,6 @@ export default function RouterPanel({ actions }: { actions: HTMLElement | null }
         </span>{' '}
         · {t(originKey(current.origin))}
       </p>
-
-      {stale && (
-        <div className="ss-note inf">
-          <span className="flex-1 break-words">
-            {t('context.router.stale', {
-              path: shortenHome(stale),
-              current: shortenHome(current.path),
-            })}
-          </span>
-        </div>
-      )}
 
       {/* Which script's numbers these are compared with, and whose rule produced them. */}
       <p className="-mt-3 text-[13px] text-ink-2">{t(version.key, version.params)}</p>

@@ -2344,6 +2344,7 @@
   "context.router.origin.agents_source": "에이전트 소스 또는 그 상위에서 찾음",
   "context.router.origin.project": "등록된 프로젝트",
   "context.router.stale": "{path}에는 더 이상 context router가 없습니다. 대신 {current}을(를) 표시합니다.",
+  "context.router.staleNone": "{path}에는 더 이상 context router가 없습니다.",
   "context.router.stat.kernel": "설정된 kernel ({file})",
   "context.router.stat.topics.one": "로컬 토픽, 필요할 때 로드",
   "context.router.stat.topics.other": "로컬 토픽, 필요할 때 로드",

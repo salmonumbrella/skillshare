@@ -2344,6 +2344,7 @@
   "context.router.origin.agents_source": "エージェントのソース、またはその上位で見つかりました",
   "context.router.origin.project": "登録済みのプロジェクト",
   "context.router.stale": "{path} には context router がなくなりました。代わりに {current} を表示しています。",
+  "context.router.staleNone": "{path} には context router がなくなりました。",
   "context.router.stat.kernel": "設定された kernel（{file}）",
   "context.router.stat.topics.one": "ローカルのトピック（必要なときに読み込み）",
   "context.router.stat.topics.other": "ローカルのトピック（必要なときに読み込み）",

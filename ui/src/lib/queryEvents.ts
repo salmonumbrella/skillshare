@@ -16,38 +16,24 @@ const ignoreFile = [k.diff(), k.overview, k.skills.all, k.doctor];
  * `syncMatrixAll` and `diffAll` are prefixes that reach every target; `syncMatrix()` and `diff()` are the all-targets query only.
  */
 const events = {
-  // Skills and agents. A skill file can be a source of a router topic, and the source folder can
-  // hold the router itself, so each event that changes source files refreshes the Router tab.
-  skillsChanged: () =>
-    keys(k.skills.all, k.overview, k.diff(), k.versionCheck, k.contextRouter.all),
+  // Skills and agents
+  skillsChanged: () => keys(k.skills.all, k.overview, k.diff(), k.versionCheck),
   // A project's config.yaml declares the branch, so the config editor reloads too.
-  skillBranchSwitched: () =>
-    keys(k.skills.all, k.overview, k.diff(), k.config, k.contextRouter.all),
+  skillBranchSwitched: () => keys(k.skills.all, k.overview, k.diff(), k.config),
   // The list shows frontmatter (description, manual only), so an edit refreshes it too.
-  skillEdited: (name: string) => keys(k.skills.all, k.skills.detail(name), k.contextRouter.all),
+  skillEdited: (name: string) => keys(k.skills.all, k.skills.detail(name)),
   // The version card reads the built-in skill and .skillignore from the source, so events that add, remove or disable a skill refresh it.
-  installDialogClosed: () => keys(k.skills.all, k.versionCheck, k.contextRouter.all),
-  reposChanged: () =>
-    keys(k.overview, k.skills.all, k.trash, k.missingConfigEntries, k.contextRouter.all),
-  skillsMoved: () =>
-    keys(k.skills.all, k.overview, k.syncMatrixAll, k.diff(), k.versionCheck, k.contextRouter.all),
+  installDialogClosed: () => keys(k.skills.all, k.versionCheck),
+  reposChanged: () => keys(k.overview, k.skills.all, k.trash, k.missingConfigEntries),
+  skillsMoved: () => keys(k.skills.all, k.overview, k.syncMatrixAll, k.diff(), k.versionCheck),
   skillsUninstalled: () =>
-    keys(
-      k.skills.all,
-      k.overview,
-      k.trash,
-      k.syncMatrixAll,
-      k.diff(),
-      k.versionCheck,
-      k.contextRouter.all,
-    ),
-  trashChanged: () =>
-    keys(k.trash, k.skills.all, k.syncMatrixAll, k.versionCheck, k.contextRouter.all),
+    keys(k.skills.all, k.overview, k.trash, k.syncMatrixAll, k.diff(), k.versionCheck),
+  trashChanged: () => keys(k.trash, k.skills.all, k.syncMatrixAll, k.versionCheck),
   skillSyncChanged: () => keys(k.skills.all, k.syncMatrixAll, k.versionCheck),
   skillsToggled: () => keys(k.skills.all, k.syncMatrixAll, k.overview, k.versionCheck),
   skillTargetFilterChanged: () => keys(k.targets.all, k.syncMatrixAll, k.diffAll),
-  sourceLinked: () => keys(...sourceLinks, k.contextRouter.all),
-  sourceUnlinked: () => keys(...sourceLinks, k.trash, k.missingConfigEntries, k.contextRouter.all),
+  sourceLinked: () => keys(...sourceLinks),
+  sourceUnlinked: () => keys(...sourceLinks, k.trash, k.missingConfigEntries),
   collected: (target?: string) =>
     keys(
       k.skills.all,
@@ -57,7 +43,6 @@ const events = {
       k.syncMatrix(),
       k.collectScan(target),
       k.versionCheck,
-      k.contextRouter.all,
     ),
   configInstalled: () =>
     keys(
@@ -67,24 +52,19 @@ const events = {
       k.syncMatrixAll,
       k.diff(),
       k.versionCheck,
-      k.contextRouter.all,
     ),
 
   // Targets, projects and sync
-  targetsChanged: () => keys(...targets, k.instructions.all, k.contextRouter.all),
-  synced: () => keys(k.targets.all, k.overview, k.diff(), k.contextRouter.all),
-  syncRan: () =>
-    keys(...targets, k.extrasDiff(), k.extras, k.mcp, k.hooks, k.logAll, k.contextRouter.all),
-  projectSynced: () => keys(...targets, k.mcp, k.hooks, k.logAll, k.contextRouter.all),
-  // The Router tab measures files on disk: a project or source folder decides where it looks,
-  // and a write to instruction, target or source files can change what it measures.
-  projectChanged: () => keys(...targets, k.mcp, k.hooks, k.contextRouter.all),
-  projectAdded: () => keys(...targets, k.mcp, k.hooks, k.contextRouter.all),
-  targetFilesChanged: (target: string) => keys(k.targetFiles.list(target), k.contextRouter.all),
+  targetsChanged: () => keys(...targets, k.instructions.all),
+  synced: () => keys(k.targets.all, k.overview, k.diff()),
+  syncRan: () => keys(...targets, k.extrasDiff(), k.extras, k.mcp, k.hooks, k.logAll),
+  projectSynced: () => keys(...targets, k.mcp, k.hooks, k.logAll),
+  projectChanged: () => keys(...targets, k.mcp, k.hooks),
+  projectAdded: () => keys(...targets, k.mcp, k.hooks),
+  targetFilesChanged: (target: string) => keys(k.targetFiles.list(target)),
   // Only the list: the removed file's content query is still mounted and would fetch again.
   targetFileRemoved: (target: string): InvalidateQueryFilters[] => [
     { queryKey: k.targetFiles.list(target), exact: true },
-    { queryKey: k.contextRouter.all },
   ],
 
   // Config
@@ -105,7 +85,6 @@ const events = {
       k.doctor,
       k.instructions.all,
       k.memory.all,
-      k.contextRouter.all,
     ),
   updatePolicyChanged: () => keys(k.versionCheck, k.doctor),
   settingsSaved: () => keys(k.updatePolicy, k.config, k.versionCheck, k.doctor),
@@ -115,13 +94,11 @@ const events = {
   auditRulesChanged: () => keys(k.audit.rules, k.audit.compiled),
 
   // Extras, instructions and memory
-  extrasChanged: () =>
-    keys(k.extras, k.extrasDiff(), k.config, k.overview, k.memory.all, k.contextRouter.all),
+  extrasChanged: () => keys(k.extras, k.extrasDiff(), k.config, k.overview, k.memory.all),
   instructionsChanged: () =>
-    keys(k.instructions.all, k.extras, k.extrasDiff(), k.config, k.memory.all, k.contextRouter.all),
-  managedFilesChanged: () =>
-    keys(k.fileBackups.all, k.instructions.all, k.memory.all, k.contextRouter.all),
-  memoryNotesChanged: () => keys(k.memory.all, k.extras, k.fileBackups.all, k.contextRouter.all),
+    keys(k.instructions.all, k.extras, k.extrasDiff(), k.config, k.memory.all),
+  managedFilesChanged: () => keys(k.fileBackups.all, k.instructions.all, k.memory.all),
+  memoryNotesChanged: () => keys(k.memory.all, k.extras, k.fileBackups.all),
   memoryRefreshed: () => keys(k.memory.all),
 
   // MCP, hooks and plugins
@@ -147,7 +124,7 @@ const events = {
   // Backups, logs, git and the app itself
   backupsChanged: () => keys(k.backups),
   backupLimitsSaved: () => keys(k.backups, k.config),
-  backupRestored: () => keys(k.backups, k.targets.all, k.contextRouter.all),
+  backupRestored: () => keys(k.backups, k.targets.all),
   logsCleared: () => keys(k.logAll, k.logStatsAll),
   gitFetched: () => keys(k.gitStatus),
   gitChanged: () =>
@@ -160,7 +137,6 @@ const events = {
       k.targets.all,
       k.diff(),
       k.versionCheck,
-      k.contextRouter.all,
     ),
   // Root scope can change any of the source resources shown elsewhere.
   sourceDiscarded: (): InvalidateQueryFilters[] => [{}],
